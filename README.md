@@ -1,106 +1,202 @@
-# 🌴 Project California
+# Project California
 
-A DIY voice assistant powered by Claude, running on a Raspberry Pi (or your laptop).
+California is a DIY voice assistant for Raspberry Pi or laptop development with a low-latency streaming voice pipeline and Mi Box / Android TV control over ADB.
 
-**Say "Hey Jarvis" → speak your question → hear the answer.**
+The current system does two main jobs:
+
+- listen, transcribe, think, and speak back with low latency
+- launch and control Stremio, YouTube, and other TV actions from voice commands
+
+The target setup is practical rather than flashy: responsive speech, predictable media control, and operating cost under EUR5/month.
+
+## Core Flows
+
+### Voice assistant
+
+```text
+Microphone -> Wake word -> VAD -> Groq Whisper -> LLM -> Sentence chunker -> TTS -> Speaker
+```
+
+The important part is streaming. LLM output is split sentence by sentence so TTS can begin speaking before the full answer is finished.
+
+### TV and media control
+
+```text
+Voice request -> LLM tool call -> MediaService / StremioService -> ADB deep link or keyevent -> Mi Box / Android TV
+```
+
+This lets California do things like:
+
+- play or continue a Stremio title
+- launch YouTube playlists or search results
+- control playback, volume, home, back, wake, and sleep
+- inspect current app and media session state
+
+## Main Features
+
+- Streaming STT -> LLM -> TTS pipeline with sentence-level overlap for lower perceived latency
+- Wake-word support via openWakeWord or Porcupine
+- Multi-provider LLM support through `services/llm.py`
+- TTS support for Kokoro, Edge TTS, Piper, and ElevenLabs
+- ADB-based control of Mi Box / Android TV
+- Stremio integration with local watch-state caching in `watch_state.json`
+- TMDB-backed title resolution when a requested title is not already cached
+- Static YouTube playlist categories with fuzzy voice matching and optional multi-ID random selection
 
 ## Quick Start
 
 ```bash
-# 1. Clone / navigate to the project
+# 1. Enter the project
 cd california
 
-# 2. Create virtual env & install deps
-python3 -m venv venv
+# 2. Create and activate a virtual environment
+python -m venv venv
+
+# Windows
+venv\Scripts\activate
+
+# Linux / macOS
 source venv/bin/activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
 
-# 3. Set up API keys
-cp .env.example .env
-# Edit .env with your keys:
-#   GROQ_API_KEY     — free at https://console.groq.com/keys
-#   ANTHROPIC_API_KEY — at https://console.anthropic.com/settings/keys
-nano .env
+# 4. Create local env file
+copy .env.example .env
 
-# 4. Test each component individually
-python main.py --test-mic       # Check your microphone works + calibrate VAD
-python main.py --test-tts       # Check TTS audio output
-python main.py --test-stt       # Record + transcribe (tests mic + Groq)
-python main.py --test-llm       # Chat via keyboard (tests Claude)
-python main.py --test-pipeline  # Full loop: Enter → speak → hear answer (no wake word)
+# 5. Edit .env with at least:
+# GROQ_API_KEY
+# ANTHROPIC_API_KEY
 
-# 5. Run the full assistant
+# 6. Run individual tests or the full assistant
+python main.py --test-mic
+python main.py --test-tts
+python main.py --test-stt
+python main.py --test-llm
+python main.py --test-pipeline
 python main.py
 ```
 
-## How It Works
+## Environment Variables
 
-```
-Mic → Wake Word (openWakeWord) → Record (VAD) → STT (Groq Whisper) → LLM (Claude) → TTS (Edge/Piper) → Speaker
-         local                     local          cloud ~0.5s       cloud streaming     cloud/local
-```
+Default voice setup:
 
-The key: everything from LLM → TTS is **streamed sentence by sentence**, so you hear the
-first words ~2 seconds after speaking — not 5-6 seconds if we waited for the full response.
+- `GROQ_API_KEY` for Whisper STT
+- `ANTHROPIC_API_KEY` for Claude
+- `PICOVOICE_ACCESS_KEY` if using a Porcupine `.ppn` wake-word model
+
+Stremio support:
+
+- `STREMIO_EMAIL`
+- `STREMIO_PASSWORD`
+
+TMDB fallback title lookup:
+
+- `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN`
+
+Keep credentials in `.env` only. Do not commit real secrets.
 
 ## Configuration
 
-All settings are in `config.yaml`. Key things to tune:
+Most tuning lives in `config.yaml`.
 
-| Setting | What it does | When to change |
-|---------|-------------|----------------|
-| `wake_word.model` | Wake word trigger | Change to custom model |
-| `wake_word.threshold` | Sensitivity (0-1) | Getting false positives → raise it |
-| `vad.energy_threshold` | Silence detection | Run `--test-mic` to calibrate |
-| `llm.provider` | claude / groq | Want free? Use groq |
-| `tts.provider` | edge / piper / elevenlabs | edge works everywhere |
+Common things to adjust:
 
-## Test Modes
+- wake-word model and threshold
+- VAD sensitivity
+- LLM provider and model
+- TTS provider and voice
+- Stremio sync interval and autoplay delay
+- YouTube saved playlist categories
+- ADB target device settings for the Mi Box / Android TV
 
-| Command | Tests | Use when |
-|---------|-------|----------|
-| `--test-mic` | Microphone levels | Setting up, calibrating VAD threshold |
-| `--test-tts` | Speaker + TTS engine | Checking audio output works |
-| `--test-stt` | Mic → Groq transcription | Verifying STT quality + API key |
-| `--test-llm` | Claude chat (keyboard) | Testing LLM responses + API key |
-| `--test-pipeline` | Full loop (no wake word) | End-to-end test, press Enter to talk |
+## Manual Test Modes
+
+`main.py` includes:
+
+- `python main.py --test-mic`
+- `python main.py --test-tts`
+- `python main.py --test-stt`
+- `python main.py --test-llm`
+- `python main.py --test-pipeline`
+
+Run the full assistant with:
+
+```bash
+python main.py
+```
+
+## Running Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Current tests cover core media integrations such as Stremio playback flows, TV control behavior, and YouTube playlist matching.
 
 ## Project Structure
 
-```
+```text
 california/
-├── main.py                  # Entry point + test modes
-├── config.yaml              # All tunables
-├── .env                     # API keys (git-ignored)
+├── CLAUDE.md
+├── README.md
+├── main.py
+├── config.yaml
+├── requirements.txt
 ├── core/
-│   ├── orchestrator.py      # State machine (the brain)
-│   ├── audio_pipeline.py    # Mic capture + playback
-│   ├── wake_word.py         # openWakeWord detector
-│   └── vad.py               # Voice activity detection
+│   ├── orchestrator.py
+│   ├── audio_pipeline.py
+│   ├── wake_word.py
+│   └── vad.py
 ├── services/
-│   ├── stt.py               # Speech-to-text (Groq Whisper)
-│   ├── llm.py               # LLM brain (Claude / Groq)
-│   ├── tts.py               # Text-to-speech (Edge / Piper / ElevenLabs)
-│   └── sentence_chunker.py  # Stream splitter for LLM → TTS
+│   ├── llm.py
+│   ├── media_service.py
+│   ├── sentence_chunker.py
+│   ├── stremio_service.py
+│   ├── stt.py
+│   ├── tts.py
+│   ├── tts_text_sanitizer.py
+│   └── youtube_playlist_resolver.py
 ├── hardware/
-│   └── led_controller.py    # LED feedback (console on laptop, pixel_ring on Pi)
-├── models/                  # Wake word models go here
-└── sounds/                  # Auto-generated chime sounds
+│   └── led_controller.py
+├── tools/
+│   ├── search_youtube_playlists.py
+│   ├── search_youtube_videos.py
+│   └── validate_youtube_playlists.py
+├── tests/
+├── sounds/
+├── models/
+└── watch_state.json
 ```
 
-## Estimated Costs
+## Stremio and YouTube Notes
 
-| Component | Cost |
-|-----------|------|
-| Hardware (Pi 4 + ReSpeaker + speaker) | ~€80 one-time |
-| Groq Whisper API | Free |
-| Claude Sonnet 4.5 (~50 queries/day) | ~€2-3/month |
-| Edge TTS | Free |
-| **Total monthly** | **~€2-3** |
+Stremio playback follows a reliability-first flow:
 
-## Next Steps
+1. check `watch_state.json`
+2. fall back to TMDB if needed
+3. resolve IMDb ID
+4. launch Stremio via ADB
+5. retry autoplay confirmation if playback does not start
 
-1. **Custom wake word**: Train "Hey California" using openWakeWord's training tools
-2. **Better TTS**: Switch to Piper (local) on Pi, or ElevenLabs (paid) for premium voice
-3. **Home automation**: Add MQTT/Home Assistant integration
-4. **Offline fallback**: Add local Whisper + small LLM for when internet is down
+YouTube support is intentionally simple:
+
+- playlist categories are stored in `config.yaml`
+- exact and fuzzy category matching is handled in `services/youtube_playlist_resolver.py`
+- categories can hold one playlist ID or several IDs
+- when multiple IDs exist, one is chosen at random
+
+## Operational Notes
+
+- `watch_state.json` is a generated local cache and should stay disposable
+- `core/orchestrator.py` is the main coordinator for speech flow and tool dispatch
+- most integrations live under `services/`
+- for stable ADB behavior on the Mi Box, Wakelock Revamp is a useful deployment-side helper
+
+## Cost Target
+
+The project is designed to stay below EUR5/month in normal use by leaning on:
+
+- Groq Whisper free-tier STT
+- concise prompts
+- lightweight, direct integrations instead of heavier cloud tooling
