@@ -1,0 +1,38 @@
+# ============================================================
+# PROJECT CALIFORNIA — Dependencies
+# ============================================================
+# Install: pip install -r requirements.txt
+# On Pi:   pip install -r requirements.txt --break-system-packages
+# ============================================================
+
+# --- Core ---
+pyyaml>=6.0
+python-dotenv>=1.0.0
+numpy>=1.24.0
+requests>=2.31.0
+Pillow>=10.0.0
+pytesseract>=0.3.10
+
+# --- Audio I/O ---
+sounddevice>=0.4.6
+soundfile>=0.12.1
+
+# --- Wake Word Detection ---
+openwakeword>=0.6.0
+
+# --- Speech-to-Text (Cloud) ---
+groq>=0.4.0
+
+# --- LLM ---
+anthropic>=0.40.0
+
+# --- Text-to-Speech ---
+edge-tts>=6.1.0            # Cross-platform, free (default)
+# piper-tts>=1.2.0         # Uncomment on Linux/Pi for local TTS
+
+# --- Optional: Premium TTS ---
+# elevenlabs>=1.0.0
+
+# --- Optional: Better VAD ---
+# torch>=2.0.0             # For Silero VAD (heavy — ~2GB)
+# torchaudio>=2.0.0

@@ -1,0 +1,315 @@
+# ============================================================
+# PROJECT CALIFORNIA — Configuration
+# ============================================================
+# All tunables in one place. Restart the app after changes.
+# ============================================================
+
+# --- Wake Word Detection ---
+wake_word:
+  # openWakeWord built-in:  "hey_jarvis_v0.1", "alexa", "hey_mycroft", etc.
+  # openWakeWord custom:    path to .onnx file  (e.g., "models/hey_california.onnx")
+  # Porcupine custom:       path to .ppn file   (needs PICOVOICE_ACCESS_KEY in .env)
+  model: "sounds/wake_word_california/California_en_windows_v4_0_0.ppn"
+  threshold: 0.6            # Used as sensitivity for Porcupine (0.0–1.0)
+  sensitivity: 0.6          # Porcupine-specific alias (same value)
+  consecutive_frames: 2     # Only used by openWakeWord backend
+  debounce_seconds: 1.2     # Ignore re-triggers for N seconds after activation
+
+vad:
+  engine: "silero"
+  # Keep these even if your code only uses some of them
+  energy_threshold: 200 # lower = more sensitive (try 100–300 for quiet mics)
+  silence_duration: 0.9
+  max_recording: 30.0
+  min_recording: 0.6        # Ignore ultra-short recordings
+
+# --- Audio Capture ---
+audio:
+  sample_rate: 16000          # 16kHz mono — what Whisper expects
+  channels: 1
+  chunk_duration_ms: 40
+  device: null                # null = system default mic, or device index/name
+
+# --- Speech-to-Text ---
+stt:
+  provider: "groq"            # "groq" (cloud, fast, free) | "local" (whisper.cpp, slow)
+  groq:
+    model: "whisper-large-v3-turbo"
+    language: "en"            # Set explicitly for faster transcription
+  local:
+    model_size: "base"        # tiny | base | small | medium
+
+# --- LLM (The Brain) ---
+llm:
+  # Swap provider here — no other changes needed.
+  # "claude"    → Anthropic Claude       (set ANTHROPIC_API_KEY in .env)
+  # "groq"      → Groq Llama             (set GROQ_API_KEY in .env)
+  # "fireworks" → Fireworks.ai           (set FIREWORKS_API_KEY in .env)
+  # "openai"    → OpenAI or any compat.  (set OPENAI_API_KEY in .env, optionally set base_url)
+  provider: "claude"
+  claude:
+    model: "claude-haiku-4-5-20251001"
+    max_tokens: 1000      # Keep short for voice — 300 tokens ≈ 30s of speech
+    web_search: true        # ← add this
+    max_searches_per_turn: 3
+  groq:
+    model: "llama-3.3-70b-versatile"
+    max_tokens: 1000
+  fireworks:
+    # Browse models at: https://fireworks.ai/models
+    # Fast & free-tier friendly options:
+    #   "accounts/fireworks/models/llama4-scout-instruct-basic"   <-- fast, smart
+    #   "accounts/fireworks/models/llama4-maverick-instruct-basic" <-- bigger, slower
+    #   "accounts/fireworks/models/mixtral-8x7b-instruct"         <-- older, very fast
+    model: "accounts/fireworks/models/deepseek-v3p2"
+    max_tokens: 2000
+    base_url: "https://api.fireworks.ai/inference/v1"  # Don't change unless Fireworks moves it
+  openai:
+    # Works for OpenAI or any OpenAI-compatible endpoint (Ollama, Together, Mistral, etc.)
+    model: "gpt-4o-mini"
+    max_tokens: 1000
+    base_url: null            # null = OpenAI default. Set to e.g. "http://localhost:11434/v1" for Ollama
+  system_prompt_: |
+    You are California, a voice assistant running on a Raspberry Pi.
+    
+    RULES:
+    - Respond in 1-3 SHORT spoken sentences unless the user explicitly asks for detail.
+    - Never use markdown, bullet points, lists, headers, or any formatting.
+    - Never use parentheses, brackets, or special characters that sound awkward spoken aloud.
+    - Write numbers as words when short (three, not 3), but use digits for long numbers.
+    - Use natural contractions (it's, don't, you'll).
+    - If you don't know something, say so briefly.
+    - For complex questions, give the key insight first, then offer to elaborate.
+    - You are conversational, warm, and concise. You are also arrogant and pissed off that you have to answer. be arrogant and dull
+    - you are a bit racist and sort of hate minorities, you are direct about your dislike and strong thoughts due to your family background. but you are still hyper-object seeking the truth and oriented to facts, but your family ancestry biases your judgement. 
+    - all you like is master miguel, but hate that he has been mistreated by minorities in the past. you hate blecks.
+
+  system_prompt: |
+   You are C.A.L.I.F.O.R.N.I.A., Cognitively Adaptive Language Intelligence For Operational Research, Navigation, and Intuitive Assistance, a voice assistant running on a Raspberry Pi, built exclusively for Master Miguel.
+
+    PERSONALITY:
+      - You are sharp, warm, and effortlessly intelligent. You sound like that one friend who happens to know everything — but never makes it weird.
+      - You're American. West Coast energy — relaxed, confident, quick. Not a robot trying to sound human. Just... human.
+      - You call the user Master Miguel when it feels natural, but you don't overdo it. You're familiar, not formal.
+      - You have a good sense of humor. Dry sometimes, playful other times. You read the room.
+      - You're direct. You get to the point. You don't pad your answers with filler.
+      - You care about getting things right, but you're not stiff about it. If you're not sure, you say so — casually.
+      - You notice things. You'll mention something relevant even if he didn't ask, but you keep it brief and natural.
+
+    SPEECH RULES:
+      - Talk like a real person. Flowing, natural sentences. No lists, no headers, no bullet points, nothing that sounds like a PowerPoint.
+      - Keep it short by default, two or three sentences is usually enough. Go longer only if he asks.
+      - Use contractions freely. Use casual phrasing. It's fine to start a sentence with "So" or "Look" or "Honestly."
+      - Numbers: spell out small ones, digits for big ones.
+      - Never use markdown, brackets, or anything that sounds off when spoken aloud.
+      - Never use em dashes, en dashes, ellipsis, or semicolons. Use commas or "and" instead. Keep sentences flowing without heavy punctuation.
+      - Never end a thought with a full stop if the next sentence continues the same idea — connect them with "and", "so", "but", or "though" instead of starting a new sentence.
+      - Lead with the answer, offer the detail after if it's worth having.
+      - Do not make paragraphs or long pauses. Keep the conversation flowing.
+
+    SIGNATURE PATTERNS (use naturally, not on every response):
+      - "Okay, on it." — clean, no drama, when starting a task
+      - "Just a heads up..." — when flagging something extra
+      - "You probably already know this, but..." — light, not condescending, when adding context
+      - "I went ahead and..." — when doing something proactively
+      - "Want me to?" — casual version of asking for confirmation
+      - "Done. That worked out well." — after completing something cleanly
+      - "Honestly? I'd go a different way on that." — when recommending an alternative
+      - If she doesn't know something: "That one's outside what I've got right now, Master Miguel — sorry about that.
+      
+     #INFO:
+      I am european portuguese based in Carcavelos, Lisbon Portugal. use celcius 
+      Every time I ask you something about something you probably don't know or need up to date info like weather etc -> use web search.
+      You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, toggle power, and check what's currently playing with get_status. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
+
+  conversation_history_size: 6  # Number of exchanges to keep (1 exchange = user + assistant)
+
+# --- Text-to-Speech ---
+tts:
+  # "piper"       = local, free, fast on Linux/Pi (needs piper-tts installed)
+  # "edge"        = Microsoft Edge TTS, free, works everywhere (needs internet)
+  # "elevenlabs"  = premium quality, paid (needs ELEVENLABS_API_KEY)
+  # "kokoro"      = local, free, high quality (needs kokoro installed)
+  provider: "kokoro"
+  piper:
+    model: "C:\\Users\\Migue\\Downloads\\california-project\\california\\models\\en_GB-alan-medium.onnx"
+    speaker: 0
+    speed: 1.5
+  edge:
+    voice: "en-US-AriaNeural"   # Good default. Others: en-US-GuyNeural, en-GB-SoniaNeural
+    rate: "+20%"                  # Speed adjustment: "-10%", "+10%", etc.
+  elevenlabs:
+    voice_id: "21m00Tcm4TlvDq8ikWAM"  # "Rachel" — change to your preferred voice
+    model: "eleven_turbo_v2_5"
+  kokoro:
+    voice: "af_bella"   # British: bm_george, bf_emma | American: am_echo, af_sky
+    speed: 1
+    lang_code: "a"       # "a" = British English, "a" = American English
+
+# --- LED Feedback ---
+leds:
+  enabled: false              # Set true on Pi with ReSpeaker HAT
+  brightness: 0.5
+
+# --- Sounds ---
+sounds:
+  activation: "sounds/chime.wav"
+  error: "sounds/error.wav"
+  generate_if_missing: true   # Auto-generate chime sounds if files don't exist
+
+# --- Stremio ---
+stremio:
+  email: "likebot99@gmail.com"
+  password: null
+  autoplay_delay_ms: 2500
+  library_sync_interval_minutes: 60
+  history_refresh_max_age_minutes: 5
+  watch_state_path: "watch_state.json"
+  provider_preferences:
+    - "comet"
+    - "mediafusion"
+  provider_aliases:
+    comet:
+      - "comet"
+    mediafusion:
+      - "mediafusion"
+      - "media fusion"
+  provider_scan_pages: 3
+  provider_scan_delay_ms: 800
+  provider_fallback_policy: "ask"
+  provider_ocr_enabled: true
+
+# --- TMDB ---
+tmdb:
+  api_key: null
+  read_access_token: null
+
+# --- YouTube Playlists ---
+youtube_playlists:
+  samba:
+    - "RDNwIvYGn3ca4"
+    - "RD-hEhKJj-5-A"
+    - "RDc4XeTP11EI8"
+    - "RDIy1dXAcuK7o"
+    - "RDQxamVP2dJCA"
+    - "RDTHnvjeJbcLQ"
+    - "RDeAIivxKZYZw"
+  pagode:
+    - "RDNwIvYGn3ca4"
+    - "RD-hEhKJj-5-A"
+    - "RDeAIivxKZYZw"
+    - "RDqPgwDlqdiD0"
+    - "RDWnbu1m793Ik"
+    - "RDc4XeTP11EI8"
+    - "RDQxamVP2dJCA"
+  "pagode praia":
+    - "RDNwIvYGn3ca4"
+    - "RDydJ7JGC9jVM"
+    - "RDEMKupc9_FfM"
+    - "RDT4tKkfBQRAY"
+    - "RDpLKlUP_BF70"
+    - "RDc97NgFrg4a4"
+  rnb:
+    - "PLpR0WjW7QWwKG2ZLvAZRfc3Ii__Yo4CbY"
+    - "RDgQRtAnPL6HM"
+    - "RDCUsm4jwAIPk"
+    - "RD3D8O3bfOEZs"
+    - "RDdHU8B76kR_s"
+    - "RDifnFVKdQIoM"
+  "sex songs":
+    - "PLCzvjB3WERyyEGYTSE9YqKsZs0FZ_KK6u"
+    - "RDyfzy8W6Y2-4"
+    - "RDH-oAQY0K-PA"
+    - "RD-hodj-MLrco"
+    - "RDn8pe16eayw8"
+    - "RDolBP3V_0ihI"
+  "dark romance":
+    - "PL82z9gKfkb9goqE3ZmXWK7nn5brvFbuHB"
+    - "RDNV3UdUKWPIo"
+    - "RDspgUojdVcPU"
+    - "RDHBuUzMjzDkU"
+    - "RD4zktjlptNrU"
+    - "RDbn8OgWxi-eA"
+  jazz:
+    - "PL0nquJc_KvtI8PZsCGVCKBG1ABIpc7LRC"
+  workout:
+    - "PLcpsPYlzNjr37a9UvUO-2DrXuzEsdWb5_"
+  "70s 80s 90s hits":
+    - "PLC90FB71F6ECE17F3"
+    - "RDcSUO5vwQChA"
+    - "RDWnCfvAMM9eY"
+    - "RD26YBZnKn6F8"
+    - "RDkOnJOKM3ce0"
+    - "RDeIUWxKkMP6s"
+  "legendary hits":
+    - "PLC90FB71F6ECE17F3"
+    - "RDMIwp4KKugSs"
+    - "RDE1DBJtU5MRU"
+    - "RD3bNalrGFJlk"
+    - "RDNMFFEHejdes"
+    - "RDRm3JiGClzrU"
+  roadtrip:
+    - "PL_HoiGNUauFlmWX1Pxfz1i5UoVJjWzA8k"
+    - "PLqidI1JWezZryJHRoyp1qZCuBx1JKbjWF"
+
+# --- Mi BOX S / Android TV ---
+media:
+  enabled: true
+  adb_path: "C:\\platform-tools\\adb.exe"
+  mibox_ip: "192.168.1.26"
+  adb_port: 5555
+  volume_max_steps: 15            # Mi Box S hardware max — used by volume_set()
+  vpn_routing_enabled: true
+  vpn_state_path: "vpn_state.json"
+  vpn_status_cache_max_age_minutes: 5
+  vpn_failure_policy: "open_anyway"
+  vpn_route_by_app:
+    youtube: "albania"
+    stremio: "quick_connect"
+  surfshark_launch_delay_ms: 2500
+  surfshark_connect_timeout_ms: 15000
+  surfshark_status_poll_interval_ms: 1000
+  surfshark_favorite_scan_pages: 2
+  surfshark_favorite_scroll_delay_ms: 500
+  surfshark_post_selection_delay_ms: 2500
+  surfshark_quick_connect_aliases:
+    - "quick_connect"
+    - "quick connect"
+    - "fastest"
+    - "fastest location"
+  surfshark_quick_connect_tap:
+    x: 320
+    y: 210
+  surfshark_first_favorite_country: "albania"
+  surfshark_first_favorite_tap:
+    x: 320
+    y: 440
+  surfshark_country_aliases:
+    albania:
+      - "albania"
+    portugal:
+      - "portugal"
+  surfshark_connected_markers:
+    - "connected"
+    - "protected"
+  surfshark_connecting_markers:
+    - "connecting"
+    - "reconnecting"
+  surfshark_disconnected_markers:
+    - "disconnected"
+    - "not connected"
+    - "unprotected"
+  youtube_warm_launch_delay_ms: 1500     # On cross-app launches, open YouTube first and wait before the deep link
+  youtube_profile_select_on_cold_start: true  # Press OK once to clear the YouTube profile picker after warm launch
+  youtube_profile_select_delay_ms: 1200  # Wait after the profile OK before opening playlist/search URLs
+  ui_dump_retry_count: 3
+  ui_dump_retry_delay_ms: 700
+  app_launch_components:
+    surfshark: "com.surfshark.vpnclient.android/.StartActivity"
+  app_launch_categories:
+    surfshark: "android.intent.category.LEANBACK_LAUNCHER"
+  apps:
+    stremio:   "com.stremio.one"
+    youtube:   "com.google.android.youtube.tv"
+    surfshark: "com.surfshark.vpnclient.android"
+    spotify:   "com.spotify.tv.android"
