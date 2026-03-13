@@ -31,17 +31,19 @@ logger = logging.getLogger(__name__)
 
 CONTROL_TV_TOOL = {
     "name": "control_tv",
-    "description": (
-        "Controls Master Miguel's Mi BOX S Android TV via ADB. "
-        "Use when asked to play, pause, stop, skip, fast-forward, rewind, "
-        "change volume, set volume to a percentage, open an app, launch "
-        "Stremio titles, continue Stremio series, check Stremio episode progress, "
-        "sync Stremio library, open YouTube playlists, search YouTube, "
-        "toggle power, or control the TV in any way. For plain Stremio series "
-        "play requests without an explicit season and episode, treat them as resume "
-        "requests. If no preferred Stremio source is found, ask before trying the "
-        "first unknown source."
-    ),
+        "description": (
+            "Controls Master Miguel's Mi BOX S Android TV via ADB. "
+            "Use when asked to play, pause, stop, skip, fast-forward, rewind, "
+            "change volume, set volume to a percentage, open an app, launch "
+            "Stremio titles, continue Stremio series, check Stremio episode progress, "
+            "sync Stremio library, open YouTube playlists, search YouTube, "
+            "toggle power, or control the TV in any way. For plain Stremio series "
+            "play requests without an explicit season and episode, sync the library "
+            "first and resume the latest tracked episode when available. If there is "
+            "no tracked progress, open the series page instead of guessing an episode. "
+            "If no preferred Stremio source is found, ask before trying the first "
+            "unknown source."
+        ),
     "input_schema": {
         "type": "object",
         "properties": {

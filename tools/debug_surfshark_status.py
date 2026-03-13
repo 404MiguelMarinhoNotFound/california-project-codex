@@ -17,9 +17,9 @@ def load_config() -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Inspect Surfshark routing status on the TV.")
-    parser.add_argument("--ensure", help="Ensure a target country after printing current status.")
+    parser.add_argument("--ensure", help="Run a Surfshark route after printing current status.")
     parser.add_argument("--force-refresh", action="store_true", help="Ignore cached vpn_state.json.")
-    parser.add_argument("--force-ensure", action="store_true", help="Bypass matching cache and always try the switch path.")
+    parser.add_argument("--force-ensure", action="store_true", help="Force the Quick Connect route to restart Surfshark first.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     args = parser.parse_args()
 
@@ -47,7 +47,7 @@ def main():
     )
 
     if args.ensure:
-        result = surfshark.ensure_country(args.ensure, force_switch=args.force_ensure)
+        result = surfshark.ensure_route(args.ensure, force_switch=args.force_ensure)
         print(
             "ensure_result="
             f"success:{result.success} "

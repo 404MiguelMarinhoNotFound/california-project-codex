@@ -168,12 +168,16 @@ stremio:
   provider_preferences:
     - "comet"
     - "mediafusion"
+    - "torrent"
   provider_aliases:
     comet:
       - "comet"
     mediafusion:
       - "mediafusion"
       - "media fusion"
+    torrent:
+      - "torrent"
+      - "torrentio"
   provider_scan_pages: 3
   provider_scan_delay_ms: 800
   provider_fallback_policy: "ask"
@@ -256,6 +260,7 @@ youtube_playlists:
 media:
   enabled: true
   adb_path: "C:\\platform-tools\\adb.exe"
+  adb_timeout_ms: 15000
   mibox_ip: "192.168.1.26"
   adb_port: 5555
   volume_max_steps: 15            # Mi Box S hardware max — used by volume_set()
@@ -264,26 +269,25 @@ media:
   vpn_status_cache_max_age_minutes: 5
   vpn_failure_policy: "open_anyway"
   vpn_route_by_app:
-    youtube: "albania"
+    youtube: "restart_autoconnect"
     stremio: "quick_connect"
-  surfshark_launch_delay_ms: 2500
+  surfshark_launch_delay_ms: 400
   surfshark_connect_timeout_ms: 15000
   surfshark_status_poll_interval_ms: 1000
   surfshark_favorite_scan_pages: 2
   surfshark_favorite_scroll_delay_ms: 500
-  surfshark_post_selection_delay_ms: 2500
-  surfshark_quick_connect_aliases:
-    - "quick_connect"
-    - "quick connect"
-    - "fastest"
-    - "fastest location"
-  surfshark_quick_connect_tap:
-    x: 320
-    y: 210
-  surfshark_first_favorite_country: "albania"
-  surfshark_first_favorite_tap:
-    x: 320
-    y: 440
+  surfshark_pre_sequence_wait_ms: 250
+  surfshark_key_delay_ms: 100
+  surfshark_post_sequence_wait_ms: 1200
+  surfshark_restart_autoconnect_wait_ms: 0
+  surfshark_ready_timeout_ms: 8000
+  surfshark_ready_poll_interval_ms: 500
+  surfshark_ready_stable_polls: 2
+  surfshark_ready_settle_ms: 300
+  surfshark_retry_count: 1
+  surfshark_debug_capture_enabled: false
+  surfshark_debug_capture_dir: "debug/surfshark"
+  surfshark_route_table_path: "surfshark_routes.json"
   surfshark_country_aliases:
     albania:
       - "albania"

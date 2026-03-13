@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock
 from unittest.mock import patch
 
@@ -12,6 +14,7 @@ class MediaServiceYouTubeTests(unittest.TestCase):
                 "mibox_ip": "192.168.1.26",
                 "adb_port": 5555,
                 "adb_path": "adb",
+                "adb_timeout_ms": 12000,
                 "volume_max_steps": 15,
                 "apps": {
                     "youtube": "com.google.android.youtube.tv",
@@ -122,6 +125,14 @@ class MediaServiceYouTubeTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(output, "")
 
+    def test_adb_uses_configured_timeout(self):
+        svc = MediaService(self.config)
+        completed = Mock(returncode=0, stdout="ok", stderr="")
+        with patch("services.media_service.subprocess.run", return_value=completed) as run:
+            svc._adb("shell echo ping")
+
+        self.assertEqual(run.call_args.kwargs["timeout"], svc.adb_timeout_s)
+
     def test_force_stop_app_uses_package_name(self):
         svc = MediaService(self.config)
         with patch.object(svc, "ensure_connected", return_value=True):
@@ -178,6 +189,30 @@ class MediaServiceYouTubeTests(unittest.TestCase):
         self.assertIn("-n com.surfshark.vpnclient.android/.StartActivity", command)
         self.assertIn("-c android.intent.category.LEANBACK_LAUNCHER", command)
 
+    def test_launch_app_falls_back_to_package_launch_when_explicit_start_fails(self):
+        svc = MediaService(self.config)
+        with patch.object(svc, "ensure_connected", return_value=True):
+            with patch.object(svc, "start_activity", return_value=(False, "Error type 3")):
+                with patch.object(svc, "launch_package", return_value=(True, "Opening surfshark")) as launch_package:
+                    ok, message = svc.launch_app("surfshark")
+
+        self.assertTrue(ok)
+        self.assertEqual(message, "Opening surfshark")
+        launch_package.assert_called_once_with("surfshark")
+
+    def test_launch_package_uses_monkey_launcher(self):
+        svc = MediaService(self.config)
+        with patch.object(svc, "ensure_connected", return_value=True):
+            with patch.object(svc, "_adb", return_value=(True, "Events injected: 1")) as adb:
+                ok, message = svc.launch_package("surfshark")
+
+        self.assertTrue(ok)
+        self.assertEqual(message, "Opening surfshark")
+        self.assertEqual(
+            adb.call_args[0][0],
+            "shell monkey -p com.surfshark.vpnclient.android -c android.intent.category.LAUNCHER 1",
+        )
+
     def test_get_current_app_parses_focus_without_host_grep(self):
         svc = MediaService(self.config)
         dumpsys_output = (
@@ -191,6 +226,49 @@ class MediaServiceYouTubeTests(unittest.TestCase):
 
         self.assertEqual(current, "surfshark")
         self.assertEqual(adb.call_args[0][0], "shell dumpsys window displays")
+
+    def test_get_current_focus_returns_package_and_activity_token(self):
+        svc = MediaService(self.config)
+        dumpsys_output = (
+            "Window #1\n"
+            "  mCurrentFocus=Window{135764f u0 com.surfshark.vpnclient.android/"
+            "com.surfshark.vpnclient.android.legacyapp.tv.feature.main.TvMainActivity}\n"
+        )
+        with patch.object(svc, "ensure_connected", return_value=True):
+            with patch.object(svc, "_adb", return_value=(True, dumpsys_output)):
+                focus = svc.get_current_focus()
+
+        self.assertEqual(
+            focus,
+            "com.surfshark.vpnclient.android/com.surfshark.vpnclient.android.legacyapp.tv.feature.main.TvMainActivity",
+        )
+
+    def test_capture_screenshot_runs_screencap_cat_and_cleanup(self):
+        svc = MediaService(self.config)
+        with TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "captures" / "screen.png"
+            with patch.object(svc, "ensure_connected", return_value=True):
+                with patch.object(
+                    svc,
+                    "_adb",
+                    side_effect=[(True, "ok"), (True, "ok"), (True, "ok")],
+                ) as adb:
+                    ok = svc.capture_screenshot(destination)
+
+        self.assertTrue(ok)
+        self.assertEqual(adb.call_count, 3)
+        self.assertEqual(adb.call_args_list[0][0][0], "shell screencap -p /sdcard/california_capture.png")
+        self.assertIn("shell cat /sdcard/california_capture.png >", adb.call_args_list[1][0][0])
+        self.assertEqual(adb.call_args_list[2][0][0], "shell rm /sdcard/california_capture.png")
+
+    def test_capture_screenshot_bytes_uses_exec_out(self):
+        svc = MediaService(self.config)
+        with patch.object(svc, "ensure_connected", return_value=True):
+            with patch.object(svc, "_adb_exec", return_value=(True, b"png-data")) as adb_exec:
+                screenshot = svc.capture_screenshot_bytes()
+
+        self.assertEqual(screenshot, b"png-data")
+        self.assertEqual(adb_exec.call_args[0], ("exec-out", "screencap", "-p"))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,41 @@
+{
+  "routes": {
+    "restart_autoconnect": {
+      "aliases": [
+        "restart_autoconnect",
+        "restart autoconnect",
+        "autoconnect",
+        "albania"
+      ],
+      "launch_mode": "package",
+      "launch_delay_ms": 0,
+      "force_stop_before_launch": true,
+      "wait_for_ready": false,
+      "settle_wait_ms": 0,
+      "retry_force_stop_on_failure": false,
+      "assumed_country": "albania",
+      "sequence": []
+    },
+    "quick_connect": {
+      "aliases": [
+        "quick_connect",
+        "quick connect",
+        "fastest",
+        "fastest location"
+      ],
+      "launch_mode": "package",
+      "wait_for_ready": true,
+      "pre_sequence_wait_ms": 250,
+      "key_delay_ms": 100,
+      "post_sequence_wait_ms": 1200,
+      "retry_force_stop_on_failure": true,
+      "assumed_country": "portugal",
+      "sequence": [
+        "DPAD_CENTER",
+        "DPAD_DOWN",
+        "DPAD_DOWN",
+        "DPAD_CENTER"
+      ]
+    }
+  }
+}

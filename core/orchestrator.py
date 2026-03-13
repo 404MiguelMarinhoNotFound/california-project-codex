@@ -15,24 +15,16 @@ import threading
 import queue
 import numpy as np
 
-from core.audio_pipeline import AudioPipeline
-from core.wake_word import WakeWordDetector
-from core.vad import VAD
-from services.stt import STTService
-from services.llm import LLMService
-from services.tts import TTSService
-from services.sentence_chunker import chunk_sentences
 from services.media_service import MediaService
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
 from services.surfshark_service import SurfsharkService
 from services.youtube_playlist_resolver import resolve_playlist_choice
-from hardware.led_controller import LEDController
 
 logger = logging.getLogger(__name__)
 
 ROUTED_ACTIONS = {
-    "youtube_playlist": ("youtube", "albania"),
-    "youtube_search": ("youtube", "albania"),
+    "youtube_playlist": ("youtube", "restart_autoconnect"),
+    "youtube_search": ("youtube", "restart_autoconnect"),
     "stremio_play": ("stremio", "quick_connect"),
     "stremio_continue": ("stremio", "quick_connect"),
 }
@@ -44,7 +36,7 @@ def _route_target_for_action(
     route_by_app: dict | None = None,
 ) -> tuple[str | None, str | None]:
     route_by_app = route_by_app or {
-        "youtube": "albania",
+        "youtube": "restart_autoconnect",
         "stremio": "quick_connect",
     }
     if action == "launch_app":
@@ -59,13 +51,14 @@ def _route_target_for_action(
     return target
 
 
-def _vpn_warning_suffix(target_country: str | None) -> str:
-    normalized = (target_country or "").strip().lower()
+def _vpn_warning_suffix(target_route: str | None) -> str:
+    normalized = (target_route or "").strip().lower()
+    if normalized == "restart_autoconnect":
+        return " but I couldn't complete Surfshark Albania auto-connect."
     if normalized in {"quick_connect", "quick connect", "fastest", "fastest location"}:
-        country_label = "Quick Connect"
-    else:
-        country_label = (target_country or "the right country").replace("_", " ").title()
-    return f" but I couldn't confirm Surfshark was on {country_label}."
+        return " but I couldn't complete Surfshark Quick Connect."
+    route_label = (target_route or "the required route").replace("_", " ").title()
+    return f" but I couldn't complete {route_label}."
 
 
 def _append_route_warning(message: str, warning_suffix: str | None) -> str:
@@ -98,18 +91,18 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
 
     routing_enabled = bool(getattr(surfshark_svc, "enabled", False)) if surfshark_svc else False
     route_by_app = getattr(surfshark_svc, "route_by_app", None) if routing_enabled else None
-    target_app, target_country = _route_target_for_action(action, params, route_by_app)
+    target_app, target_route = _route_target_for_action(action, params, route_by_app)
     if target_app and routing_enabled:
         is_foreground = media_svc.is_app_foreground(target_app)
         logger.info(
-            "VPN preflight for action=%s target_app=%s target_country=%s already_foreground=%s",
+            "VPN preflight for action=%s target_app=%s target_route=%s already_foreground=%s",
             action,
             target_app,
-            target_country,
+            target_route,
             is_foreground,
         )
         if not is_foreground:
-            vpn_result = surfshark_svc.ensure_country(target_country)
+            vpn_result = surfshark_svc.ensure_route(target_route)
             logger.info(
                 "VPN preflight result for %s: success=%s switched=%s current_country=%s message=%s",
                 target_app,
@@ -119,7 +112,7 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
                 vpn_result.message,
             )
             if not vpn_result.success:
-                route_warning = _vpn_warning_suffix(target_country)
+                route_warning = _vpn_warning_suffix(target_route)
             if target_app == "youtube":
                 stopped = media_svc.force_stop_app("youtube")
                 logger.info("Post-VPN YouTube force-stop result: %s", stopped)
@@ -198,19 +191,22 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
         title = (params.get("title") or "").strip()
         if not title:
             return "Tell me what show you want to continue."
-        entry = stremio_svc.get_progress(title, refresh_if_stale=True)
-        if not entry:
-            return f"I couldn't find continue progress for {title}. Try syncing your Stremio library first."
-
-        result = stremio_svc.play(
-            title=entry.get("title", title),
-            media_type=entry.get("type"),
-            allow_unknown_source=bool(params.get("allow_unknown_source", False)),
-        )
+        try:
+            result = stremio_svc.play(
+                title=title,
+                media_type="series",
+                allow_unknown_source=bool(params.get("allow_unknown_source", False)),
+            )
+        except Exception as exc:
+            logger.warning("Stremio continue failed: %s", exc)
+            return f"I couldn't find {title} in Stremio or TMDB."
         if result.requires_confirmation:
             return result.message or AUTOPLAY_FALLBACK_LINE
         if result.success:
-            response = f"Continuing {entry.get('title', title)}."
+            if result.target_mode == "episode":
+                response = f"Continuing {title}."
+            else:
+                response = f"Opening {title} on Stremio."
             return _append_route_warning(response, route_warning)
         return result.message or AUTOPLAY_FALLBACK_LINE
 
@@ -302,6 +298,14 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
 class Orchestrator:
     def __init__(self, config: dict):
         self.config = config
+
+        from core.audio_pipeline import AudioPipeline
+        from core.wake_word import WakeWordDetector
+        from core.vad import VAD
+        from hardware.led_controller import LEDController
+        from services.llm import LLMService
+        from services.stt import STTService
+        from services.tts import TTSService
 
         # Initialize all components
         logger.info("Initializing components...")
@@ -495,6 +499,8 @@ class Orchestrator:
 
         try:
             # Stream LLM → accumulate sentences → enqueue for TTS
+            from services.sentence_chunker import chunk_sentences
+
             token_stream = self.llm.stream_response(user_text)
             first_sentence = True
 

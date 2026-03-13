@@ -1,7 +1,9 @@
 import logging
+import re
 import subprocess
 import time
 import yaml
+from pathlib import Path
 from urllib.parse import quote_plus
 
 log = logging.getLogger(__name__)
@@ -20,6 +22,7 @@ class MediaService:
         self.app_launch_categories = media_cfg.get("app_launch_categories", {})
         self.target = f"{self.ip}:{self.port}"
         self.adb_path = media_cfg.get("adb_path", "adb")
+        self.adb_timeout_s = max(1, int(media_cfg.get("adb_timeout_ms", 15000))) / 1000
         self.volume_max_steps = media_cfg.get("volume_max_steps", 15)
         self.youtube_warm_launch_delay_s = media_cfg.get("youtube_warm_launch_delay_ms", 1500) / 1000
         self.youtube_profile_select_on_cold_start = media_cfg.get("youtube_profile_select_on_cold_start", True)
@@ -31,7 +34,7 @@ class MediaService:
         self._connected = False
         self._last_fail_time: float = 0  # monotonic timestamp of last failed reconnect
 
-    def _adb(self, command: str, use_target: bool = True) -> tuple[bool, str]:
+    def _adb(self, command: str, use_target: bool = True, timeout_s: float | None = None) -> tuple[bool, str]:
         adb = self.adb_path
         cmd = f'"{adb}" -s {self.target} {command}' if use_target else f'"{adb}" {command}'
         log.debug(f"ADB exec: {cmd}")
@@ -43,7 +46,7 @@ class MediaService:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=8,
+                timeout=timeout_s if timeout_s is not None else self.adb_timeout_s,
             )
             stdout = (result.stdout or "").strip()
             stderr = (result.stderr or "").strip()
@@ -58,6 +61,38 @@ class MediaService:
         except subprocess.TimeoutExpired:
             log.warning(f"ADB command timed out: {cmd}")
             return False, "timeout"
+
+    def _adb_exec(
+        self,
+        *args: str,
+        use_target: bool = True,
+        capture_text: bool = True,
+        timeout_s: float | None = None,
+    ) -> tuple[bool, str | bytes]:
+        cmd = [self.adb_path]
+        if use_target:
+            cmd.extend(["-s", self.target])
+        cmd.extend(args)
+        log.debug("ADB exec list: %s", cmd)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=capture_text,
+                encoding="utf-8" if capture_text else None,
+                errors="replace" if capture_text else None,
+                check=False,
+                timeout=timeout_s if timeout_s is not None else self.adb_timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("ADB command timed out: %s", cmd)
+            return False, "timeout" if capture_text else b""
+
+        if capture_text:
+            output = (result.stdout or result.stderr or "").strip()
+        else:
+            output = result.stdout if result.stdout else result.stderr
+        return result.returncode == 0, output
 
     def connect(self) -> bool:
         # adb connect doesn't need -s, it's a global command
@@ -194,7 +229,22 @@ class MediaService:
                 wait=False,
             )
             log.info("explicit start result: ok=%s, output=%s", ok, output)
-            return ok, f"Opening {normalized_name}" if ok else f"Couldn't open {normalized_name}"
+            if ok:
+                return True, f"Opening {normalized_name}"
+            log.info("Explicit launch failed for %s, falling back to package launch", normalized_name)
+            return self.launch_package(normalized_name)
+
+        return self.launch_package(normalized_name)
+
+    def launch_package(self, app_name: str) -> tuple[bool, str]:
+        normalized_name = (app_name or "").strip().lower()
+        package = self._app_package(normalized_name)
+        if not package:
+            known = ", ".join(self.apps.keys())
+            log.warning(f"Unknown app '{app_name}', known apps: {known}")
+            return False, f"I don't have {app_name} in my app list"
+        if not self.ensure_connected():
+            return False, "I can't reach the TV right now"
 
         log.info(f"Launching {normalized_name} ({package}) via monkey")
         ok, output = self._adb(
@@ -289,6 +339,31 @@ class MediaService:
         log.debug("Input keyevent %s", key_name)
         return self.ensure_connected() and self._adb(f"shell input keyevent {key_name}")[0]
 
+    def capture_screenshot(self, local_path: str | Path) -> bool:
+        if not self.ensure_connected():
+            return False
+
+        destination = Path(local_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        remote_path = "/sdcard/california_capture.png"
+
+        ok, _ = self._adb(f"shell screencap -p {remote_path}")
+        if not ok:
+            return False
+
+        ok, _ = self._adb(f'shell cat {remote_path} > "{destination}"')
+        self._adb(f"shell rm {remote_path}")
+        return ok
+
+    def capture_screenshot_bytes(self) -> bytes:
+        if not self.ensure_connected():
+            return b""
+
+        ok, output = self._adb_exec("exec-out", "screencap", "-p", capture_text=False)
+        if not ok:
+            return b""
+        return output if isinstance(output, bytes) else b""
+
     # --- YouTube ---
 
     def _youtube_package(self) -> str:
@@ -378,6 +453,23 @@ class MediaService:
             except Exception:
                 return output
         return "unknown"
+
+    def get_current_focus(self) -> str:
+        """Return the raw foreground package/activity token when available."""
+        if not self.ensure_connected():
+            return ""
+        ok, output = self._adb("shell dumpsys window displays")
+        if not ok or not output:
+            return ""
+        for line in output.splitlines():
+            if "mCurrentFocus=" not in line:
+                continue
+            stripped = line.strip()
+            match = re.search(r"([A-Za-z0-9._$]+/[A-Za-z0-9._$]+)\}?\s*$", stripped)
+            if match:
+                return match.group(1)
+            return stripped.split("mCurrentFocus=", 1)[-1].strip()
+        return ""
 
     def get_media_session(self) -> str:
         """Return active media session info (track/show if the app exposes it)."""

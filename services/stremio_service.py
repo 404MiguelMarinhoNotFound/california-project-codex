@@ -16,12 +16,13 @@ log = logging.getLogger(__name__)
 
 AUTOPLAY_FALLBACK_LINE = "Stremio's open but it didn't start on its own. Just hit OK on the remote."
 UNKNOWN_SOURCE_CONFIRMATION_TEMPLATE = (
-    "I couldn't find Comet or MediaFusion for {title}. Want me to try the first available source?"
+    "I couldn't find Comet, MediaFusion, or Torrent for {title}. Want me to try the first available source?"
 )
-DEFAULT_PROVIDER_PREFERENCES = ["comet", "mediafusion"]
+DEFAULT_PROVIDER_PREFERENCES = ["comet", "mediafusion", "torrent"]
 DEFAULT_PROVIDER_ALIASES = {
     "comet": ["comet"],
     "mediafusion": ["mediafusion", "media fusion"],
+    "torrent": ["torrent", "torrentio"],
 }
 GENERIC_UI_LABELS = {
     "continue",
@@ -59,6 +60,7 @@ class StremioPlayResult:
     message: str | None = None
     played_source: str | None = None
     requires_confirmation: bool = False
+    target_mode: str | None = None
 
     def __bool__(self) -> bool:
         return self.success
@@ -95,6 +97,7 @@ class StremioService:
         media_cfg = config.get("media", {})
         self.adb_path = media_cfg.get("adb_path", "adb")
         self.adb_target = f"{media_cfg.get('mibox_ip', '')}:{media_cfg.get('adb_port', 5555)}"
+        self.adb_timeout_s = max(1, int(media_cfg.get("adb_timeout_ms", 15000))) / 1000
 
         self._auth_key: str | None = None
 
@@ -470,8 +473,10 @@ class StremioService:
         episode: int | None = None,
         allow_unknown_source: bool = False,
     ) -> StremioPlayResult:
-        refresh_before_lookup = not (season and episode)
-        if refresh_before_lookup:
+        resume_sensitive = self._is_resume_sensitive_request(media_type, season, episode)
+        if resume_sensitive:
+            self._sync_library_for_resume(title)
+        elif not (season and episode):
             self._ensure_fresh_history(title)
 
         imdb_id, resolved_type = self.resolve_imdb_id(title, media_type)
@@ -498,6 +503,28 @@ class StremioService:
             remembered_source=remembered_source,
         )
 
+    def _is_resume_sensitive_request(
+        self,
+        media_type: str | None,
+        season: int | None,
+        episode: int | None,
+    ) -> bool:
+        if season and episode:
+            return False
+        normalized_type = (media_type or "").strip().lower()
+        return normalized_type != "movie"
+
+    def _sync_library_for_resume(self, title: str | None = None) -> bool:
+        if not self.can_sync():
+            return False
+        try:
+            synced = self.sync_library()
+            log.info("Resume sync for %s completed: %s", title or "Stremio request", synced)
+            return synced
+        except Exception as exc:
+            log.warning("Resume sync failed for %s: %s", title or "Stremio request", exc)
+            return False
+
     def _play_deep_link(
         self,
         imdb_id: str,
@@ -511,10 +538,13 @@ class StremioService:
     ) -> StremioPlayResult:
         if media_type == "movie":
             uri = f"stremio:///detail/movie/{imdb_id}/{imdb_id}"
+            target_mode = "movie_detail"
         elif season and episode:
             uri = f"stremio:///detail/series/{imdb_id}/{imdb_id}:{season}:{episode}"
+            target_mode = "episode"
         else:
             uri = f"stremio:///detail/series/{imdb_id}/{imdb_id}"
+            target_mode = "series_detail"
 
         source_order = self._source_preference_order(remembered_source)
         found_preferred_source = False
@@ -524,6 +554,7 @@ class StremioService:
             if not selection:
                 continue
 
+            selection.target_mode = target_mode
             found_preferred_source = True
             if selection.success:
                 self._remember_successful_source(
@@ -541,9 +572,11 @@ class StremioService:
                 success=False,
                 message=UNKNOWN_SOURCE_CONFIRMATION_TEMPLATE.format(title=title_for_message),
                 requires_confirmation=True,
+                target_mode=target_mode,
             )
 
         fallback_attempt = self._attempt_unknown_source(uri)
+        fallback_attempt.target_mode = target_mode
         if fallback_attempt.success:
             self._remember_successful_source(
                 title_key=title_key,
@@ -555,10 +588,18 @@ class StremioService:
             return fallback_attempt
 
         if found_preferred_source:
-            return StremioPlayResult(success=False, message=AUTOPLAY_FALLBACK_LINE)
+            return StremioPlayResult(
+                success=False,
+                message=AUTOPLAY_FALLBACK_LINE,
+                target_mode=target_mode,
+            )
         if fallback_attempt.message:
             return fallback_attempt
-        return StremioPlayResult(success=False, message=AUTOPLAY_FALLBACK_LINE)
+        return StremioPlayResult(
+            success=False,
+            message=AUTOPLAY_FALLBACK_LINE,
+            target_mode=target_mode,
+        )
 
     def _attempt_provider(self, uri: str, provider_key: str) -> StremioPlayResult | None:
         self._launch_uri(uri)
@@ -679,6 +720,8 @@ class StremioService:
         return self._extract_candidates_from_ocr()
 
     def _dump_ui_hierarchy(self) -> str:
+        if self.media_service is not None:
+            return self.media_service.dump_ui_hierarchy()
         self._run_shell(f"uiautomator dump --compressed {UI_DUMP_REMOTE_PATH}")
         _, output = self._run_shell(f"cat {UI_DUMP_REMOTE_PATH}")
         return output or ""
@@ -771,9 +814,15 @@ class StremioService:
         return tuple(int(part) for part in match.groups())
 
     def _scroll_source_list(self):
+        if self.media_service is not None:
+            self.media_service.swipe(960, 900, 960, 260, 250)
+            return
         self._run_shell("input swipe 960 900 960 260 250")
 
     def _tap(self, x: int, y: int):
+        if self.media_service is not None:
+            self.media_service.tap(x, y)
+            return
         self._run_shell(f"input tap {x} {y}")
 
     def _extract_candidates_from_ocr(self) -> list[SourceCandidate]:
@@ -850,6 +899,8 @@ class StremioService:
         return candidates
 
     def _capture_screenshot(self) -> bytes:
+        if self.media_service is not None and hasattr(self.media_service, "capture_screenshot_bytes"):
+            return self.media_service.capture_screenshot_bytes()
         result = self._run_adb_command("exec-out", "screencap", "-p", capture_text=False)
         if not result[0]:
             return b""
@@ -901,14 +952,19 @@ class StremioService:
             cmd.extend(["-s", self.adb_target])
         cmd.extend(args)
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=capture_text,
-            encoding="utf-8" if capture_text else None,
-            errors="replace" if capture_text else None,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=capture_text,
+                encoding="utf-8" if capture_text else None,
+                errors="replace" if capture_text else None,
+                check=False,
+                timeout=self.adb_timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("ADB command timed out: %s", cmd)
+            return False, "timeout" if capture_text else b""
         if capture_text:
             output = (result.stdout or result.stderr or "").strip()
         else:
@@ -923,4 +979,7 @@ class StremioService:
         return ok, output  # type: ignore[return-value]
 
     def _keyevent(self, code: int):
+        if self.media_service is not None:
+            self.media_service.keyevent(code)
+            return
         self._run_shell(f"input keyevent {code}")

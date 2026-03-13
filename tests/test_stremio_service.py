@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from services.stremio_service import StremioPlayResult, StremioService
 
@@ -26,10 +26,11 @@ class StremioServiceTests(unittest.TestCase):
                 "watch_state_path": str(watch_state_path),
                 "autoplay_delay_ms": 1,
                 "history_refresh_max_age_minutes": 5,
-                "provider_preferences": ["comet", "mediafusion"],
+                "provider_preferences": ["comet", "mediafusion", "torrent"],
                 "provider_aliases": {
                     "comet": ["comet"],
                     "mediafusion": ["mediafusion", "media fusion"],
+                    "torrent": ["torrent", "torrentio"],
                 },
                 "provider_scan_pages": 3,
                 "provider_scan_delay_ms": 1,
@@ -42,6 +43,7 @@ class StremioServiceTests(unittest.TestCase):
             },
             "media": {
                 "adb_path": "adb",
+                "adb_timeout_ms": 5000,
                 "mibox_ip": "192.168.1.26",
                 "adb_port": 5555,
             },
@@ -141,7 +143,7 @@ class StremioServiceTests(unittest.TestCase):
             self.assertEqual(cached["shrinking"]["season"], 2)
             self.assertEqual(cached["shrinking"]["episode"], 4)
 
-    def test_plain_series_play_uses_cached_resume_episode(self):
+    def test_plain_series_play_forces_sync_and_uses_latest_episode(self):
         with tempfile.TemporaryDirectory() as tmp:
             watch_state = Path(tmp) / "watch_state.json"
             self._write_state(
@@ -160,20 +162,46 @@ class StremioServiceTests(unittest.TestCase):
             )
 
             svc = StremioService(self._config(watch_state))
-            with patch.object(svc, "resolve_imdb_id", return_value=("tt13315786", "series")):
-                with patch.object(
-                    svc,
-                    "_play_deep_link",
-                    return_value=StremioPlayResult(success=True, played_source="Comet"),
-                ) as deep_link:
-                    result = svc.play("Shrinking")
+            svc.email = "user@example.com"
+            svc.password = "secret"
+
+            def sync_side_effect():
+                self._write_state(
+                    watch_state,
+                    {
+                        "shrinking": {
+                            "title": "Shrinking",
+                            "imdb_id": "tt13315786",
+                            "type": "series",
+                            "season": 2,
+                            "episode": 5,
+                            "last_successful_source": "Comet",
+                            "history_updated_at": self._iso_now(),
+                        }
+                    },
+                )
+                return True
+
+            with patch.object(svc, "sync_library", side_effect=sync_side_effect) as sync_library:
+                with patch.object(svc, "resolve_imdb_id", return_value=("tt13315786", "series")):
+                    with patch.object(
+                        svc,
+                        "_play_deep_link",
+                        return_value=StremioPlayResult(
+                            success=True,
+                            played_source="Comet",
+                            target_mode="episode",
+                        ),
+                    ) as deep_link:
+                        result = svc.play("Shrinking", media_type="series")
 
             self.assertTrue(result.success)
+            sync_library.assert_called_once()
             self.assertEqual(deep_link.call_args.kwargs["season"], 2)
-            self.assertEqual(deep_link.call_args.kwargs["episode"], 4)
+            self.assertEqual(deep_link.call_args.kwargs["episode"], 5)
             self.assertEqual(deep_link.call_args.kwargs["remembered_source"], "Comet")
 
-    def test_explicit_episode_bypasses_resume_refresh(self):
+    def test_plain_series_play_uses_cached_episode_when_forced_sync_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             watch_state = Path(tmp) / "watch_state.json"
             self._write_state(
@@ -185,26 +213,60 @@ class StremioServiceTests(unittest.TestCase):
                         "type": "series",
                         "season": 2,
                         "episode": 4,
-                        "history_updated_at": self._iso_minutes_ago(20),
+                        "last_successful_source": "Comet",
+                        "history_updated_at": self._iso_minutes_ago(30),
                     }
                 },
             )
 
             svc = StremioService(self._config(watch_state))
-            with patch.object(svc, "_ensure_fresh_history") as refresh_history:
+            svc.email = "user@example.com"
+            svc.password = "secret"
+
+            with patch.object(svc, "sync_library", side_effect=RuntimeError("boom")) as sync_library:
                 with patch.object(svc, "resolve_imdb_id", return_value=("tt13315786", "series")):
                     with patch.object(
                         svc,
                         "_play_deep_link",
-                        return_value=StremioPlayResult(success=True, played_source="Comet"),
+                        return_value=StremioPlayResult(
+                            success=True,
+                            played_source="Comet",
+                            target_mode="episode",
+                        ),
                     ) as deep_link:
-                        svc.play("Shrinking", season=1, episode=1)
+                        result = svc.play("Shrinking", media_type="series")
 
-            refresh_history.assert_not_called()
-            self.assertEqual(deep_link.call_args.kwargs["season"], 1)
-            self.assertEqual(deep_link.call_args.kwargs["episode"], 1)
+            self.assertTrue(result.success)
+            sync_library.assert_called_once()
+            self.assertEqual(deep_link.call_args.kwargs["season"], 2)
+            self.assertEqual(deep_link.call_args.kwargs["episode"], 4)
 
-    def test_stale_history_triggers_sync_before_resume_sensitive_play(self):
+    def test_plain_series_play_falls_back_to_series_detail_when_no_progress_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            watch_state = Path(tmp) / "watch_state.json"
+            svc = StremioService(self._config(watch_state))
+            svc.email = "user@example.com"
+            svc.password = "secret"
+
+            with patch.object(svc, "sync_library", side_effect=RuntimeError("boom")):
+                with patch.object(svc, "resolve_imdb_id", return_value=("tt13315786", "series")):
+                    with patch.object(
+                        svc,
+                        "_play_deep_link",
+                        return_value=StremioPlayResult(
+                            success=True,
+                            played_source="Comet",
+                            target_mode="series_detail",
+                        ),
+                    ) as deep_link:
+                        result = svc.play("Shrinking", media_type="series")
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.target_mode, "series_detail")
+            self.assertIsNone(deep_link.call_args.kwargs["season"])
+            self.assertIsNone(deep_link.call_args.kwargs["episode"])
+
+    def test_explicit_episode_bypasses_resume_sync(self):
         with tempfile.TemporaryDirectory() as tmp:
             watch_state = Path(tmp) / "watch_state.json"
             self._write_state(
@@ -225,48 +287,22 @@ class StremioServiceTests(unittest.TestCase):
             svc.email = "user@example.com"
             svc.password = "secret"
 
-            with patch.object(svc, "sync_library", return_value=True) as sync_library:
+            with patch.object(svc, "sync_library") as sync_library:
                 with patch.object(svc, "resolve_imdb_id", return_value=("tt13315786", "series")):
                     with patch.object(
                         svc,
                         "_play_deep_link",
-                        return_value=StremioPlayResult(success=True, played_source="Comet"),
-                    ):
-                        svc.play("Shrinking")
-
-            sync_library.assert_called_once()
-
-    def test_fresh_history_skips_sync_before_resume_sensitive_play(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            watch_state = Path(tmp) / "watch_state.json"
-            self._write_state(
-                watch_state,
-                {
-                    "shrinking": {
-                        "title": "Shrinking",
-                        "imdb_id": "tt13315786",
-                        "type": "series",
-                        "season": 2,
-                        "episode": 4,
-                        "history_updated_at": self._iso_now(),
-                    }
-                },
-            )
-
-            svc = StremioService(self._config(watch_state))
-            svc.email = "user@example.com"
-            svc.password = "secret"
-
-            with patch.object(svc, "sync_library", return_value=True) as sync_library:
-                with patch.object(svc, "resolve_imdb_id", return_value=("tt13315786", "series")):
-                    with patch.object(
-                        svc,
-                        "_play_deep_link",
-                        return_value=StremioPlayResult(success=True, played_source="Comet"),
-                    ):
-                        svc.play("Shrinking")
+                        return_value=StremioPlayResult(
+                            success=True,
+                            played_source="Comet",
+                            target_mode="episode",
+                        ),
+                    ) as deep_link:
+                        svc.play("Shrinking", media_type="series", season=1, episode=1)
 
             sync_library.assert_not_called()
+            self.assertEqual(deep_link.call_args.kwargs["season"], 1)
+            self.assertEqual(deep_link.call_args.kwargs["episode"], 1)
 
     def test_source_preference_order_tries_remembered_source_first(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -275,28 +311,32 @@ class StremioServiceTests(unittest.TestCase):
 
             order = svc._source_preference_order("Torrentio")
 
-            self.assertEqual(order, ["torrentio", "comet", "mediafusion"])
+            self.assertEqual(order, ["torrentio", "comet", "mediafusion", "torrent"])
 
-    def test_extract_candidates_from_ui_xml_matches_known_providers(self):
+    def test_extract_candidates_from_ui_xml_matches_known_providers_including_torrent(self):
         svc = StremioService(self._config(Path("watch_state.json")))
         xml_text = """
         <hierarchy>
           <node text="Fallout" bounds="[100,80][500,180]" />
           <node text="Comet" bounds="[120,520][420,620]" />
           <node text="MediaFusion" bounds="[120,700][420,800]" />
+          <node text="Torrentio" bounds="[120,880][420,980]" />
         </hierarchy>
         """
 
         candidates = svc._extract_candidates_from_ui_xml(xml_text)
 
-        self.assertEqual([candidate.provider_key for candidate in candidates], ["comet", "mediafusion"])
+        self.assertEqual(
+            [candidate.provider_key for candidate in candidates],
+            ["comet", "mediafusion", "torrent"],
+        )
 
-    def test_play_returns_confirmation_when_no_preferred_provider_is_found(self):
+    def test_play_returns_confirmation_only_after_all_preferred_providers_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
             watch_state = Path(tmp) / "watch_state.json"
             svc = StremioService(self._config(watch_state))
 
-            with patch.object(svc, "_attempt_provider", return_value=None):
+            with patch.object(svc, "_attempt_provider", return_value=None) as attempt_provider:
                 with patch.object(svc, "_attempt_unknown_source") as unknown_attempt:
                     result = svc._play_deep_link(
                         imdb_id="tt0903747",
@@ -308,6 +348,8 @@ class StremioServiceTests(unittest.TestCase):
 
             self.assertFalse(result.success)
             self.assertTrue(result.requires_confirmation)
+            self.assertEqual(result.target_mode, "series_detail")
+            self.assertEqual(attempt_provider.call_count, 3)
             self.assertIn("Want me to try the first available source?", result.message)
             unknown_attempt.assert_not_called()
 
@@ -332,6 +374,7 @@ class StremioServiceTests(unittest.TestCase):
 
             self.assertTrue(result.success)
             self.assertEqual(result.played_source, "Torrentio")
+            self.assertEqual(result.target_mode, "series_detail")
             unknown_attempt.assert_called_once()
 
     def test_successful_play_updates_last_successful_source(self):
@@ -355,19 +398,43 @@ class StremioServiceTests(unittest.TestCase):
             with patch.object(
                 svc,
                 "_attempt_provider",
-                return_value=StremioPlayResult(success=True, played_source="Comet"),
+                return_value=StremioPlayResult(
+                    success=True,
+                    played_source="Comet",
+                    target_mode="episode",
+                ),
             ):
                 result = svc._play_deep_link(
                     imdb_id="tt13315786",
                     media_type="series",
                     title_key="shrinking",
                     title_label="Shrinking",
+                    season=2,
+                    episode=4,
                     remembered_source=None,
                 )
 
             self.assertTrue(result.success)
             cached = json.loads(watch_state.read_text(encoding="utf-8"))
             self.assertEqual(cached["shrinking"]["last_successful_source"], "Comet")
+
+    def test_shared_media_service_helpers_are_used_for_ui_actions(self):
+        media_service = Mock()
+        media_service.dump_ui_hierarchy.return_value = "<hierarchy />"
+        media_service.capture_screenshot_bytes.return_value = b"png"
+        svc = StremioService(self._config(Path("watch_state.json")), media_service=media_service)
+
+        self.assertEqual(svc._dump_ui_hierarchy(), "<hierarchy />")
+        svc._scroll_source_list()
+        svc._tap(200, 300)
+        svc._keyevent(23)
+        self.assertEqual(svc._capture_screenshot(), b"png")
+
+        media_service.dump_ui_hierarchy.assert_called_once_with()
+        media_service.swipe.assert_called_once_with(960, 900, 960, 260, 250)
+        media_service.tap.assert_called_once_with(200, 300)
+        media_service.keyevent.assert_called_once_with(23)
+        media_service.capture_screenshot_bytes.assert_called_once_with()
 
 
 if __name__ == "__main__":
