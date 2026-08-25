@@ -1,0 +1,67 @@
+[project]
+name = "california"
+version = "0.1.0"
+description = "C.A.L.I.F.O.R.N.I.A. — DIY streaming voice assistant with Mi Box / Android TV control"
+requires-python = ">=3.11"
+
+# --- Core runtime dependencies (always installed) ---
+dependencies = [
+    # Config, env, HTTP
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "numpy>=1.24.0",
+    # Stremio poster OCR
+    "pillow>=10.0.0",
+    "pytesseract>=0.3.10",
+    # Audio I/O
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12.1",
+    # Wake word
+    "openwakeword>=0.6.0",
+    # STT
+    "groq>=0.4.0",
+    # LLM
+    "anthropic>=0.40.0",
+    # TTS (cross-platform default)
+    "edge-tts>=6.1.0",
+]
+
+# --- Optional feature sets: uv sync --extra <name> ---
+[project.optional-dependencies]
+# TTS provider: kokoro (config.yaml default `tts.provider: kokoro`)
+kokoro = [
+    "kokoro>=0.9.0",
+    # misaki/spacy fetch this at runtime via `spacy download` otherwise, which
+    # writes into .venv outside uv.lock and needs network on first speak.
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
+# TTS provider: piper — local synthesis, Linux/Pi only
+piper = ["piper-tts>=1.2.0; sys_platform == 'linux'"]
+# TTS provider: elevenlabs (premium)
+elevenlabs = ["elevenlabs>=1.0.0"]
+# LLM provider: any OpenAI-compatible endpoint (Fireworks, local, ...)
+openai = ["openai>=1.0.0"]
+# Wake word provider: Porcupine.
+# DEAD as of 2026-06-30: Picovoice sunset its Free Tier and disabled all Free Tier
+# AccessKeys, so this only works with a paid key. Kept for anyone who has one.
+# The project ships openWakeWord instead. See config.yaml wake_word.
+porcupine = ["pvporcupine>=3.0.0"]
+# VAD provider: Silero — heavy (~2GB of torch wheels)
+silero = ["torch>=2.0.0", "torchaudio>=2.0.0"]
+# Raspberry Pi hardware: ReSpeaker 2-Mic HAT LED ring
+pi = ["pixel-ring>=0.1.0; sys_platform == 'linux'"]
+# Everything the shipped config.yaml actually selects out of the box:
+#   tts.provider = "kokoro" -> kokoro (+ its spacy pipeline)
+# wake_word.model is an openWakeWord built-in, covered by the core `openwakeword` dep.
+# `uv sync --extra default` gives a bootable app with the committed config.
+# (vad.engine = "silero" is NOT included: core/vad.py falls back to energy-based
+#  VAD when torch is absent, so it stays in the heavy `silero` extra.)
+default = ["california[kokoro]"]
+
+[tool.uv]
+# Always use uv's own managed CPython. Building .venv on the Windows Store
+# Python (WindowsApps\PythonSoftwareFoundation...) produces an interpreter uv
+# cannot re-query once its marker cache goes stale, which breaks every
+# `uv run` with "ModuleNotFoundError: No module named 'python'".
+python-preference = "only-managed"

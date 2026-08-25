@@ -32,7 +32,7 @@ Voice request -> LLM tool call (control_tv) -> Orchestrator VPN preflight -> Med
 
 | Component | Technology |
 |-----------|------------|
-| Wake word | openWakeWord / Porcupine |
+| Wake word | openWakeWord (Porcupine retired, see note below) |
 | STT | Groq Whisper API |
 | LLM | Anthropic Claude, Groq, Fireworks, or OpenAI-compatible |
 | TTS | Kokoro, Edge TTS, Piper, ElevenLabs |
@@ -40,7 +40,8 @@ Voice request -> LLM tool call (control_tv) -> Orchestrator VPN preflight -> Med
 | Stremio state | Stremio private API + local `watch_state.json` cache |
 | Title resolution | TMDB |
 | Audio I/O | `sounddevice`, `soundfile` |
-| Language | Python |
+| Language | Python (pinned in `.python-version`, `requires-python = ">=3.11"`) |
+| Packages / env | **uv only** — `pyproject.toml` + `uv.lock`, never pip |
 | Key libraries | `numpy`, `queue`, `requests`, `yaml` |
 
 ### Credentials and Secrets
@@ -49,7 +50,8 @@ Required for the default setup:
 
 - `GROQ_API_KEY` - Whisper STT
 - `ANTHROPIC_API_KEY` - Claude LLM
-- `PICOVOICE_ACCESS_KEY` - only if using a `.ppn` Porcupine wake-word model
+- ~~`PICOVOICE_ACCESS_KEY`~~ - **dead.** Picovoice disabled all Free Tier AccessKeys
+  on 2026-06-30. The Porcupine backend is no longer usable in this project
 
 Required for Stremio features:
 
@@ -61,6 +63,14 @@ Required for TMDB fallback title resolution:
 - `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN`
 
 Keep secrets in `.env` or another local-only secret mechanism. Do not commit real credentials.
+
+> **Porcupine is retired in this project.** Picovoice sunset its Free Tier on
+> **2026-06-30** and disabled all Free Tier AccessKeys, so `PICOVOICE_ACCESS_KEY`
+> no longer activates and the custom `California_*.ppn` models cannot load.
+> The wake word now runs on **openWakeWord** (Apache-2.0, no key, no activation
+> server), configured as `wake_word.model: "hey_jarvis_v0.1"` in `config.yaml`.
+> To restore "California" as the trigger word, train a custom openWakeWord `.onnx`
+> and point `wake_word.model` at it. Do not reintroduce Porcupine without a paid key.
 
 -----
 
@@ -74,7 +84,11 @@ california/
 ├── main.py                      # Entry point and manual test modes
 ├── config.yaml                  # Main configuration
 ├── surfshark_routes.json        # Named Surfshark route table for TV VPN automation
-├── requirements.txt             # Python dependencies
+├── pyproject.toml               # Dependency + project metadata (uv, source of truth)
+├── uv.lock                      # Fully resolved cross-platform lockfile, commit this
+├── .python-version              # Interpreter pin used by uv
+├── setup.sh                     # uv bootstrap for Linux / macOS / Pi
+├── setup.ps1                    # uv bootstrap for Windows
 ├── core/
 │   ├── orchestrator.py          # Main state machine and tool dispatch
 │   ├── audio_pipeline.py        # Microphone capture and playback
@@ -124,6 +138,73 @@ Important runtime note:
 - `core/orchestrator.py` is the main coordinator, not a top-level `orchestrator.py`
 - Most integrations live under `services/`
 - `surfshark_routes.json` is the preferred place to retune Surfshark route timing or DPAD steps without editing code
+- `pyproject.toml` and `uv.lock` are the only dependency sources of truth. There is no `requirements.txt` any more
+- `.venv/` is created and owned by uv. Never create it by hand and never commit it
+
+-----
+
+## Dependency Management (uv only)
+
+**This project uses `uv` exclusively. Do not use `pip`, `pip3`, `venv`, `virtualenv`,
+`pipx`, `poetry`, `conda`, or `easy_install` anywhere — not in code, not in scripts,
+not in docs, and not in commands you run or suggest.**
+
+`pyproject.toml` (declared deps) and `uv.lock` (resolved deps) are the single source of
+truth. `requirements.txt` has been deleted and must not be reintroduced.
+
+### Command mapping
+
+| Instead of this | Do this |
+|-----------------|---------|
+| `pip install <pkg>` | `uv add <pkg>` |
+| `pip install -r requirements.txt` | `uv sync` |
+| `pip uninstall <pkg>` | `uv remove <pkg>` |
+| `pip freeze` / `pip list` | `uv tree` or `uv pip list` |
+| `python -m venv venv` + `activate` | `uv sync` (uv owns `.venv`) |
+| `source venv/bin/activate && python x.py` | `uv run python x.py` |
+| `python main.py` | `uv run python main.py` |
+| `python -m unittest ...` | `uv run python -m unittest ...` |
+| installing a CLI tool globally | `uvx <tool>` or `uv tool install <tool>` |
+| `pyenv install 3.11` | `uv python install 3.11` / `uv python pin 3.11` |
+
+### Rules
+
+- **Never activate a virtualenv.** `uv run` syncs the environment and then executes, so
+  there is no activation step. Any command that needs project imports goes through `uv run`.
+- **Never hand-edit `uv.lock`.** Change `pyproject.toml` via `uv add` / `uv remove`, or run
+  `uv lock` to re-resolve.
+- **Commit `pyproject.toml` and `uv.lock` together.** A dependency change without a lock
+  update is an incomplete change.
+- **Run `uv sync` after pulling** so the environment matches the lockfile.
+- **Optional/heavy providers go in `[project.optional-dependencies]`,** not in the core
+  `dependencies` list. Current extras: `kokoro`, `piper`, `elevenlabs`, `openai`,
+  `porcupine`, `silero`, `pi`. Install with `uv sync --extra <name>`.
+- **Platform-specific deps carry an environment marker** (for example
+  `piper-tts>=1.2.0; sys_platform == 'linux'`) so the universal lock still resolves on Windows.
+- **Beware packages that download assets into `site-packages` at runtime.** They are
+  invisible to `uv.lock` (nothing in the wheel `RECORD` covers them) and any `uv sync`
+  that reinstalls the package silently deletes them. Two live cases in this project:
+  - `en-core-web-sm` (pulled by kokoro/misaki via `spacy download`) is **pinned as a
+    direct URL dependency** in the `kokoro` extra so uv owns it.
+  - openWakeWord's wake-word models cannot be pinned (they are not packages), so
+    `core/wake_word.py` re-downloads them whenever they are missing. Never assume they
+    survive a sync.
+- **Error messages that tell a user to install something must name a `uv` command,**
+  e.g. `"kokoro package not found. Install it with: uv sync --extra kokoro"`.
+- If `uv` is missing on a machine, install it with the official Astral installer
+  (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or the PowerShell equivalent on
+  Windows) or just run `./setup.sh` / `./setup.ps1`, which bootstrap uv themselves.
+
+### Note on the config default TTS provider
+
+`config.yaml` defaults to `tts.provider: kokoro`, and `kokoro` is an **extra**, not a core
+dependency. A plain `uv sync` therefore does not install it. Use:
+
+```bash
+uv sync --extra kokoro
+```
+
+or set `tts.provider: edge`, which is covered by the core dependency set.
 
 -----
 
@@ -437,20 +518,20 @@ System-prompt guidance:
 
 `main.py` exposes these manual test modes:
 
-- `python main.py --test-mic`
-- `python main.py --test-tts`
-- `python main.py --test-stt`
-- `python main.py --test-llm`
-- `python main.py --test-pipeline`
+- `uv run python main.py --test-mic`
+- `uv run python main.py --test-tts`
+- `uv run python main.py --test-stt`
+- `uv run python main.py --test-llm`
+- `uv run python main.py --test-pipeline`
 
-Use full `python main.py` for real wake-word and TV-tool testing.
+Use full `uv run python main.py` for real wake-word and TV-tool testing.
 
 ### Unit Tests
 
 Run unit tests with:
 
 ```bash
-python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
 ```
 
 Current automated coverage exists for:
@@ -465,18 +546,18 @@ Current automated coverage exists for:
 Useful live-debug commands:
 
 ```bash
-python tools\debug_surfshark_sequence.py restart_autoconnect --capture --debug
-python tools\debug_surfshark_sequence.py quick_connect --capture --debug
-python tools\run_youtube_playlist_e2e.py --prep-app stremio --debug
-python tools\run_stremio_e2e.py --prep-app youtube --debug
-python tools\probe_stremio_sync.py
+uv run python tools\debug_surfshark_sequence.py restart_autoconnect --capture --debug
+uv run python tools\debug_surfshark_sequence.py quick_connect --capture --debug
+uv run python tools\run_youtube_playlist_e2e.py --prep-app stremio --debug
+uv run python tools\run_stremio_e2e.py --prep-app youtube --debug
+uv run python tools\probe_stremio_sync.py
 ```
 
 Targeted validation used for the latest Stremio resume work:
 
 ```bash
-python -m py_compile services\stremio_service.py core\orchestrator.py services\llm.py services\media_service.py tests\test_stremio_service.py tests\test_media_service.py tests\test_orchestrator_vpn_routing.py
-python -m unittest tests.test_media_service tests.test_stremio_service tests.test_orchestrator_vpn_routing -v
+uv run python -m py_compile services\stremio_service.py core\orchestrator.py services\llm.py services\media_service.py tests\test_stremio_service.py tests\test_media_service.py tests\test_orchestrator_vpn_routing.py
+uv run python -m unittest tests.test_media_service tests.test_stremio_service tests.test_orchestrator_vpn_routing -v
 ```
 
 -----
@@ -490,6 +571,8 @@ python -m unittest tests.test_media_service tests.test_stremio_service tests.tes
 - Add new integrations as dedicated service modules when possible
 - Prefer extending the `control_tv` tool instead of adding scattered command pathways
 - If a feature touches playback or state sync, add unit tests under `tests/`
+- Add dependencies with `uv add` only. Never `pip install`, and never reintroduce a
+  `requirements.txt`. Commit the resulting `pyproject.toml` and `uv.lock` together
 
 ### Problem-Solving Approach
 

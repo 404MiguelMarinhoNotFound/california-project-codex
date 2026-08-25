@@ -60,6 +60,12 @@ re-investigated later.
 **Suggested fix:** Switch `_stream_claude` to `self.client.messages.stream(...)` and yield `text` deltas from the streaming events (handling `tool_use` accumulation as the OpenAI path does).
 
 ### H3 — Default TTS provider `kokoro` is missing from `requirements.txt`
+
+> **Update (uv migration):** `requirements.txt` no longer exists. Dependencies now live in
+> `pyproject.toml` / `uv.lock`, and `kokoro` is declared as the `kokoro` optional extra.
+> The crash still reproduces on a plain `uv sync`; install with `uv sync --extra kokoro`
+> or switch `tts.provider` to `edge`. See the "Dependency Management (uv only)" section
+> in `AGENTS.md`.
 **Location:** `config.yaml:133` (`provider: "kokoro"`); `requirements.txt` (no `kokoro` entry); init at `services/tts.py:189-201`.
 **What's wrong:** The shipped default TTS provider is `kokoro`, but `kokoro` appears nowhere in `requirements.txt`. On a clean `pip install -r requirements.txt`, `_init_kokoro` raises `RuntimeError("kokoro package not found …")` during `TTSService.__init__`, which is constructed unconditionally in `Orchestrator.__init__` (`orchestrator.py:330`) — so the whole app fails to start.
 **Trigger:** Fresh environment following the documented install, default config.

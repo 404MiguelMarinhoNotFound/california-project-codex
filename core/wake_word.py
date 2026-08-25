@@ -40,7 +40,7 @@ class WakeWordDetector:
         # ── openWakeWord (.onnx or built-in name) ───────────────────
         else:
             self._backend = "oww"
-            self._init_oww(model_spec)
+            self._init_oww(model_spec, ww_cfg)
 
     # ─── Init helpers ────────────────────────────────────────────────
 
@@ -50,7 +50,7 @@ class WakeWordDetector:
             import pvporcupine
         except ImportError:
             raise RuntimeError(
-                "pvporcupine not installed. Run: pip install pvporcupine"
+                "pvporcupine not installed. Run: uv sync --extra porcupine"
             )
 
         access_key = os.environ.get("PICOVOICE_ACCESS_KEY", "")
@@ -76,7 +76,44 @@ class WakeWordDetector:
             f"sample_rate={self._porcupine.sample_rate}"
         )
 
-    def _init_oww(self, model_spec: str):
+    @staticmethod
+    def _ensure_oww_models(model_spec: str, framework: str):
+        """
+        Make sure openWakeWord's model files are on disk before loading them.
+
+        openWakeWord ships no models in its wheel: they are downloaded at runtime
+        into site-packages/openwakeword/resources/models/. Nothing in the package
+        RECORD covers them, so any `uv sync` that reinstalls openwakeword deletes
+        them again and startup dies with onnxruntime NO_SUCHFILE. Re-fetch them
+        whenever they are missing so the environment is self-healing.
+        """
+        import os
+
+        import openwakeword
+        from openwakeword.utils import download_models
+
+        ext = "onnx" if framework == "onnx" else "tflite"
+        res_dir = os.path.join(os.path.dirname(openwakeword.__file__), "resources", "models")
+
+        # Feature extractors are always required, plus the wake word model itself
+        # unless the user pointed at their own .onnx elsewhere on disk.
+        required = [f"melspectrogram.{ext}", f"embedding_model.{ext}"]
+        if not model_spec.endswith((".onnx", ".tflite")):
+            required.append(f"{model_spec}.{ext}")
+
+        missing = [f for f in required if not os.path.exists(os.path.join(res_dir, f))]
+        if not missing:
+            return
+
+        logger.info(
+            f"openWakeWord model files missing ({', '.join(missing)}) - downloading. "
+            "This happens on first run and after any uv sync that reinstalls openwakeword."
+        )
+        os.makedirs(res_dir, exist_ok=True)
+        download_models()
+        logger.info("openWakeWord models downloaded")
+
+    def _init_oww(self, model_spec: str, ww_cfg: dict):
         """Load an openWakeWord model (built-in name or .onnx path)."""
         from openwakeword.model import Model as OWWModel
 
@@ -85,7 +122,24 @@ class WakeWordDetector:
         else:
             logger.info(f"Loading pre-built openWakeWord model: {model_spec}")
 
-        self._oww_model = OWWModel(wakeword_models=[model_spec])
+        # openWakeWord defaults to the tflite runtime, but `tflite-runtime` has no
+        # Windows wheels. onnxruntime is already pulled in by openwakeword itself and
+        # works on Windows, Linux, and the Pi, so it is the portable default here.
+        framework = ww_cfg.get("inference_framework", "onnx")
+
+        self._ensure_oww_models(model_spec, framework)
+
+        try:
+            self._oww_model = OWWModel(
+                wakeword_models=[model_spec], inference_framework=framework
+            )
+        except ValueError as exc:
+            # Most often: the model files were never downloaded post-install.
+            raise RuntimeError(
+                f"openWakeWord failed to load '{model_spec}' with the "
+                f"'{framework}' runtime ({exc}). If the model files are missing, run: "
+                "uv run python -c \"import openwakeword.utils as u; u.download_models()\""
+            ) from exc
 
         model_keys = list(self._oww_model.models.keys())
         if not model_keys:

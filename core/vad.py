@@ -45,8 +45,14 @@ class VAD:
             self._silero_model = model
             self._silero_get_speech = utils[0]
             logger.info("Silero VAD loaded successfully")
-        except ImportError:
-            logger.warning("torch not installed — falling back to energy-based VAD")
+        except ImportError as exc:
+            # Not necessarily torch itself: the silero-vad hub module also needs
+            # torchaudio, which only the `silero` extra installs (the `kokoro`
+            # extra pulls torch alone). Report what actually failed.
+            logger.warning(
+                f"Silero VAD unavailable ({exc}) — falling back to energy-based VAD. "
+                "Install the full stack with: uv sync --extra silero"
+            )
             self.engine = "energy"
 
     def is_speech(self, audio_chunk: np.ndarray) -> bool:
