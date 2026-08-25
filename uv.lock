@@ -283,10 +283,15 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+default = [
+    { name = "en-core-web-sm" },
+    { name = "kokoro" },
+]
 elevenlabs = [
     { name = "elevenlabs" },
 ]
 kokoro = [
+    { name = "en-core-web-sm" },
     { name = "kokoro" },
 ]
 openai = [
@@ -309,8 +314,10 @@ silero = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40.0" },
+    { name = "california", extras = ["kokoro"], marker = "extra == 'default'" },
     { name = "edge-tts", specifier = ">=6.1.0" },
     { name = "elevenlabs", marker = "extra == 'elevenlabs'", specifier = ">=1.0.0" },
+    { name = "en-core-web-sm", marker = "extra == 'kokoro'", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
     { name = "groq", specifier = ">=0.4.0" },
     { name = "kokoro", marker = "extra == 'kokoro'", specifier = ">=0.9.0" },
     { name = "numpy", specifier = ">=1.24.0" },
@@ -329,7 +336,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'silero'", specifier = ">=2.0.0" },
     { name = "torchaudio", marker = "extra == 'silero'", specifier = ">=2.0.0" },
 ]
-provides-extras = ["kokoro", "piper", "elevenlabs", "openai", "porcupine", "silero", "pi"]
+provides-extras = ["kokoro", "piper", "elevenlabs", "openai", "porcupine", "silero", "pi", "default"]
 
 [[package]]
 name = "catalogue"
@@ -917,6 +924,14 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/af/f3/0931fc203e86797e46c132174990f6476141ee4593631b8b42d19b00817a/elevenlabs-2.64.0.tar.gz", hash = "sha256:97cab1d3b84019a08f0e52fa00c8ed38dae9276e4209745be929cb3f6d830426", size = 777749, upload-time = "2026-08-14T14:36:41.462Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d3/c7/f70ff6b05fd040238500894d4092c8416a7049f1dd2a6b1843a5b8c972fe/elevenlabs-2.64.0-py3-none-any.whl", hash = "sha256:806bb8123f7b3d0559cb67537e819dacdc7a2df7cda8334a99627e6a92cf8f8a", size = 2062258, upload-time = "2026-08-14T14:36:39.501Z" },
+]
+
+[[package]]
+name = "en-core-web-sm"
+version = "3.8.0"
+source = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+wheels = [
+    { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl", hash = "sha256:1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85" },
 ]
 
 [[package]]

@@ -35,7 +35,7 @@ This lets California do things like:
 ## Main Features
 
 - Streaming STT -> LLM -> TTS pipeline with sentence-level overlap for lower perceived latency
-- Wake-word support via openWakeWord or Porcupine
+- Wake-word support via openWakeWord (Porcupine retired, see note under Environment Variables)
 - Multi-provider LLM support through `services/llm.py`
 - TTS support for Kokoro, Edge TTS, Piper, and ElevenLabs
 - ADB-based control of Mi Box / Android TV
@@ -128,7 +128,15 @@ Default voice setup:
 
 - `GROQ_API_KEY` for Whisper STT
 - `ANTHROPIC_API_KEY` for Claude
-- `PICOVOICE_ACCESS_KEY` if using a Porcupine `.ppn` wake-word model
+- ~~`PICOVOICE_ACCESS_KEY`~~ - no longer usable, see the note below
+
+> **Porcupine is retired in this project.** Picovoice sunset its Free Tier on
+> **2026-06-30** and disabled all Free Tier AccessKeys, so `PICOVOICE_ACCESS_KEY`
+> no longer activates and the custom `California_*.ppn` models cannot load.
+> The wake word now runs on **openWakeWord** (Apache-2.0, no key, no activation
+> server), configured as `wake_word.model: "hey_jarvis_v0.1"` in `config.yaml`.
+> To restore "California" as the trigger word, train a custom openWakeWord `.onnx`
+> and point `wake_word.model` at it. Do not reintroduce Porcupine without a paid key.
 
 Stremio support:
 

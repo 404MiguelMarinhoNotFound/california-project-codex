@@ -23,6 +23,15 @@ import sys
 import logging
 import argparse
 
+# The UI prints Unicode (LED state dots, arrows, em dashes). On Windows a piped or
+# non-UTF-8 console falls back to cp1252 and any of those characters raise
+# UnicodeEncodeError mid-render. Force UTF-8 and never let output kill the app.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import yaml
 from dotenv import load_dotenv
 

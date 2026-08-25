@@ -30,7 +30,7 @@ Voice request -> LLM tool call (control_tv) -> Orchestrator VPN preflight -> Med
 
 | Component | Technology |
 |-----------|------------|
-| Wake word | openWakeWord / Porcupine |
+| Wake word | openWakeWord (Porcupine retired, see note below) |
 | STT | Groq Whisper API |
 | LLM | Anthropic Claude, Groq, Fireworks, or OpenAI-compatible |
 | TTS | Kokoro, Edge TTS, Piper, ElevenLabs |
@@ -48,7 +48,8 @@ Required for the default setup:
 
 - `GROQ_API_KEY` - Whisper STT
 - `ANTHROPIC_API_KEY` - Claude LLM
-- `PICOVOICE_ACCESS_KEY` - only if using a `.ppn` Porcupine wake-word model
+- ~~`PICOVOICE_ACCESS_KEY`~~ - **dead.** Picovoice disabled all Free Tier AccessKeys
+  on 2026-06-30. The Porcupine backend is no longer usable in this project
 
 Required for Stremio features:
 
@@ -60,6 +61,14 @@ Required for TMDB fallback title resolution:
 - `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN`
 
 Keep secrets in `.env` or another local-only secret mechanism. Do not commit real credentials.
+
+> **Porcupine is retired in this project.** Picovoice sunset its Free Tier on
+> **2026-06-30** and disabled all Free Tier AccessKeys, so `PICOVOICE_ACCESS_KEY`
+> no longer activates and the custom `California_*.ppn` models cannot load.
+> The wake word now runs on **openWakeWord** (Apache-2.0, no key, no activation
+> server), configured as `wake_word.model: "hey_jarvis_v0.1"` in `config.yaml`.
+> To restore "California" as the trigger word, train a custom openWakeWord `.onnx`
+> and point `wake_word.model` at it. Do not reintroduce Porcupine without a paid key.
 
 -----
 

@@ -9,7 +9,15 @@ wake_word:
   # openWakeWord built-in:  "hey_jarvis_v0.1", "alexa", "hey_mycroft", etc.
   # openWakeWord custom:    path to .onnx file  (e.g., "models/hey_california.onnx")
   # Porcupine custom:       path to .ppn file   (needs PICOVOICE_ACCESS_KEY in .env)
-  model: "sounds/wake_word_california/California_en_windows_v4_0_0.ppn"
+  #
+  # NOTE: Picovoice sunset its Free Tier on 2026-06-30 and disabled all free
+  # AccessKeys, so the Porcupine backend and the two custom "California" .ppn
+  # models in sounds/wake_word_california/ no longer load (they fail with
+  # PorcupineActivationRefusedError regardless of the model file). Using the
+  # openWakeWord backend instead: Apache-2.0, no key, no activation server.
+  # To get "California" back as the trigger word, train a custom openWakeWord
+  # model (.onnx) and point this at it.
+  model: "hey_jarvis_v0.1"
   threshold: 0.6            # Used as sensitivity for Porcupine (0.0–1.0)
   sensitivity: 0.6          # Porcupine-specific alias (same value)
   consecutive_frames: 2     # Only used by openWakeWord backend
