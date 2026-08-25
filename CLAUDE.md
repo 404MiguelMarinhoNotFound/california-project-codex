@@ -179,6 +179,14 @@ truth. `requirements.txt` has been deleted and must not be reintroduced.
   `porcupine`, `silero`, `pi`. Install with `uv sync --extra <name>`.
 - **Platform-specific deps carry an environment marker** (for example
   `piper-tts>=1.2.0; sys_platform == 'linux'`) so the universal lock still resolves on Windows.
+- **Beware packages that download assets into `site-packages` at runtime.** They are
+  invisible to `uv.lock` (nothing in the wheel `RECORD` covers them) and any `uv sync`
+  that reinstalls the package silently deletes them. Two live cases in this project:
+  - `en-core-web-sm` (pulled by kokoro/misaki via `spacy download`) is **pinned as a
+    direct URL dependency** in the `kokoro` extra so uv owns it.
+  - openWakeWord's wake-word models cannot be pinned (they are not packages), so
+    `core/wake_word.py` re-downloads them whenever they are missing. Never assume they
+    survive a sync.
 - **Error messages that tell a user to install something must name a `uv` command,**
   e.g. `"kokoro package not found. Install it with: uv sync --extra kokoro"`.
 - If `uv` is missing on a machine, install it with the official Astral installer
