@@ -108,13 +108,17 @@ california/
 │   └── test_youtube_playlist_resolver.py # Matching and random-selection coverage for saved playlists
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
+├── deprecated/                  # Retired files kept for reference, see deprecated/README.md
 ├── vpn_state.json               # Generated locally, Surfshark diagnostic cache
 └── watch_state.json             # Generated locally, cached Stremio progress
 ```
 
 Important runtime note:
 
-- `watch_state.json` and `vpn_state.json` are generated cache files and should stay local
+- `watch_state.json` and `vpn_state.json` are generated cache files and should stay local;
+  both are gitignored, so they will not show up as pending changes
+- `deprecated/` holds files retired from the live tree. Nothing there is imported or
+  executed. Do not add references to it; see `deprecated/README.md` for what was moved and why
 - `core/orchestrator.py` is the main coordinator, not a top-level `orchestrator.py`
 - Most integrations live under `services/`
 - `surfshark_routes.json` is the preferred place to retune Surfshark route timing or DPAD steps without editing code
