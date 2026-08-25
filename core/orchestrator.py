@@ -9,6 +9,9 @@ LLM tokens flow through sentence chunker into TTS, so the user hears
 the first sentence while the LLM is still generating.
 """
 
+import glob
+import os
+import random
 import time
 import logging
 import threading
@@ -102,7 +105,12 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
             is_foreground,
         )
         if not is_foreground:
+            t_vpn = time.monotonic()
             vpn_result = surfshark_svc.ensure_route(target_route)
+            logger.info(
+                "[timing] VPN preflight %s took %.3fs success=%s",
+                target_route, time.monotonic() - t_vpn, vpn_result.success,
+            )
             logger.info(
                 "VPN preflight result for %s: success=%s switched=%s current_country=%s message=%s",
                 target_app,
@@ -114,8 +122,9 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
             if not vpn_result.success:
                 route_warning = _vpn_warning_suffix(target_route)
             if target_app == "youtube":
+                t_fstop = time.monotonic()
                 stopped = media_svc.force_stop_app("youtube")
-                logger.info("Post-VPN YouTube force-stop result: %s", stopped)
+                logger.info("[timing] Post-VPN YouTube force-stop took %.3fs ok=%s", time.monotonic() - t_fstop, stopped)
         else:
             logger.info("Skipping VPN preflight because %s is already foreground", target_app)
 
@@ -237,6 +246,7 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
 
     # YouTube
     elif action == "youtube_playlist":
+        t_yt = time.monotonic()
         playlist_id = (params.get("playlist_id") or "").strip()
         playlist_name = (params.get("playlist_name") or "").strip()
         matched_key = None
@@ -249,6 +259,7 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
             return f"I don't have a {fallback_name} playlist saved. Want me to search YouTube for it?"
 
         ok = media_svc.youtube_playlist(playlist_id)
+        logger.info("[timing] youtube_playlist dispatch took %.3fs ok=%s", time.monotonic() - t_yt, ok)
         if not ok:
             return "I couldn't open that YouTube playlist right now."
         if matched_key:
@@ -258,10 +269,12 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
         return _append_route_warning(response, route_warning)
 
     elif action == "youtube_search":
+        t_yt = time.monotonic()
         query = (params.get("query") or "").strip()
         if not query:
             return "Tell me what to search for on YouTube."
         ok = media_svc.youtube_search(query)
+        logger.info("[timing] youtube_search dispatch took %.3fs ok=%s", time.monotonic() - t_yt, ok)
         if not ok:
             return "I couldn't open YouTube search right now."
         response = f"Searching YouTube for {query}."
@@ -351,6 +364,24 @@ class Orchestrator:
 
         logger.info("All components initialized successfully")
 
+    def _play_bootup_sound(self):
+        """Pick a random WAV from sounds/bootup/ and play it."""
+        import soundfile as sf
+
+        bootup_dir = os.path.join(os.path.dirname(__file__), "..", "sounds", "bootup")
+        bootup_dir = os.path.normpath(bootup_dir)
+        files = glob.glob(os.path.join(bootup_dir, "*.wav"))
+        if not files:
+            logger.debug("No bootup sounds found in %s — skipping", bootup_dir)
+            return
+        chosen = random.choice(files)
+        logger.info("Bootup sound: %s", os.path.basename(chosen))
+        try:
+            audio, sr = sf.read(chosen, dtype="float32")
+            self.audio.play_audio(audio, sr, blocking=True)
+        except Exception:
+            logger.exception("Failed to play bootup sound %s", chosen)
+
     def run(self):
         """Main loop. Blocks until interrupted."""
         self._running = True
@@ -366,6 +397,7 @@ class Orchestrator:
 
         mic_stream = self.audio.create_mic_stream()
         mic_stream.start()
+        self._play_bootup_sound()
 
         try:
             while self._running:

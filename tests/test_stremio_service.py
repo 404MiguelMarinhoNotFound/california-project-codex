@@ -35,7 +35,6 @@ class StremioServiceTests(unittest.TestCase):
                 "provider_scan_pages": 3,
                 "provider_scan_delay_ms": 1,
                 "provider_fallback_policy": "ask",
-                "provider_ocr_enabled": False,
             },
             "tmdb": {
                 "api_key": "dummy",
@@ -353,6 +352,30 @@ class StremioServiceTests(unittest.TestCase):
             self.assertIn("Want me to try the first available source?", result.message)
             unknown_attempt.assert_not_called()
 
+    def test_play_launches_detail_page_once_across_multiple_provider_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            watch_state = Path(tmp) / "watch_state.json"
+            svc = StremioService(self._config(watch_state))
+
+            with patch.object(svc, "_launch_uri") as launch_uri:
+                with patch.object(svc, "_attempt_provider", return_value=None) as attempt_provider:
+                    with patch.object(
+                        svc,
+                        "_attempt_unknown_source",
+                        return_value=StremioPlayResult(success=False),
+                    ) as unknown_attempt:
+                        svc._play_deep_link(
+                            imdb_id="tt0903747",
+                            media_type="series",
+                            title_key="fallout",
+                            title_label="Fallout",
+                            allow_unknown_source=True,
+                        )
+
+            launch_uri.assert_called_once()
+            self.assertEqual(attempt_provider.call_count, 3)
+            unknown_attempt.assert_called_once()
+
     def test_confirmed_unknown_source_can_play(self):
         with tempfile.TemporaryDirectory() as tmp:
             watch_state = Path(tmp) / "watch_state.json"
@@ -421,20 +444,17 @@ class StremioServiceTests(unittest.TestCase):
     def test_shared_media_service_helpers_are_used_for_ui_actions(self):
         media_service = Mock()
         media_service.dump_ui_hierarchy.return_value = "<hierarchy />"
-        media_service.capture_screenshot_bytes.return_value = b"png"
         svc = StremioService(self._config(Path("watch_state.json")), media_service=media_service)
 
         self.assertEqual(svc._dump_ui_hierarchy(), "<hierarchy />")
         svc._scroll_source_list()
         svc._tap(200, 300)
         svc._keyevent(23)
-        self.assertEqual(svc._capture_screenshot(), b"png")
 
         media_service.dump_ui_hierarchy.assert_called_once_with()
         media_service.swipe.assert_called_once_with(960, 900, 960, 260, 250)
         media_service.tap.assert_called_once_with(200, 300)
         media_service.keyevent.assert_called_once_with(23)
-        media_service.capture_screenshot_bytes.assert_called_once_with()
 
 
 if __name__ == "__main__":

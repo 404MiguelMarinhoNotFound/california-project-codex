@@ -22,6 +22,8 @@ Microphone -> Wake word -> VAD -> Groq Whisper (STT) -> Claude or compatible LLM
 
 ### TV Control Pipeline
 
+_Status: Surfshark VPN preflight is currently disabled via `media.vpn_routing_enabled: false` in `config.yaml`. With the flag off, tool calls dispatch straight to `MediaService` / `StremioService` without a VPN step. The diagram below describes the architecture when routing is on, kept for a potential future re-enable._
+
 ```text
 Voice request -> LLM tool call (control_tv) -> Orchestrator VPN preflight -> MediaService / StremioService / SurfsharkService -> ADB deep link or keyevent -> Mi Box
 ```
@@ -173,6 +175,8 @@ Use `queue.Queue(maxsize=2)` for synthesized audio buffering so synthesis and pl
 - YouTube warm launch plus one OK press to clear the profile picker on cold starts
 
 ### SurfsharkService
+
+_Status: Idle. `media.vpn_routing_enabled` is `false` in `config.yaml`, so the orchestrator never calls `ensure_route()`. The code below is kept in place for easy rollback but does not run in the current setup._
 
 `services/surfshark_service.py` handles:
 
@@ -326,6 +330,8 @@ For the Mi Box itself, **Wakelock Revamp** is a good deployment-side addition to
 
 ### Final VPN Routing Rules
 
+_Status: Inactive. Routing is disabled via `media.vpn_routing_enabled: false`. Stremio and YouTube actions now launch directly with no VPN preflight. The rules below are retained for history and in case the flag is flipped back on._
+
 These are the current final decisions and should be preserved unless the user explicitly wants a policy change:
 
 - If the requested app is already foreground, skip Surfshark entirely
@@ -338,6 +344,8 @@ These are the current final decisions and should be preserved unless the user ex
 - The route table is easier to retune than hardcoding more logic into `surfshark_service.py`
 
 ### Current Surfshark Route Calibration
+
+_Status: Not in use while routing is disabled. Retained for reference if the flag is flipped back on._
 
 At the time of this update:
 
@@ -526,3 +534,26 @@ python -m unittest tests.test_media_service tests.test_stremio_service tests.tes
 - Same-app requests should preserve the active session and skip Surfshark, even if that means VPN policy is only enforced on cross-app transitions
 - Package launch plus named route tables is easier to maintain than scattering Surfshark timing and key sequences through the codebase
 - Graceful fallback lines build trust more than pretending automation is perfect
+
+-----
+
+## Known Bugs / Audit
+
+A whole-codebase bug audit was run on **2026-07-12**. Full report:
+[`BUG_AUDIT.md`](BUG_AUDIT.md). Baseline at audit time: all 63 unit tests passing;
+`py_compile` clean except the stale `services/tts copy.py` dead file (that file, and
+`services/sentence_chunker copy.py`, were moved to `deprecated/` on 2026-08-25; the
+live tree now parses clean).
+
+Confirmed **High-severity** backlog (identification only — not yet fixed):
+
+- **Barge-in / "stop" is non-functional** — `_interrupted` is never set `True`, so the
+  interrupt guards are dead code and "stop" only skips the current sentence
+  (`core/orchestrator.py`).
+- **Claude provider does not stream** — `_stream_claude` uses the non-streaming
+  `messages.create()`, so the default provider loses token-by-token streaming
+  (`services/llm.py:270`).
+- **Default TTS `kokoro` missing from `requirements.txt`** — clean install crashes at
+  `TTSService.__init__` (`config.yaml:133`).
+
+See `BUG_AUDIT.md` for Medium/Low findings and the verified-rejected false positives.

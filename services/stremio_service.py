@@ -1,4 +1,3 @@
-import io
 import json
 import logging
 import os
@@ -89,7 +88,6 @@ class StremioService:
         self.provider_aliases = self._build_provider_aliases(
             stremio_cfg.get("provider_aliases", {})
         )
-        self.ocr_enabled = bool(stremio_cfg.get("provider_ocr_enabled", True))
 
         watch_state_name = stremio_cfg.get("watch_state_path", "watch_state.json")
         self.watch_state_path = Path(watch_state_name)
@@ -549,8 +547,28 @@ class StremioService:
         source_order = self._source_preference_order(remembered_source)
         found_preferred_source = False
 
+        if self.media_service is not None:
+            self.media_service.force_stop_app("stremio")
+            time.sleep(0.3)
+
+        self._launch_uri(uri)
+        if not self._wait_for_stremio_foreground():
+            log.warning("Stremio did not become foreground within wait window")
+        time.sleep(self.autoplay_delay_ms / 1000)
+
+        # Stremio TV typically focuses Play/Resume on the detail page, so
+        # pressing OK lets its built-in autoplay pick a source. This is the
+        # documented happy-path in CLAUDE.md and avoids the slow uiautomator
+        # scan that hangs while Stremio is still resolving streams.
+        if self._try_stremio_autoplay():
+            return StremioPlayResult(
+                success=True,
+                played_source=None,
+                target_mode=target_mode,
+            )
+
         for source_key in source_order:
-            selection = self._attempt_provider(uri, source_key)
+            selection = self._attempt_provider(source_key)
             if not selection:
                 continue
 
@@ -575,7 +593,7 @@ class StremioService:
                 target_mode=target_mode,
             )
 
-        fallback_attempt = self._attempt_unknown_source(uri)
+        fallback_attempt = self._attempt_unknown_source()
         fallback_attempt.target_mode = target_mode
         if fallback_attempt.success:
             self._remember_successful_source(
@@ -601,10 +619,7 @@ class StremioService:
             target_mode=target_mode,
         )
 
-    def _attempt_provider(self, uri: str, provider_key: str) -> StremioPlayResult | None:
-        self._launch_uri(uri)
-        time.sleep(self.autoplay_delay_ms / 1000)
-
+    def _attempt_provider(self, provider_key: str) -> StremioPlayResult | None:
         candidate = self._find_provider_candidate(provider_key)
         if not candidate:
             return None
@@ -616,10 +631,7 @@ class StremioService:
         log.info("Preferred source '%s' did not start playback", provider_key)
         return StremioPlayResult(success=False, played_source=candidate.label)
 
-    def _attempt_unknown_source(self, uri: str) -> StremioPlayResult:
-        self._launch_uri(uri)
-        time.sleep(self.autoplay_delay_ms / 1000)
-
+    def _attempt_unknown_source(self) -> StremioPlayResult:
         candidate = self._find_first_unknown_candidate()
         if candidate:
             self._tap(candidate.center_x, candidate.center_y)
@@ -634,6 +646,25 @@ class StremioService:
 
     def _launch_uri(self, uri: str):
         self._run_shell(f'am start -a android.intent.action.VIEW -d "{uri}"')
+
+    def _try_stremio_autoplay(self) -> bool:
+        self._keyevent(23)
+        if self._wait_for_playback(timeout_seconds=4.0):
+            return True
+        self._keyevent(23)
+        return self._wait_for_playback(timeout_seconds=3.0)
+
+    def _wait_for_stremio_foreground(
+        self, timeout_s: float = 10.0, poll_s: float = 0.5
+    ) -> bool:
+        if self.media_service is None:
+            return False
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self.media_service.is_app_foreground("stremio"):
+                return True
+            time.sleep(poll_s)
+        return self.media_service.is_app_foreground("stremio")
 
     def _wait_for_playback(self, timeout_seconds: float = 2.5) -> bool:
         deadline = time.time() + timeout_seconds
@@ -714,10 +745,7 @@ class StremioService:
 
     def _get_visible_source_candidates(self) -> list[SourceCandidate]:
         xml_text = self._dump_ui_hierarchy()
-        candidates = self._extract_candidates_from_ui_xml(xml_text)
-        if candidates:
-            return candidates
-        return self._extract_candidates_from_ocr()
+        return self._extract_candidates_from_ui_xml(xml_text)
 
     def _dump_ui_hierarchy(self) -> str:
         if self.media_service is not None:
@@ -824,87 +852,6 @@ class StremioService:
             self.media_service.tap(x, y)
             return
         self._run_shell(f"input tap {x} {y}")
-
-    def _extract_candidates_from_ocr(self) -> list[SourceCandidate]:
-        if not self.ocr_enabled:
-            return []
-
-        try:
-            from PIL import Image
-            import pytesseract
-        except ImportError:
-            log.debug("OCR fallback unavailable because Pillow or pytesseract is not installed")
-            return []
-
-        screenshot = self._capture_screenshot()
-        if not screenshot:
-            return []
-
-        try:
-            image = Image.open(io.BytesIO(screenshot))
-            ocr_data = pytesseract.image_to_data(
-                image, output_type=pytesseract.Output.DICT
-            )
-        except Exception as exc:
-            log.debug("OCR fallback failed: %s", exc)
-            return []
-
-        lines = {}
-        for index, word in enumerate(ocr_data.get("text", [])):
-            cleaned = word.strip()
-            if not cleaned:
-                continue
-
-            line_key = (
-                ocr_data["page_num"][index],
-                ocr_data["block_num"][index],
-                ocr_data["par_num"][index],
-                ocr_data["line_num"][index],
-            )
-            entry = lines.setdefault(
-                line_key,
-                {
-                    "words": [],
-                    "left": ocr_data["left"][index],
-                    "top": ocr_data["top"][index],
-                    "right": ocr_data["left"][index] + ocr_data["width"][index],
-                    "bottom": ocr_data["top"][index] + ocr_data["height"][index],
-                },
-            )
-            entry["words"].append(cleaned)
-            entry["left"] = min(entry["left"], ocr_data["left"][index])
-            entry["top"] = min(entry["top"], ocr_data["top"][index])
-            entry["right"] = max(
-                entry["right"], ocr_data["left"][index] + ocr_data["width"][index]
-            )
-            entry["bottom"] = max(
-                entry["bottom"], ocr_data["top"][index] + ocr_data["height"][index]
-            )
-
-        candidates = []
-        for entry in lines.values():
-            label = " ".join(entry["words"]).strip()
-            if not self._looks_like_source_label(label):
-                continue
-            candidates.append(
-                SourceCandidate(
-                    label=label,
-                    center_x=(entry["left"] + entry["right"]) // 2,
-                    center_y=(entry["top"] + entry["bottom"]) // 2,
-                    provider_key=self._provider_key_for_label(label),
-                )
-            )
-
-        candidates.sort(key=lambda item: (item.center_y, item.center_x))
-        return candidates
-
-    def _capture_screenshot(self) -> bytes:
-        if self.media_service is not None and hasattr(self.media_service, "capture_screenshot_bytes"):
-            return self.media_service.capture_screenshot_bytes()
-        result = self._run_adb_command("exec-out", "screencap", "-p", capture_text=False)
-        if not result[0]:
-            return b""
-        return result[1]
 
     def _remember_successful_source(
         self,
