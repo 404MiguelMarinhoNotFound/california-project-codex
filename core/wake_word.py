@@ -50,7 +50,7 @@ class WakeWordDetector:
             import pvporcupine
         except ImportError:
             raise RuntimeError(
-                "pvporcupine not installed. Run: pip install pvporcupine"
+                "pvporcupine not installed. Run: uv sync --extra porcupine"
             )
 
         access_key = os.environ.get("PICOVOICE_ACCESS_KEY", "")

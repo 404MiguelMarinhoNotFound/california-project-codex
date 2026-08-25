@@ -1,0 +1,45 @@
+[project]
+name = "california"
+version = "0.1.0"
+description = "C.A.L.I.F.O.R.N.I.A. — DIY streaming voice assistant with Mi Box / Android TV control"
+requires-python = ">=3.11"
+
+# --- Core runtime dependencies (always installed) ---
+dependencies = [
+    # Config, env, HTTP
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "numpy>=1.24.0",
+    # Stremio poster OCR
+    "pillow>=10.0.0",
+    "pytesseract>=0.3.10",
+    # Audio I/O
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12.1",
+    # Wake word
+    "openwakeword>=0.6.0",
+    # STT
+    "groq>=0.4.0",
+    # LLM
+    "anthropic>=0.40.0",
+    # TTS (cross-platform default)
+    "edge-tts>=6.1.0",
+]
+
+# --- Optional feature sets: uv sync --extra <name> ---
+[project.optional-dependencies]
+# TTS provider: kokoro (config.yaml default `tts.provider: kokoro`)
+kokoro = ["kokoro>=0.9.0"]
+# TTS provider: piper — local synthesis, Linux/Pi only
+piper = ["piper-tts>=1.2.0; sys_platform == 'linux'"]
+# TTS provider: elevenlabs (premium)
+elevenlabs = ["elevenlabs>=1.0.0"]
+# LLM provider: any OpenAI-compatible endpoint (Fireworks, local, ...)
+openai = ["openai>=1.0.0"]
+# Wake word provider: Porcupine (alternative to openWakeWord)
+porcupine = ["pvporcupine>=3.0.0"]
+# VAD provider: Silero — heavy (~2GB of torch wheels)
+silero = ["torch>=2.0.0", "torchaudio>=2.0.0"]
+# Raspberry Pi hardware: ReSpeaker 2-Mic HAT LED ring
+pi = ["pixel-ring>=0.1.0; sys_platform == 'linux'"]

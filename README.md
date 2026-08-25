@@ -45,37 +45,82 @@ This lets California do things like:
 
 ## Quick Start
 
+> **This project is uv-only.** Do not use `pip`, `venv`, or `virtualenv` here.
+> `pyproject.toml` + `uv.lock` are the single source of truth for dependencies.
+
 ```bash
-# 1. Enter the project
+# 1. Install uv (one time)
+# Linux / macOS / Pi
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Windows PowerShell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 2. Enter the project
 cd california
 
-# 2. Create and activate a virtual environment
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# Linux / macOS
-source venv/bin/activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
+# 3. Create the environment from the lockfile
+# uv downloads the pinned CPython (see .python-version) and builds .venv itself
+uv sync
 
 # 4. Create local env file
-copy .env.example .env
+cp .env.example .env        # Windows: copy .env.example .env
 
 # 5. Edit .env with at least:
 # GROQ_API_KEY
 # ANTHROPIC_API_KEY
 
 # 6. Run individual tests or the full assistant
-python main.py --test-mic
-python main.py --test-tts
-python main.py --test-stt
-python main.py --test-llm
-python main.py --test-pipeline
-python main.py
+# uv run re-syncs the environment first, so there is no "activate" step
+uv run python main.py --test-mic
+uv run python main.py --test-tts
+uv run python main.py --test-stt
+uv run python main.py --test-llm
+uv run python main.py --test-pipeline
+uv run python main.py
 ```
+
+Or just run the setup script, which installs uv if it is missing:
+
+```bash
+./setup.sh          # Linux / macOS / Pi
+```
+
+```powershell
+./setup.ps1         # Windows
+```
+
+### Optional Feature Sets
+
+Non-core providers live in `[project.optional-dependencies]` and are installed on demand:
+
+| Extra | Installs | Used for |
+|-------|----------|----------|
+| `kokoro` | `kokoro` | Kokoro TTS (the `config.yaml` default `tts.provider`) |
+| `piper` | `piper-tts` | Local Piper TTS, Linux / Pi only |
+| `elevenlabs` | `elevenlabs` | Premium ElevenLabs TTS |
+| `openai` | `openai` | OpenAI-compatible LLM endpoints (Fireworks, local, ...) |
+| `porcupine` | `pvporcupine` | Porcupine wake word instead of openWakeWord |
+| `silero` | `torch`, `torchaudio` | Silero VAD (heavy, ~2GB) |
+| `pi` | `pixel-ring` | ReSpeaker 2-Mic HAT LED ring, Linux / Pi only |
+
+```bash
+uv sync --extra kokoro                  # one extra
+uv sync --extra kokoro --extra silero   # several
+uv sync --all-extras                    # everything
+```
+
+### Managing Dependencies
+
+```bash
+uv add <package>                # add a runtime dependency (updates pyproject.toml + uv.lock)
+uv add --optional kokoro <pkg>  # add to an optional feature set
+uv remove <package>             # drop a dependency
+uv lock                         # re-resolve without changing installs
+uv sync                         # make .venv match uv.lock exactly (run after git pull)
+uv tree                         # inspect the resolved dependency tree
+```
+
+Commit both `pyproject.toml` and `uv.lock`. Never commit `.venv/`.
 
 ## Environment Variables
 
@@ -114,22 +159,22 @@ Common things to adjust:
 
 `main.py` includes:
 
-- `python main.py --test-mic`
-- `python main.py --test-tts`
-- `python main.py --test-stt`
-- `python main.py --test-llm`
-- `python main.py --test-pipeline`
+- `uv run python main.py --test-mic`
+- `uv run python main.py --test-tts`
+- `uv run python main.py --test-stt`
+- `uv run python main.py --test-llm`
+- `uv run python main.py --test-pipeline`
 
 Run the full assistant with:
 
 ```bash
-python main.py
+uv run python main.py
 ```
 
 ## Running Tests
 
 ```bash
-python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
 ```
 
 Current tests cover core media integrations such as Stremio playback flows, TV control behavior, and YouTube playlist matching.
@@ -142,7 +187,9 @@ california/
 ├── README.md
 ├── main.py
 ├── config.yaml
-├── requirements.txt
+├── pyproject.toml
+├── uv.lock
+├── .python-version
 ├── core/
 │   ├── orchestrator.py
 │   ├── audio_pipeline.py

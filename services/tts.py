@@ -157,7 +157,7 @@ class TTSService:
         except ImportError:
             raise RuntimeError(
                 "piper-tts Python package not found. "
-                "Install it with: pip install piper-tts"
+                "Install it with: uv sync --extra piper"
             )
 
         logger.info(f"Loading Piper model: {self.piper_model}")
@@ -193,7 +193,7 @@ class TTSService:
             from kokoro import KPipeline
         except ImportError:
             raise RuntimeError(
-                "kokoro package not found. Install it with: pip install kokoro"
+                "kokoro package not found. Install it with: uv sync --extra kokoro"
             )
         logger.info(
             f"Loading Kokoro pipeline (lang_code='{self.kokoro_lang_code}', voice='{self.kokoro_voice}')"
