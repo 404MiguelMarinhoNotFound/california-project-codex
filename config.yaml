@@ -181,7 +181,6 @@ stremio:
   provider_scan_pages: 3
   provider_scan_delay_ms: 800
   provider_fallback_policy: "ask"
-  provider_ocr_enabled: true
 
 # --- TMDB ---
 tmdb:
@@ -264,7 +263,7 @@ media:
   mibox_ip: "192.168.1.26"
   adb_port: 5555
   volume_max_steps: 15            # Mi Box S hardware max — used by volume_set()
-  vpn_routing_enabled: true
+  vpn_routing_enabled: false
   vpn_state_path: "vpn_state.json"
   vpn_status_cache_max_age_minutes: 5
   vpn_failure_policy: "open_anyway"
@@ -279,7 +278,7 @@ media:
   surfshark_pre_sequence_wait_ms: 250
   surfshark_key_delay_ms: 100
   surfshark_post_sequence_wait_ms: 1200
-  surfshark_restart_autoconnect_wait_ms: 0
+  surfshark_restart_autoconnect_wait_ms: 5000
   surfshark_ready_timeout_ms: 8000
   surfshark_ready_poll_interval_ms: 500
   surfshark_ready_stable_polls: 2
@@ -306,8 +305,9 @@ media:
   youtube_warm_launch_delay_ms: 1500     # On cross-app launches, open YouTube first and wait before the deep link
   youtube_profile_select_on_cold_start: true  # Press OK once to clear the YouTube profile picker after warm launch
   youtube_profile_select_delay_ms: 1200  # Wait after the profile OK before opening playlist/search URLs
-  ui_dump_retry_count: 3
+  ui_dump_retry_count: 2
   ui_dump_retry_delay_ms: 700
+  ui_dump_timeout_ms: 6000               # Per-call cap for `uiautomator dump` so hung a11y trees fail fast
   app_launch_components:
     surfshark: "com.surfshark.vpnclient.android/.StartActivity"
   app_launch_categories:

@@ -564,13 +564,15 @@ class SurfsharkService:
         self,
         capture_hook: Callable[[str], None] | None = None,
     ) -> SurfsharkRouteResult:
+        t_start = time.monotonic()
         route_definition = self._route_definition("restart_autoconnect")
         if capture_hook:
             capture_hook("attempt_1_before_launch")
 
         if route_definition and route_definition.force_stop_before_launch:
+            t_stop = time.monotonic()
             stopped = self.media_service.force_stop_app("surfshark")
-            log.info("Surfshark restart_autoconnect force-stop result: %s", stopped)
+            log.info("[timing] restart_autoconnect: force_stop took %.3fs ok=%s", time.monotonic() - t_stop, stopped)
             if not stopped:
                 return SurfsharkRouteResult(
                     success=False,
@@ -580,7 +582,9 @@ class SurfsharkService:
                 )
             time.sleep(0.5)
 
+        t_launch = time.monotonic()
         ok, message = self._open_surfshark(route_definition=route_definition)
+        log.info("[timing] restart_autoconnect: open_surfshark took %.3fs ok=%s", time.monotonic() - t_launch, ok)
         if not ok:
             return SurfsharkRouteResult(
                 success=False,
@@ -595,7 +599,9 @@ class SurfsharkService:
         log.info("Surfshark restart_autoconnect skipping readiness poll and continuing in background")
 
         if route_definition and route_definition.settle_wait_s > 0:
+            t_settle = time.monotonic()
             time.sleep(route_definition.settle_wait_s)
+            log.info("[timing] restart_autoconnect: settle_wait took %.3fs", time.monotonic() - t_settle)
 
         if capture_hook:
             capture_hook("attempt_1_after_restart_wait")
@@ -604,6 +610,7 @@ class SurfsharkService:
             "restart_autoconnect",
             route_definition.assumed_country if route_definition else "albania",
         )
+        log.info("[timing] restart_autoconnect: total %.3fs", time.monotonic() - t_start)
         return SurfsharkRouteResult(
             success=True,
             route_name="restart_autoconnect",
@@ -616,6 +623,7 @@ class SurfsharkService:
         pause_between_steps_s: float = 0.0,
         force_restart: bool = False,
     ) -> SurfsharkRouteResult:
+        t_start = time.monotonic()
         route_definition = self._route_definition("quick_connect")
         if not route_definition:
             return SurfsharkRouteResult(
@@ -635,11 +643,14 @@ class SurfsharkService:
 
             should_restart = force_restart or route_definition.force_stop_before_launch or attempt > 1
             if should_restart:
+                t_stop = time.monotonic()
                 stopped = self.media_service.force_stop_app("surfshark")
-                log.info("Surfshark quick_connect force-stop on attempt %d: %s", attempt, stopped)
+                log.info("[timing] quick_connect attempt %d: force_stop took %.3fs ok=%s", attempt, time.monotonic() - t_stop, stopped)
                 time.sleep(0.5)
 
+            t_launch = time.monotonic()
             ok, message = self._open_surfshark(route_definition=route_definition)
+            log.info("[timing] quick_connect attempt %d: open_surfshark took %.3fs ok=%s", attempt, time.monotonic() - t_launch, ok)
             if not ok:
                 last_message = message or "I couldn't open Surfshark."
                 continue
@@ -648,17 +659,21 @@ class SurfsharkService:
                 capture_hook(f"{stage_prefix}_after_launch")
 
             if route_definition.wait_for_ready:
+                t_ready = time.monotonic()
                 ready = self._wait_for_surfshark_ready()
-                log.info("Surfshark quick_connect readiness gate on attempt %d: %s", attempt, ready)
+                log.info("[timing] quick_connect attempt %d: wait_for_ready took %.3fs ready=%s", attempt, time.monotonic() - t_ready, ready)
                 if not ready:
                     last_message = "Surfshark did not reach its TV home screen in time."
                     continue
 
             if route_definition.pre_sequence_wait_s > 0:
+                t_pre = time.monotonic()
                 time.sleep(route_definition.pre_sequence_wait_s)
+                log.info("[timing] quick_connect attempt %d: pre_sequence_wait took %.3fs", attempt, time.monotonic() - t_pre)
             if capture_hook:
                 capture_hook(f"{stage_prefix}_after_pre_wait")
 
+            t_seq = time.monotonic()
             dispatch_error = self._dispatch_sequence(
                 route_name="quick_connect",
                 sequence=route_definition.sequence,
@@ -667,16 +682,20 @@ class SurfsharkService:
                 capture_hook=capture_hook,
                 pause_between_steps_s=pause_between_steps_s,
             )
+            log.info("[timing] quick_connect attempt %d: sequence_dispatch took %.3fs", attempt, time.monotonic() - t_seq)
             if dispatch_error:
                 last_message = dispatch_error
                 continue
 
             if route_definition.post_sequence_wait_s > 0:
+                t_post = time.monotonic()
                 time.sleep(route_definition.post_sequence_wait_s)
+                log.info("[timing] quick_connect attempt %d: post_sequence_wait took %.3fs", attempt, time.monotonic() - t_post)
             if capture_hook:
                 capture_hook(f"{stage_prefix}_after_post_wait")
 
             self._write_diagnostic_status("quick_connect", route_definition.assumed_country)
+            log.info("[timing] quick_connect: total %.3fs (attempt %d)", time.monotonic() - t_start, attempt)
             return SurfsharkRouteResult(
                 success=True,
                 route_name="quick_connect",
@@ -684,6 +703,7 @@ class SurfsharkService:
                 used_recovery=attempt > 1,
             )
 
+        log.info("[timing] quick_connect: total %.3fs (all attempts failed)", time.monotonic() - t_start)
         return SurfsharkRouteResult(
             success=False,
             route_name="quick_connect",

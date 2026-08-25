@@ -27,17 +27,22 @@ class MediaService:
         self.youtube_warm_launch_delay_s = media_cfg.get("youtube_warm_launch_delay_ms", 1500) / 1000
         self.youtube_profile_select_on_cold_start = media_cfg.get("youtube_profile_select_on_cold_start", True)
         self.youtube_profile_select_delay_s = media_cfg.get("youtube_profile_select_delay_ms", 1200) / 1000
-        self.ui_dump_retry_count = max(1, int(media_cfg.get("ui_dump_retry_count", 3)))
+        self.ui_dump_retry_count = max(1, int(media_cfg.get("ui_dump_retry_count", 2)))
         self.ui_dump_retry_delay_s = max(0, int(media_cfg.get("ui_dump_retry_delay_ms", 700)) / 1000)
+        self.ui_dump_timeout_s = max(1, int(media_cfg.get("ui_dump_timeout_ms", 6000))) / 1000
 
         # Connection state tracking
         self._connected = False
         self._last_fail_time: float = 0  # monotonic timestamp of last failed reconnect
 
+        # Cleared once per YouTube cold start; see _prepare_youtube_launch.
+        self._youtube_profile_cleared: bool = False
+
     def _adb(self, command: str, use_target: bool = True, timeout_s: float | None = None) -> tuple[bool, str]:
         adb = self.adb_path
         cmd = f'"{adb}" -s {self.target} {command}' if use_target else f'"{adb}" {command}'
         log.debug(f"ADB exec: {cmd}")
+        t0 = time.monotonic()
         try:
             result = subprocess.run(
                 cmd,
@@ -51,15 +56,19 @@ class MediaService:
             stdout = (result.stdout or "").strip()
             stderr = (result.stderr or "").strip()
             ok = result.returncode == 0
+            elapsed = time.monotonic() - t0
             if stderr:
                 log.debug(f"ADB stderr: {stderr}")
             if not ok:
                 log.warning(f"ADB failed (rc={result.returncode}): cmd={cmd} | stdout={stdout} | stderr={stderr}")
             else:
                 log.debug(f"ADB ok: {stdout}")
+            log.info("[timing] ADB cmd='%s' took %.3fs ok=%s", command[:80], elapsed, ok)
             return ok, stdout
         except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - t0
             log.warning(f"ADB command timed out: {cmd}")
+            log.info("[timing] ADB cmd='%s' timed out after %.3fs", command[:80], elapsed)
             return False, "timeout"
 
     def _adb_exec(
@@ -74,6 +83,7 @@ class MediaService:
             cmd.extend(["-s", self.target])
         cmd.extend(args)
         log.debug("ADB exec list: %s", cmd)
+        t0 = time.monotonic()
         try:
             result = subprocess.run(
                 cmd,
@@ -85,14 +95,19 @@ class MediaService:
                 timeout=timeout_s if timeout_s is not None else self.adb_timeout_s,
             )
         except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - t0
             log.warning("ADB command timed out: %s", cmd)
+            log.info("[timing] ADB exec %s timed out after %.3fs", args[:2], elapsed)
             return False, "timeout" if capture_text else b""
 
+        elapsed = time.monotonic() - t0
         if capture_text:
             output = (result.stdout or result.stderr or "").strip()
         else:
             output = result.stdout if result.stdout else result.stderr
-        return result.returncode == 0, output
+        ok = result.returncode == 0
+        log.info("[timing] ADB exec %s took %.3fs ok=%s", args[:2], elapsed, ok)
+        return ok, output
 
     def connect(self) -> bool:
         # adb connect doesn't need -s, it's a global command
@@ -101,6 +116,8 @@ class MediaService:
         self._connected = success
         if not success:
             self._last_fail_time = time.monotonic()
+        else:
+            self._youtube_profile_cleared = False
         log.info(f"ADB connect -> '{output}' (success={success})")
         return success
 
@@ -257,7 +274,10 @@ class MediaService:
         if not package or not self.ensure_connected():
             return False
         log.info("Force-stopping %s (%s)", app_name, package)
-        return self._adb(f"shell am force-stop {package}")[0]
+        ok = self._adb(f"shell am force-stop {package}")[0]
+        if ok and (app_name or "").strip().lower() == "youtube":
+            self._youtube_profile_cleared = False
+        return ok
 
     def start_activity(
         self,
@@ -296,7 +316,10 @@ class MediaService:
             return ""
         remote_path = "/sdcard/window_dump.xml"
         for attempt in range(1, self.ui_dump_retry_count + 1):
-            ok, dump_output = self._adb(f"shell uiautomator dump --compressed {remote_path}")
+            ok, dump_output = self._adb(
+                f"shell uiautomator dump --compressed {remote_path}",
+                timeout_s=self.ui_dump_timeout_s,
+            )
             if ok and dump_output and "error:" not in dump_output.lower():
                 break
             log.warning(
@@ -372,22 +395,106 @@ class MediaService:
     def _youtube_is_foreground(self) -> bool:
         return self.is_app_foreground("youtube")
 
+    _YOUTUBE_PROFILE_PICKER_MARKERS = [
+        "who's watching",
+        "who\u2019s watching",
+        "whos watching",
+    ]
+
+    _YOUTUBE_PROFILE_ACTIVITY_MARKERS = (
+        "profile",
+        "switcher",
+        "accountselect",
+        "accountpicker",
+        "account_select",
+        "signin",
+        "sign_in",
+    )
+
+    def _detect_youtube_profile_picker_fast(self) -> tuple[bool, str]:
+        """Classify the current foreground activity without a UI dump.
+
+        Returns (should_press_dpad_center, detection_source):
+        - focus is the YouTube package with a non-picker activity -> skip press
+        - focus is the YouTube package with a profile-picker-ish activity -> press
+        - focus is empty / unknown / different package -> press (safe fallback)
+        """
+        focus = self.get_current_focus()
+        if not focus:
+            return True, "focus_empty"
+
+        focus_lower = focus.lower()
+        youtube_pkg = self._youtube_package().lower()
+        if youtube_pkg not in focus_lower:
+            return True, f"focus_other:{focus}"
+
+        if "/" in focus:
+            activity = focus.split("/", 1)[1].lower()
+        else:
+            activity = focus_lower
+
+        for marker in self._YOUTUBE_PROFILE_ACTIVITY_MARKERS:
+            if marker in activity:
+                return True, f"focus_picker:{marker}"
+
+        return False, f"focus_main:{activity}"
+
+    def _detect_youtube_profile_picker(self) -> tuple[bool, str]:
+        """Check if the YouTube profile picker is showing.
+
+        Returns (should_press_dpad_center, detection_source).
+        Falls back to True when the UI dump fails, preserving current behavior.
+        """
+        xml = self.dump_ui_hierarchy()
+        if not xml:
+            log.info("YouTube profile picker: UI dump empty, falling back to press")
+            return True, "ui_dump_failed_fallback"
+
+        xml_lower = xml.lower()
+        for marker in self._YOUTUBE_PROFILE_PICKER_MARKERS:
+            if marker in xml_lower:
+                return True, f"marker_found:{marker}"
+
+        return False, "no_marker_found"
+
     def _prepare_youtube_launch(self) -> bool:
+        t_start = time.monotonic()
+
         if self._youtube_is_foreground():
+            log.info("[timing] _prepare_youtube_launch: already foreground, skipped in %.3fs", time.monotonic() - t_start)
             return True
 
+        t_launch = time.monotonic()
         ok, _ = self.launch_app("youtube")
+        log.info("[timing] _prepare_youtube_launch: launch_app took %.3fs ok=%s", time.monotonic() - t_launch, ok)
         if not ok:
             return False
 
         if self.youtube_warm_launch_delay_s > 0:
+            t_warm = time.monotonic()
             time.sleep(self.youtube_warm_launch_delay_s)
+            log.info("[timing] _prepare_youtube_launch: warm_delay took %.3fs", time.monotonic() - t_warm)
 
-        if self.youtube_profile_select_on_cold_start:
-            self.keyevent("DPAD_CENTER")
-            if self.youtube_profile_select_delay_s > 0:
-                time.sleep(self.youtube_profile_select_delay_s)
+        if self.youtube_profile_select_on_cold_start and not self._youtube_profile_cleared:
+            t_detect = time.monotonic()
+            should_press, detection_source = self._detect_youtube_profile_picker_fast()
+            log.info(
+                "[timing] _prepare_youtube_launch: profile_detect took %.3fs should_press=%s source=%s",
+                time.monotonic() - t_detect,
+                should_press,
+                detection_source,
+            )
+            if should_press:
+                self.keyevent("DPAD_CENTER")
+                if self.youtube_profile_select_delay_s > 0:
+                    t_profile = time.monotonic()
+                    time.sleep(self.youtube_profile_select_delay_s)
+                    log.info("[timing] _prepare_youtube_launch: profile_select_delay took %.3fs", time.monotonic() - t_profile)
+            self._youtube_profile_cleared = True
+        elif self._youtube_profile_cleared:
+            log.info("[timing] _prepare_youtube_launch: profile_detect skipped (cleared earlier this session)")
 
+        log.info("[timing] _prepare_youtube_launch: total %.3fs", time.monotonic() - t_start)
         return True
 
     def _open_youtube_url(self, url: str) -> bool:
@@ -438,13 +545,9 @@ class MediaService:
         ok, output = self._adb("shell dumpsys window displays")
         if ok and output:
             try:
-                focus_line = next(
-                    (line.strip() for line in output.splitlines() if "mCurrentFocus=" in line),
-                    "",
-                )
-                if not focus_line:
+                pkg = self._parse_focus_package(output)
+                if not pkg:
                     return "unknown"
-                pkg = focus_line.split("/")[0].split(" ")[-1]
                 # Reverse-lookup friendly name
                 for name, package in self.apps.items():
                     if package in pkg:
@@ -453,6 +556,27 @@ class MediaService:
             except Exception:
                 return output
         return "unknown"
+
+    def _parse_focus_package(self, dumpsys_output: str) -> str:
+        """Best-effort foreground package extraction.
+
+        Stremio shows ``mCurrentFocus=null`` while its splash screen is up even
+        though ``mFocusedApp`` already points at ``com.stremio.one``. Try the
+        window focus first, then fall back to the activity focus.
+        """
+        for line in dumpsys_output.splitlines():
+            stripped = line.strip()
+            if "mCurrentFocus=" not in stripped or "mCurrentFocus=null" in stripped:
+                continue
+            if "/" in stripped:
+                return stripped.split("/")[0].split(" ")[-1]
+        match = re.search(
+            r"mFocusedApp=ActivityRecord\{[^}]*\s([\w.]+)/",
+            dumpsys_output,
+        )
+        if match:
+            return match.group(1)
+        return ""
 
     def get_current_focus(self) -> str:
         """Return the raw foreground package/activity token when available."""
