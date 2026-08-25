@@ -9,3 +9,5 @@ models/
 .DS_Store
 watch_state.json
 config.local.yaml
+vpn_state.json
+debug/
