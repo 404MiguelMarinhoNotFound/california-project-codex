@@ -118,7 +118,48 @@ CONTROL_TV_TOOL = {
     }
 }
 
-# OpenAI-compatible format of the same tool
+CONTROL_LIGHTS_TOOL = {
+    "name": "control_lights",
+    "description": (
+        "Controls Master Miguel's Govee smart lights: power, brightness, and colour. "
+        "Use when asked to turn lights on or off, dim or brighten them, or change "
+        "their colour, in any room. If no room is named, the default light is used. "
+        "Brightness and colour only show on a light that is already on, so call "
+        "light_on first if it might be off. Do not use this for the TV."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["light_on", "light_off", "light_brightness", "light_color"],
+                "description": "What to do to the light."
+            },
+            "light": {
+                "type": "string",
+                "description": "Room or light name, for example attic. Omit to use the default light."
+            },
+            "brightness_percent": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Target brightness 1-100. Required only for light_brightness."
+            },
+            "color": {
+                "type": "string",
+                "description": (
+                    "Colour for light_color. Use a plain name for common colours: red, green, "
+                    "blue, white, warm white, cool white, orange, yellow, amber, gold, lime, "
+                    "teal, cyan, turquoise, purple, violet, magenta, pink, coral, crimson. "
+                    "For anything else pass a hex value like #FF7F00."
+                )
+            }
+        },
+        "required": ["action"]
+    }
+}
+
+# OpenAI-compatible format of the same tools
 CONTROL_TV_TOOL_OPENAI = {
     "type": "function",
     "function": {
@@ -127,6 +168,20 @@ CONTROL_TV_TOOL_OPENAI = {
         "parameters": CONTROL_TV_TOOL["input_schema"],
     }
 }
+
+CONTROL_LIGHTS_TOOL_OPENAI = {
+    "type": "function",
+    "function": {
+        "name": CONTROL_LIGHTS_TOOL["name"],
+        "description": CONTROL_LIGHTS_TOOL["description"],
+        "parameters": CONTROL_LIGHTS_TOOL["input_schema"],
+    }
+}
+
+# Tools this project dispatches locally via tool_handler. Claude's built-in
+# web_search also arrives as a tool_use block but is executed server-side, so
+# the dispatch loop must check membership here rather than block.type alone.
+LOCAL_TOOL_NAMES = {CONTROL_TV_TOOL["name"], CONTROL_LIGHTS_TOOL["name"]}
 
 
 class LLMService:
@@ -144,6 +199,18 @@ class LLMService:
 
         # Whether media tools are available (set after config is checked)
         self.media_enabled = config.get("media", {}).get("enabled", False)
+
+        # Whether Govee light control is available
+        govee_cfg = config.get("govee", {}) or {}
+        self.lights_enabled = govee_cfg.get("enabled", False)
+
+        # Light inventory injected into the system prompt each turn, so "what
+        # lights do you have" stays correct when config.yaml changes without
+        # anyone remembering to edit the prompt text too. The orchestrator
+        # overwrites these with what GoveeService actually loaded, which excludes
+        # any light skipped for a missing mac/sku.
+        self.light_names: list[str] = list((govee_cfg.get("lights") or {}).keys())
+        self.default_light: str = str(govee_cfg.get("default_light") or "").strip()
 
         if self.provider == "claude":
             import anthropic
@@ -205,10 +272,25 @@ class LLMService:
             )
 
     def _build_system_prompt(self) -> str:
-        """Inject current date/time into system prompt."""
+        """Inject current date/time and the live light inventory into the system prompt."""
         now = datetime.now()
         time_info = f"\nCurrent date and time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}."
-        return self.system_prompt + time_info
+        return self.system_prompt + time_info + self._light_inventory()
+
+    def _light_inventory(self) -> str:
+        """
+        Describe the configured lights so the assistant can answer "what lights
+        do you have" without a tool call, and never from a stale hardcoded list.
+        """
+        if not self.lights_enabled or not self.light_names:
+            return ""
+        rooms = ", ".join(self.light_names)
+        line = f"\nLights you can control: {rooms}."
+        if self.default_light in self.light_names:
+            line += f" If a request names no room, use {self.default_light}."
+        elif len(self.light_names) == 1:
+            line += " If a request names no room, use that one."
+        return line
 
     def stream_response(self, user_text: str) -> Generator[str, None, None]:
         """
@@ -263,6 +345,13 @@ class LLMService:
                 "description": CONTROL_TV_TOOL["description"],
                 "input_schema": CONTROL_TV_TOOL["input_schema"],
             })
+        if self.lights_enabled:
+            tools.append({
+                "type": "custom",
+                "name": CONTROL_LIGHTS_TOOL["name"],
+                "description": CONTROL_LIGHTS_TOOL["description"],
+                "input_schema": CONTROL_LIGHTS_TOOL["input_schema"],
+            })
 
         messages = list(self.history)
 
@@ -280,7 +369,7 @@ class LLMService:
                 if block.type == "text":
                     response_ref["text"] += block.text
                     yield block.text
-                elif block.type == "tool_use" and block.name == "control_tv":
+                elif block.type == "tool_use" and block.name in LOCAL_TOOL_NAMES:
                     logger.info(f"Claude tool call: {block.name}({block.input})")
                     result_text = "tool not available"
                     if self.tool_handler:
@@ -310,7 +399,11 @@ class LLMService:
             *self.history,
         ]
 
-        tools_arg = [CONTROL_TV_TOOL_OPENAI] if self.media_enabled else None
+        tools_arg = []
+        if self.media_enabled:
+            tools_arg.append(CONTROL_TV_TOOL_OPENAI)
+        if self.lights_enabled:
+            tools_arg.append(CONTROL_LIGHTS_TOOL_OPENAI)
 
         while True:
             create_kwargs = dict(

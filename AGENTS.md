@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**California** (C.A.L.I.F.O.R.N.I.A. - Cognitively Adaptive Language Intelligence For Operational Research, Navigation, and Intuitive Assistance) is a DIY voice assistant running on a Raspberry Pi or laptop in Carcavelos, Lisbon, Portugal. It is built around a streaming STT -> LLM -> TTS pipeline and now also controls a Mi Box / Android TV over ADB for Stremio, YouTube, and Surfshark routing. The primary user is **Master Miguel**. Target operational cost: **under EUR5/month**.
+**California** (C.A.L.I.F.O.R.N.I.A. - Cognitively Adaptive Language Intelligence For Operational Research, Navigation, and Intuitive Assistance) is a DIY voice assistant running on a Raspberry Pi or laptop in Carcavelos, Lisbon, Portugal. It is built around a streaming STT -> LLM -> TTS pipeline and now also controls a Mi Box / Android TV over ADB for Stremio, YouTube, and Surfshark routing, plus Govee smart lights over Bluetooth LE. The primary user is **Master Miguel**. Target operational cost: **under EUR5/month**.
 
 -----
 
@@ -26,6 +26,14 @@ Microphone -> Wake word -> VAD -> Groq Whisper (STT) -> Claude or compatible LLM
 Voice request -> LLM tool call (control_tv) -> Orchestrator VPN preflight -> MediaService / StremioService / SurfsharkService -> ADB deep link or keyevent -> Mi Box
 ```
 
+### Light Control Pipeline
+
+```text
+Voice request -> LLM tool call (control_lights) -> GoveeService -> BleTransport -> Bluetooth LE -> light strip
+```
+
+No VPN preflight and no ADB on this path, and by default no network at all.
+
 ### Tech Stack
 
 | Component | Technology |
@@ -35,6 +43,7 @@ Voice request -> LLM tool call (control_tv) -> Orchestrator VPN preflight -> Med
 | LLM | Anthropic Claude, Groq, Fireworks, or OpenAI-compatible |
 | TTS | Kokoro, Edge TTS, Piper, ElevenLabs |
 | TV control | ADB over network to Mi Box / Android TV |
+| Light control | Govee over Bluetooth LE (`bleak`); Govee cloud v2 API optional |
 | Stremio state | Stremio private API + local `watch_state.json` cache |
 | Title resolution | TMDB |
 | Audio I/O | `sounddevice`, `soundfile` |
@@ -59,6 +68,13 @@ Required for Stremio features:
 Required for TMDB fallback title resolution:
 
 - `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN`
+
+Optional, only for the Govee **cloud** transport:
+
+- `GOVEE_API_KEY` - issued from the Govee Home app under profile -> settings -> Apply for API Key,
+  not from the developer portal. **Not needed for the default BLE transport**, which uses no
+  credentials at all. Without it the cloud transport disables itself and the rest of the
+  assistant keeps working
 
 Keep secrets in `.env` or another local-only secret mechanism. Do not commit real credentials.
 
@@ -94,6 +110,8 @@ california/
 │   └── vad.py                   # Voice activity detection
 ├── services/
 │   ├── llm.py                   # Multi-provider LLM streaming + tool calling
+│   ├── govee_service.py         # Govee cloud v2 light control
+│   ├── name_matcher.py          # Shared fuzzy hint -> key matching (playlists, light rooms)
 │   ├── media_service.py         # Generic Mi Box / Android TV ADB controls
 │   ├── sentence_chunker.py      # Splits streamed LLM output into sentences
 │   ├── stremio_service.py       # Stremio auth, sync, TMDB lookup, deep-link playback
@@ -109,13 +127,16 @@ california/
 │   ├── debug_surfshark_status.py   # Inspects current Surfshark status and route execution
 │   ├── run_stremio_e2e.py          # Live end-to-end Stremio routing and playback test
 │   ├── run_youtube_playlist_e2e.py # Live end-to-end YouTube playlist routing test
+│   ├── probe_govee_devices.py      # Lists Govee devices with sku, device id, and capabilities
 │   ├── probe_stremio_sync.py       # Refreshes and inspects Stremio watch-state cache
 │   ├── debug_stremio_collections.py # Inspects raw Stremio collection payloads when sync is wrong
 │   ├── search_youtube_playlists.py # Finds public YouTube playlist candidates by search query
 │   ├── search_youtube_videos.py    # Finds YouTube video candidates and derives radio playlist IDs
 │   └── validate_youtube_playlists.py # Fetches real YouTube page titles to confirm playlist IDs match the intended vibe
 ├── tests/
+│   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
 │   ├── test_media_service.py    # YouTube / ADB unit tests
+│   ├── test_orchestrator_lights.py # control_lights dispatch behavior
 │   ├── test_orchestrator_vpn_routing.py # VPN preflight routing behavior
 │   ├── test_stremio_service.py  # Stremio / TMDB / playback unit tests
 │   ├── test_surfshark_service.py # Surfshark route execution and cache behavior
@@ -176,7 +197,14 @@ truth. `requirements.txt` has been deleted and must not be reintroduced.
 - **Run `uv sync` after pulling** so the environment matches the lockfile.
 - **Optional/heavy providers go in `[project.optional-dependencies]`,** not in the core
   `dependencies` list. Current extras: `kokoro`, `piper`, `elevenlabs`, `openai`,
-  `porcupine`, `silero`, `pi`. Install with `uv sync --extra <name>`.
+  `porcupine`, `silero`, `pi`, `govee`, and the aggregate `default`.
+- **`uv sync --extra <name>` syncs ONLY that extra and uninstalls everything else.**
+  It is not additive. Running `uv sync --extra govee` on this project removes kokoro,
+  torch and spacy, which silently breaks TTS on the next launch because `config.yaml`
+  selects `tts.provider: kokoro`. To install several, either pass every one
+  (`uv sync --extra kokoro --extra govee`) or use the aggregate: **`uv sync --extra default`**.
+  Prefer `--extra default` — it is defined as exactly what the committed `config.yaml`
+  selects, so it is the one command that always leaves a bootable environment.
 - **Platform-specific deps carry an environment marker** (for example
   `piper-tts>=1.2.0; sys_platform == 'linux'`) so the universal lock still resolves on Windows.
 - **Beware packages that download assets into `site-packages` at runtime.** They are
@@ -204,6 +232,11 @@ uv sync --extra kokoro
 
 or set `tts.provider: edge`, which is covered by the core dependency set.
 
+The same applies to lights: `config.yaml` defaults to `govee.transport: ble`, which needs
+`bleak` from the `govee` extra. Without it `GoveeService` logs a warning and disables itself,
+and `control_lights` is not offered to the LLM at all. `uv sync --extra default` installs
+both `kokoro` and `govee`, which is what the committed config actually selects.
+
 -----
 
 ## Architecture Principles
@@ -226,9 +259,13 @@ Use `queue.Queue(maxsize=2)` for synthesized audio buffering so synthesis and pl
 
 ### Tool-Driven Device Control
 
-- TV control is exposed to the LLM through the `control_tv` tool
-- `services.llm.LLMService` defines the tool schema
-- `core.orchestrator._handle_tool_call()` dispatches tool calls to `MediaService`, `StremioService`, and `SurfsharkService`
+- TV control is exposed to the LLM through the `control_tv` tool, lights through `control_lights`
+- `services/llm.py` defines both tool schemas and lists the locally dispatched ones in `LOCAL_TOOL_NAMES`
+- `core.orchestrator._handle_tool_call()` routes by tool name to `_dispatch_tv` or `_dispatch_lights`
+- Both dispatchers are **module-level functions taking services as parameters**, not methods. That is
+  what lets the tests exercise them without constructing an `Orchestrator`. Keep new ones that way
+- Handlers return a short natural-language string, never JSON, because the string goes straight back
+  to the LLM to be spoken
 - The assistant should confirm what happened in one short spoken sentence
 
 -----
@@ -263,6 +300,106 @@ Use `queue.Queue(maxsize=2)` for synthesized audio buffering so synthesis and pl
 - Optional status refresh from Surfshark UI XML when the XML is available
 - Diagnostic `vpn_state.json` writes for route attempts and authoritative cache writes for real UI status refreshes
 - Debug capture flows used by `tools/debug_surfshark_sequence.py`
+
+### GoveeService
+
+`services/govee_service.py` controls Govee smart lights through one of two transports,
+selected by `govee.transport` in `config.yaml`:
+
+| Transport | Reach | Credentials | Dependency |
+|-----------|-------|-------------|------------|
+| `ble` (default) | Any Govee BLE device in Bluetooth range | none | `uv sync --extra govee` |
+| `cloud` | Only Wi-Fi models on Govee's published whitelist, owned by the key's account | `GOVEE_API_KEY` | core `requests` |
+
+**Why BLE is the default here.** Master Miguel's attic strip is an **H617E**, which is
+BLE-only. It is absent from Govee's supported-model list, so `GET /user/devices` returns
+`code: 200, "success", data: []` with a perfectly valid API key, and it never joins Wi-Fi
+at all, so the LAN API cannot see it either. Its setup flow pairs over Bluetooth and never
+asks for an SSID, which is the tell. The cloud transport is kept for any future whitelisted
+device and is fully tested, just unused.
+
+Common structure:
+
+- **Power, brightness, and colour.** Both transports implement the same three methods
+  (`set_power`, `set_brightness`, `set_color`), so the dispatch layer never branches on
+  transport. Cloud maps them to `on_off`/`powerSwitch`, `range`/`brightness`, and
+  `color_setting`/`colorRgb` (packed `R*65536 + G*256 + B`); BLE maps them to raw packets.
+  `_control()` stays capability-generic, so scenes (`dynamic_scene`/`lightScene`) remain a
+  small addition rather than a rewrite
+- **Brightness is 1-100 on this device, not 0-255.** `clamp_percent()` clamps rather than
+  rejecting, so a model that asks for 400 gets full brightness instead of an error
+- Named rooms in `config.yaml` under `govee.lights`, each with optional `aliases`.
+  `govee.default_light` covers plain "turn my lights on" requests
+- **The room list is injected into the system prompt automatically**, so "what lights do you
+  have" is answered without a tool call and can never go stale. `LLMService._light_inventory()`
+  builds it, and `Orchestrator.__init__` overwrites `llm.light_names` with what `GoveeService`
+  actually loaded so a light skipped for a bad mac is not advertised. **Do not hardcode room
+  names in `config.yaml`'s `system_prompt`** — that is what this replaced. Available colours
+  are self-documented by the `color` parameter description in the tool schema
+- Required fields per light depend on the transport: `mac` for `ble`, `sku` + `device` for
+  `cloud`. Lights missing them are skipped with a warning rather than crashing startup
+- Returns `GoveeCommandResult` rather than raising, matching `StremioPlayResult` and
+  `EnsureVpnResult`. **It defines `__bool__`, so a failed result is falsy.** Never
+  truthiness-test one to check whether it *exists* — always `is None` / `is not None`.
+  Every shape of this bites: `result or default` returns the default on failure, and
+  `error if error else call()` runs `call()` on failure. Both happened during this feature,
+  once in a test helper and once in `GoveeService.set_power` itself, where it called the
+  transport with `light=None`. Truthiness is only ever a *success* check
+  (`if result:` after an actual command), never an existence check.
+  `test_unknown_light_returns_the_error_not_a_transport_call` guards it
+- Self-disables when the config flag is off, the transport is unknown, or the transport's
+  dependency/credential is missing. Never raises at construction
+
+**BLE protocol** (reverse-engineered, verified against the real H617E):
+
+- Characteristic `00010203-0405-0607-0809-0a0b0c0d2b11`, **Write Without Response**
+- 20-byte packets: 19 command bytes then a XOR checksum of those 19. `ble_packet()` builds them
+- Power on `33 01 01 ...`, power off `33 01 00 ...`
+- Brightness `33 04 <1-100>`
+- Colour `33 05 15 01 R G B 00*5 FF 7F ...`. **The `FF 7F` at offsets 12-13 selects
+  "all segments" and is mandatory** — without it the strip silently ignores the colour
+
+**Colour naming does not go through plain `match_name`.** `resolve_color()` adds a despaced
+alias for every colour ("warmwhite" for "warm white") so the exact-match tier fires first.
+Without it the substring tier matches "white" inside "warmwhite" and returns the wrong colour.
+Hex input is checked before name matching. Do not "simplify" either away.
+
+**Three BLE findings worth not rediscovering:**
+
+- **All BLE work must run on the transport's own thread, in an MTA COM apartment.**
+  bleak's WinRT backend fails with `Thread is configured for Windows GUI but callbacks
+  are not working` whenever it is driven from a thread in an **STA** apartment, and the
+  orchestrator's audio stack (`sounddevice`/PortAudio) puts its thread into STA. This one
+  is nasty because it does not reproduce in isolation: a standalone script runs on a clean
+  main thread and works, then the identical call fails inside the running assistant.
+  `BleTransport._worker` runs `CoInitializeEx(None, COINIT_MULTITHREADED)` on a dedicated
+  single-worker `ThreadPoolExecutor` before `asyncio.run`. Never call `asyncio.run` on a
+  bleak coroutine directly from orchestrator code.
+  `test_ble_work_runs_off_the_calling_thread` guards this
+
+- **`BleakScanner.find_device_by_address` is unreliable on Windows.** It returned "not found"
+  three times running while the strip was advertising steadily at -82 dBm. A
+  `detection_callback` scan finds it immediately, every time. `_find()` uses the callback
+- **Connect-per-command beats a persistent connection.** Measured here: cold connect 2.7-4.8s
+  (it varies with how recently the strip advertised), warm reconnect ~0.2s, whole dispatch
+  ~0.3s. A persistent session with the documented 2s heartbeat timed out outright. Windows
+  keeps the link warm, so the simple approach is both faster and more reliable. The
+  `BLEDevice` object is cached and dropped on any failure to force a rescan
+
+**Operational notes:**
+
+- Signal at the current laptop position averages **-82 to -83 dBm** — usable, not comfortable.
+  Below about -90 it stops working. `govee.ble.retries` exists because of this
+- **BLE allows one connection at a time.** An open Govee phone app will hold the device and
+  lock the assistant out, and the strip stops advertising entirely while connected
+- Transient `Characteristic ... was not found` and `[WinError -2147024809] The parameter is
+  incorrect` show up on a first connect after idle. They are a WinRT GATT-cache artefact, the
+  retry loop absorbs them, and they are not worth chasing
+- If range becomes the limiting factor, an ESP32 BLE proxy in the attic slots in behind the
+  same transport interface without touching the tool or dispatch layers
+
+Setup: `uv sync --extra govee`, then `uv run python tools/probe_govee_devices.py` to get the
+MAC, and put it in `config.yaml` under `govee.lights.<room>.mac`.
 
 ### StremioService
 
@@ -435,9 +572,33 @@ At the time of this update:
 The Claude path supports:
 
 - Anthropic web search via `web_search_20250305`
-- Custom `control_tv` tool for Mi Box control
+- Custom `control_tv` tool for Mi Box control (23 actions)
+- Custom `control_lights` tool for Govee light control (2 actions)
 
-The tool schema in `services/llm.py` currently supports these TV-related actions:
+With the committed `config.yaml` that is **3 tools** in every request: `web_search`,
+`control_tv`, `control_lights`. Each custom tool's full schema is sent on every turn, so
+adding actions and parameters costs input tokens on every single exchange. Keep descriptions
+tight — see Cost Discipline.
+
+Both custom tools are gated by config: `control_tv` on `media.enabled`, `control_lights` on
+`govee.enabled`. Web search runs server-side at Anthropic and is **not** dispatched locally, which
+is why the Claude tool loop checks `block.name in LOCAL_TOOL_NAMES` instead of `block.type` alone.
+Widening that check to any `tool_use` block would break web search.
+
+`control_lights` supports these actions:
+
+- `light_on`, `light_off`
+- `light_brightness` (needs `brightness_percent`, 1-100, clamped not rejected)
+- `light_color` (needs `color`)
+
+with an optional `light` parameter naming the room. Omitting it uses `govee.default_light`.
+
+`color` accepts a spoken name from `COLOR_NAMES` in `services/govee_service.py` or a hex
+value like `#FF7F00`; the tool description tells the model to use hex for anything outside
+the name table. Brightness and colour only take visible effect on a light that is already
+on, which the tool description and system prompt both state so the model turns it on first.
+
+The `control_tv` schema in `services/llm.py` currently supports these TV-related actions:
 
 - `play_pause`, `stop`, `next`, `prev`
 - `fast_forward`, `rewind`
@@ -532,6 +693,8 @@ Current automated coverage exists for:
 - Stremio playback retry logic
 - Surfshark route execution, route cache semantics, and debug route capture
 - Orchestrator VPN preflight routing and warning behavior
+- Govee transport selection, light resolution, BLE packet format, and cloud HTTP error mapping
+- `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
 
@@ -543,6 +706,8 @@ uv run python tools\debug_surfshark_sequence.py quick_connect --capture --debug
 uv run python tools\run_youtube_playlist_e2e.py --prep-app stremio --debug
 uv run python tools\run_stremio_e2e.py --prep-app youtube --debug
 uv run python tools\probe_stremio_sync.py
+uv run python tools\probe_govee_devices.py
+uv run python tools\probe_govee_devices.py --transport cloud
 ```
 
 Targeted validation used for the latest Stremio resume work:
@@ -561,7 +726,10 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 - Keep components modular and service-oriented
 - Put config in `config.yaml`, not inline constants
 - Add new integrations as dedicated service modules when possible
-- Prefer extending the `control_tv` tool instead of adding scattered command pathways
+- Extend `control_tv` for TV actions and `control_lights` for light actions instead of adding
+  scattered command pathways. A genuinely new device class gets its own tool: add the schema and
+  its OpenAI re-wrap in `services/llm.py`, add the name to `LOCAL_TOOL_NAMES`, add a module-level
+  `_dispatch_*` in `core/orchestrator.py`, and branch on the name in `_handle_tool_call`
 - If a feature touches playback or state sync, add unit tests under `tests/`
 - Add dependencies with `uv add` only. Never `pip install`, and never reintroduce a
   `requirements.txt`. Commit the resulting `pyproject.toml` and `uv.lock` together

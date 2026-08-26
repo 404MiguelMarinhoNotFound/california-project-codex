@@ -51,13 +51,18 @@ porcupine = ["pvporcupine>=3.0.0"]
 silero = ["torch>=2.0.0", "torchaudio>=2.0.0"]
 # Raspberry Pi hardware: ReSpeaker 2-Mic HAT LED ring
 pi = ["pixel-ring>=0.1.0; sys_platform == 'linux'"]
+# Light control: Govee over Bluetooth LE (config.yaml `govee.transport: "ble"`).
+# Required for BLE-only models such as the H617E attic strip, which Govee's cloud
+# API cannot see at all. The "cloud" transport needs nothing beyond core `requests`.
+govee = ["bleak>=0.22.0"]
 # Everything the shipped config.yaml actually selects out of the box:
-#   tts.provider = "kokoro" -> kokoro (+ its spacy pipeline)
+#   tts.provider = "kokoro"  -> kokoro (+ its spacy pipeline)
+#   govee.transport = "ble"  -> govee (bleak)
 # wake_word.model is an openWakeWord built-in, covered by the core `openwakeword` dep.
 # `uv sync --extra default` gives a bootable app with the committed config.
 # (vad.engine = "silero" is NOT included: core/vad.py falls back to energy-based
 #  VAD when torch is absent, so it stays in the heavy `silero` extra.)
-default = ["california[kokoro]"]
+default = ["california[kokoro]", "california[govee]"]
 
 [tool.uv]
 # Always use uv's own managed CPython. Building .venv on the Windows Store
