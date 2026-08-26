@@ -18,12 +18,15 @@ import threading
 import queue
 import numpy as np
 
+from services.govee_service import GoveeService, clamp_percent, resolve_color
 from services.media_service import MediaService
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
 from services.surfshark_service import SurfsharkService
 from services.youtube_playlist_resolver import resolve_playlist_choice
 
 logger = logging.getLogger(__name__)
+
+_LIGHTS_UNREACHABLE = "I couldn't reach your lights just now."
 
 ROUTED_ACTIONS = {
     "youtube_playlist": ("youtube", "restart_autoconnect"),
@@ -308,6 +311,57 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
     return "unknown action"
 
 
+def _dispatch_lights(params: dict, govee_svc) -> str:
+    """
+    Govee light control. Module-level and service-injected for the same reason
+    _dispatch_tv is: it keeps the tool layer testable without an Orchestrator.
+
+    No ADB check and no VPN preflight here on purpose. These are cloud calls to
+    Govee and have nothing to do with the Mi Box or Surfshark.
+    """
+    action = params.get("action")
+
+    if not govee_svc or not getattr(govee_svc, "enabled", False):
+        return "light control isn't set up right now"
+
+    hint = (params.get("light") or "").strip()
+    key, light = govee_svc.resolve_light(hint)
+    if not light:
+        if hint:
+            return f"I don't have a light called {hint} saved."
+        return "I don't have any lights saved yet."
+
+    if action in ("light_on", "light_off"):
+        result = govee_svc.set_power(key, on=(action == "light_on"))
+        if result:
+            return f"{key} lights on." if action == "light_on" else f"{key} lights off."
+        return result.message or _LIGHTS_UNREACHABLE
+
+    if action == "light_brightness":
+        raw = params.get("brightness_percent")
+        if raw is None:
+            return "Tell me what brightness you want, from 1 to 100."
+        percent = clamp_percent(raw)
+        result = govee_svc.set_brightness(key, percent)
+        if result:
+            return f"{key} lights at {percent} percent."
+        return result.message or _LIGHTS_UNREACHABLE
+
+    if action == "light_color":
+        requested = (params.get("color") or "").strip()
+        if not requested:
+            return "Tell me what colour you want."
+        rgb = resolve_color(requested)
+        if not rgb:
+            return f"I don't know the colour {requested}."
+        result = govee_svc.set_color(key, rgb)
+        if result:
+            return f"{key} lights set to {requested}."
+        return result.message or _LIGHTS_UNREACHABLE
+
+    return "unknown action"
+
+
 class Orchestrator:
     def __init__(self, config: dict):
         self.config = config
@@ -340,6 +394,10 @@ class Orchestrator:
             self.media_service = None
             self.surfshark_service = None
 
+        # Govee lights. Constructed unconditionally — the service self-disables
+        # when config is off or GOVEE_API_KEY is missing, so there is no None branch.
+        self.govee_service = GoveeService(config)
+
         # Stremio library/progress + deep-link control
         self.stremio_service = StremioService(config, media_service=self.media_service)
         self._background_stop = threading.Event()
@@ -355,8 +413,13 @@ class Orchestrator:
             self._stremio_sync_thread.start()
             logger.info("Stremio background sync started (%d min interval)", sync_interval)
 
-        # Register tool handler so LLM can dispatch control_tv
+        # Register tool handler so LLM can dispatch control_tv / control_lights
         self.llm.tool_handler = self._handle_tool_call
+
+        # Tell the LLM which lights actually loaded, so the system prompt reflects
+        # reality rather than raw config (lights missing a mac/sku are skipped).
+        self.llm.light_names = list(self.govee_service.lights)
+        self.llm.default_light = self.govee_service.default_light
 
         # State
         self._running = False
@@ -645,6 +708,8 @@ class Orchestrator:
                 self.surfshark_service,
                 self.config.get("youtube_playlists", {}),
             )
+        if tool_name == "control_lights":
+            return _dispatch_lights(tool_input, self.govee_service)
         return "unknown tool"
 
     def _stremio_sync_loop(self, interval_minutes: int):

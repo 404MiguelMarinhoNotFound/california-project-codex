@@ -1,9 +1,6 @@
 import random
 
-
-def _normalize_text(value: str) -> str:
-    cleaned = " ".join((value or "").lower().split())
-    return "".join(ch for ch in cleaned if ch.isalnum() or ch.isspace()).strip()
+from services.name_matcher import match_name
 
 
 def _playlist_ids(value) -> list[str]:
@@ -26,36 +23,17 @@ def resolve_playlist_choice(
     playlists: dict,
     chooser=random.choice,
 ) -> tuple[str | None, str | None]:
-    hint = _normalize_text(playlist_hint)
-    if not hint or not playlists:
+    if not playlists:
         return None, None
 
-    normalized_entries = []
+    ids_by_key = {}
     for key, playlist_value in playlists.items():
         playlist_ids = _playlist_ids(playlist_value)
-        if not playlist_ids:
-            continue
-        normalized_entries.append((key, _normalize_text(key), playlist_ids))
+        if playlist_ids:
+            ids_by_key[key] = playlist_ids
 
-    for key, normalized_key, playlist_ids in normalized_entries:
-        if normalized_key == hint:
-            return key, chooser(playlist_ids)
+    matched_key = match_name(playlist_hint, {key: [key] for key in ids_by_key})
+    if not matched_key:
+        return None, None
 
-    for key, normalized_key, playlist_ids in normalized_entries:
-        if hint in normalized_key or normalized_key in hint:
-            return key, chooser(playlist_ids)
-
-    hint_tokens = set(hint.split())
-    best_match = (None, None, 0.0)
-    for key, normalized_key, playlist_ids in normalized_entries:
-        key_tokens = set(normalized_key.split())
-        if not key_tokens:
-            continue
-        score = len(hint_tokens & key_tokens) / len(key_tokens)
-        if score > best_match[2]:
-            best_match = (key, chooser(playlist_ids), score)
-
-    if best_match[2] >= 0.5:
-        return best_match[0], best_match[1]
-
-    return None, None
+    return matched_key, chooser(ids_by_key[matched_key])
