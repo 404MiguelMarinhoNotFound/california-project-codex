@@ -5,7 +5,11 @@ Continuously processes audio chunks and detects the configured wake word.
 
 Backends:
 - .ppn  → Picovoice Porcupine (high accuracy, needs PICOVOICE_ACCESS_KEY in .env)
-- .onnx → openWakeWord custom model
+- .onnx → openWakeWord custom model. A livekit-wakeword export also loads here:
+          it has the same `embeddings (batch, 16, 96)` -> `score (batch, 1)`
+          contract, and openWakeWord reads the input name off the model rather
+          than hardcoding it, so no separate backend is needed. See
+          training/README.md
 - name  → openWakeWord pre-built model (hey_jarvis, alexa, etc.)
 """
 

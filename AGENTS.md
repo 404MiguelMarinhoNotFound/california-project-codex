@@ -85,8 +85,21 @@ Keep secrets in `.env` or another local-only secret mechanism. Do not commit rea
 > no longer activates and the custom `California_*.ppn` models cannot load.
 > The wake word now runs on **openWakeWord** (Apache-2.0, no key, no activation
 > server), configured as `wake_word.model: "hey_jarvis_v0.1"` in `config.yaml`.
-> To restore "California" as the trigger word, train a custom openWakeWord `.onnx`
-> and point `wake_word.model` at it. Do not reintroduce Porcupine without a paid key.
+> To restore "California" as the trigger word, train a custom `.onnx` and point
+> `wake_word.model` at it — see [`training/README.md`](training/README.md). Training
+> runs on **livekit-wakeword** rather than openWakeWord's own trainer: openWakeWord's
+> notebook path is blocked by `piper-phonemize` shipping no wheels past cp312, and
+> livekit's `conv_attention` head measures 100x fewer false positives, which is the
+> whole problem for a wake word sitting next to a TV that plays Hotel California.
+>
+> **This needs no new backend.** livekit's exported ONNX has the same contract as an
+> openWakeWord custom model — input `embeddings (batch, 16, 96)`, output
+> `score (batch, 1)` — and `_init_oww` reads the input name off the model rather than
+> hardcoding it, so the existing `oww` path loads it as-is. Verified against a real
+> exported model. Take the `optimal_threshold` from the trained
+> `<model>_metrics.json`; do not keep the 0.6 tuned for `hey_jarvis_v0.1`.
+>
+> Do not reintroduce Porcupine without a paid key.
 
 -----
 
