@@ -1,0 +1,110 @@
+# California wake word — production run.
+#
+# Based on livekit-wakeword configs/prod.yaml, retuned for this project:
+#   - bare "california" as the trigger (not "hey california" — the word is the identity)
+#   - negatives aimed at the Mi Box, which plays the exact songs that would false-trigger
+#   - paths point at the Modal layout (see training/modal_train.py)
+#
+# Sample counts sit in livekit's "quick experiments" band (5000-10000) rather than
+# prod's 25000. That is deliberate: the $30/month Modal credit is ~15 L40S-hours and
+# you WILL retrain while tuning negatives. Scale n_samples to 25000 and steps to
+# 100000 once a run has proven itself.
+
+model_name: california
+
+target_phrases: ["california"]
+
+# ============================================================================
+# Data Generation
+# ============================================================================
+
+n_samples: 10000
+n_samples_val: 2000
+n_background_samples: 2000
+n_background_samples_val: 500
+
+# 100+ is livekit's guidance for 16GB+ VRAM; the L40S has 48GB.
+tts_batch_size: 100
+
+# The generator already derives adversarial phrases automatically via CMUDict
+# phoneme substitution. These are additive — the ones that matter for a living
+# room in Carcavelos with an Android TV in it.
+custom_negative_phrases:
+  # The songs. This is the actual threat model.
+  - "hotel california"
+  - "californication"
+  - "california love"
+  - "california gurls"
+  - "california dreaming"
+  - "california dreamin"
+  # Morphological neighbours
+  - "californian"
+  - "californians"
+  - "california roll"
+  - "cali"
+  # Phonetic neighbours that also happen to be high-frequency in music
+  - "cauliflower"
+  - "carolina"
+  - "caroline"
+
+# ============================================================================
+# TTS Parameters (VITS + SLERP speaker blending over 904 speakers)
+# ============================================================================
+
+noise_scales: [0.98]
+noise_scale_ws: [0.98]
+length_scales: [0.75, 1.0, 1.25]
+slerp_weights: [0.2, 0.35, 0.5, 0.65, 0.8]
+
+# ============================================================================
+# Paths — Modal layout
+# ============================================================================
+
+# Volume-backed: the ~16GB ACAV100M features, RIRs, MUSAN, Piper checkpoint.
+data_dir: /data
+
+# Container-local on purpose. This fills with ~30k .wav files and Modal Volume v1
+# degrades past 50,000 inodes. Only the final artifacts get copied to the volume.
+output_dir: /root/output
+
+# ============================================================================
+# Augmentation
+# ============================================================================
+
+augmentation:
+  clip_duration: 2.0
+  batch_size: 16
+  rounds: 3
+  background_paths: [/data/backgrounds]
+  rir_paths: [/data/rirs]
+
+# ============================================================================
+# Model Architecture
+# ============================================================================
+
+model:
+  # conv_attention is what buys the 100x false-positive reduction over
+  # openWakeWord's flat DNN. Do not switch to dnn unless you specifically need
+  # the openWakeWord-compatible TFLite export, which only supports that head.
+  model_type: conv_attention
+  model_size: medium
+
+# ============================================================================
+# Training
+# ============================================================================
+
+steps: 50000
+learning_rate: 0.0001
+weight_decay: 0.01
+label_smoothing: 0.05
+
+# 3000+ is livekit's "very low false positives" setting. The trainer doubles it
+# again between phases if FPPH still misses target_fp_per_hour.
+max_negative_weight: 3000
+target_fp_per_hour: 0.1
+
+batch_n_per_class:
+  positive: 50
+  adversarial_negative: 50
+  ACAV100M_sample: 1024
+  background_noise: 50

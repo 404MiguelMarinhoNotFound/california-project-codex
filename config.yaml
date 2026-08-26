@@ -7,19 +7,27 @@
 # --- Wake Word Detection ---
 wake_word:
   # openWakeWord built-in:  "hey_jarvis_v0.1", "alexa", "hey_mycroft", etc.
-  # openWakeWord custom:    path to .onnx file  (e.g., "models/hey_california.onnx")
+  # openWakeWord custom:    path to .onnx file
   # Porcupine custom:       path to .ppn file   (needs PICOVOICE_ACCESS_KEY in .env)
   #
-  # NOTE: Picovoice sunset its Free Tier on 2026-06-30 and disabled all free
-  # AccessKeys, so the Porcupine backend and the two custom "California" .ppn
-  # models in sounds/wake_word_california/ no longer load (they fail with
-  # PorcupineActivationRefusedError regardless of the model file). Using the
-  # openWakeWord backend instead: Apache-2.0, no key, no activation server.
-  # To get "California" back as the trigger word, train a custom openWakeWord
-  # model (.onnx) and point this at it.
-  model: "hey_jarvis_v0.1"
-  threshold: 0.6            # Used as sensitivity for Porcupine (0.0–1.0)
-  sensitivity: 0.6          # Porcupine-specific alias (same value)
+  # "California" is back. models/california.onnx was trained with livekit-wakeword
+  # (conv-attention head) on Modal - see training/README.md to retrain. It loads
+  # through the openWakeWord backend unchanged, because a livekit export has the
+  # same embeddings (batch, 16, 96) -> score (batch, 1) contract as an openWakeWord
+  # custom model. No livekit runtime dependency is needed or wanted.
+  #
+  # Picovoice sunset its Free Tier on 2026-06-30 and disabled all free AccessKeys,
+  # so the Porcupine backend and the .ppn models in sounds/wake_word_california/
+  # no longer load, failing with PorcupineActivationRefusedError regardless of the
+  # model file.
+  model: "models/california.onnx"
+  # 0.59 is optimal_threshold from the trained california_eval.json: 92.4% recall at
+  # 0.096 false positives/hour over 20.9 hours of validation audio. If the TV starts
+  # triggering it, raise toward 0.7 before touching anything else - that trades recall
+  # for quiet. Retraining with the offending phrase added to custom_negative_phrases
+  # in training/california.yaml is the better fix.
+  threshold: 0.59
+  sensitivity: 0.6          # Porcupine-specific alias, unused on this backend
   consecutive_frames: 2     # Only used by openWakeWord backend
   debounce_seconds: 1.2     # Ignore re-triggers for N seconds after activation
 
