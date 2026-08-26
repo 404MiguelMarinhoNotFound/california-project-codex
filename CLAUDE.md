@@ -105,6 +105,8 @@ california/
 ├── .python-version              # Interpreter pin used by uv
 ├── setup.sh                     # uv bootstrap for Linux / macOS / Pi
 ├── setup.ps1                    # uv bootstrap for Windows
+├── generate_bootup_sounds.py    # Regenerates the startup one-liners in sounds/bootup/
+├── generate_activation_phrases.py # Regenerates the post-wake acknowledgements
 ├── core/
 │   ├── orchestrator.py          # Main state machine and tool dispatch
 │   ├── audio_pipeline.py        # Microphone capture and playback
@@ -154,6 +156,12 @@ Important runtime note:
 
 - `watch_state.json` and `vpn_state.json` are generated cache files and should stay local;
   both are gitignored, so they will not show up as pending changes
+- `sounds/bootup/`, `sounds/california_activations/`, `sounds/chime.wav`, and
+  `sounds/error.wav` are generated audio and are **not** committed. This repo carries
+  audio sources, not audio output. Run `generate_bootup_sounds.py` and
+  `generate_activation_phrases.py` on a fresh clone, both of which need
+  `uv sync --extra default` for Kokoro. Missing files are handled gracefully:
+  the orchestrator skips the greeting and `sounds.generate_if_missing` recreates the chime
 - `deprecated/` holds files retired from the live tree. Nothing there is imported or
   executed. Do not add references to it; see `deprecated/README.md` for what was moved and why
 - `core/orchestrator.py` is the main coordinator, not a top-level `orchestrator.py`
