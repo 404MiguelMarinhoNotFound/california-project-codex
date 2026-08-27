@@ -291,6 +291,13 @@ talk straight over the line.
 - **The onset carries the information, the tail carries the charm.** You know the wake
   fired within ~150ms of her voice starting. Everything after that is personality, so
   shortening the warm tier costs no confirmation value
+- **Kokoro pads every clip with silence — trim it.** Measured on the real output: about
+  0.40s on the front and 0.50s on the back, regardless of line length. On `"Sup."` that
+  was more padding than speech (1.30s total for 0.42s of audio), and the leading half is
+  the damaging one because it delays the onset. `generate_activation_phrases.trim_silence`
+  cuts it to a 20ms lead-in and a 60ms tail with 5ms fades, which took the warm tier from
+  a 1.48s mean to 0.61s and the cold tier from 2.16s to 1.25s. Any future generated audio
+  from Kokoro is worth measuring the same way
 - **`EchoGate` handles speaker bleed.** Recording overlaps playback by design, so the first
   chunks are California's own voice through the speaker. The gate holds the VAD clock until
   either the line ends or the mic goes loud enough that it can only be Master Miguel talking

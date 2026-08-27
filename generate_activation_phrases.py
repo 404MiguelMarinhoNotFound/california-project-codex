@@ -111,6 +111,38 @@ WARM_RESPONSES = {
 
 TIERS = {"cold": COLD_RESPONSES, "warm": WARM_RESPONSES}
 
+# Kokoro pads roughly 0.4s of silence onto the front of every clip and 0.5s onto
+# the back. On a 0.42s line like "Sup." that is more padding than speech, and the
+# leading half is the damaging one: it delays the onset, which is the whole point
+# of the acknowledgement. Master Miguel knows the wake fired the moment he hears
+# her, so every millisecond before that is pure lag.
+SILENCE_FLOOR = 0.02   # fraction of peak amplitude that still counts as silence
+LEAD_IN_MS = 20        # keep a sliver before the first sound
+TAIL_MS = 60           # and a little decay after the last
+FADE_MS = 5            # avoid a click from cutting mid-waveform
+
+
+def trim_silence(audio: np.ndarray) -> np.ndarray:
+    """Strip the synthesiser's leading and trailing padding."""
+    amplitude = np.abs(audio)
+    peak = amplitude.max() if len(amplitude) else 0.0
+    if peak <= 0:
+        return audio
+
+    loud = np.flatnonzero(amplitude > peak * SILENCE_FLOOR)
+    if loud.size == 0:
+        return audio
+
+    start = max(0, int(loud[0]) - SAMPLE_RATE * LEAD_IN_MS // 1000)
+    end = min(len(audio), int(loud[-1]) + SAMPLE_RATE * TAIL_MS // 1000)
+    trimmed = audio[start:end].copy()
+
+    fade = min(SAMPLE_RATE * FADE_MS // 1000, len(trimmed) // 2)
+    if fade > 0:
+        trimmed[:fade] *= np.linspace(0.0, 1.0, fade, dtype=trimmed.dtype)
+        trimmed[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=trimmed.dtype)
+    return trimmed
+
 
 def synthesize(tier: str, responses: dict) -> tuple[dict, list]:
     """Render every line in `responses` into sounds/.../<tier>/."""
@@ -123,16 +155,18 @@ def synthesize(tier: str, responses: dict) -> tuple[dict, list]:
     for name, text in responses.items():
         try:
             chunks = [chunk for _, _, chunk in pipeline(text, voice="af_bella", speed=1.0)]
-            audio = np.concatenate(chunks)
+            raw = np.concatenate(chunks)
+            audio = trim_silence(raw)
             sf.write(os.path.join(tier_dir, f"{name}.wav"), audio, SAMPLE_RATE)
         except Exception as exc:
             print(f"  ✗  {name} failed: {exc}")
             continue
 
         seconds = len(audio) / SAMPLE_RATE
+        saved = (len(raw) - len(audio)) / SAMPLE_RATE
         written[name] = text
         durations.append(seconds)
-        print(f"  ✓  {seconds:4.2f}s  {name}.wav  —  \"{text}\"")
+        print(f"  ✓  {seconds:4.2f}s  (-{saved:4.2f}s)  {name}.wav  —  \"{text}\"")
 
     return written, durations
 

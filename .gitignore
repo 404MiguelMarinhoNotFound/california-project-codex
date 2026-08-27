@@ -6,6 +6,9 @@ __pycache__/
 *.onnx
 *.wav
 !sounds/.gitkeep
+# Generated alongside the activation WAVs by generate_activation_phrases.py.
+# Committing it would let the line text drift from the audio it describes.
+sounds/california_activations/manifest.json
 models/
 .DS_Store
 watch_state.json
