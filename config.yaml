@@ -158,6 +158,33 @@ sounds:
   activation: "sounds/chime.wav"
   error: "sounds/error.wav"
   generate_if_missing: true   # Auto-generate chime sounds if files don't exist
+  activation_dir: "sounds/california_activations"
+
+  # The wake acknowledgement is split into two pools by
+  # generate_activation_phrases.py:
+  #   cold/  long personality lines, played on the FIRST wake of a run
+  #   warm/  one or two words, played on every wake after that
+  # The long ones only land on first contact. On the fifth command in a row they
+  # are a toll booth, and the spread between "Sup." and "This better be good.
+  # Kidding. Go ahead." is what makes California feel slow.
+
+  # Playback does not hold the microphone: recording starts the instant the wake
+  # word fires, so you can talk straight over the line. Set true for the old
+  # behaviour, where the mic waits for the line to finish.
+  activation_blocking: false
+
+  # RMS above which mic input during playback counts as you talking over her,
+  # which cuts the line short. Well above vad.energy_threshold on purpose — it
+  # has to clear the speaker bleed, and you are much closer to the mic than the
+  # speaker is. Too high just means the line always plays out, which is still
+  # better than before because the mic was already recording. Lower it if
+  # barge-in never fires, raise it if the line cuts itself off.
+  barge_in_energy_threshold: 900
+  # Ignore this much of the start of playback: nobody reacts that fast, and the
+  # onset of the line is its loudest moment.
+  activation_onset_guard_ms: 150
+  # On barge-in, back the recording up this far so your first phoneme survives.
+  barge_in_guard_ms: 120
 
 # --- Stremio ---
 stremio:

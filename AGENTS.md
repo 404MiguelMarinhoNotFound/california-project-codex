@@ -126,6 +126,7 @@ california/
 │   ├── wake_word.py             # Wake-word detection
 │   └── vad.py                   # Voice activity detection
 ├── services/
+│   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
 │   ├── llm.py                   # Multi-provider LLM streaming + tool calling
 │   ├── govee_service.py         # Govee cloud v2 light control
 │   ├── name_matcher.py          # Shared fuzzy hint -> key matching (playlists, light rooms)
@@ -151,6 +152,7 @@ california/
 │   ├── search_youtube_videos.py    # Finds YouTube video candidates and derives radio playlist IDs
 │   └── validate_youtube_playlists.py # Fetches real YouTube page titles to confirm playlist IDs match the intended vibe
 ├── tests/
+│   ├── test_activation_phrases.py # Wake tiers, echo stripping, and recording trim
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
 │   ├── test_media_service.py    # YouTube / ADB unit tests
 │   ├── test_orchestrator_lights.py # control_lights dispatch behavior
@@ -175,6 +177,9 @@ Important runtime note:
   `generate_activation_phrases.py` on a fresh clone, both of which need
   `uv sync --extra default` for Kokoro. Missing files are handled gracefully:
   the orchestrator skips the greeting and `sounds.generate_if_missing` recreates the chime
+- `sounds/california_activations/` holds `cold/` and `warm/` subdirectories plus a
+  `manifest.json` of line text. A flat directory of WAVs is the pre-tier layout and still
+  loads, into both pools; re-run `generate_activation_phrases.py` to get the split
 - `deprecated/` holds files retired from the live tree. Nothing there is imported or
   executed. Do not add references to it; see `deprecated/README.md` for what was moved and why
 - `core/orchestrator.py` is the main coordinator, not a top-level `orchestrator.py`
@@ -270,6 +275,36 @@ both `kokoro` and `govee`, which is what the committed config actually selects.
 - Each sentence should go to TTS as soon as it is complete
 - Never wait for the full LLM response before speaking
 - Target latency remains roughly 1.5 to 3 seconds from end of speech to first audio
+
+### Wake Acknowledgement and Echo Gating
+
+The activation line no longer holds the microphone. `AudioPipeline.play_activation_sound`
+is non-blocking and returns an `ActivationPlayback` (name, text, duration), so
+`_record_speech` starts capturing the instant the wake word fires and Master Miguel can
+talk straight over the line.
+
+- **Two tiers.** `services/activation_phrases.resolve_tier` picks `cold` on the first wake
+  of a run and `warm` on every wake after. Cold lines are the long personality ones, warm
+  lines are one or two words. The long ones only land on first contact; the spread between
+  `"Sup."` and `"This better be good. Kidding. Go ahead."` is a large part of what makes
+  California feel slow, and unpredictable latency reads worse than consistent latency
+- **The onset carries the information, the tail carries the charm.** You know the wake
+  fired within ~150ms of her voice starting. Everything after that is personality, so
+  shortening the warm tier costs no confirmation value
+- **`EchoGate` handles speaker bleed.** Recording overlaps playback by design, so the first
+  chunks are California's own voice through the speaker. The gate holds the VAD clock until
+  either the line ends or the mic goes loud enough that it can only be Master Miguel talking
+  over her (which also calls `stop_playback()`). Those chunks are then dropped before STT.
+  `vad.start_recording()` is re-called at that moment so `min_recording` and the silence
+  timer measure his speech, not her line
+- **`barge_in_energy_threshold` sits well above `vad.energy_threshold`** because it has to
+  clear the bleed. A bad value costs responsiveness, never correctness: too high just means
+  the line plays out, which is still better than before because the mic was already recording
+- **`strip_activation_echo` is a safety net, not the primary defence.** The audio trim does
+  the real work. The text strip catches residue that reaches Whisper as a prefix, and
+  requires a match of at least two words — plenty of real commands open with the same single
+  word as a short line (`"Go."` vs `"go home"`, a real `control_tv` action)
+- `sounds.activation_blocking: true` restores the old behaviour, where the mic waits
 
 ### Producer-Consumer Audio Pattern
 
@@ -726,6 +761,7 @@ Current automated coverage exists for:
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
+- Activation tier selection, echo stripping, `EchoGate` arming, and the recording trim
 
 Useful live-debug commands:
 

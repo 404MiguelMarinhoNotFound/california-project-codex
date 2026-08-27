@@ -18,6 +18,7 @@ import threading
 import queue
 import numpy as np
 
+from services.activation_phrases import EchoGate, resolve_tier, strip_activation_echo
 from services.govee_service import GoveeService, clamp_percent, resolve_color
 from services.media_service import MediaService
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
@@ -311,6 +312,13 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
     return "unknown action"
 
 
+def _chunk_rms(audio_chunk: np.ndarray) -> float:
+    """RMS of an int16 chunk, on the same scale as vad.energy_threshold."""
+    if len(audio_chunk) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2)))
+
+
 def _dispatch_lights(params: dict, govee_svc) -> str:
     """
     Govee light control. Module-level and service-injected for the same reason
@@ -421,6 +429,15 @@ class Orchestrator:
         self.llm.light_names = list(self.govee_service.lights)
         self.llm.default_light = self.govee_service.default_light
 
+        # Activation sound tiering + echo gating. The first wake of a run gets a
+        # long personality line, every wake after gets a short one, and playback
+        # never blocks the microphone.
+        sounds_cfg = config.get("sounds", {})
+        self._wake_count = 0
+        self._barge_in_rms = float(sounds_cfg.get("barge_in_energy_threshold", 900))
+        self._onset_guard_s = float(sounds_cfg.get("activation_onset_guard_ms", 150)) / 1000.0
+        self._barge_in_guard_s = float(sounds_cfg.get("barge_in_guard_ms", 120)) / 1000.0
+
         # State
         self._running = False
         self._interrupted = False  # Barge-in flag
@@ -498,20 +515,31 @@ class Orchestrator:
     def _handle_activation(self, mic_stream):
         """
         Handle a wake word activation:
-        1. Play chime
-        2. Record user speech
+        1. Start the activation line (does not block the microphone)
+        2. Record user speech, gating out the line's own bleed
         3. Transcribe
         4. Query LLM (streaming)
         5. Speak response (streaming)
         """
         logger.info("--- Wake word activated ---")
 
-        # Play activation chime
-        self.audio.play_activation_sound()
+        # First wake of the run gets a long line, the rest get short ones.
+        tier = resolve_tier(self._wake_count)
+        self._wake_count += 1
+
+        # Playback does not block: recording starts now and the EchoGate inside
+        # _record_speech discards whatever the mic picks up of the line itself.
+        playback = self.audio.play_activation_sound(tier)
+        logger.info(
+            "Activation tier=%s line=%s (%.2fs)",
+            tier,
+            playback.name if playback else "none",
+            playback.duration if playback else 0.0,
+        )
 
         # --- LISTENING: Record until silence ---
         self.leds.set_state("listening")
-        audio_data = self._record_speech(mic_stream)
+        audio_data = self._record_speech(mic_stream, playback)
 
         if audio_data is None or len(audio_data) == 0:
             logger.info("No speech recorded, returning to idle")
@@ -523,6 +551,15 @@ class Orchestrator:
         # Convert to WAV and transcribe
         wav_bytes = self.audio.numpy_to_wav_bytes(audio_data)
         transcript = self.stt.transcribe(wav_bytes)
+
+        # Safety net for any of the activation line that survived the audio trim
+        # and reached Whisper as a prefix. Conservative by design: see
+        # services.activation_phrases.strip_activation_echo.
+        if playback and playback.text:
+            cleaned = strip_activation_echo(transcript, playback.text)
+            if cleaned != transcript:
+                logger.info("Stripped activation echo: %r -> %r", transcript, cleaned)
+                transcript = cleaned
 
         if not transcript or transcript.strip() == "":
             logger.info("Empty transcription, returning to idle")
@@ -539,30 +576,69 @@ class Orchestrator:
         self.leds.set_state("thinking")
         self._stream_response(transcript)
 
-    def _record_speech(self, mic_stream) -> np.ndarray | None:
+    def _record_speech(self, mic_stream, playback=None) -> np.ndarray | None:
         """
         Record audio until VAD detects silence.
         Returns numpy array of recorded audio (int16), or None if too short.
+
+        Recording starts the moment the wake word fires, while the activation
+        line is still playing, so the first chunks are California's own voice
+        coming back through the speaker. An EchoGate holds the VAD clock until
+        the line ends or Master Miguel talks over it, and those chunks are then
+        dropped so Whisper never sees them.
         """
+        window = playback.duration if playback else 0.0
+        gate = EchoGate(window, self._barge_in_rms, self._onset_guard_s)
+
         self.vad.start_recording()
+        started = time.monotonic()
         chunks = []
+        trim_from = 0
 
         while True:
             audio_bytes, overflowed = mic_stream.read(self.audio.chunk_samples)
             audio_chunk = self.audio.bytes_to_numpy(audio_bytes)
             chunks.append(audio_chunk)
 
+            if not gate.armed:
+                if not gate.update(time.monotonic() - started, _chunk_rms(audio_chunk)):
+                    continue
+                if gate.barged_in:
+                    # He started talking over the line. Cut her off mid-word the
+                    # way a person would, and back the trim up a little so the
+                    # first phoneme is not clipped.
+                    self.audio.stop_playback()
+                    guard_chunks = max(
+                        0, int(self._barge_in_guard_s * self.audio.sample_rate)
+                        // self.audio.chunk_samples
+                    )
+                    trim_from = max(0, len(chunks) - 1 - guard_chunks)
+                    logger.info("Barge-in: cut activation line short")
+                else:
+                    # The line finished on its own, so everything before this
+                    # chunk was speaker bleed and none of it was him.
+                    trim_from = len(chunks) - 1
+                # min_recording and the silence timer should measure his speech,
+                # not the activation line, so restart the VAD clock here.
+                self.vad.start_recording()
+                continue
+
             should_stop, reason = self.vad.should_stop_recording(audio_chunk)
             if should_stop:
                 logger.info(f"Recording stopped: {reason}")
                 break
 
-        if not chunks:
+        kept = chunks[trim_from:]
+        if not kept:
             return None
 
-        audio_data = np.concatenate(chunks)
+        audio_data = np.concatenate(kept)
         duration = len(audio_data) / self.audio.sample_rate
-        logger.info(f"Recorded {duration:.1f}s of audio")
+        logger.info(
+            "Recorded %.1fs of audio (dropped %.1fs of activation overlap)",
+            duration,
+            sum(len(c) for c in chunks[:trim_from]) / self.audio.sample_rate,
+        )
 
         return audio_data
 
