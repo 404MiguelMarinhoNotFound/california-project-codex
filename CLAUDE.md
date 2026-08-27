@@ -822,9 +822,11 @@ Confirmed **High-severity** backlog (identification only — not yet fixed):
 - **Barge-in / "stop" is non-functional** — `_interrupted` is never set `True`, so the
   interrupt guards are dead code and "stop" only skips the current sentence
   (`core/orchestrator.py`).
-- **Claude provider does not stream** — `_stream_claude` uses the non-streaming
-  `messages.create()`, so the default provider loses token-by-token streaming
-  (`services/llm.py:270`).
+- ~~**Claude provider does not stream**~~ — **fixed 2026-08-27.** `_stream_claude` now
+  uses `client.messages.stream()` and yields real token deltas, so the default provider
+  gets the sentence-chunker/TTS overlap the design assumes. The same change fixed **M2**
+  (a response with two `tool_use` blocks used to build a malformed next request).
+  Covered by `tests/test_llm_claude_streaming.py`.
 - **Default TTS `kokoro` missing from `requirements.txt`** — clean install crashes at
   `TTSService.__init__` (`config.yaml:133`).
 

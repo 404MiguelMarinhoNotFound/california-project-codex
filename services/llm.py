@@ -327,8 +327,9 @@ class LLMService:
 
         elapsed = time.time() - start
         logger.info(f"LLM completed in {elapsed:.2f}s ({len(full_response)} chars)")
+
     def _stream_claude(self, response_ref: dict) -> Generator[str, None, None]:
-        """Stream from Claude API with web search and control_tv tool support."""
+        """Stream from Claude API with web search, control_tv, and control_lights support."""
         import anthropic
 
         tools = []
@@ -356,38 +357,59 @@ class LLMService:
         messages = list(self.history)
 
         while True:
-            response = self.client.messages.create(
+            # messages.stream() yields real token deltas. The old messages.create()
+            # returned only after the whole generation finished, so the first
+            # sentence could not reach TTS until the last token was written —
+            # which defeated the sentence-chunker overlap on the default provider.
+            with self.client.messages.stream(
                 model=self.model,
                 max_tokens=self.max_tokens,
                 system=self._build_system_prompt(),
                 messages=messages,
                 tools=tools if tools else anthropic.NOT_GIVEN,
-            )
+            ) as stream:
+                for text in stream.text_stream:
+                    response_ref["text"] += text
+                    yield text
+                response = stream.get_final_message()
 
-            # Process content blocks
+            # Tool calls are dispatched only after the text has been streamed out,
+            # so speech starts while the tool is still to run.
+            #
+            # Every tool_use block in this response must be answered in ONE user
+            # message containing ONE tool_result per block — that is what the API
+            # expects. Appending per block (the old shape) resent the whole
+            # assistant message once per tool and split the results across
+            # several user messages, which breaks the next request as soon as
+            # Claude asks for two tools in a turn ("lights on and play my show").
+            tool_results = []
             for block in response.content:
-                if block.type == "text":
-                    response_ref["text"] += block.text
-                    yield block.text
-                elif block.type == "tool_use" and block.name in LOCAL_TOOL_NAMES:
+                if block.type != "tool_use":
+                    continue
+                if block.name in LOCAL_TOOL_NAMES:
                     logger.info(f"Claude tool call: {block.name}({block.input})")
                     result_text = "tool not available"
                     if self.tool_handler:
                         result_text = self.tool_handler(block.name, block.input)
-                    # Append assistant message with tool use + tool result for next turn
-                    messages.append({"role": "assistant", "content": response.content})
-                    messages.append({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result_text,
-                        }]
-                    })
+                else:
+                    # Not one of ours. Still answer it: leaving a tool_use block
+                    # unanswered makes the next request invalid, and returning
+                    # nothing would spin this loop on an identical payload.
+                    logger.warning(f"Claude asked for an unknown tool: {block.name}")
+                    result_text = "tool not available"
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                })
 
-            # If stop_reason is "tool_use", loop back so Claude can respond with text
-            if response.stop_reason != "tool_use":
+            # Nothing to answer means nothing would change on the next pass, so
+            # stop even if stop_reason still says tool_use.
+            if not tool_results:
                 break
+
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
 
     def _stream_openai_compatible(self, response_ref: dict) -> Generator[str, None, None]:
         """
