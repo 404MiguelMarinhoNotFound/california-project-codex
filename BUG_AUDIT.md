@@ -25,10 +25,10 @@ re-investigated later.
 | ID | Title | Location | Severity | Confidence |
 |----|-------|----------|----------|------------|
 | H1 | Barge-in / "stop" command is non-functional (`_interrupted` never set) | `core/orchestrator.py:363,540,565,590,622,672` | High | Confirmed |
-| H2 | Claude provider does not actually stream tokens | `services/llm.py:270,279-282` | High | Confirmed |
+| H2 | Claude provider does not actually stream tokens | `services/llm.py:270,279-282` | High | **Fixed 2026-08-27** |
 | H3 | Default TTS provider `kokoro` missing from `requirements.txt` | `config.yaml:133` + `requirements.txt` | High | Confirmed |
 | M1 | `_adb` uses `shell=True`; timeout may orphan hung `adb.exe` on Windows | `services/media_service.py:47-55` | Medium | Likely |
-| M2 | Multi-`tool_use`-block responses build malformed Claude message history | `services/llm.py:283-297` | Medium | Likely |
+| M2 | Multi-`tool_use`-block responses build malformed Claude message history | `services/llm.py:283-297` | Medium | **Fixed 2026-08-27** |
 | M3 | Synchronous tool dispatch blocks the token/TTS stream | `core/orchestrator.py:536-550` | Medium | Confirmed (by-design limit) |
 | M4 | LLM tool-loop `messages` list never trimmed during multi-tool turns | `services/llm.py:267-301,398-402` | Medium | Confirmed |
 | L1 | Dead-code files, one with a syntax error | `services/tts copy.py`, `services/sentence_chunker copy.py` | Low | Confirmed |
@@ -58,6 +58,14 @@ re-investigated later.
 **Trigger:** Any normal turn while `llm.provider: "claude"`.
 **Impact:** The user waits for the *entire* LLM generation (up to `max_tokens: 1000`) before hearing the first word — directly defeating the "first sentence while the LLM is still generating" design the project calls non-negotiable. Sentence-chunker/TTS overlap provides no latency benefit on the default provider.
 **Suggested fix:** Switch `_stream_claude` to `self.client.messages.stream(...)` and yield `text` deltas from the streaming events (handling `tool_use` accumulation as the OpenAI path does).
+
+**FIXED 2026-08-27.** `_stream_claude` now opens `self.client.messages.stream(...)`, yields
+each delta off `stream.text_stream` as it arrives, and reads `stream.get_final_message()`
+afterwards for `content` and `stop_reason`. Tool calls are dispatched after the text has
+been streamed, so speech starts before the tool runs. Regression cover:
+`tests/test_llm_claude_streaming.py` — `test_a_delta_reaches_the_caller_before_the_response_is_complete`
+asserts a chunk leaves the generator before the response is finished, and
+`test_text_is_streamed_before_any_tool_runs` pins the text-then-tool ordering.
 
 ### H3 — Default TTS provider `kokoro` is missing from `requirements.txt`
 
@@ -89,6 +97,16 @@ re-investigated later.
 **Trigger:** Claude returns 2+ tool calls in one turn (possible for compound requests).
 **Impact:** Occasional API error / broken turn after multi-tool responses.
 **Suggested fix:** Move the assistant-message append out of the per-block loop; collect all `tool_result`s into a single user message appended once after processing every block.
+
+**FIXED 2026-08-27**, alongside H2 — the streaming rewrite restructured the same loop.
+Every `tool_use` block in a response now collects into one `tool_results` list, appended as
+a single assistant message plus a single user message. Two extras fell out of it: a
+`tool_use` block naming an unknown tool is answered with `"tool not available"` rather than
+dropped (an unanswered block makes the next request invalid), and the loop breaks when there
+is nothing to answer, which previously could resend an identical payload forever. Regression
+cover: `test_two_tool_calls_in_one_turn_build_one_assistant_and_one_user_message`,
+`test_an_unknown_tool_is_answered_instead_of_looping_forever`, and
+`test_tool_use_stop_reason_with_nothing_to_answer_terminates`.
 
 ### M3 — Synchronous tool dispatch blocks the token/TTS stream
 **Location:** `core/orchestrator.py:536-550` (stream loop) → `llm` `tool_handler` → `_dispatch_tv` → ADB / Stremio UI scans.
