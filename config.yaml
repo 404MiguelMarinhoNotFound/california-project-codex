@@ -20,13 +20,22 @@ wake_word:
   # so the Porcupine backend and the .ppn models in sounds/wake_word_california/
   # no longer load, failing with PorcupineActivationRefusedError regardless of the
   # model file.
-  model: "models/california.onnx"
-  # 0.59 is optimal_threshold from the trained california_eval.json: 92.4% recall at
-  # 0.096 false positives/hour over 20.9 hours of validation audio. If the TV starts
-  # triggering it, raise toward 0.7 before touching anything else - that trades recall
-  # for quiet. Retraining with the offending phrase added to custom_negative_phrases
-  # in training/california.yaml is the better fix.
-  threshold: 0.59
+  model: "models/california_v2.onnx"
+  # 0.81 is california_v2_eval.json's optimal_threshold, chosen deliberately as the
+  # false-positive-safe end. Know the trade: that figure is computed against
+  # synthetic Piper validation audio, and measured on 40 held-out recordings of
+  # Master Miguel it catches 40% of them. Expect to repeat yourself.
+  #
+  # Measured recall on the holdout - English / Portuguese:
+  #   0.81  35% / 45%   <- here      0.30  55% / 75%
+  #   0.50  45% / 60%               0.20  65% / 80%
+  #   0.40  50% / 75%               0.15  75% / 80%
+  #
+  # Walk it down this table if misses annoy more than false fires. Those numbers
+  # are peak single-frame scores, while the detector needs consecutive_frames in a
+  # row, so live recall runs a little under them and live false positives under too.
+  # Measure both ends with tools/score_wakeword.py --save-clips before moving it.
+  threshold: 0.81
   sensitivity: 0.6          # Porcupine-specific alias, unused on this backend
   consecutive_frames: 2     # Only used by openWakeWord backend
   debounce_seconds: 1.2     # Ignore re-triggers for N seconds after activation

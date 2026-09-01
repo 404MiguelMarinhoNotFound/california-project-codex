@@ -84,11 +84,17 @@ loads, the volume mounts, and export writes a file, before spending real GPU hou
 uvx modal run training/modal_train.py::smoke
 ```
 
-The real run on an L40S.
+The real run on an L40S. Use `--detach` — without it the app is tied to your
+terminal session, so closing the window kills a multi-hour run.
 
 ```bash
-uvx modal run training/modal_train.py::train
+uvx modal run --detach training/modal_train.py::train
 ```
+
+`train` defaults to `california_v2.yaml`. Pass `--config california.yaml` to
+re-run an older one. `model_name` is read out of the YAML, so runs land in
+separate directories on the volume and can be compared rather than overwriting
+each other.
 
 Pull the model down:
 
@@ -149,10 +155,135 @@ model uses `conv_attention`. livekit documents all three heads as sharing one ON
 contract, and their own eval stage runs the exported file through onnxruntime, so this is
 expected to hold — but confirm it loads before assuming.
 
-## Tuning
+## When the model is not good enough
 
-The plan if it false-triggers: play Hotel California and Californication at the TV at
-normal volume and count activations. If it fires, add what fired to
-`custom_negative_phrases` in `california.yaml` and retrain — that is what the loop is
-for, and why sample counts here sit in livekit's "quick experiments" band rather than
-prod's. Once a config proves itself, scale `n_samples` to 25000 and `steps` to 100000.
+Run 1 (`california.yaml`) scored 92.4% recall at 0.096 FPPH and still both missed
+Master Miguel and fired on non-wake-words in the actual room. That is not a
+contradiction — those numbers were measured against synthetic Piper audio, where
+904 LibriTTS speakers read calmly into a clean channel. A European Portuguese
+speaker saying one clipped word across a room is out of that distribution.
+
+**Measure before spending money.** A retrain is roughly 4-5 hours and $9, so it is
+worth ten minutes first:
+
+```bash
+uv run python tools/score_wakeword.py
+```
+
+Say the wake word ten times, normally, from where you actually stand. The tool
+prints the raw score rather than a yes/no, and that distinction decides everything:
+
+| Peak score | Meaning | Fix |
+|---|---|---|
+| above threshold | fires | nothing |
+| 0.4 - 0.6 | heard, threshold too high | lower `wake_word.threshold`, stop |
+| under 0.1 | genuinely not recognised | retrain, no threshold helps |
+
+For false fires, leave it running with the TV on:
+
+```bash
+uv run python tools/score_wakeword.py --save-clips debug/wakeword
+```
+
+Every event writes the two seconds of audio that caused it. Listening to those is
+how you learn what belongs in `custom_negative_phrases`. Adding guesses instead is
+how you spend $9 on a model that fails the same way.
+
+### What run 2 changes, and why
+
+`california_v2.yaml` targets separation rather than either failure mode alone,
+because when a model both misses and false-fires, the classes are not far enough
+apart and pushing on one side only moves the problem:
+
+- **`model_size: large`** (256d, 3 blocks, up from medium). Inference cost is
+  irrelevant here — this runs once per 2-second window on ~1500 floats, not per
+  audio frame
+- **`n_samples: 25000`** and **`steps: 100000`**, up from 10000/50000. Run 1 sat in
+  livekit's own "quick experiments" band
+- **wider TTS spread** — this is the recall lever, and the most overlooked one. Run
+  1 used a single `noise_scales` and `noise_scale_ws` value, so all 10,000 positives
+  shared one timbre and one phoneme-duration setting, and `length_scales` only
+  spanned 0.75-1.25. Run 2 spreads all three and widens `slerp_weights` at both
+  ends. A wake word said fast, flat, or half-swallowed only counts if the model has
+  seen it said that way
+- **`max_negative_weight` deliberately unchanged at 3000.** Raising it is the
+  obvious reflex for false fires and the wrong one here: the trainer already doubles
+  it between phases when FPPH misses target, and pushing higher buys quiet by giving
+  up the recall that is already the louder complaint
+
+### The accent problem, and the fix
+
+Reported symptom: said with an English accent it fires, said with a Portuguese
+accent it does not. That is not a tuning problem, it is a data problem, and the
+cause is fixed in the toolchain:
+
+- the Piper checkpoint is **`en-us-libritts-high`**
+- `synthesis.py` reads its espeak voice from that checkpoint's own JSON
+  (`config["espeak"]["voice"]`), so phonemization is **`en-us`** and is not
+  settable from the wake-word YAML
+
+So every synthetic positive is American English. The model has never heard
+*/ka.li.ˈfɔɾ.ni.ɐ/*, only */ˌkæ.lɪ.ˈfɔɹ.njə/*. Raising `model_size` would only
+teach it the English pronunciation more thoroughly.
+
+The fix is real audio. Record yourself, and the pipeline folds it in as extra
+positives:
+
+```bash
+uv run python tools/record_wakeword.py --count 140
+```
+
+About ten minutes. The prompts cycle through delivery styles deliberately —
+a model trained only on careful pronunciations learns to require one. Clips are
+trimmed tightly at both ends, which matters because livekit's `align_clip_to_end`
+places positives at the END of the 2s window with 200ms jitter, so trailing
+silence would shift the word out of position relative to the Piper clips.
+
+**Hold some back.** Move roughly 20 takes into a separate directory and do not
+upload them. They are the only honest measure of whether this worked, because
+livekit's eval scores against synthetic Piper audio and therefore cannot tell you
+anything about your own voice.
+
+```bash
+uvx modal volume put california-wakeword-data training/recordings/positive /recordings/positive
+```
+
+```bash
+uvx modal run --detach training/modal_train.py::train
+```
+
+Then score the held-out takes against the old model and the new one:
+
+```bash
+uv run python tools/score_wakeword.py --dir training/recordings/holdout
+```
+
+### How the merge works
+
+`train` runs the stages separately when `--replicate` is above 0 (default 25),
+because `livekit-wakeword run` does everything in one go and leaves no seam:
+
+```
+generate -> merge recordings -> augment -> train -> export -> eval
+```
+
+Two details are load-bearing, and both fail silently if got wrong:
+
+- **Naming.** `augment.py` selects sources with a strict `^clip_\d{6}\.wav$`
+  regex. Anything else is ignored, so wrongly-named clips would sit in the
+  directory, never train, and the run would look completely healthy. The merge
+  renames into that pattern, continuing past the highest index Piper wrote.
+- **Replication.** 120 real clips against 25,000 synthetic is under half a
+  percent, which the model would barely notice. Each take is copied 25 times.
+  The copies are identical on disk, but augmentation applies independently random
+  reverb, noise, and EQ per clip per round, so each becomes a distinct example.
+  120 takes at x25 lands around 10% real.
+
+Pass `--replicate 0` to train on synthetic audio only. Uploading no recordings is
+not an error either; the merge simply no-ops and says so.
+
+### If that is still not enough
+
+`augmentation.background_paths` accepts extra directories, so recordings of the
+actual living room with the TV playing can go in as negatives — the same trick,
+applied to the false-positive side.

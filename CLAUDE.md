@@ -40,7 +40,7 @@ No VPN preflight and no ADB on this path, and by default no network at all.
 
 | Component | Technology |
 |-----------|------------|
-| Wake word | openWakeWord (Porcupine retired, see note below) |
+| Wake word | openWakeWord runtime + custom model trained with livekit-wakeword (Porcupine retired, see note below) |
 | STT | Groq Whisper API |
 | LLM | Anthropic Claude, Groq, Fireworks, or OpenAI-compatible |
 | TTS | Kokoro, Edge TTS, Piper, ElevenLabs |
@@ -92,12 +92,20 @@ Keep secrets in `.env` or another local-only secret mechanism. Do not commit rea
 > livekit's `conv_attention` head measures 100x fewer false positives, which is the
 > whole problem for a wake word sitting next to a TV that plays Hotel California.
 >
+> **"California" is live again as of 2026-09-01**: `models/california_v2.onnx`,
+> trained on Modal with livekit-wakeword. `hey_jarvis_v0.1` above is the historical
+> placeholder, not the current setting.
+>
 > **This needs no new backend.** livekit's exported ONNX has the same contract as an
 > openWakeWord custom model — input `embeddings (batch, 16, 96)`, output
 > `score (batch, 1)` — and `_init_oww` reads the input name off the model rather than
 > hardcoding it, so the existing `oww` path loads it as-is. Verified against a real
-> exported model. Take the `optimal_threshold` from the trained
-> `<model>_metrics.json`; do not keep the 0.6 tuned for `hey_jarvis_v0.1`.
+> exported model.
+>
+> **Do not trust `optimal_threshold` from the trained metrics.** It is computed against
+> synthetic Piper validation audio and does not survive contact with a microphone. Both
+> runs so far were badly optimistic — see Key Learnings. Set the threshold from held-out
+> recordings of Master Miguel using `tools/score_wakeword.py --dir`, never from the eval.
 >
 > Do not reintroduce Porcupine without a paid key.
 
@@ -140,12 +148,19 @@ california/
 │   └── youtube_playlist_resolver.py # Matches voice playlist names and picks one saved ID at random
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
+├── training/                    # Wake-word training, runs on Modal, see training/README.md
+│   ├── modal_train.py           # Modal app: setup / smoke / train entrypoints
+│   ├── california.yaml          # Run 1 config, kept for comparison
+│   ├── california_v2.yaml       # Current config: large head, wider TTS spread
+│   └── california_smoke.yaml    # Tiny end-to-end pipeline check
 ├── tools/
 │   ├── debug_surfshark_sequence.py # Runs named Surfshark routes with optional screenshot capture
 │   ├── debug_surfshark_status.py   # Inspects current Surfshark status and route execution
 │   ├── run_stremio_e2e.py          # Live end-to-end Stremio routing and playback test
 │   ├── run_youtube_playlist_e2e.py # Live end-to-end YouTube playlist routing test
 │   ├── probe_govee_devices.py      # Lists Govee devices with sku, device id, and capabilities
+│   ├── score_wakeword.py           # Prints raw wake-word scores live; separates misses from threshold problems
+│   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
 │   ├── probe_stremio_sync.py       # Refreshes and inspects Stremio watch-state cache
 │   ├── debug_stremio_collections.py # Inspects raw Stremio collection payloads when sync is wrong
 │   ├── search_youtube_playlists.py # Finds public YouTube playlist candidates by search query
@@ -311,7 +326,14 @@ talk straight over the line.
   the real work. The text strip catches residue that reaches Whisper as a prefix, and
   requires a match of at least two words — plenty of real commands open with the same single
   word as a short line (`"Go."` vs `"go home"`, a real `control_tv` action)
-- `sounds.activation_blocking: true` restores the old behaviour, where the mic waits
+- **`sounds.activation_blocking` is `true`, and that is not the default this section
+  describes.** With the mic open during playback, California's own line came back through
+  the speaker above `barge_in_energy_threshold: 900`, so the gate read her as Master Miguel
+  talking over her: it cut the line short and handed Whisper her own voice, transcribing as
+  `"I'm with-"`. Blocking costs the ability to talk over her, which the warm tier makes
+  cheap. To go back, raise `barge_in_energy_threshold` above the speaker's bleed level
+  first — 900 is under it. `play_activation_sound` returns `duration = 0.0` when blocking,
+  so the EchoGate window collapses to zero rather than waiting out a finished line
 
 ### Producer-Consumer Audio Pattern
 
@@ -780,6 +802,19 @@ uv run python tools\run_stremio_e2e.py --prep-app youtube --debug
 uv run python tools\probe_stremio_sync.py
 uv run python tools\probe_govee_devices.py
 uv run python tools\probe_govee_devices.py --transport cloud
+
+# Wake word. score_wakeword prints raw scores instead of a yes/no, which is the
+# only way to tell "she did not hear me" from "she heard me at 0.55 and the
+# threshold is 0.81" — those need opposite fixes.
+uv run python tools\score_wakeword.py
+uv run python tools\score_wakeword.py --save-clips debug\wakeword
+uv run python tools\score_wakeword.py --dir training
+ecordings\holdout_pt
+uv run python tools\score_wakeword.py --dir training
+ecordings\holdout_en --model models\california.onnx --threshold 0.59
+uv run python tools
+ecord_wakeword.py --count 150 --out training
+ecordings\positive
 ```
 
 Targeted validation used for the latest Stremio resume work:
@@ -836,6 +871,20 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 
 - Streaming is non-negotiable for a responsive assistant
 - Sentence-level TTS overlap is the right pattern for voice latency
+- **A wake-word eval measured on synthetic audio predicts nothing about a real
+  microphone, and it fails optimistically.** Run 1 reported 92.4% recall and caught
+  **25%** of real English utterances and **0%** of Portuguese ones. Run 2 reported 93.3%
+  at its `optimal_threshold` of 0.81 and caught **40%**. Both were measured against the
+  same Piper voices that generated the training data, so they measure self-consistency,
+  not detection. Always hold back real recordings and score those instead
+- **An accent absent from the training data is absent from the model, and no threshold
+  recovers it.** Piper's checkpoint is `en-us-libritts-high` and `synthesis.py` reads its
+  espeak voice from that checkpoint's own JSON, so every synthetic positive is American
+  English regardless of config. Merging ~50 real Portuguese-accented recordings moved the
+  median score from 0.007 to 0.77
+- Real recordings are scarce and synthetic clips are cheap, so replication and recording
+  count are different levers: replication sets training *weight*, recording count sets
+  *diversity*, and only the second adds information
 - Plain show requests should sync first, then use `watch_state.json` as the resume source of truth for Stremio titles
 - TMDB is the fallback resolver for titles outside the local Stremio cache
 - `state=3` in `dumpsys media_session` is the practical playback signal
@@ -860,17 +909,18 @@ A whole-codebase bug audit was run on **2026-07-12**. Full report:
 `services/sentence_chunker copy.py`, were moved to `deprecated/` on 2026-08-25; the
 live tree now parses clean).
 
-Confirmed **High-severity** backlog (identification only — not yet fixed):
+Confirmed **High-severity** backlog:
 
-- **Barge-in / "stop" is non-functional** — `_interrupted` is never set `True`, so the
-  interrupt guards are dead code and "stop" only skips the current sentence
-  (`core/orchestrator.py`).
+- **Barge-in / "stop" is non-functional** — still open. `_interrupted` is never set
+  `True`, so the interrupt guards are dead code and "stop" only skips the current
+  sentence (`core/orchestrator.py`).
 - ~~**Claude provider does not stream**~~ — **fixed 2026-08-27.** `_stream_claude` now
   uses `client.messages.stream()` and yields real token deltas, so the default provider
   gets the sentence-chunker/TTS overlap the design assumes. The same change fixed **M2**
   (a response with two `tool_use` blocks used to build a malformed next request).
   Covered by `tests/test_llm_claude_streaming.py`.
-- **Default TTS `kokoro` missing from `requirements.txt`** — clean install crashes at
-  `TTSService.__init__` (`config.yaml:133`).
+- ~~**Default TTS `kokoro` missing from `requirements.txt`**~~ — **obsolete.** There is no
+  `requirements.txt` any more; `kokoro` is an extra and `uv sync --extra default` installs
+  exactly what the committed `config.yaml` selects.
 
 See `BUG_AUDIT.md` for Medium/Low findings and the verified-rejected false positives.
