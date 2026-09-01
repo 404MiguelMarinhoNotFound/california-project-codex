@@ -177,10 +177,18 @@ sounds:
   # are a toll booth, and the spread between "Sup." and "This better be good.
   # Kidding. Go ahead." is what makes California feel slow.
 
-  # Playback does not hold the microphone: recording starts the instant the wake
-  # word fires, so you can talk straight over the line. Set true for the old
-  # behaviour, where the mic waits for the line to finish.
-  activation_blocking: false
+  # TRUE because California was hearing herself. With the mic open during
+  # playback, her own line came back through the speaker loud enough to clear
+  # barge_in_energy_threshold, so she barged in on herself, cut the line short,
+  # and handed Whisper her own voice - observed transcribing as "I'm with-".
+  #
+  # Blocking costs the ability to talk over her, which the warm tier makes cheap:
+  # those lines are one or two words, so the wait is short by design.
+  #
+  # Set false to record during playback again, but raise
+  # barge_in_energy_threshold first - the 900 below is under this speaker's bleed
+  # level, and that is what caused the self-trigger.
+  activation_blocking: true
 
   # RMS above which mic input during playback counts as you talking over her,
   # which cuts the line short. Well above vad.energy_threshold on purpose — it
