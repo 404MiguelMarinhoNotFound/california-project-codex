@@ -20,13 +20,22 @@ wake_word:
   # so the Porcupine backend and the .ppn models in sounds/wake_word_california/
   # no longer load, failing with PorcupineActivationRefusedError regardless of the
   # model file.
-  model: "models/california.onnx"
-  # 0.59 is optimal_threshold from the trained california_eval.json: 92.4% recall at
-  # 0.096 false positives/hour over 20.9 hours of validation audio. If the TV starts
-  # triggering it, raise toward 0.7 before touching anything else - that trades recall
-  # for quiet. Retraining with the offending phrase added to custom_negative_phrases
-  # in training/california.yaml is the better fix.
-  threshold: 0.59
+  model: "models/california_v2.onnx"
+  # 0.81 is california_v2_eval.json's optimal_threshold, chosen deliberately as the
+  # false-positive-safe end. Know the trade: that figure is computed against
+  # synthetic Piper validation audio, and measured on 40 held-out recordings of
+  # Master Miguel it catches 40% of them. Expect to repeat yourself.
+  #
+  # Measured recall on the holdout - English / Portuguese:
+  #   0.81  35% / 45%   <- here      0.30  55% / 75%
+  #   0.50  45% / 60%               0.20  65% / 80%
+  #   0.40  50% / 75%               0.15  75% / 80%
+  #
+  # Walk it down this table if misses annoy more than false fires. Those numbers
+  # are peak single-frame scores, while the detector needs consecutive_frames in a
+  # row, so live recall runs a little under them and live false positives under too.
+  # Measure both ends with tools/score_wakeword.py --save-clips before moving it.
+  threshold: 0.81
   sensitivity: 0.6          # Porcupine-specific alias, unused on this backend
   consecutive_frames: 2     # Only used by openWakeWord backend
   debounce_seconds: 1.2     # Ignore re-triggers for N seconds after activation
@@ -158,6 +167,41 @@ sounds:
   activation: "sounds/chime.wav"
   error: "sounds/error.wav"
   generate_if_missing: true   # Auto-generate chime sounds if files don't exist
+  activation_dir: "sounds/california_activations"
+
+  # The wake acknowledgement is split into two pools by
+  # generate_activation_phrases.py:
+  #   cold/  long personality lines, played on the FIRST wake of a run
+  #   warm/  one or two words, played on every wake after that
+  # The long ones only land on first contact. On the fifth command in a row they
+  # are a toll booth, and the spread between "Sup." and "This better be good.
+  # Kidding. Go ahead." is what makes California feel slow.
+
+  # TRUE because California was hearing herself. With the mic open during
+  # playback, her own line came back through the speaker loud enough to clear
+  # barge_in_energy_threshold, so she barged in on herself, cut the line short,
+  # and handed Whisper her own voice - observed transcribing as "I'm with-".
+  #
+  # Blocking costs the ability to talk over her, which the warm tier makes cheap:
+  # those lines are one or two words, so the wait is short by design.
+  #
+  # Set false to record during playback again, but raise
+  # barge_in_energy_threshold first - the 900 below is under this speaker's bleed
+  # level, and that is what caused the self-trigger.
+  activation_blocking: true
+
+  # RMS above which mic input during playback counts as you talking over her,
+  # which cuts the line short. Well above vad.energy_threshold on purpose — it
+  # has to clear the speaker bleed, and you are much closer to the mic than the
+  # speaker is. Too high just means the line always plays out, which is still
+  # better than before because the mic was already recording. Lower it if
+  # barge-in never fires, raise it if the line cuts itself off.
+  barge_in_energy_threshold: 900
+  # Ignore this much of the start of playback: nobody reacts that fast, and the
+  # onset of the line is its loudest moment.
+  activation_onset_guard_ms: 150
+  # On barge-in, back the recording up this far so your first phoneme survives.
+  barge_in_guard_ms: 120
 
 # --- Stremio ---
 stremio:

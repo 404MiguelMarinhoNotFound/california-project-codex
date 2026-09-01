@@ -132,7 +132,7 @@ def test_stt(config: dict):
     stt = STTService(config)
 
     # Play chime
-    audio_pipeline.play_activation_sound()
+    audio_pipeline.play_activation_sound(blocking=True)
 
     # Record
     print("  🔴 Recording... (speak now)")
@@ -218,7 +218,7 @@ def test_full_pipeline(config: dict):
 
             # Record
             leds.set_state("listening")
-            audio_pipeline.play_activation_sound()
+            audio_pipeline.play_activation_sound(blocking=True)
 
             stream = audio_pipeline.create_mic_stream()
             stream.start()

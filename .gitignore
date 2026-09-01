@@ -6,9 +6,16 @@ __pycache__/
 *.onnx
 *.wav
 !sounds/.gitkeep
+# Generated alongside the activation WAVs by generate_activation_phrases.py.
+# Committing it would let the line text drift from the audio it describes.
+sounds/california_activations/manifest.json
 models/
 .DS_Store
 watch_state.json
 config.local.yaml
 vpn_state.json
 debug/
+
+# Recorded wake-word takes: audio output, and personal voice data
+training/recordings/
+debug/wakeword/

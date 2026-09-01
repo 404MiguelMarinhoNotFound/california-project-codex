@@ -41,6 +41,9 @@ DATA_DIR = "/data"
 OUTPUT_DIR = "/root/output"
 CONFIG_PATH = "/root/config.yaml"
 
+# Real recordings uploaded with `modal volume put`, folded in as extra positives.
+RECORDINGS_DIR = "/data/recordings"
+
 # Artifacts worth keeping, mirroring livekit's own skypilot/train.yaml.
 ARTIFACT_SUFFIXES = (".pt", ".onnx", "_metrics.json", "_det.png", "_eval.json")
 
@@ -60,6 +63,20 @@ image = (
 def _read_config(name: str) -> str:
     """Read a config next to this file. Sent as text so no local-file mount is needed."""
     return (Path(__file__).parent / name).read_text(encoding="utf-8")
+
+
+def _model_name(config_text: str) -> str:
+    """Pull model_name out of the YAML without importing yaml.
+
+    This runs locally under `uvx modal`, whose isolated environment has modal and
+    nothing else, so a regex is the portable option.
+    """
+    import re
+
+    match = re.search(r"^model_name:\s*[\"']?([\w.-]+)", config_text, re.M)
+    if not match:
+        raise SystemExit("config has no model_name")
+    return match.group(1)
 
 
 def _write_config(config_text: str) -> str:
@@ -91,7 +108,65 @@ def _setup_remote(config_text: str) -> None:
     _sh("du", "-sh", DATA_DIR)
 
 
-def _run_pipeline(config_text: str, model_name: str) -> dict:
+def _merge_recordings(model_name: str, replicate: int) -> int:
+    """Fold real recordings into the generated positives, before augmentation.
+
+    Two details here are load-bearing:
+
+    Naming. `augment.py` selects source clips with a strict `^clip_\d{6}\.wav$`
+    regex, so anything named otherwise is silently ignored — the clips would sit
+    in the directory, never train, and the run would look perfectly healthy.
+    Files are therefore renamed into that pattern, continuing past the highest
+    index Piper already wrote so nothing is overwritten.
+
+    Replication. A hundred-odd real clips against 25,000 synthetic ones is under
+    half a percent and the model would barely notice them. Each take is copied
+    `replicate` times; the copies are byte-identical here, but augmentation
+    applies independently random reverb, noise, and EQ per clip per round, so
+    each one becomes a genuinely distinct training example.
+    """
+    import re
+    import shutil
+
+    src_dir = Path(RECORDINGS_DIR)
+    dest_dir = Path(OUTPUT_DIR) / model_name / "positive_train"
+    if not src_dir.is_dir():
+        print(f"No recordings at {src_dir}, training on synthetic positives only.", flush=True)
+        return 0
+
+    # Recursive so accents can live in sibling directories (positive/, positive_pt/)
+    # and the share of each is controlled simply by how many are recorded.
+    takes = sorted(src_dir.glob("**/*.wav"))
+    if not takes:
+        print(f"{src_dir} is empty, training on synthetic positives only.", flush=True)
+        return 0
+
+    pattern = re.compile(r"^clip_(\d{6})\.wav$")
+    used = [
+        int(match.group(1))
+        for path in dest_dir.glob("*.wav")
+        if (match := pattern.match(path.name))
+    ]
+    index = max(used) + 1 if used else 0
+    synthetic = len(used)
+
+    written = 0
+    for take in takes:
+        for _ in range(replicate):
+            shutil.copy2(take, dest_dir / f"clip_{index:06d}.wav")
+            index += 1
+            written += 1
+
+    share = written / (synthetic + written) * 100 if synthetic + written else 0
+    print(
+        f"Merged {len(takes)} recordings x{replicate} = {written} clips into "
+        f"{dest_dir.name} alongside {synthetic} synthetic ({share:.1f}% real).",
+        flush=True,
+    )
+    return written
+
+
+def _run_pipeline(config_text: str, model_name: str, replicate: int = 0) -> dict:
     """generate -> augment -> train -> export -> eval, then save artifacts to the volume."""
     import json
     import shutil
@@ -103,7 +178,19 @@ def _run_pipeline(config_text: str, model_name: str) -> dict:
         print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
 
     cfg = _write_config(config_text)
-    _sh("livekit-wakeword", "run", cfg)
+
+    if replicate > 0:
+        # Stages run separately so recordings can be injected between generation
+        # and augmentation. `livekit-wakeword run` would do all of it in one go
+        # and leave no seam to merge into.
+        _sh("livekit-wakeword", "generate", cfg)
+        _merge_recordings(model_name, replicate)
+        _sh("livekit-wakeword", "augment", cfg)
+        _sh("livekit-wakeword", "train", cfg)
+        _sh("livekit-wakeword", "export", cfg)
+        _sh("livekit-wakeword", "eval", cfg)
+    else:
+        _sh("livekit-wakeword", "run", cfg)
 
     src = Path(OUTPUT_DIR) / model_name
     dest = Path(DATA_DIR) / "artifacts" / model_name
@@ -135,8 +222,8 @@ def _run_pipeline(config_text: str, model_name: str) -> dict:
     memory=32768,
     timeout=2 * 60 * 60,
 )
-def _run_smoke(config_text: str, model_name: str) -> dict:
-    return _run_pipeline(config_text, model_name)
+def _run_smoke(config_text: str, model_name: str, replicate: int = 0) -> dict:
+    return _run_pipeline(config_text, model_name, replicate)
 
 
 @app.function(
@@ -147,23 +234,45 @@ def _run_smoke(config_text: str, model_name: str) -> dict:
     memory=32768,
     timeout=24 * 60 * 60,
 )
-def _run_prod(config_text: str, model_name: str) -> dict:
-    return _run_pipeline(config_text, model_name)
+def _run_prod(config_text: str, model_name: str, replicate: int = 0) -> dict:
+    return _run_pipeline(config_text, model_name, replicate)
 
 
 @app.local_entrypoint()
-def setup():
-    """One-time: populate the volume. ~16GB, mostly the ACAV100M feature file."""
-    _setup_remote.remote(_read_config("california.yaml"))
+def setup(config: str = "california.yaml"):
+    """One-time: populate the volume. ~16GB, mostly the ACAV100M feature file.
+
+    Every config shares the same data_dir, so this only needs running once no
+    matter how many wake words get trained afterwards.
+    """
+    _setup_remote.remote(_read_config(config))
 
 
 @app.local_entrypoint()
-def smoke():
+def smoke(config: str = "california_smoke.yaml"):
     """Cheap end-to-end pipeline check on a T4. The resulting model is not usable."""
-    _run_smoke.remote(_read_config("california_smoke.yaml"), "california_smoke")
+    text = _read_config(config)
+    _run_smoke.remote(text, _model_name(text))
 
 
 @app.local_entrypoint()
-def train():
-    """The real run on an L40S."""
-    _run_prod.remote(_read_config("california.yaml"), "california")
+def train(config: str = "california_v2.yaml", replicate: int = 60):
+    """The real run on an L40S.
+
+        uvx modal run --detach training/modal_train.py::train
+        uvx modal run --detach training/modal_train.py::train --config california.yaml
+        uvx modal run --detach training/modal_train.py::train --replicate 0
+
+    Defaults to the current best config. model_name comes from the YAML, so runs
+    do not overwrite each other on the volume and can be compared.
+
+    `replicate` controls how many times each real recording in /data/recordings
+    is copied into the positive set before augmentation (60 puts ~175 takes at ~41%
+    of the positive set against n_samples: 15000, chosen because the baseline holdout
+    showed the synthetic English was carrying far less than assumed). 0 disables the
+    merge and
+    trains on synthetic audio only. Having no recordings uploaded is not an error;
+    the merge just no-ops.
+    """
+    text = _read_config(config)
+    _run_prod.remote(text, _model_name(text), replicate)
