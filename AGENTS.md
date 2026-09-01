@@ -107,6 +107,20 @@ Keep secrets in `.env` or another local-only secret mechanism. Do not commit rea
 > runs so far were badly optimistic — see Key Learnings. Set the threshold from held-out
 > recordings of Master Miguel using `tools/score_wakeword.py --dir`, never from the eval.
 >
+> **openWakeWord must be fed 1280-sample frames, and `consecutive_frames` did
+> nothing until it was.** `audio.chunk_duration_ms: 40` means the detector is fed
+> 640-sample chunks, but openWakeWord only computes a new embedding every 1280
+> samples (`openwakeword/utils.py::AudioFeatures._streaming_features` gates on
+> `accumulated_samples >= 1280 and accumulated_samples % 1280 == 0`). On a shorter
+> chunk `Model.predict` takes its `n_prepared_samples < 1280` branch and returns
+> the **previous prediction verbatim**. The live score stream was therefore
+> `0, S1, S1, S2, S2, ...`, so one real detection always produced two identical
+> frames over threshold and `consecutive_frames: 2` was silently equivalent to 1 —
+> the false-positive defence was off. `_process_oww` now buffers to the native
+> frame, mirroring what `_process_porcupine` always did. Do not "simplify" that
+> buffer away, and do not raise `audio.chunk_duration_ms` to 80 instead — the
+> recording path wants 40ms chunks.
+>
 > Do not reintroduce Porcupine without a paid key.
 
 -----
@@ -159,7 +173,7 @@ california/
 │   ├── run_stremio_e2e.py          # Live end-to-end Stremio routing and playback test
 │   ├── run_youtube_playlist_e2e.py # Live end-to-end YouTube playlist routing test
 │   ├── probe_govee_devices.py      # Lists Govee devices with sku, device id, and capabilities
-│   ├── score_wakeword.py           # Prints raw wake-word scores live; separates misses from threshold problems
+│   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
 │   ├── probe_stremio_sync.py       # Refreshes and inspects Stremio watch-state cache
 │   ├── debug_stremio_collections.py # Inspects raw Stremio collection payloads when sync is wrong
@@ -167,13 +181,16 @@ california/
 │   ├── search_youtube_videos.py    # Finds YouTube video candidates and derives radio playlist IDs
 │   └── validate_youtube_playlists.py # Fetches real YouTube page titles to confirm playlist IDs match the intended vibe
 ├── tests/
-│   ├── test_activation_phrases.py # Wake tiers, echo stripping, and recording trim
+│   ├── test_activation_capture.py # Activation clip naming and pruning
+│   ├── test_activation_phrases.py # Wake tiers, echo stripping, recording trim, dropped turns
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
 │   ├── test_media_service.py    # YouTube / ADB unit tests
 │   ├── test_orchestrator_lights.py # control_lights dispatch behavior
 │   ├── test_orchestrator_vpn_routing.py # VPN preflight routing behavior
 │   ├── test_stremio_service.py  # Stremio / TMDB / playback unit tests
 │   ├── test_surfshark_service.py # Surfshark route execution and cache behavior
+│   ├── test_vad_silence.py      # Grace window, saw-speech flag, Silero framing
+│   ├── test_wake_word_framing.py # openWakeWord native-frame buffering and consecutive frames
 │   └── test_youtube_playlist_resolver.py # Matching and random-selection coverage for saved playlists
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -334,6 +351,37 @@ talk straight over the line.
   cheap. To go back, raise `barge_in_energy_threshold` above the speaker's bleed level
   first — 900 is under it. `play_activation_sound` returns `duration = 0.0` when blocking,
   so the EchoGate window collapses to zero rather than waiting out a finished line
+
+### Listening: The Grace Window, and Why Silence Is Not An Input
+
+Recording has two phases, and they are deliberately asymmetric. `core/vad.py`
+tracks `saw_speech`, and the silence timer does not run until it is set.
+
+- **Pre-speech.** From `start_recording()` until the first real speech, the only
+  clock that runs is `vad.speech_timeout` (4.0s). If it expires,
+  `should_stop_recording` returns `"no_speech"` and the turn is dropped: no
+  Whisper call, no LLM call, no spoken reply, no LED change beyond going back to
+  idle. Call California and take two seconds to think — that now works
+- **Post-speech.** The old behaviour, except `min_recording` is measured from the
+  first speech rather than from the top of the recording
+- **`min_recording` used to be wall-clock elapsed, and silence counted toward it.**
+  That is the entire bug: on pure room tone the stop fired at
+  `max(min_recording 0.6, silence_duration 0.9)` ≈ 0.9s, and `_record_speech`
+  returned a buffer of nothing. Whisper reliably hallucinates its silence filler
+  out of that (`"Thank you."`, `"you"`, `"."`), the only pre-LLM guard was
+  `transcript.strip() == ""`, so Claude answered it and California spoke. Every
+  false wake cost a full turn and two API calls
+- **`speech_start_frames: 2`** means two consecutive 40ms chunks above the energy
+  threshold before the recorder decides he has started. A door or a keystroke is
+  one chunk
+- **`_record_speech` keeps its docstring's promise now.** It returns `None` on
+  `"no_speech"` and on any recording under `vad.min_recording`, and
+  `_handle_activation`'s `audio_data is None` branch — which was unreachable for
+  the life of the function — aborts silently, resets the wake detector so stale
+  audio cannot immediately re-fire, and rolls `_wake_count` back so a false
+  positive does not burn the one long cold-open line
+- **Only `"no_speech"` drops a turn.** A `"max_duration"` stop is still a command;
+  a 30-second monologue gets transcribed
 
 ### Producer-Consumer Audio Pattern
 
@@ -791,6 +839,10 @@ Current automated coverage exists for:
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
 - Activation tier selection, echo stripping, `EchoGate` arming, and the recording trim
+- The VAD grace window, the `saw_speech` flag, and Silero's 512-sample framing
+- openWakeWord native-frame buffering and real consecutive-frame behaviour
+- Dropped turns: `_record_speech` returning `None`, and `_handle_activation`
+  aborting without touching STT, the LLM, or TTS
 
 Useful live-debug commands:
 
@@ -808,6 +860,14 @@ uv run python tools\probe_govee_devices.py --transport cloud
 # threshold is 0.81" — those need opposite fixes.
 uv run python tools\score_wakeword.py
 uv run python tools\score_wakeword.py --save-clips debug\wakeword
+
+# Recall and false positives together. Set wake_word.capture.enabled: true in
+# config.yaml, live with her for a day, then score what she recorded of her own
+# false wakes. --framed decides with the live detector (threshold +
+# consecutive_frames + debounce) rather than peak model score; since the
+# 1280-frame fix those genuinely differ.
+uv run python tools\score_wakeword.py --negatives debug\activations --sweep
+uv run python tools\score_wakeword.py --dir training\recordings\holdout_en --framed
 uv run python tools\score_wakeword.py --dir training
 ecordings\holdout_pt
 uv run python tools\score_wakeword.py --dir training
@@ -885,6 +945,20 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 - Real recordings are scarce and synthetic clips are cheap, so replication and recording
   count are different levers: replication sets training *weight*, recording count sets
   *diversity*, and only the second adds information
+- **A knob that is never measured is a knob that may not be connected.**
+  `consecutive_frames: 2` read as a working false-positive defence for the life
+  of the project and was equivalent to 1, because the chunk size the orchestrator
+  reads (640) and the frame size openWakeWord scores (1280) were never reconciled.
+  Nothing failed loudly; the score stream just quietly repeated itself
+- **Silence is not an input, and a VAD that cannot tell "he has not started" from
+  "he has stopped" will treat it as one.** One boolean — has this recording ever
+  heard speech — is the difference between a false wake costing nothing and a
+  false wake costing two API calls and a spoken non-sequitur
+- **Recall tooling without false-positive tooling optimises one direction only.**
+  `tools/score_wakeword.py` could measure "would she hear me" from the first day
+  and had no way at all to measure "would she wake for nothing", so every
+  threshold decision was half-blind. `--negatives` and `--sweep` close that, fed
+  by clips California records of her own false wakes (`wake_word.capture`)
 - Plain show requests should sync first, then use `watch_state.json` as the resume source of truth for Stremio titles
 - TMDB is the fallback resolver for titles outside the local Stremio cache
 - `state=3` in `dumpsys media_session` is the practical playback signal
@@ -908,6 +982,16 @@ A whole-codebase bug audit was run on **2026-07-12**. Full report:
 `py_compile` clean except the stale `services/tts copy.py` dead file (that file, and
 `services/sentence_chunker copy.py`, were moved to `deprecated/` on 2026-08-25; the
 live tree now parses clean).
+
+Two bugs reported by Master Miguel were fixed on **2026-09-01**, both in the
+listening path and both compounding each other:
+
+- ~~**False wake-ups**~~ — the openWakeWord frame-size mismatch that disabled
+  `consecutive_frames` is fixed (see the wake-word note above). Threshold left at
+  0.81 deliberately; retune it from `--negatives --sweep` rather than from the
+  synthetic eval.
+- ~~**Silence treated as the command**~~ — `vad.speech_timeout` plus a
+  `saw_speech` flag; a wake nobody speaks into is now dropped before STT.
 
 Confirmed **High-severity** backlog:
 
