@@ -10,6 +10,8 @@ anything above --floor as an event, and can dump the audio that caused it.
   uv run python tools/score_wakeword.py
   uv run python tools/score_wakeword.py --floor 0.05 --save-clips debug/wakeword
   uv run python tools/score_wakeword.py --wav recording.wav
+  uv run python tools/score_wakeword.py --dir holdout/ --framed
+  uv run python tools/score_wakeword.py --negatives debug/activations --sweep
 
 Two things to measure before retraining:
 
@@ -24,6 +26,33 @@ Two things to measure before retraining:
 
 The score comes from the same openWakeWord model the assistant loads, at the
 same 16kHz, so the numbers transfer directly to config.yaml.
+
+Two ways to score, and they answer different questions:
+
+  Peak model score (default). The highest single-frame score in the file.
+  This measures the MODEL, and is what the recall table in config.yaml is
+  built from.
+
+  --framed. Pushes the file through detector.process_audio() in the same
+  640-sample chunks the assistant feeds it, so threshold, consecutive_frames
+  and debounce all apply. This measures the DECISION, which is what Master
+  Miguel actually experiences. Since the 1280-sample framing fix the two
+  genuinely differ: a lone spike now scores high and does not fire.
+
+Recall is only half the picture, and until --negatives existed it was the only
+half this tool could see. Turn on wake_word.capture in config.yaml, live with
+her for a day, and every debug/activations/*_no_speech.wav is a false fire she
+recorded herself. Then:
+
+  uv run python tools/score_wakeword.py --negatives debug/activations --sweep
+
+gives false fires per hour at each threshold, next to recall from --dir. That
+pair is what a threshold should be chosen from.
+
+Gotcha when building a negatives corpus: openWakeWord zeroes its first five
+predictions after a reset, so any clip shorter than about 0.5s scores 0.0 no
+matter what is in it, and would silently understate the false-positive rate.
+The 2s clips written by wake_word.capture are safely clear of this.
 """
 
 import argparse
@@ -96,15 +125,21 @@ def run_wav(detector, path: str, floor: float) -> None:
         if score > peak:
             peak, peak_at = score, t
 
+    detector._oww_model.reset()
     print(f"\npeak {peak:.4f} at {peak_at:.2f}s   (threshold is {detector.threshold})")
     print("verdict:", verdict(peak, detector.threshold))
 
 
-def score_wav(detector, path: str) -> float:
-    """Peak score over a WAV file. Returns 0.0 for unreadable or empty audio."""
+def read_wav(path: str) -> np.ndarray:
+    """int16 samples from a WAV, mono assumed (the whole pipeline is 16kHz mono)."""
     with wave.open(path, "rb") as wf:
         raw = wf.readframes(wf.getnframes())
-    audio = np.frombuffer(raw, dtype=np.int16)
+    return np.frombuffer(raw, dtype=np.int16)
+
+
+def score_wav(detector, path: str) -> float:
+    """Peak score over a WAV file. Returns 0.0 for unreadable or empty audio."""
+    audio = read_wav(path)
 
     chunk = 1280
     peak = 0.0
@@ -117,29 +152,69 @@ def score_wav(detector, path: str) -> float:
     return peak
 
 
-def run_dir(detector, directory: str, floor: float) -> None:
+def fires_framed(detector, path: str, chunk_samples: int = 640) -> bool:
+    """
+    Would the live detector actually fire on this file?
+
+    Runs process_audio() in the assistant's own chunk size, so threshold,
+    consecutive_frames and debounce all apply. Peak score answers "did the
+    model see it"; this answers "would she wake up", and since the 1280-frame
+    fix those are different questions.
+    """
+    audio = read_wav(path)
+    detector.reset()
+    detector._last_activation_time = 0.0
+    for start in range(0, len(audio) - chunk_samples + 1, chunk_samples):
+        if detector.process_audio(audio[start : start + chunk_samples]):
+            detector.reset()
+            return True
+    detector.reset()
+    return False
+
+
+def score_dir(detector, directory: str) -> list[tuple[Path, float, float]]:
+    """
+    (path, peak score, duration in seconds) for every WAV in a directory.
+
+    Shared by the recall (--dir) and false-positive (--negatives) modes so both
+    are measured the same way.
+    """
+    paths = sorted(Path(directory).glob("*.wav"))
+    if not paths:
+        raise SystemExit(f"no .wav files in {directory}")
+
+    rows = []
+    for path in paths:
+        peak = score_wav(detector, str(path))
+        rows.append((path, peak, len(read_wav(str(path))) / 16000))
+    return rows
+
+
+def run_dir(detector, directory: str, floor: float, framed: bool = False) -> list[tuple[Path, float, float]]:
     """Score every WAV in a directory and summarise. This is the retrain scorecard.
 
     Hold a slice of recordings back from training and run them through here before
     and after. Recall on livekit's own eval is measured against synthetic Piper
     audio, so it cannot tell you whether the model learned *your* voice; this can.
     """
-    paths = sorted(Path(directory).glob("*.wav"))
-    if not paths:
-        raise SystemExit(f"no .wav files in {directory}")
+    rows = score_dir(detector, directory)
 
-    peaks = []
-    for path in paths:
-        peak = score_wav(detector, str(path))
-        peaks.append(peak)
-        flag = "fires" if peak >= detector.threshold else "MISS "
+    for path, peak, _ in rows:
+        hit = fires_framed(detector, str(path)) if framed else peak >= detector.threshold
+        flag = "fires" if hit else "MISS "
         print(f"  {flag}  {peak:.4f}  {path.name}")
 
-    peaks_arr = np.array(peaks)
-    fired = int((peaks_arr >= detector.threshold).sum())
+    peaks_arr = np.array([peak for _, peak, _ in rows])
+    if framed:
+        fired = sum(1 for path, _, _ in rows if fires_framed(detector, str(path)))
+        label = f"live decision at {detector.threshold}, {detector.consecutive_required} frames"
+    else:
+        fired = int((peaks_arr >= detector.threshold).sum())
+        label = f"peak score at {detector.threshold}"
+
     print()
-    print(f"  files      : {len(peaks)}")
-    print(f"  would fire : {fired}/{len(peaks)}  ({fired / len(peaks):.1%} recall at {detector.threshold})")
+    print(f"  files      : {len(rows)}")
+    print(f"  would fire : {fired}/{len(rows)}  ({fired / len(rows):.1%} recall, {label})")
     print(f"  peak score : min {peaks_arr.min():.4f}  median {np.median(peaks_arr):.4f}  max {peaks_arr.max():.4f}")
 
     # The threshold that would catch 90% of these, if one exists.
@@ -148,6 +223,92 @@ def run_dir(detector, directory: str, floor: float) -> None:
         print(f"  a threshold of {ninety:.2f} would catch 90% of them")
     else:
         print("  no threshold catches 90% of these - the model does not know this voice")
+
+    return rows
+
+
+def run_negatives(detector, directory: str, framed: bool = False) -> list[tuple[Path, float, float]]:
+    """
+    False-positive rate over audio that should never have woken her.
+
+    Point this at debug/activations (see wake_word.capture in config.yaml):
+    every *_no_speech.wav there is a wake that nobody spoke into, which is the
+    definition of a false fire. Anything else with no wake word in it works too.
+    """
+    rows = score_dir(detector, directory)
+
+    short = [p.name for p, _, dur in rows if dur < 0.5]
+    fired_rows = []
+    for path, peak, dur in rows:
+        hit = fires_framed(detector, str(path)) if framed else peak >= detector.threshold
+        if hit:
+            fired_rows.append((path, peak))
+            print(f"  FIRES  {peak:.4f}  {path.name}")
+
+    total_hours = sum(dur for _, _, dur in rows) / 3600
+    peaks_arr = np.array([peak for _, peak, _ in rows])
+
+    print()
+    print(f"  files       : {len(rows)}  ({total_hours * 60:.1f} minutes of audio)")
+    print(f"  false fires : {len(fired_rows)}/{len(rows)} at threshold {detector.threshold}")
+    if total_hours > 0:
+        print(f"              : {len(fired_rows) / total_hours:.1f} per hour of this audio")
+    print(f"  worst peak  : {peaks_arr.max():.4f}")
+    clean = float(peaks_arr.max()) + 0.01
+    if clean <= 1.0:
+        print(f"  a threshold of {clean:.2f} would silence every one of these")
+    else:
+        print("  no threshold silences all of these - these need to be training negatives")
+    if short:
+        print(
+            f"  warning: {len(short)} clip(s) under 0.5s always score 0.0 "
+            "(openWakeWord zeroes its first 5 predictions after a reset) - "
+            f"ignore them: {', '.join(short[:5])}"
+        )
+    return rows
+
+
+def run_sweep(detector, positives, negatives, framed: bool = False) -> None:
+    """
+    Recall and false fires per hour across the threshold range.
+
+    This is the table config.yaml hand-writes, except measured. Pick a
+    threshold off the row where the two columns trade acceptably, rather
+    than off an eval computed against synthetic Piper audio.
+    """
+    steps = [round(x, 2) for x in np.arange(0.15, 0.96, 0.05)]
+    neg_hours = sum(dur for _, _, dur in negatives) / 3600 if negatives else 0.0
+
+    print()
+    print("  threshold   recall        false fires/hour")
+    print("  " + "-" * 44)
+    original = detector.threshold
+    try:
+        for step in steps:
+            detector.threshold = step
+
+            if positives:
+                if framed:
+                    hits = sum(1 for p, _, _ in positives if fires_framed(detector, str(p)))
+                else:
+                    hits = sum(1 for _, peak, _ in positives if peak >= step)
+                recall = f"{hits}/{len(positives)} ({hits / len(positives):5.1%})"
+            else:
+                recall = "     -"
+
+            if negatives:
+                if framed:
+                    fp = sum(1 for p, _, _ in negatives if fires_framed(detector, str(p)))
+                else:
+                    fp = sum(1 for _, peak, _ in negatives if peak >= step)
+                per_hour = f"{fp / neg_hours:8.1f}" if neg_hours > 0 else f"{fp:8d} total"
+            else:
+                per_hour = "       -"
+
+            marker = "  <- current" if abs(step - original) < 1e-9 else ""
+            print(f"     {step:.2f}     {recall:<16}{per_hour}{marker}")
+    finally:
+        detector.threshold = original
 
 
 def verdict(peak: float, threshold: float) -> str:
@@ -231,6 +392,24 @@ def main() -> None:
         metavar="DIR",
         help="write the 2s of audio behind each event to DIR, for listening back",
     )
+    parser.add_argument(
+        "--negatives",
+        metavar="DIR",
+        help="score audio that should NOT wake her (try debug/activations, "
+             "written by wake_word.capture) and report false fires per hour",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="with --dir and/or --negatives, print recall vs false-fires-per-hour "
+             "across the threshold range instead of guessing from one value",
+    )
+    parser.add_argument(
+        "--framed",
+        action="store_true",
+        help="decide with the live detector (threshold + consecutive_frames + "
+             "debounce) instead of peak model score - what she actually does",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -240,8 +419,16 @@ def main() -> None:
         config["wake_word"]["threshold"] = args.threshold
     detector = build_model(config)
 
-    if args.dir:
-        run_dir(detector, args.dir, args.floor)
+    if args.dir or args.negatives:
+        positives, negatives = [], []
+        if args.dir:
+            print(f"\npositives - should fire ({args.dir})\n")
+            positives = run_dir(detector, args.dir, args.floor, framed=args.framed)
+        if args.negatives:
+            print(f"\nnegatives - should stay quiet ({args.negatives})\n")
+            negatives = run_negatives(detector, args.negatives, framed=args.framed)
+        if args.sweep:
+            run_sweep(detector, positives, negatives, framed=args.framed)
     elif args.wav:
         run_wav(detector, args.wav, args.floor)
     else:

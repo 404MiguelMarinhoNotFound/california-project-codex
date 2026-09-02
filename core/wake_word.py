@@ -149,6 +149,19 @@ class WakeWordDetector:
         if not model_keys:
             raise ValueError(f"No wake word models loaded. Check model name: {model_spec}")
         self.primary_key = model_keys[0]
+
+        # openWakeWord only computes a new embedding every 1280 samples: see
+        # openwakeword/utils.py::AudioFeatures._streaming_features, which gates on
+        # `accumulated_samples >= 1280 and accumulated_samples % 1280 == 0`. Feed it
+        # anything smaller and Model.predict takes its `n_prepared_samples < 1280`
+        # branch and returns the PREVIOUS prediction verbatim. With this project's
+        # 40ms/640-sample chunks that made the score stream 0, S1, S1, S2, S2, ...
+        # so every real detection produced two identical frames above threshold and
+        # `consecutive_frames: 2` was silently equivalent to 1 — the false-positive
+        # defence was off. Buffer to the native frame so a "frame" is one inference.
+        self._oww_frame_length = 1280
+        self._oww_buffer = np.array([], dtype=np.int16)
+
         logger.info(f"Wake word model key: {self.primary_key}")
 
     # ─── Audio processing ────────────────────────────────────────────
@@ -187,17 +200,33 @@ class WakeWordDetector:
         return False
 
     def _process_oww(self, audio_chunk: np.ndarray) -> bool:
-        """openWakeWord scoring with consecutive-frame logic."""
-        prediction = self._oww_model.predict(audio_chunk)
-        score = prediction.get(self.primary_key, 0.0)
+        """
+        openWakeWord scoring with consecutive-frame logic.
 
-        if score >= self.threshold:
-            self._consecutive_count += 1
-        else:
-            self._consecutive_count = 0
+        Buffers to openWakeWord's native 1280-sample step (see _init_oww) so each
+        counted frame is a distinct inference. `consecutive_frames: 2` therefore
+        means ~160ms of sustained detection, which is what it always claimed to mean.
+        """
+        self._oww_buffer = np.concatenate([self._oww_buffer, audio_chunk.astype(np.int16)])
 
-        if self._consecutive_count >= self.consecutive_required:
-            return self._check_debounce(score=score)
+        while len(self._oww_buffer) >= self._oww_frame_length:
+            frame = self._oww_buffer[:self._oww_frame_length]
+            self._oww_buffer = self._oww_buffer[self._oww_frame_length:]
+
+            prediction = self._oww_model.predict(frame)
+            score = prediction.get(self.primary_key, 0.0)
+
+            if score >= self.threshold:
+                self._consecutive_count += 1
+            else:
+                self._consecutive_count = 0
+
+            if self._consecutive_count >= self.consecutive_required:
+                # Whatever is left in the buffer is the start of his command,
+                # not wake word, and the recorder owns the mic from here.
+                self._oww_buffer = np.array([], dtype=np.int16)
+                return self._check_debounce(score=score)
+
         return False
 
     def _check_debounce(self, score: float) -> bool:
@@ -213,6 +242,7 @@ class WakeWordDetector:
 
         if self._backend == "oww":
             self._oww_model.reset()
+            self._oww_buffer = np.array([], dtype=np.int16)
         return True
 
     # ─── Control ─────────────────────────────────────────────────────
@@ -230,6 +260,7 @@ class WakeWordDetector:
         self._consecutive_count = 0
         if self._backend == "oww":
             self._oww_model.reset()
+            self._oww_buffer = np.array([], dtype=np.int16)
         elif self._backend == "porcupine":
             self._ppn_buffer = np.array([], dtype=np.int16)
 

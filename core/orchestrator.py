@@ -9,6 +9,7 @@ LLM tokens flow through sentence chunker into TTS, so the user hears
 the first sentence while the LLM is still generating.
 """
 
+import collections
 import glob
 import os
 import random
@@ -319,6 +320,34 @@ def _chunk_rms(audio_chunk: np.ndarray) -> float:
     return float(np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2)))
 
 
+def _activation_clip_name(outcome: str, when: float | None = None) -> str:
+    """
+    Filename for a captured activation, labelled by what came of it.
+
+    The label is the whole point: a `no_speech` or `short` clip is by
+    construction a false positive, so `debug/activations/*_no_speech.wav`
+    is a ready-made negatives corpus for
+    `tools/score_wakeword.py --negatives`.
+    """
+    when = time.time() if when is None else when
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(when))
+    return f"{stamp}_{int(when * 1000) % 1000:03d}_{outcome}.wav"
+
+
+def _prune_clips(directory: str, max_files: int) -> list[str]:
+    """Delete the oldest clips beyond max_files. Returns what was removed."""
+    if max_files <= 0:
+        return []
+    existing = sorted(glob.glob(os.path.join(directory, "*.wav")))
+    doomed = existing[:-max_files] if len(existing) > max_files else []
+    for path in doomed:
+        try:
+            os.remove(path)
+        except OSError:
+            logger.debug("Could not prune activation clip %s", path)
+    return doomed
+
+
 def _dispatch_lights(params: dict, govee_svc) -> str:
     """
     Govee light control. Module-level and service-injected for the same reason
@@ -438,9 +467,31 @@ class Orchestrator:
         self._onset_guard_s = float(sounds_cfg.get("activation_onset_guard_ms", 150)) / 1000.0
         self._barge_in_guard_s = float(sounds_cfg.get("barge_in_guard_ms", 120)) / 1000.0
 
+        # A recording shorter than this is not a command, whatever the VAD said.
+        # _record_speech has always promised this in its docstring; now it keeps it.
+        self._min_recording_s = float(config.get("vad", {}).get("min_recording", 0.0))
+
+        # Optional capture of the audio around each activation, off by default.
+        # Flip it on to collect real false positives, then score them with
+        # tools/score_wakeword.py --negatives.
+        capture_cfg = config.get("wake_word", {}).get("capture", {}) or {}
+        self._capture_enabled = bool(capture_cfg.get("enabled", False))
+        self._capture_dir = capture_cfg.get("dir", "debug/activations")
+        self._capture_max_files = int(capture_cfg.get("max_files", 200))
+        pre_seconds = float(capture_cfg.get("pre_seconds", 2.0))
+        self._capture_ring = None
+        if self._capture_enabled:
+            ring_len = max(1, int(pre_seconds * self.audio.sample_rate / self.audio.chunk_samples))
+            self._capture_ring = collections.deque(maxlen=ring_len)
+            logger.info(
+                "Activation capture on: %s (%.1fs pre-roll, keeping %d clips)",
+                self._capture_dir, pre_seconds, self._capture_max_files,
+            )
+
         # State
         self._running = False
         self._interrupted = False  # Barge-in flag
+        self._last_record_outcome = "ok"  # "ok" | "no_speech" | "short"
 
         logger.info("All components initialized successfully")
 
@@ -507,12 +558,18 @@ class Orchestrator:
 
         audio_chunk = self.audio.bytes_to_numpy(audio_bytes)
 
+        # Keep the last couple of seconds so a capture can show what she
+        # actually heard, including the audio *before* the wake fired.
+        if self._capture_ring is not None:
+            self._capture_ring.append(audio_chunk)
+
         # Feed to wake word detector
         if self.wake_word.process_audio(audio_chunk):
             # Wake word detected!
-            self._handle_activation(mic_stream)
+            pre_roll = list(self._capture_ring) if self._capture_ring is not None else []
+            self._handle_activation(mic_stream, pre_roll=pre_roll)
 
-    def _handle_activation(self, mic_stream):
+    def _handle_activation(self, mic_stream, pre_roll=None):
         """
         Handle a wake word activation:
         1. Start the activation line (does not block the microphone)
@@ -520,6 +577,10 @@ class Orchestrator:
         3. Transcribe
         4. Query LLM (streaming)
         5. Speak response (streaming)
+
+        If nothing was ever said (a false wake, or he changed his mind), step 2
+        returns None and this goes quietly back to idle — no Whisper call, no
+        LLM call, no spoken reply. Silence is not an input.
         """
         logger.info("--- Wake word activated ---")
 
@@ -542,8 +603,18 @@ class Orchestrator:
         audio_data = self._record_speech(mic_stream, playback)
 
         if audio_data is None or len(audio_data) == 0:
-            logger.info("No speech recorded, returning to idle")
+            logger.info("No speech after the wake word — returning to idle without asking")
+            self._capture_activation(pre_roll, None, self._last_record_outcome)
+            self.audio.stop_playback()
+            # Clear the detector's frame counter and openWakeWord's feature
+            # buffers so the same stale audio cannot immediately re-fire.
+            self.wake_word.reset()
+            # Do not let a false positive burn the one long cold-open line.
+            self._wake_count = max(0, self._wake_count - 1)
+            self.leds.set_state("idle")
             return
+
+        self._capture_activation(pre_roll, audio_data, self._last_record_outcome)
 
         # --- PROCESSING: STT → LLM ---
         self.leds.set_state("thinking")
@@ -576,6 +647,32 @@ class Orchestrator:
         self.leds.set_state("thinking")
         self._stream_response(transcript)
 
+    def _capture_activation(self, pre_roll, recorded, outcome: str):
+        """
+        Write the audio around one activation to disk, labelled by outcome.
+
+        Diagnostics only, and off unless wake_word.capture.enabled is set. It
+        must never be able to break a turn, hence the blanket except.
+        """
+        if not self._capture_enabled:
+            return
+
+        try:
+            parts = list(pre_roll or [])
+            if recorded is not None and len(recorded):
+                parts.append(recorded)
+            if not parts:
+                return
+
+            os.makedirs(self._capture_dir, exist_ok=True)
+            path = os.path.join(self._capture_dir, _activation_clip_name(outcome))
+            with open(path, "wb") as fh:
+                fh.write(self.audio.numpy_to_wav_bytes(np.concatenate(parts)))
+            _prune_clips(self._capture_dir, self._capture_max_files)
+            logger.info("Captured activation clip: %s", path)
+        except Exception:
+            logger.exception("Failed to capture activation clip")
+
     def _record_speech(self, mic_stream, playback=None) -> np.ndarray | None:
         """
         Record audio until VAD detects silence.
@@ -586,7 +683,12 @@ class Orchestrator:
         coming back through the speaker. An EchoGate holds the VAD clock until
         the line ends or Master Miguel talks over it, and those chunks are then
         dropped so Whisper never sees them.
+
+        Returns None when he never spoke ("no_speech", the VAD's grace window
+        expired) or when what he said is shorter than vad.min_recording. Both
+        are dropped before STT — an empty turn is cheaper than a hallucinated one.
         """
+        self._last_record_outcome = "ok"
         window = playback.duration if playback else 0.0
         gate = EchoGate(window, self._barge_in_rms, self._onset_guard_s)
 
@@ -594,6 +696,7 @@ class Orchestrator:
         started = time.monotonic()
         chunks = []
         trim_from = 0
+        stop_reason = "continue"
 
         while True:
             audio_bytes, overflowed = mic_stream.read(self.audio.chunk_samples)
@@ -626,14 +729,38 @@ class Orchestrator:
             should_stop, reason = self.vad.should_stop_recording(audio_chunk)
             if should_stop:
                 logger.info(f"Recording stopped: {reason}")
+                stop_reason = reason
                 break
+
+        if stop_reason == "no_speech":
+            # The grace window ran out with nothing said. Almost always a false
+            # wake; occasionally he called her and thought better of it. Either
+            # way there is nothing to transcribe.
+            self._last_record_outcome = "no_speech"
+            logger.info(
+                "Nothing said within %.1fs of the wake word — dropping the turn",
+                getattr(self.vad, "speech_timeout", 0.0),
+            )
+            return None
 
         kept = chunks[trim_from:]
         if not kept:
+            self._last_record_outcome = "short"
             return None
 
         audio_data = np.concatenate(kept)
         duration = len(audio_data) / self.audio.sample_rate
+
+        if duration < self._min_recording_s:
+            # The docstring has always promised this; now it is true. Mostly
+            # reachable via the barge-in trim, which can leave a few chunks.
+            self._last_record_outcome = "short"
+            logger.info(
+                "Recording too short (%.2fs < %.2fs) — dropping the turn",
+                duration, self._min_recording_s,
+            )
+            return None
+
         logger.info(
             "Recorded %.1fs of audio (dropped %.1fs of activation overlap)",
             duration,

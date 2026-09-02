@@ -34,19 +34,67 @@ wake_word:
   # Walk it down this table if misses annoy more than false fires. Those numbers
   # are peak single-frame scores, while the detector needs consecutive_frames in a
   # row, so live recall runs a little under them and live false positives under too.
-  # Measure both ends with tools/score_wakeword.py --save-clips before moving it.
+  #
+  # IMPORTANT: that table was measured while consecutive_frames was silently
+  # broken (see below), i.e. under a detector that fired on ONE frame. Live recall
+  # is now somewhat lower than it shows, and live false positives lower too.
+  # Re-measure with tools/score_wakeword.py --framed before trusting a number here.
   threshold: 0.81
   sensitivity: 0.6          # Porcupine-specific alias, unused on this backend
-  consecutive_frames: 2     # Only used by openWakeWord backend
+  # Native openWakeWord frames (1280 samples / 80ms each) that must clear the
+  # threshold back to back. 2 = 160ms of sustained detection.
+  #
+  # This did nothing until 2026-09-01. audio.chunk_duration_ms is 40, so the
+  # detector was fed 640-sample chunks, and openWakeWord only computes a new
+  # score every 1280 samples - on a short chunk Model.predict returns the
+  # PREVIOUS score verbatim. The stream was 0, S1, S1, S2, S2, ... so one real
+  # detection always produced two frames over threshold and 2 meant 1.
+  # core/wake_word.py now buffers to 1280 so this knob is real. Raise to 3 for
+  # fewer false fires at the cost of having to hold the word slightly longer.
+  consecutive_frames: 2
   debounce_seconds: 1.2     # Ignore re-triggers for N seconds after activation
 
+  # Record what she heard around each activation, so false positives stop being
+  # anecdotes. Clips are labelled by outcome: *_no_speech.wav and *_short.wav are
+  # by construction false fires (she woke, nobody spoke), which makes the folder a
+  # ready-made negatives corpus:
+  #   uv run python tools/score_wakeword.py --negatives debug/activations --sweep
+  # Off by default - it costs a deque of recent audio on the idle path.
+  capture:
+    enabled: false
+    dir: "debug/activations"
+    pre_seconds: 2.0        # audio kept from BEFORE the wake fired
+    max_files: 200          # oldest clips are pruned past this
+
 vad:
+  # "silero" is neural and better in noise, but torch/torchaudio only ship in the
+  # `silero` extra, which `default` does not include - so on a normal install this
+  # silently falls back to "energy" and the energy_threshold below is what actually
+  # runs. Set "energy" explicitly if you want to stop pretending otherwise.
   engine: "silero"
   # Keep these even if your code only uses some of them
   energy_threshold: 200 # lower = more sensitive (try 100–300 for quiet mics)
-  silence_duration: 0.9
+  silence_duration: 0.9     # quiet needed to end a turn, measured AFTER he speaks
   max_recording: 30.0
-  min_recording: 0.6        # Ignore ultra-short recordings
+
+  # How long she waits for you to START talking after the wake word. Say
+  # "California", think for two seconds, then speak - that now works. Before
+  # this key existed, min_recording counted silence, so a 0.9s pause was taken
+  # as the whole command and Whisper hallucinated something out of room tone.
+  # If the window expires with nothing said she drops the turn silently: no
+  # transcription, no LLM call, no reply. Raise it if you like to think out
+  # loud, lower it to reset faster after a false wake.
+  speech_timeout: 4.0
+  # Consecutive chunks (40ms each) of speech-level audio needed to decide you
+  # have actually started. 2 = 80ms, enough that a door or a keystroke does not
+  # count as the beginning of a sentence.
+  speech_start_frames: 2
+  # Silero confidence above which a window counts as speech. Ignored on the
+  # energy engine.
+  silero_threshold: 0.5
+  # Minimum SPEECH, not minimum wall clock. Anything shorter is dropped before
+  # STT rather than sent as a command.
+  min_recording: 0.6
 
 # --- Audio Capture ---
 audio:

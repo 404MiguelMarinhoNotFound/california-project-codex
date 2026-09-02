@@ -105,7 +105,8 @@ class ChunkRmsTests(unittest.TestCase):
         self.assertAlmostEqual(_chunk_rms(np.full(64, 500, dtype=np.int16)), 500.0, places=3)
 
 
-def _fake_orchestrator(loud_from=None, stop_after=3):
+def _fake_orchestrator(loud_from=None, stop_after=3, stop_reason="silence",
+                       min_recording_s=0.0):
     """
     An Orchestrator with only what _record_speech touches, built without running
     __init__ so the test needs no audio device, model or API key.
@@ -117,6 +118,10 @@ def _fake_orchestrator(loud_from=None, stop_after=3):
     orch._barge_in_rms = 900.0
     orch._onset_guard_s = 0.15
     orch._barge_in_guard_s = 0.12
+    # The trim tests deal in 3-6 chunks (120-240ms), so the real 0.6s floor
+    # would drop every one of them. The floor itself is tested separately.
+    orch._min_recording_s = min_recording_s
+    orch._last_record_outcome = "ok"
 
     orch.audio = Mock()
     orch.audio.chunk_samples = CHUNK_SAMPLES
@@ -139,9 +144,10 @@ def _fake_orchestrator(loud_from=None, stop_after=3):
 
     def should_stop(_chunk):
         live["n"] += 1
-        return (live["n"] >= stop_after, "silence")
+        return (live["n"] >= stop_after, stop_reason)
 
     orch.vad = Mock()
+    orch.vad.speech_timeout = 4.0
     orch.vad.should_stop_recording = should_stop
     return orch, mic, counter
 
@@ -203,6 +209,88 @@ class RecordSpeechTrimTests(unittest.TestCase):
         orch, mic, _ = _fake_orchestrator(loud_from=0, stop_after=3)
         audio = self._run(orch, mic, None)
         self.assertEqual(len(audio), 3 * CHUNK_SAMPLES)
+
+
+class RecordSpeechDropsEmptyTurnsTests(unittest.TestCase):
+    """
+    A wake with nothing said after it must not reach Whisper. It used to: the
+    VAD stopped on ~0.9s of room tone, Whisper hallucinated "Thank you." out of
+    it, and California answered that.
+    """
+
+    def _run(self, orch, mic, playback=None):
+        ticks = [i * CHUNK_SECONDS for i in range(500)]
+        with patch("core.orchestrator.time.monotonic", side_effect=ticks):
+            return orch._record_speech(mic, playback)
+
+    def test_returns_none_when_nothing_was_said(self):
+        orch, mic, _ = _fake_orchestrator(stop_after=3, stop_reason="no_speech")
+        self.assertIsNone(self._run(orch, mic))
+        self.assertEqual(orch._last_record_outcome, "no_speech")
+
+    def test_returns_none_when_the_recording_is_shorter_than_min_recording(self):
+        # 3 chunks = 120ms, well under a 0.6s floor.
+        orch, mic, _ = _fake_orchestrator(stop_after=3, min_recording_s=0.6)
+        self.assertIsNone(self._run(orch, mic))
+        self.assertEqual(orch._last_record_outcome, "short")
+
+    def test_keeps_a_recording_that_clears_the_floor(self):
+        # 20 chunks = 800ms.
+        orch, mic, _ = _fake_orchestrator(stop_after=20, min_recording_s=0.6)
+        audio = self._run(orch, mic)
+        self.assertEqual(len(audio), 20 * CHUNK_SAMPLES)
+        self.assertEqual(orch._last_record_outcome, "ok")
+
+    def test_a_max_duration_stop_is_still_kept(self):
+        # Only "no_speech" drops the turn — a 30s monologue is still a command.
+        orch, mic, _ = _fake_orchestrator(stop_after=20, stop_reason="max_duration")
+        self.assertIsNotNone(self._run(orch, mic))
+
+
+class HandleActivationAbortTests(unittest.TestCase):
+    """A dropped turn must be silent and free: no STT, no LLM, no spoken reply."""
+
+    def _orchestrator(self):
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.audio = Mock()
+        orch.stt = Mock()
+        orch.leds = Mock()
+        orch.wake_word = Mock()
+        orch._wake_count = 3
+        orch._capture_enabled = False
+        orch._capture_ring = None
+        orch._last_record_outcome = "no_speech"
+        orch._stream_response = Mock()
+        orch.audio.play_activation_sound.return_value = Mock(
+            duration=0.0, name="warm_01", text="Sup."
+        )
+        return orch
+
+    def test_no_speech_never_reaches_stt_or_the_llm(self):
+        orch = self._orchestrator()
+        with patch.object(Orchestrator, "_record_speech", return_value=None):
+            orch._handle_activation(Mock())
+
+        orch.stt.transcribe.assert_not_called()
+        orch._stream_response.assert_not_called()
+        orch.audio.play_error_sound.assert_not_called()
+
+    def test_no_speech_resets_the_detector_and_returns_to_idle(self):
+        orch = self._orchestrator()
+        with patch.object(Orchestrator, "_record_speech", return_value=None):
+            orch._handle_activation(Mock())
+
+        orch.wake_word.reset.assert_called_once()
+        orch.leds.set_state.assert_called_with("idle")
+
+    def test_a_false_wake_does_not_burn_the_cold_open_line(self):
+        # The long first-of-run line is worth exactly one use. A false positive
+        # that consumed it would mean the real first wake gets a curt "Sup."
+        orch = self._orchestrator()
+        orch._wake_count = 0
+        with patch.object(Orchestrator, "_record_speech", return_value=None):
+            orch._handle_activation(Mock())
+        self.assertEqual(orch._wake_count, 0)
 
 
 if __name__ == "__main__":
