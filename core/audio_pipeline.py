@@ -183,6 +183,37 @@ class AudioPipeline:
             device=self.device,
         )
 
+    def drain_mic_stream(self, mic_stream, max_seconds: float = 30.0) -> int:
+        """
+        Throw away everything sitting in the mic's buffer. Returns frames dropped.
+
+        The stream is opened once at boot and never stopped, so it keeps
+        capturing whenever nobody is reading it — through the bootup sound,
+        through a blocking activation line, and through the whole LLM and TTS
+        response. `RawInputStream.read()` hands back the OLDEST buffered frames,
+        so without this the next read replays California's own voice out of the
+        buffer instead of listening to the room. That is not a theoretical
+        concern: it is why a blocking activation line was still being recorded
+        and transcribed, and why her own spoken reply was being fed straight
+        back into the wake-word detector.
+
+        Call this at every point where the orchestrator has been away from the
+        microphone and is about to start listening again.
+        """
+        limit = int(max_seconds * self.sample_rate)
+        dropped = 0
+        # New audio keeps arriving while draining, but reads drain far faster
+        # than real time, so this converges. `limit` is a safety net, not a
+        # working part.
+        while dropped < limit:
+            available = mic_stream.read_available
+            if available <= 0:
+                break
+            frames = min(available, limit - dropped)
+            mic_stream.read(frames)
+            dropped += frames
+        return dropped
+
     def bytes_to_numpy(self, audio_bytes: bytes) -> np.ndarray:
         """Convert raw int16 bytes to numpy array."""
         return np.frombuffer(audio_bytes, dtype=np.int16)

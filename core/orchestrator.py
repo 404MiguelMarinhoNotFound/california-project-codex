@@ -529,6 +529,9 @@ class Orchestrator:
         mic_stream = self.audio.create_mic_stream()
         mic_stream.start()
         self._play_bootup_sound()
+        # The bootup line went out of the speaker and straight into the mic
+        # buffer. Do not hand it to the wake-word detector.
+        self._drain_mic(mic_stream, "bootup sound")
 
         try:
             while self._running:
@@ -568,6 +571,14 @@ class Orchestrator:
             # Wake word detected!
             pre_roll = list(self._capture_ring) if self._capture_ring is not None else []
             self._handle_activation(mic_stream, pre_roll=pre_roll)
+
+            # The whole turn — thinking, and every sentence she spoke — went
+            # into the mic buffer while nobody was reading it. Feeding her own
+            # reply back to the wake-word detector is a false-positive machine,
+            # so drop it. One drain here covers every way an activation ends.
+            self._drain_mic(mic_stream, "response playback")
+            if self._capture_ring is not None:
+                self._capture_ring.clear()
 
     def _handle_activation(self, mic_stream, pre_roll=None):
         """
@@ -647,6 +658,27 @@ class Orchestrator:
         self.leds.set_state("thinking")
         self._stream_response(transcript)
 
+    def _drain_mic(self, mic_stream, why: str):
+        """
+        Drop whatever the mic buffered while we were not listening.
+
+        See AudioPipeline.drain_mic_stream. Anywhere the orchestrator stops
+        reading the stream — playing a line, thinking, speaking — the buffer
+        fills with the room and with California herself, and the next read
+        would hand that back as if it had just happened.
+        """
+        # The logging lives inside the try on purpose: a diagnostic must never
+        # be the thing that breaks a turn.
+        try:
+            dropped = self.audio.drain_mic_stream(mic_stream)
+            if dropped:
+                logger.debug(
+                    "Dropped %.2fs of stale mic audio (%s)",
+                    dropped / self.audio.sample_rate, why,
+                )
+        except Exception:
+            logger.exception("Could not drain the mic buffer (%s)", why)
+
     def _capture_activation(self, pre_roll, recorded, outcome: str):
         """
         Write the audio around one activation to disk, labelled by outcome.
@@ -689,6 +721,14 @@ class Orchestrator:
         are dropped before STT — an empty turn is cheaper than a hallucinated one.
         """
         self._last_record_outcome = "ok"
+
+        # Start from what the room is doing NOW. With a blocking activation
+        # line this is the whole fix: the line played out of the speaker and
+        # into the mic buffer, and without this the first thing "recorded" is
+        # her own voice read back out of it — which is exactly what got
+        # transcribed and answered.
+        self._drain_mic(mic_stream, "activation line")
+
         window = playback.duration if playback else 0.0
         gate = EchoGate(window, self._barge_in_rms, self._onset_guard_s)
 

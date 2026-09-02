@@ -236,6 +236,14 @@ sounds:
   # Set false to record during playback again, but raise
   # barge_in_energy_threshold first - the 900 below is under this speaker's bleed
   # level, and that is what caused the self-trigger.
+  #
+  # NOTE: blocking on its own was NOT enough, and for a while looked like it was
+  # doing nothing at all. The mic stream is opened once at boot and never
+  # stopped, so it kept capturing her line while playback blocked, and
+  # RawInputStream.read() returns the OLDEST buffered frames - so _record_speech
+  # read her own line straight back out of the buffer and sent it to Whisper.
+  # Orchestrator._drain_mic() now flushes that buffer before recording. Do not
+  # remove it; blocking playback is only half the fix.
   activation_blocking: true
 
   # RMS above which mic input during playback counts as you talking over her,

@@ -185,6 +185,7 @@ california/
 │   ├── test_activation_phrases.py # Wake tiers, echo stripping, recording trim, dropped turns
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
 │   ├── test_media_service.py    # YouTube / ADB unit tests
+│   ├── test_mic_drain.py        # Stale mic-buffer draining after playback
 │   ├── test_orchestrator_lights.py # control_lights dispatch behavior
 │   ├── test_orchestrator_vpn_routing.py # VPN preflight routing behavior
 │   ├── test_stremio_service.py  # Stremio / TMDB / playback unit tests
@@ -351,6 +352,31 @@ talk straight over the line.
   cheap. To go back, raise `barge_in_energy_threshold` above the speaker's bleed level
   first — 900 is under it. `play_activation_sound` returns `duration = 0.0` when blocking,
   so the EchoGate window collapses to zero rather than waiting out a finished line
+
+### The Microphone Buffer Is Not A Live Feed
+
+`AudioPipeline.create_mic_stream()` is called once in `run()` and the stream is
+never stopped until shutdown. It keeps capturing the whole time, and
+`sd.RawInputStream.read()` returns the **oldest buffered frames**, not what the
+room is doing now. So every stretch where the orchestrator is not reading —
+the bootup line, a blocking activation line, the entire LLM and TTS response —
+piles up in that buffer, and the next `read()` replays it.
+
+- **This is why `sounds.activation_blocking: true` did not fix the overlap.**
+  It really does wait for the line to finish. The line is then sitting in the
+  mic buffer, and `_record_speech` reads it straight back. Observed live: a
+  1.25s cold line, `Recorded 1.2s of audio`, transcript `"Yeah."` — her own
+  tail, answered as a command. `EchoGate` cannot help here; with blocking
+  playback `duration` is `0.0`, so the gate is pre-armed and inert
+- **It is also a false-positive source.** After she finishes speaking a reply,
+  `_idle_loop`'s next read hands her own voice to the wake-word detector
+- `AudioPipeline.drain_mic_stream()` discards what is buffered, and
+  `Orchestrator._drain_mic()` wraps it. It is called after the bootup sound, at
+  the top of `_record_speech`, and after every activation completes. **Any new
+  code path that plays audio and then listens must drain too**
+- Draining is a no-op while the idle loop is running, because that loop
+  consumes chunks in real time and the buffer stays near empty. Never drain
+  inside the idle loop itself — that would throw away the wake word
 
 ### Listening: The Grace Window, and Why Silence Is Not An Input
 
@@ -840,6 +866,7 @@ Current automated coverage exists for:
 - YouTube playlist name matching and random multi-ID selection
 - Activation tier selection, echo stripping, `EchoGate` arming, and the recording trim
 - The VAD grace window, the `saw_speech` flag, and Silero's 512-sample framing
+- Mic-buffer draining after playback, and that the idle loop does not drain
 - openWakeWord native-frame buffering and real consecutive-frame behaviour
 - Dropped turns: `_record_speech` returning `None`, and `_handle_activation`
   aborting without touching STT, the LLM, or TTS
@@ -945,6 +972,12 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 - Real recordings are scarce and synthetic clips are cheap, so replication and recording
   count are different levers: replication sets training *weight*, recording count sets
   *diversity*, and only the second adds information
+- **A buffered stream is a recording of the past, not a view of the present.**
+  Blocking playback looked like the conservative, obviously-correct way to keep
+  California from hearing herself, and it was not, because nothing was reading
+  the mic while she spoke. Two separate defences — `activation_blocking` and
+  `EchoGate` — were both aimed at speaker bleed arriving *live*, and neither
+  addressed audio arriving *late*
 - **A knob that is never measured is a knob that may not be connected.**
   `consecutive_frames: 2` read as a working false-positive defence for the life
   of the project and was equivalent to 1, because the chunk size the orchestrator

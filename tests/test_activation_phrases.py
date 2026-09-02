@@ -127,6 +127,8 @@ def _fake_orchestrator(loud_from=None, stop_after=3, stop_reason="silence",
     orch.audio.chunk_samples = CHUNK_SAMPLES
     orch.audio.sample_rate = SAMPLE_RATE
     orch.audio.bytes_to_numpy = lambda b: np.frombuffer(b, dtype=np.int16)
+    # Real drain_mic_stream returns a frame count; a bare Mock would not divide.
+    orch.audio.drain_mic_stream = Mock(return_value=0)
 
     counter = {"n": 0}
 
