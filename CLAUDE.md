@@ -189,7 +189,7 @@ california/
 │   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
 │   ├── llm.py                   # Multi-provider LLM streaming + tool calling
 │   ├── govee_service.py         # Govee cloud v2 light control
-│   ├── name_matcher.py          # Shared fuzzy hint -> key matching (playlists, light rooms)
+│   ├── name_matcher.py          # Shared fuzzy hint -> key matching: exact, despaced, substring, token overlap
 │   ├── media_service.py         # Generic Mi Box / Android TV ADB controls
 │   ├── sentence_chunker.py      # Splits streamed LLM output into sentences
 │   ├── stremio_service.py       # Stremio auth, sync, TMDB lookup, deep-link playback
@@ -217,7 +217,8 @@ california/
 │   ├── debug_stremio_collections.py # Inspects raw Stremio collection payloads when sync is wrong
 │   ├── search_youtube_playlists.py # Finds public YouTube playlist candidates by search query
 │   ├── search_youtube_videos.py    # Finds YouTube video candidates and derives radio playlist IDs
-│   └── validate_youtube_playlists.py # Fetches real YouTube page titles to confirm playlist IDs match the intended vibe
+│   ├── validate_youtube_playlists.py # Checks every saved playlist ID still exists (oembed); nonzero exit on failure
+│   └── youtube_http.py             # Shared spoofed-UA fetch for the three YouTube tools
 ├── tests/
 │   ├── test_activation_capture.py # Activation clip naming and pruning
 │   ├── test_activation_phrases.py # Wake tiers, echo stripping, recording trim, dropped turns
@@ -231,7 +232,10 @@ california/
 │   ├── test_surfshark_service.py # Surfshark route execution and cache behavior
 │   ├── test_vad_silence.py      # Grace window, saw-speech flag, Silero framing
 │   ├── test_wake_word_framing.py # openWakeWord native-frame buffering, consecutive frames, dither floor
-│   └── test_youtube_playlist_resolver.py # Matching and random-selection coverage for saved playlists
+│   ├── test_name_matcher.py     # Matcher tier order, despacing, "&" normalization
+│   ├── test_playlist_config.py  # Structural sweep of the real config.yaml playlist data
+│   ├── test_youtube_playlist_resolver.py # Matching, aliases, and random-selection coverage
+│   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
 ├── deprecated/                  # Retired files kept for reference, see deprecated/README.md
@@ -576,6 +580,11 @@ alias for every colour ("warmwhite" for "warm white") so the exact-match tier fi
 Without it the substring tier matches "white" inside "warmwhite" and returns the wrong colour.
 Hex input is checked before name matching. Do not "simplify" either away.
 
+`match_name` now has a despaced tier of its own, sitting between exact and substring, which
+makes `resolve_color()`'s manual despaced alias strictly redundant. **It stays anyway**: it keeps
+`resolve_color` correct without depending on `name_matcher`'s tier list staying in its current
+order. Still do not remove either. `tests/test_name_matcher.py` pins the ordering.
+
 **Three BLE findings worth not rediscovering:**
 
 - **All BLE work must run on the transport's own thread, in an MTA COM apartment.**
@@ -719,10 +728,43 @@ Cold-start behavior:
 `services/youtube_playlist_resolver.py` is responsible for turning a spoken request into a saved playlist launch:
 
 - exact category matches win first
+- then exact matches once spaces are removed, so "road trip" reaches the `roadtrip` key
 - then partial string matches
 - then token overlap matches for near-phrases like "beach samba" or "old school hits"
 - if a category resolves, one playlist ID is chosen from that category's saved list
 - if nothing resolves confidently, the assistant offers a YouTube search instead of guessing
+
+**Aliases live in a separate top-level `youtube_playlist_aliases` map**, not nested inside
+`youtube_playlists`. That is deliberate: `youtube_playlists` has four readers, and two of them
+(`tools/validate_youtube_playlists.py`, `tools/run_youtube_playlist_e2e.py`) hand-roll the
+str-or-list parse. A nested shape would make the validator *silently skip* every aliased
+category and crash the e2e tool. Keeping the block a plain key -> IDs map also means
+`LLMService._playlist_inventory()`'s "advertise exactly what the resolver accepts" invariant
+cannot be broken from here. `resolve_playlist_choice(hint, playlists, aliases)` merges them.
+
+**Prefer bucket nouns over bare adjectives when adding an alias.** The substring tier scans in
+config order, so an adjective on an earlier category steals `"<adjective> <genre>"` from a later
+one: `"moody"` on `dark romance` sends `"moody jazz"` to dark romance instead of `jazz`. Measured
+and rejected for the same reason: `"classics"` on `legendary hits` steals `"80s classics"`, and
+`"r&b"` normalizes to `"rb"`, which the substring tier finds inside "he**rb**ie" and "u**rb**an" —
+`normalize_text` expands `&` to " and " instead, so `"R&B"` resolves with no alias needed.
+`tests/test_playlist_config.py` asserts every configured alias still resolves to its own key.
+
+**The category list is injected into the system prompt**, exactly like the light rooms and
+for the same reason: "what playlists do you know" is an inventory question, and the model
+could not answer it from a tool schema that only takes a free-text name. Master Miguel asked
+and she did not know. `LLMService._playlist_inventory()` builds the line from
+`config.yaml`'s `youtube_playlists`, gated on `media.enabled`, filtering through the
+resolver's own `playlist_ids()` so a category with no usable ID is never advertised —
+the prompt must offer exactly what `resolve_playlist_choice` would accept. **Do not
+hardcode playlist names in the `system_prompt`.**
+
+**There is no YouTube account integration, and the prompt says so.** No OAuth, no Data API,
+no access to his subscriptions, liked songs, or account playlists. The saved categories are
+curated IDs that play on the Mi Box's own signed-in YouTube app, which is why his private
+playlists work at all — adding one is a `config.yaml` edit, not a code change. The
+`system_prompt` also routes "put on X" / "play X" / "what can you play" to the TV rather
+than letting her answer as if they were questions about her own abilities.
 
 ### Playlist Curation Workflow
 
@@ -730,8 +772,10 @@ The project now uses a stricter workflow for YouTube playlist data because rando
 
 1. Find candidates with `tools/search_youtube_playlists.py` or `tools/search_youtube_videos.py`
 2. Prefer strong video-based radio seeds for vibe-heavy categories when normal playlists are unreliable
-3. Validate every candidate with `tools/validate_youtube_playlists.py`
-4. Only keep IDs whose fetched YouTube page title clearly matches the intended category
+3. Validate every candidate with `tools/validate_youtube_playlists.py`, which proves existence
+   through YouTube's oembed endpoint and exits nonzero when anything is gone
+4. Only keep IDs whose fetched title clearly matches the intended category — that comparison is
+   the separate `--strict-title` pass, and it is advisory (see below)
 
 This matters because the playlist ID itself is not trustworthy. The fetched title is the real check.
 
@@ -744,6 +788,21 @@ The current saved categories in `config.yaml` include:
 - nostalgia buckets such as `70s 80s 90s hits` and `legendary hits`
 
 Many of the newer entries are `RD...` radio playlist IDs rather than community playlist IDs. That is intentional. They were easier to verify semantically and are often a better fit for vibe-based voice requests.
+
+**An RD id is validated through its seed video, and that is all it proves.** `RDxxxx` is an
+auto-generated mix seeded from one video, so every HTTP check runs against that seed. `ok` means
+the seed still exists — never that the mix still sounds like the category. YouTube regenerates
+those mixes and they drift; only a human listening can catch that. This is also why
+`--strict-title` is advisory and off by default: oembed returns the *seed's* title, so
+`samba/RDc4XeTP11EI8` comes back as "Grupo Revelacao - Deixa Acontecer", which shares no word
+with "samba". A strict check by default would flag most healthy entries.
+
+**IDs rot, and the old validator could not see it.** On 2026-09-03 a sweep found **6 of 54
+saved IDs already dead** (404): two each in `rnb` and `legendary hits`, one each in
+`dark romance` and `70s 80s 90s hits` — so a third of `rnb` and `legendary hits` requests were
+launching a dud. All six were replaced the same day and the sweep is clean. Re-run the validator
+after any curation pass; it is the only thing standing between a rotted ID and a dead-air
+request.
 
 Recommended behavior:
 
@@ -913,6 +972,18 @@ Current automated coverage exists for:
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
+- System-prompt inventory injection for lights and saved YouTube playlists,
+  including that an empty category is not advertised
+- `match_name` tier order, including that the despaced tier fires before the
+  substring tier (the guard on "warmwhite" not resolving to "white"), and that
+  `normalize_text` expands "&" rather than collapsing "R&B" to "rb"
+- Playlist aliases: parsing, that an alias for an empty or unknown category is
+  inert, and a structural sweep of the real `config.yaml` asserting every alias
+  resolves to its own key and no alias steals a canonical category name
+- Playlist existence classification: that a dead page returning HTTP 200 with a
+  "Visit source" decoy title classifies as `unavailable` rather than `ok`, and
+  that an RD id never produces a `/playlist?list=RD` URL (which 404s even when
+  the mix is healthy)
 - Activation tier selection, echo stripping, `EchoGate` arming, and the recording trim
 - The VAD grace window, the `saw_speech` flag, and Silero's 512-sample framing
 - Mic-buffer draining after playback, and that the idle loop does not drain
@@ -936,6 +1007,14 @@ uv run python tools\run_stremio_e2e.py --prep-app youtube --debug
 uv run python tools\probe_stremio_sync.py
 uv run python tools\probe_govee_devices.py
 uv run python tools\probe_govee_devices.py --transport cloud
+
+# Playlist rot. Exits nonzero when an ID is gone, so it can gate a curation pass.
+uv run python toolsalidate_youtube_playlists.py
+uv run python toolsalidate_youtube_playlists.py --json --strict-title
+uv run python toolsalidate_youtube_playlists.py --id RDgQRtAnPL6HM
+
+# The only network-touching tests. Skipped unless the env var is set.
+set CALIFORNIA_LIVE_TESTS=1 && uv run python -m unittest tests.test_youtube_validator -v
 
 # Wake word. score_wakeword prints raw scores instead of a yes/no, which is the
 # only way to tell "she did not hear me" from "she heard me at 0.55 and the

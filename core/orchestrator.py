@@ -78,7 +78,14 @@ def _append_route_warning(message: str, warning_suffix: str | None) -> str:
     return base + warning_suffix
 
 
-def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_playlists: dict) -> str:
+def _dispatch_tv(
+    params: dict,
+    media_svc,
+    stremio_svc,
+    surfshark_svc,
+    youtube_playlists: dict,
+    youtube_playlist_aliases: dict | None = None,
+) -> str:
     action = params.get("action")
     route_warning = None
 
@@ -257,7 +264,9 @@ def _dispatch_tv(params: dict, media_svc, stremio_svc, surfshark_svc, youtube_pl
         matched_key = None
 
         if not playlist_id:
-            matched_key, playlist_id = resolve_playlist_choice(playlist_name, youtube_playlists)
+            matched_key, playlist_id = resolve_playlist_choice(
+                playlist_name, youtube_playlists, youtube_playlist_aliases
+            )
 
         if not playlist_id:
             fallback_name = playlist_name or "that"
@@ -950,6 +959,7 @@ class Orchestrator:
                 self.stremio_service,
                 self.surfshark_service,
                 self.config.get("youtube_playlists", {}),
+                self.config.get("youtube_playlist_aliases") or {},
             )
         if tool_name == "control_lights":
             return _dispatch_lights(tool_input, self.govee_service)

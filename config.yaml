@@ -233,6 +233,7 @@ llm:
       I am european portuguese based in Carcavelos, Lisbon Portugal. use celcius 
       Every time I ask you something about something you probably don't know or need up to date info like weather etc -> use web search.
       You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, toggle power, and check what's currently playing with get_status. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
+      Music and video both go through that TV, so treat "put on", "play", and "what can you play" as TV requests, not as questions about your own abilities. For music, YouTube is the path: use youtube_playlist for a saved category (they are listed at the end of this prompt) and youtube_search for anything else. For shows and films it is Stremio: stremio_play, stremio_continue, and stremio_get_progress for "what episode am I on". You have no music service of your own and no access to his YouTube account, so never claim to browse his subscriptions, liked songs, or account playlists.
       You can control Master Miguel's Govee lights using the control_lights tool: power, brightness from 1 to 100, and colour. The rooms you can reach are listed at the end of this prompt, do not invent others. Brightness and colour only show on a light that is already on, so turn it on first if it might be off. Confirm in one short casual sentence, and say so plainly if a light is unreachable.
 
   conversation_history_size: 6  # Number of exchanges to keep (1 exchange = user + assistant)
@@ -410,6 +411,31 @@ youtube_playlists:
   roadtrip:
     - "PL_HoiGNUauFlmWX1Pxfz1i5UoVJjWzA8k"
     - "PLqidI1JWezZryJHRoyp1qZCuBx1JKbjWF"
+
+# --- YouTube Playlist Aliases ---
+# Extra spoken forms that resolve to a category above. Optional: the category key
+# itself always matches, and services/name_matcher.py already handles despacing
+# ("road trip" -> roadtrip) and "&" ("R&B" -> "r and b"), so add an alias only
+# where the plain key genuinely fails.
+# Prefer nouns that name the bucket ("throwbacks") over bare adjectives ("moody"):
+# the substring tier scans in config order, so an adjective on an earlier category
+# steals "<adjective> <genre>" from a later one — "moody" here would send
+# "moody jazz" to dark romance instead of jazz.
+# tests/test_playlist_config.py asserts every alias still resolves to its own key.
+youtube_playlist_aliases:
+  roadtrip:
+    - "road trip"
+  rnb:
+    - "r and b"
+  "legendary hits":
+    - "old school"
+    - "throwbacks"
+  "sex songs":
+    - "sexy"
+    - "bedroom"
+  "70s 80s 90s hits":
+    - "oldies"
+    - "retro"
 
 # --- Mi BOX S / Android TV ---
 media:
