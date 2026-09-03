@@ -32,6 +32,7 @@ class _FakeOWW:
     def __init__(self, scores):
         self.scores = list(scores)
         self.calls = []
+        self.frames = []
         self.resets = 0
 
     def predict(self, chunk):
@@ -40,6 +41,7 @@ class _FakeOWW:
             "it would return a stale duplicate score"
         )
         self.calls.append(len(chunk))
+        self.frames.append(np.asarray(chunk).copy())
         score = self.scores.pop(0) if self.scores else 0.0
         return {"california_v2": score}
 
@@ -47,7 +49,7 @@ class _FakeOWW:
         self.resets += 1
 
 
-def _detector(scores, threshold=0.81, consecutive=2, debounce=1.2):
+def _detector(scores, threshold=0.81, consecutive=2, debounce=1.2, dither=0.0):
     """A detector with no model file, audio device or onnxruntime involved."""
     det = WakeWordDetector.__new__(WakeWordDetector)
     det._backend = "oww"
@@ -60,6 +62,8 @@ def _detector(scores, threshold=0.81, consecutive=2, debounce=1.2):
     det.primary_key = "california_v2"
     det._oww_frame_length = NATIVE_FRAME
     det._oww_buffer = np.array([], dtype=np.int16)
+    det._dither_rms = dither
+    det._dither_rng = np.random.default_rng(0)
     det._oww_model = _FakeOWW(scores)
     return det
 
@@ -163,6 +167,67 @@ class DetectionSideEffectTests(unittest.TestCase):
         det.process_audio(_chunk())
         self.assertEqual(det._oww_model.calls, [])
         self.assertEqual(len(det._oww_buffer), 0)
+
+
+class DitherTests(unittest.TestCase):
+    """
+    The fix for "she woke up and I was purely silent".
+
+    Master Miguel's mic gates near-silence to RMS ~5 with its spectral structure
+    intact, which is out-of-distribution for a model trained only on audio with a
+    real noise floor — measured, the QUIETEST frames in his room scored highest
+    (worst 0.8005 against a 0.81 threshold). An inaudible noise floor takes that
+    to 0.032. These tests police the mechanics; the numbers live in config.yaml.
+    """
+
+    def test_dither_perturbs_the_frame_the_model_scores(self):
+        det = _detector([0.0] * 4, dither=10.0)
+        det.process_audio(np.full(NATIVE_FRAME, 1000, dtype=np.int16))
+
+        scored = det._oww_model.frames[0]
+        self.assertEqual(len(scored), NATIVE_FRAME)
+        self.assertFalse(np.all(scored == 1000), "dither never reached the model")
+        # Inaudible: it must perturb, not swamp. RMS 10 on a 1000 signal.
+        self.assertLess(float(np.abs(scored.astype(np.float32) - 1000).mean()), 40.0)
+
+    def test_zero_dither_is_bit_exact(self):
+        """The revert path. dither_rms: 0 must be the old behaviour exactly."""
+        det = _detector([0.0] * 4, dither=0.0)
+        frame = np.arange(NATIVE_FRAME, dtype=np.int16)
+        det.process_audio(frame)
+        np.testing.assert_array_equal(det._oww_model.frames[0], frame)
+
+    def test_dither_clips_instead_of_overflowing(self):
+        """A loud frame plus noise wraps to negative without the clip."""
+        det = _detector([0.0] * 4, dither=200.0)
+        det.process_audio(np.full(NATIVE_FRAME, 32767, dtype=np.int16))
+
+        scored = det._oww_model.frames[0]
+        self.assertEqual(scored.dtype, np.int16)
+        self.assertGreaterEqual(int(scored.min()), 0, "int16 overflow wrapped to negative")
+
+    def test_dither_does_not_disturb_framing_or_the_remainder(self):
+        """
+        Dither must touch the frame handed to predict, never the buffer — the
+        native-frame contract above it is what makes consecutive_frames real.
+        """
+        det = _detector([0.0] * 10, dither=10.0)
+        odd = np.full(300, 1000, dtype=np.int16)
+        for _ in range(9):  # 2700 samples = 2 native frames, 140 left over
+            det.process_audio(odd)
+
+        self.assertEqual(len(det._oww_model.calls), 2)
+        self.assertEqual(len(det._oww_buffer), 2700 - 2 * NATIVE_FRAME)
+        # The carried remainder is raw audio, not a dithered copy.
+        np.testing.assert_array_equal(
+            det._oww_buffer, np.full(len(det._oww_buffer), 1000, dtype=np.int16)
+        )
+
+    def test_detection_still_works_with_dither_on(self):
+        """Scores are the model's business; dither must not break the decision."""
+        det = _detector([0.95, 0.93], dither=10.0)
+        fired = det.process_audio(np.full(NATIVE_FRAME * 2, 1000, dtype=np.int16))
+        self.assertTrue(fired)
 
 
 if __name__ == "__main__":

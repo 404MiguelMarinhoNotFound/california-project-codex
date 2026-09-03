@@ -25,7 +25,10 @@ Two things to measure before retraining:
   how you learn what to put in custom_negative_phrases, instead of guessing.
 
 The score comes from the same openWakeWord model the assistant loads, at the
-same 16kHz, so the numbers transfer directly to config.yaml.
+same 16kHz, and with the same `wake_word.dither_rms` noise floor applied, so the
+numbers transfer directly to config.yaml. That last part matters: undithered,
+this tool reports ~0.80 on a silent room and would send you straight back to
+raising the threshold, which is the fix that does not work.
 
 Two ways to score, and they answer different questions:
 
@@ -117,7 +120,11 @@ def run_wav(detector, path: str, floor: float) -> None:
     peak, peak_at = 0.0, 0.0
     for start in range(0, len(audio) - chunk + 1, chunk):
         score = float(
-            list(detector._oww_model.predict(audio[start : start + chunk]).values())[0]
+            list(
+                detector._oww_model.predict(
+                    detector._apply_dither(audio[start : start + chunk])
+                ).values()
+            )[0]
         )
         t = start / 16000
         if score >= floor:
@@ -145,7 +152,11 @@ def score_wav(detector, path: str) -> float:
     peak = 0.0
     for start in range(0, len(audio) - chunk + 1, chunk):
         score = float(
-            list(detector._oww_model.predict(audio[start : start + chunk]).values())[0]
+            list(
+                detector._oww_model.predict(
+                    detector._apply_dither(audio[start : start + chunk])
+                ).values()
+            )[0]
         )
         peak = max(peak, score)
     detector._oww_model.reset()
@@ -341,7 +352,9 @@ def run_live(detector, config: dict, floor: float, save_dir: str | None) -> None
             chunk = audio.bytes_to_numpy(data)
             ring.append(chunk.astype(np.int16))
 
-            score = float(list(detector._oww_model.predict(chunk).values())[0])
+            score = float(
+                list(detector._oww_model.predict(detector._apply_dither(chunk)).values())[0]
+            )
             session_peak = max(session_peak, score)
 
             if score >= floor:
