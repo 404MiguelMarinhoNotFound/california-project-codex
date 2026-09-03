@@ -164,6 +164,9 @@ def resolve_color(value: str) -> tuple[int, int, int] | None:
     # Offer a despaced alias for every name so "warmwhite" matches exactly on the
     # first tier. Without it the substring tier fires instead and "white", being a
     # substring of "warmwhite", wins — the wrong colour entirely.
+    # match_name now has a despaced tier of its own, above substring, so this is
+    # strictly redundant. It stays on purpose: it keeps resolve_color correct
+    # without depending on that tier list staying in its current order.
     candidates = {name: [name, name.replace(" ", "")] for name in COLOR_NAMES}
     matched = match_name(cleaned, candidates)
     return COLOR_NAMES[matched] if matched else None

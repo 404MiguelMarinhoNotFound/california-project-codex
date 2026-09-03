@@ -25,6 +25,8 @@ import logging
 from datetime import datetime
 from typing import Generator
 
+from services.youtube_playlist_resolver import playlist_ids
+
 logger = logging.getLogger(__name__)
 
 # --- Tool definitions shared across providers ---
@@ -98,7 +100,7 @@ CONTROL_TV_TOOL = {
             },
             "playlist_name": {
                 "type": "string",
-                "description": "Configured playlist key label for youtube_playlist (for example: samba, lofi, workout, chill, jazz)."
+                "description": "Configured playlist key for youtube_playlist. Use one of the saved category names listed in the system prompt, not a guess."
             },
             "playlist_id": {
                 "type": "string",
@@ -212,6 +214,17 @@ class LLMService:
         self.light_names: list[str] = list((govee_cfg.get("lights") or {}).keys())
         self.default_light: str = str(govee_cfg.get("default_light") or "").strip()
 
+        # Saved YouTube playlist categories, injected for the same reason as the
+        # lights: "what playlists do you know" is an inventory question, and the
+        # model cannot answer it from a tool schema that only takes a name. Only
+        # categories the resolver would actually accept are advertised, so a key
+        # with an empty ID list is never offered.
+        self.playlist_names: list[str] = [
+            name
+            for name, value in (config.get("youtube_playlists") or {}).items()
+            if playlist_ids(value)
+        ]
+
         if self.provider == "claude":
             import anthropic
             api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -272,10 +285,10 @@ class LLMService:
             )
 
     def _build_system_prompt(self) -> str:
-        """Inject current date/time and the live light inventory into the system prompt."""
+        """Inject current date/time and the live device inventories into the system prompt."""
         now = datetime.now()
         time_info = f"\nCurrent date and time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}."
-        return self.system_prompt + time_info + self._light_inventory()
+        return self.system_prompt + time_info + self._light_inventory() + self._playlist_inventory()
 
     def _light_inventory(self) -> str:
         """
@@ -291,6 +304,31 @@ class LLMService:
         elif len(self.light_names) == 1:
             line += " If a request names no room, use that one."
         return line
+
+    def _playlist_inventory(self) -> str:
+        """
+        Describe the saved YouTube playlist categories so "what playlists do you
+        know" is answered directly instead of guessed at or refused.
+
+        These are curated buckets in config.yaml, not Master Miguel's YouTube
+        account — there is no account integration — but they play on his own
+        signed-in Mi Box, so from his side they are simply "his" playlists. The
+        wording below says what he can ask for without promising a live library.
+        """
+        if not self.media_enabled or not self.playlist_names:
+            return ""
+        names = ", ".join(self.playlist_names)
+        return (
+            f"\nSaved YouTube playlists you can put on the TV: {names}."
+            " If he asks what playlists or music you know, or what you can put on,"
+            " just read that list back conversationally, do not call a tool for it,"
+            " and do not invent categories that are not on it. Each one holds several"
+            " playlists and you pick one at random, so the same request stays fresh."
+            " A close phrasing still counts, so 'put on some samba' or 'some 80s' should"
+            " go straight to youtube_playlist. Matching is on the words themselves and"
+            " not on the vibe, so if a request does not clearly contain one of those"
+            " names, use youtube_search rather than guessing at a category."
+        )
 
     def stream_response(self, user_text: str) -> Generator[str, None, None]:
         """

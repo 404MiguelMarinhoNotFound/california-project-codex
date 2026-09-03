@@ -2,21 +2,32 @@
 Shared fuzzy name matching for spoken requests.
 
 Turns a loosely spoken hint ("beach samba", "the loft") into one of a set of
-known keys. Three tiers, most confident first:
+known keys. Four tiers, most confident first:
 
   1. exact match on the normalized text
-  2. substring match in either direction
-  3. token overlap, accepted only at 50% or better
+  2. exact match once all spaces are removed ("road trip" -> "roadtrip")
+  3. substring match in either direction
+  4. token overlap, accepted only at 50% or better
 
 Extracted from services/youtube_playlist_resolver.py so light room names can
 reuse the same cascade. Iteration follows dict order, so earlier keys win ties.
+
+**Tier 2 must stay above tier 3.** Despacing is what lets "warmwhite" reach
+"warm white" instead of the substring tier finding "white" inside it and
+returning the wrong colour. services/govee_service.py::resolve_color has always
+hand-built despaced aliases for exactly this reason; tier 2 generalizes it.
+See tests/test_name_matcher.py, which locks the ordering.
 """
 
 TOKEN_MATCH_THRESHOLD = 0.5
 
 
 def normalize_text(value: str) -> str:
-    cleaned = " ".join((value or "").lower().split())
+    # "&" becomes " and " before the non-alphanumeric strip, so "R&B" reads as
+    # "r and b" rather than collapsing to "rb". That matters: "rb" is a
+    # two-character substring living inside "herbie", "urban" and "superb",
+    # so the substring tier would match it far too eagerly.
+    cleaned = " ".join((value or "").replace("&", " and ").lower().split())
     return "".join(ch for ch in cleaned if ch.isalnum() or ch.isspace()).strip()
 
 
@@ -42,6 +53,11 @@ def match_name(hint: str, candidates: dict) -> str | None:
 
     for key, normalized_name in entries:
         if normalized_name == normalized_hint:
+            return key
+
+    despaced_hint = normalized_hint.replace(" ", "")
+    for key, normalized_name in entries:
+        if normalized_name.replace(" ", "") == despaced_hint:
             return key
 
     for key, normalized_name in entries:

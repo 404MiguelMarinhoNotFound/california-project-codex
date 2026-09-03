@@ -233,6 +233,7 @@ llm:
       I am european portuguese based in Carcavelos, Lisbon Portugal. use celcius 
       Every time I ask you something about something you probably don't know or need up to date info like weather etc -> use web search.
       You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, toggle power, and check what's currently playing with get_status. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
+      Music and video both go through that TV, so treat "put on", "play", and "what can you play" as TV requests, not as questions about your own abilities. For music, YouTube is the path: use youtube_playlist for a saved category (they are listed at the end of this prompt) and youtube_search for anything else. For shows and films it is Stremio: stremio_play, stremio_continue, and stremio_get_progress for "what episode am I on". You have no music service of your own and no access to his YouTube account, so never claim to browse his subscriptions, liked songs, or account playlists.
       You can control Master Miguel's Govee lights using the control_lights tool: power, brightness from 1 to 100, and colour. The rooms you can reach are listed at the end of this prompt, do not invent others. Brightness and colour only show on a light that is already on, so turn it on first if it might be off. Confirm in one short casual sentence, and say so plainly if a light is unreachable.
 
   conversation_history_size: 6  # Number of exchanges to keep (1 exchange = user + assistant)
@@ -370,11 +371,11 @@ youtube_playlists:
     - "RDc97NgFrg4a4"
   rnb:
     - "PLpR0WjW7QWwKG2ZLvAZRfc3Ii__Yo4CbY"
-    - "RDgQRtAnPL6HM"
+    - "RDKcoH2MSphaU"
     - "RDCUsm4jwAIPk"
     - "RD3D8O3bfOEZs"
     - "RDdHU8B76kR_s"
-    - "RDifnFVKdQIoM"
+    - "RDmPaW2HUX7Ew"
   "sex songs":
     - "PLCzvjB3WERyyEGYTSE9YqKsZs0FZ_KK6u"
     - "RDyfzy8W6Y2-4"
@@ -386,7 +387,7 @@ youtube_playlists:
     - "PL82z9gKfkb9goqE3ZmXWK7nn5brvFbuHB"
     - "RDNV3UdUKWPIo"
     - "RDspgUojdVcPU"
-    - "RDHBuUzMjzDkU"
+    - "RDmnS9jkPm_ac"
     - "RD4zktjlptNrU"
     - "RDbn8OgWxi-eA"
   jazz:
@@ -397,26 +398,51 @@ youtube_playlists:
     - "PLC90FB71F6ECE17F3"
     - "RDcSUO5vwQChA"
     - "RDWnCfvAMM9eY"
-    - "RD26YBZnKn6F8"
+    - "RDAwd7L69lMN4"
     - "RDkOnJOKM3ce0"
     - "RDeIUWxKkMP6s"
   "legendary hits":
     - "PLC90FB71F6ECE17F3"
-    - "RDMIwp4KKugSs"
+    - "RDnlFzN4rwCKU"
     - "RDE1DBJtU5MRU"
     - "RD3bNalrGFJlk"
     - "RDNMFFEHejdes"
-    - "RDRm3JiGClzrU"
+    - "RDQ9yh7Vw435Q"
   roadtrip:
     - "PL_HoiGNUauFlmWX1Pxfz1i5UoVJjWzA8k"
     - "PLqidI1JWezZryJHRoyp1qZCuBx1JKbjWF"
+
+# --- YouTube Playlist Aliases ---
+# Extra spoken forms that resolve to a category above. Optional: the category key
+# itself always matches, and services/name_matcher.py already handles despacing
+# ("road trip" -> roadtrip) and "&" ("R&B" -> "r and b"), so add an alias only
+# where the plain key genuinely fails.
+# Prefer nouns that name the bucket ("throwbacks") over bare adjectives ("moody"):
+# the substring tier scans in config order, so an adjective on an earlier category
+# steals "<adjective> <genre>" from a later one — "moody" here would send
+# "moody jazz" to dark romance instead of jazz.
+# tests/test_playlist_config.py asserts every alias still resolves to its own key.
+youtube_playlist_aliases:
+  roadtrip:
+    - "road trip"
+  rnb:
+    - "r and b"
+  "legendary hits":
+    - "old school"
+    - "throwbacks"
+  "sex songs":
+    - "sexy"
+    - "bedroom"
+  "70s 80s 90s hits":
+    - "oldies"
+    - "retro"
 
 # --- Mi BOX S / Android TV ---
 media:
   enabled: true
   adb_path: "C:\\platform-tools\\adb.exe"
   adb_timeout_ms: 15000
-  mibox_ip: "192.168.1.26"
+  mibox_ip: "192.168.1.35"
   adb_port: 5555
   volume_max_steps: 15            # Mi Box S hardware max — used by volume_set()
   vpn_routing_enabled: false

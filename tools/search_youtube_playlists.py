@@ -1,15 +1,16 @@
 import argparse
 import json
 import re
+import sys
+from pathlib import Path
 from urllib.parse import quote_plus
-from urllib.request import Request, urlopen
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
+from tools.youtube_http import fetch_text
+
 
 
 def _extract_initial_data(body: str) -> dict:
@@ -51,9 +52,9 @@ def search(query: str, limit: int = 10):
         "https://www.youtube.com/results?"
         f"search_query={quote_plus(query)}&sp=EgIQAw%253D%253D"
     )
-    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
-    with urlopen(request, timeout=20) as response:
-        body = response.read().decode("utf-8", errors="replace")
+    status, body = fetch_text(url)
+    if status != 200:
+        raise RuntimeError(f"YouTube search returned HTTP {status}")
 
     data = _extract_initial_data(body)
     results = []

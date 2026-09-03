@@ -1,6 +1,10 @@
 import unittest
 
-from services.youtube_playlist_resolver import resolve_playlist_choice
+from services.youtube_playlist_resolver import (
+    playlist_aliases,
+    playlist_ids,
+    resolve_playlist_choice,
+)
 
 
 class YouTubePlaylistResolverTests(unittest.TestCase):
@@ -54,6 +58,72 @@ class YouTubePlaylistResolverTests(unittest.TestCase):
 
         self.assertIsNone(matched_key)
         self.assertIsNone(playlist_id)
+
+
+class PlaylistIdsTests(unittest.TestCase):
+    def test_accepts_a_bare_string_or_a_list(self):
+        self.assertEqual(["PL-1"], playlist_ids("PL-1"))
+        self.assertEqual(["PL-1", "PL-2"], playlist_ids(["PL-1", " PL-2 "]))
+
+    def test_unusable_values_yield_nothing(self):
+        # The system-prompt inventory in services/llm.py filters on this, so a
+        # category that returns [] here is never advertised to the model either.
+        for value in ("", "   ", [], ["", "  "], None, 7, {"ids": ["PL-1"]}):
+            self.assertEqual([], playlist_ids(value), value)
+
+
+class PlaylistAliasTests(unittest.TestCase):
+    def test_missing_map_or_key_yields_nothing(self):
+        self.assertEqual([], playlist_aliases(None, "samba"))
+        self.assertEqual([], playlist_aliases({}, "samba"))
+        self.assertEqual([], playlist_aliases({"jazz": ["smooth"]}, "samba"))
+
+    def test_configured_aliases_are_stripped(self):
+        self.assertEqual(["road trip"], playlist_aliases({"roadtrip": [" road trip "]}, "roadtrip"))
+
+    def test_non_string_and_empty_entries_are_dropped(self):
+        self.assertEqual(["ok"], playlist_aliases({"k": ["ok", "", "  ", 7, None]}, "k"))
+
+    def test_an_alias_resolves_to_its_category(self):
+        matched_key, playlist_id = resolve_playlist_choice(
+            "r and b",
+            {"rnb": ["PL-RNB-1"], "jazz": ["PL-JAZZ-1"]},
+            aliases={"rnb": ["r and b"]},
+            chooser=lambda ids: ids[0],
+        )
+
+        self.assertEqual("rnb", matched_key)
+        self.assertEqual("PL-RNB-1", playlist_id)
+
+    def test_alias_for_a_category_with_no_ids_is_inert(self):
+        # Dead config, not a crash: ids_by_key gates which candidates exist.
+        matched_key, playlist_id = resolve_playlist_choice(
+            "road trip",
+            {"roadtrip": [], "jazz": ["PL-JAZZ-1"]},
+            aliases={"roadtrip": ["road trip"]},
+            chooser=lambda ids: ids[0],
+        )
+
+        self.assertIsNone(matched_key)
+        self.assertIsNone(playlist_id)
+
+    def test_alias_naming_an_unknown_category_is_inert(self):
+        matched_key, _ = resolve_playlist_choice(
+            "polka",
+            {"jazz": ["PL-JAZZ-1"]},
+            aliases={"nonexistent": ["polka"]},
+            chooser=lambda ids: ids[0],
+        )
+
+        self.assertIsNone(matched_key)
+
+    def test_aliases_default_to_none_so_old_call_sites_still_work(self):
+        matched_key, playlist_id = resolve_playlist_choice(
+            "samba", {"samba": ["PL-SAMBA-1"]}, chooser=lambda ids: ids[0]
+        )
+
+        self.assertEqual("samba", matched_key)
+        self.assertEqual("PL-SAMBA-1", playlist_id)
 
 
 if __name__ == "__main__":
