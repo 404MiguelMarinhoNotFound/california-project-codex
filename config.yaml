@@ -442,7 +442,7 @@ media:
   enabled: true
   adb_path: "C:\\platform-tools\\adb.exe"
   adb_timeout_ms: 15000
-  mibox_ip: "192.168.1.26"
+  mibox_ip: "192.168.1.35"
   adb_port: 5555
   volume_max_steps: 15            # Mi Box S hardware max — used by volume_set()
   vpn_routing_enabled: false
