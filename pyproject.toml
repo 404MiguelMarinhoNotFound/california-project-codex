@@ -58,11 +58,18 @@ govee = ["bleak>=0.22.0"]
 # Everything the shipped config.yaml actually selects out of the box:
 #   tts.provider = "kokoro"  -> kokoro (+ its spacy pipeline)
 #   govee.transport = "ble"  -> govee (bleak)
+#   vad.engine = "silero"    -> silero (torch + torchaudio)
 # wake_word.model is an openWakeWord built-in, covered by the core `openwakeword` dep.
 # `uv sync --extra default` gives a bootable app with the committed config.
-# (vad.engine = "silero" is NOT included: core/vad.py falls back to energy-based
-#  VAD when torch is absent, so it stays in the heavy `silero` extra.)
-default = ["california[kokoro]", "california[govee]"]
+#
+# silero was deliberately excluded here until 2026-09-03, on the reasoning that
+# core/vad.py falls back to energy VAD when torch is absent. It does — silently, and
+# that was the bug: `torch` arrives anyway via kokoro, `torchaudio` did not, so
+# _load_silero failed with ModuleNotFoundError on every boot and the config had been
+# lying about which VAD ran for the life of the project. `default` is defined as
+# exactly what the committed config.yaml selects, and config.yaml selects silero, so
+# it belongs here. This adds torchaudio only, not the full ~2GB — torch is already in.
+default = ["california[kokoro]", "california[govee]", "california[silero]"]
 
 [tool.uv]
 # Always use uv's own managed CPython. Building .venv on the Windows Store

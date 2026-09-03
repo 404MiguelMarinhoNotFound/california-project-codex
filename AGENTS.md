@@ -121,6 +121,44 @@ Keep secrets in `.env` or another local-only secret mechanism. Do not commit rea
 > buffer away, and do not raise `audio.chunk_duration_ms` to 80 instead — the
 > recording path wants 40ms chunks.
 >
+> **She was waking on SILENCE, and `wake_word.dither_rms` is the fix.** Reported
+> 2026-09-03 as "false positives, I was purely silent" — and the silence was the
+> cause, not the context. Master Miguel's Realtek mic array gates near-silence
+> down to RMS ~5 while leaving its spectral structure intact, and openWakeWord's
+> log-mel front end turns that into features no training clip ever contained:
+> every one of them has real background mixed in at an audible level. The model
+> does not fail quietly there, it fails *confidently*. Measured over 150s of the
+> real room, the **highest-scoring frames were the quietest ones** (RMS 3-9 across
+> their whole context) while the loudest events in the same recording (RMS ~500)
+> scored low. Worst ambient score 0.8005 against a 0.81 threshold — 0.0095 of
+> headroom is where the false wakes lived.
+>
+> `WakeWordDetector._apply_dither` mixes white noise at RMS 10 into each native
+> frame before scoring. That takes the worst ambient score to **0.032** (measured
+> live afterwards: 0.0194) and frames over 0.5 from 14 to 0. Flat digital silence
+> and flat white noise both score ~0.002, so the trigger is gated near-silence
+> specifically, not low energy. Wake path only — Whisper still gets clean audio
+> and the capture ring still records raw, so negatives stay honest.
+>
+> **Raising the threshold does not fix this, and it was the obvious wrong move.**
+> The observed false wakes were 0.896 and 0.927, and real wake words peak in
+> exactly that band (0.89/0.94/0.95/0.97/0.97/0.97). No threshold separates them:
+> 0.90 costs 5-11 points of recall and leaves the worst ambient score untouched at
+> 0.801. The dither removes the artefact instead, which is why it works at *every*
+> threshold rather than shuffling the same overlap around — and it is what makes
+> the threshold a free parameter again. See the measured table in `config.yaml`.
+>
+> **`tools/score_wakeword.py` applies the same dither**, in `score_wav`, `run_wav`
+> and `run_live`. Without that it reports ~0.80 on a silent room and sends you
+> straight back to raising the threshold. `fires_framed` gets it for free by going
+> through `process_audio`.
+>
+> **Wake-word measurements are not reproducible unless you seed numpy.**
+> `openwakeword.utils.AudioFeatures.reset()` re-seeds its feature buffer from the
+> **global** numpy RNG, so a single pass over a directory varies run to run — two
+> honest measurements of the same thing will disagree by a couple of files. Seed
+> and average before trusting any recall number, including the ones in `config.yaml`.
+>
 > Do not reintroduce Porcupine without a paid key.
 
 -----
@@ -189,9 +227,10 @@ california/
 │   ├── test_orchestrator_lights.py # control_lights dispatch behavior
 │   ├── test_orchestrator_vpn_routing.py # VPN preflight routing behavior
 │   ├── test_stremio_service.py  # Stremio / TMDB / playback unit tests
+│   ├── test_stt_hallucination.py # Whisper non-speech filler and segment-probability gating
 │   ├── test_surfshark_service.py # Surfshark route execution and cache behavior
 │   ├── test_vad_silence.py      # Grace window, saw-speech flag, Silero framing
-│   ├── test_wake_word_framing.py # openWakeWord native-frame buffering and consecutive frames
+│   ├── test_wake_word_framing.py # openWakeWord native-frame buffering, consecutive frames, dither floor
 │   └── test_youtube_playlist_resolver.py # Matching and random-selection coverage for saved playlists
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -295,8 +334,18 @@ or set `tts.provider: edge`, which is covered by the core dependency set.
 
 The same applies to lights: `config.yaml` defaults to `govee.transport: ble`, which needs
 `bleak` from the `govee` extra. Without it `GoveeService` logs a warning and disables itself,
-and `control_lights` is not offered to the LLM at all. `uv sync --extra default` installs
-both `kokoro` and `govee`, which is what the committed config actually selects.
+and `control_lights` is not offered to the LLM at all.
+
+The same applies a third time to the VAD, and this one hid for the life of the project:
+`config.yaml` sets `vad.engine: "silero"`, which needs **both** `torch` and `torchaudio`.
+`torch` arrives anyway as a kokoro dependency, `torchaudio` did not, and `core/vad.py`
+catches the resulting `ModuleNotFoundError` and falls back to energy VAD with a warning
+nobody reads. The config had been describing a VAD that never ran. `silero` is now part of
+`default` for exactly this reason.
+
+`uv sync --extra default` installs `kokoro`, `govee` and `silero` — which is what the
+committed config actually selects. If a future config key selects a provider from an extra,
+add that extra to `default` in the same change, or the config is lying again.
 
 -----
 
@@ -868,6 +917,12 @@ Current automated coverage exists for:
 - The VAD grace window, the `saw_speech` flag, and Silero's 512-sample framing
 - Mic-buffer draining after playback, and that the idle loop does not drain
 - openWakeWord native-frame buffering and real consecutive-frame behaviour
+- The wake-word dither floor: that it reaches the model, clips instead of
+  overflowing int16, leaves framing and the carried remainder untouched, and is
+  bit-exact identity at `dither_rms: 0`
+- Whisper hallucination rejection: the filler blocklist (and that live control
+  words like "go" and "stop" are not in it), `no_speech_prob` / `avg_logprob`
+  gating on the worst segment, and failing open on an unexpected response shape
 - Dropped turns: `_record_speech` returning `None`, and `_handle_activation`
   aborting without touching STT, the LLM, or TTS
 
@@ -987,6 +1042,24 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
   "he has stopped" will treat it as one.** One boolean — has this recording ever
   heard speech — is the difference between a false wake costing nothing and a
   false wake costing two API calls and a spoken non-sequitur
+- **A model that has only ever seen audio with a noise floor will not behave on
+  audio without one, and it fails confidently rather than quietly.** Every
+  training clip had background mixed in at an audible level, so gated
+  near-silence was never in the distribution — and the model answered 0.80 on it
+  instead of 0.00. The quietest frames in the room scored highest and the loudest
+  scored low, which is the exact inverse of the intuition that sent the first
+  three fixes after *noise*. Adding back the noise floor the training data always
+  had costs nothing and removes the artefact at every threshold.
+- **When the obvious knob does not separate the two distributions, it is the
+  wrong knob.** Raising the threshold was the natural response to false wakes at
+  0.896 and 0.927, and it could not work: real wake words peak in that same band.
+  Plotting both distributions before turning anything is what showed the overlap,
+  and what showed that the threshold was pinned at 0.81 by an artefact rather
+  than by the model's actual quality.
+- **A measurement harness that does not apply the fix will send you back to the
+  bug.** `tools/score_wakeword.py` scored raw frames, so post-dither it would
+  still have reported 0.80 on silence. A tool that measures something other than
+  what runs is worse than no tool, because it is believed.
 - **Recall tooling without false-positive tooling optimises one direction only.**
   `tools/score_wakeword.py` could measure "would she hear me" from the first day
   and had no way at all to measure "would she wake for nothing", so every
@@ -1023,8 +1096,31 @@ listening path and both compounding each other:
   `consecutive_frames` is fixed (see the wake-word note above). Threshold left at
   0.81 deliberately; retune it from `--negatives --sweep` rather than from the
   synthetic eval.
+
+  **This was only half of it, and the framing fix did not stop the false wakes.**
+  Reported again on 2026-09-03 and fixed the same day: the real driver was gated
+  near-silence scoring ~0.80 out of the model, not transient spikes. See
+  `wake_word.dither_rms` in the note above. Do not mark false wake-ups closed
+  again without a `--negatives` measurement of the actual room.
 - ~~**Silence treated as the command**~~ — `vad.speech_timeout` plus a
   `saw_speech` flag; a wake nobody speaks into is now dropped before STT.
+
+Three more were found and fixed on **2026-09-03**, all in the same path:
+
+- ~~**Wake-word false positives on silence**~~ — `wake_word.dither_rms: 10`.
+  Worst score on 150s of the real quiet room: 0.8005 → 0.0194.
+- ~~**Silero VAD had never run once**~~ — `vad.engine` was `"silero"` and
+  `_load_silero` failed with `ModuleNotFoundError: torchaudio` on every boot,
+  falling back to energy VAD silently. `torch` arrives via kokoro; `torchaudio`
+  did not. `california[silero]` is now part of the `default` extra, so
+  `uv sync --extra default` gives the VAD the config claims. The energy fallback
+  mattered: the room produced 5 transient bursts over RMS 200 lasting ≥2 chunks
+  in 150s, each enough to set `saw_speech` and defeat the `no_speech` guard.
+- ~~**Whisper hallucinations reached the LLM**~~ — `services/stt.py` asked for
+  `response_format="text"`, discarding `no_speech_prob` and `avg_logprob`. A false
+  wake produced `"Hmm."` from 5.2s of room tone and Claude answered it. Now
+  `verbose_json` plus a filler blocklist; a rejected transcript returns `""`,
+  which the existing empty-transcript guard already drops.
 
 Confirmed **High-severity** backlog:
 

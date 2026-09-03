@@ -162,7 +162,50 @@ class WakeWordDetector:
         self._oww_frame_length = 1280
         self._oww_buffer = np.array([], dtype=np.int16)
 
+        # Raise the noise floor before scoring. See _apply_dither: without this,
+        # the quietest moments in the room are the ones that score highest.
+        self._dither_rms = float(ww_cfg.get("dither_rms", 0.0))
+        self._dither_rng = np.random.default_rng()
+        if self._dither_rms:
+            logger.info(f"Wake-word dither floor: RMS {self._dither_rms:g}")
+
         logger.info(f"Wake word model key: {self.primary_key}")
+
+    def _apply_dither(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Add an inaudible noise floor to one native frame before scoring it.
+
+        Master Miguel's Realtek mic array gates near-silence down to RMS ~5 while
+        leaving its spectral structure intact, and openWakeWord's log-mel front end
+        turns that structured near-nothing into features the model has never seen:
+        every training clip has real background mixed in at an audible level. The
+        model does not fail quietly on it, it fails confidently. Measured over 150s
+        of the real room, the highest-scoring frames were the QUIETEST ones (RMS 3-9
+        across their whole 1.3s context) while the loudest events in the same
+        recording (RMS ~500) scored low. Worst ambient score 0.8005 against a 0.81
+        threshold — 0.0095 of headroom, which is what the false wakes were.
+
+        Adding white noise at RMS 10 takes that worst ambient score to 0.032 and
+        drops frames over 0.5 from 14 to 0. It is not a threshold workaround: it
+        removes the artefact, which is why it works at every threshold rather than
+        just pushing the same overlap around. Flat digital silence and flat white
+        noise both score ~0.002, so the trigger is specifically gated near-silence,
+        not low energy as such.
+
+        Only the wake path is dithered. _record_speech reads the mic separately, so
+        Whisper still gets clean audio, and the capture ring stays raw so recorded
+        negatives can be re-scored honestly.
+
+        RMS 20 and 40 were also measured and start costing real recall. 0 disables
+        this exactly, for a one-line revert.
+        """
+        if not self._dither_rms:
+            return frame
+        noisy = frame.astype(np.float32) + self._dither_rng.normal(
+            0.0, self._dither_rms, len(frame)
+        )
+        # A loud frame plus noise overflows int16 without this.
+        return np.clip(noisy, -32768, 32767).astype(np.int16)
 
     # ─── Audio processing ────────────────────────────────────────────
 
@@ -213,7 +256,9 @@ class WakeWordDetector:
             frame = self._oww_buffer[:self._oww_frame_length]
             self._oww_buffer = self._oww_buffer[self._oww_frame_length:]
 
-            prediction = self._oww_model.predict(frame)
+            # Dither the frame handed to the model, never the buffer: framing and
+            # the remainder carried to the next call must stay byte-identical.
+            prediction = self._oww_model.predict(self._apply_dither(frame))
             score = prediction.get(self.primary_key, 0.0)
 
             if score >= self.threshold:

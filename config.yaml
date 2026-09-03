@@ -22,23 +22,40 @@ wake_word:
   # model file.
   model: "models/california_v2.onnx"
   # 0.81 is california_v2_eval.json's optimal_threshold, chosen deliberately as the
-  # false-positive-safe end. Know the trade: that figure is computed against
-  # synthetic Piper validation audio, and measured on 40 held-out recordings of
-  # Master Miguel it catches 40% of them. Expect to repeat yourself.
+  # false-positive-safe end. That figure is computed against synthetic Piper
+  # validation audio, so treat it as a starting point, never as a measurement.
   #
-  # Measured recall on the holdout - English / Portuguese:
-  #   0.81  35% / 45%   <- here      0.30  55% / 75%
-  #   0.50  45% / 60%               0.20  65% / 80%
-  #   0.40  50% / 75%               0.15  75% / 80%
+  # Re-measured 2026-09-03: 4-seed average, cf=2, framed decision (not peak score),
+  # recall over the 40 held-out recordings, false fires against 150s of the real
+  # quiet room. The dither column is what runs now - see dither_rms below.
   #
-  # Walk it down this table if misses annoy more than false fires. Those numbers
-  # are peak single-frame scores, while the detector needs consecutive_frames in a
-  # row, so live recall runs a little under them and live false positives under too.
+  #     thr | NO DITHER: EN   PT   fires/h  | DITHER 10: EN   PT   fires/h
+  #   ---------------------------------------------------------------------
+  #    0.25 |    40%   51%     264.0        |    43%   55%       0.0
+  #    0.45 |    35%   41%     144.0        |    32%   41%       0.0
+  #    0.55 |    32%   34%      72.0        |    29%   36%       0.0
+  #    0.70 |    26%   29%       0.0        |    21%   29%       0.0
+  #    0.81 |    19%   25%       0.0        |    16%   20%       0.0   <- here
+  #    0.90 |    15%   16%       0.0        |    10%    8%       0.0
   #
-  # IMPORTANT: that table was measured while consecutive_frames was silently
-  # broken (see below), i.e. under a detector that fired on ONE frame. Live recall
-  # is now somewhat lower than it shows, and live false positives lower too.
-  # Re-measure with tools/score_wakeword.py --framed before trusting a number here.
+  # Read the left column before touching this number: undithered, lowering the
+  # threshold detonates (264 false fires/hour at 0.25), and that entire cliff is
+  # the gated-silence artefact dither_rms removes. Raising it does not work either
+  # - the observed false wakes were 0.896 and 0.927, and real wake words peak in
+  # exactly that band (0.89/0.94/0.95/0.97/0.97/0.97), so no threshold separates
+  # them. 0.90 costs 5-11 points of recall and leaves the worst ambient score
+  # untouched at 0.801.
+  #
+  # With the dither the false-fire column is flat zero, so this is a free
+  # parameter again - but that 150s sample has no speech, music or TV in it. It
+  # says nothing about false fires from actual talking. Before dropping to 0.55,
+  # live a day with wake_word.capture on and run:
+  #   uv run python tools/score_wakeword.py --negatives debug/activations --sweep
+  #
+  # Reproducibility trap: openwakeword.utils.AudioFeatures.reset() re-seeds its
+  # feature buffer from the GLOBAL numpy RNG, so a single pass over a directory is
+  # not repeatable. Seed numpy and average several runs, or two honest measurements
+  # of the same thing will disagree by a couple of files.
   threshold: 0.81
   sensitivity: 0.6          # Porcupine-specific alias, unused on this backend
   # Native openWakeWord frames (1280 samples / 80ms each) that must clear the
@@ -54,6 +71,29 @@ wake_word:
   consecutive_frames: 2
   debounce_seconds: 1.2     # Ignore re-triggers for N seconds after activation
 
+  # Inaudible white-noise floor (int16 RMS) mixed into each frame before scoring.
+  # THIS IS THE FALSE-POSITIVE FIX, and it is counter-intuitive: she was waking on
+  # SILENCE, not on noise.
+  #
+  # The Realtek mic array gates near-silence down to RMS ~5 while leaving its
+  # spectral structure intact. openWakeWord's log-mel front end turns that into
+  # features no training clip ever contained - every one of them has real
+  # background mixed in at an audible level - and the model answers confidently
+  # rather than quietly. Over 150s of the real room the HIGHEST-scoring frames were
+  # the quietest ones (RMS 3-9 across their whole context) while the loudest events
+  # in the same recording (RMS ~500) scored low. Worst ambient score was 0.8005
+  # against this 0.81 threshold: 0.0095 of headroom, which is what the false wakes
+  # were living in.
+  #
+  # RMS 10 takes that worst ambient score to 0.032 and frames over 0.5 from 14 to
+  # 0. Measured alternatives: 20 and 40 also silence the room but start costing
+  # real recall. Flat digital silence and flat white noise both score ~0.002, so
+  # the trigger is gated near-silence specifically, not low energy.
+  #
+  # Wake path only - Whisper still gets clean audio, and wake_word.capture still
+  # records raw. Set to 0 to disable exactly and revert to the old behaviour.
+  dither_rms: 10
+
   # Record what she heard around each activation, so false positives stop being
   # anecdotes. Clips are labelled by outcome: *_no_speech.wav and *_short.wav are
   # by construction false fires (she woke, nobody spoke), which makes the folder a
@@ -61,7 +101,10 @@ wake_word:
   #   uv run python tools/score_wakeword.py --negatives debug/activations --sweep
   # Off by default - it costs a deque of recent audio on the idle path.
   capture:
-    enabled: false
+    # ON since 2026-09-03. The dither fixed the silence false positives, but the
+    # threshold cannot come down off a silent-room measurement - that needs real
+    # negatives recorded with the TV on. This is how they get collected.
+    enabled: true
     dir: "debug/activations"
     pre_seconds: 2.0        # audio kept from BEFORE the wake fired
     max_files: 200          # oldest clips are pruned past this
@@ -109,6 +152,17 @@ stt:
   groq:
     model: "whisper-large-v3-turbo"
     language: "en"            # Set explicitly for faster transcription
+    # Whisper hallucinates filler out of non-speech: a false wake once produced
+    # "Hmm." from 5.2s of room tone and Claude answered it. response_format is
+    # now verbose_json so these two per-segment fields come back and can be used
+    # to drop the turn before the LLM call.
+    #
+    # no_speech_prob is Whisper's own confidence that a segment is not speech.
+    # avg_logprob falls when it is guessing. Raise max_no_speech_prob (toward 1.0)
+    # or lower min_avg_logprob if real commands start getting dropped - the log
+    # line names which check rejected it and what the values were.
+    max_no_speech_prob: 0.6
+    min_avg_logprob: -1.0
   local:
     model_size: "base"        # tiny | base | small | medium
 
