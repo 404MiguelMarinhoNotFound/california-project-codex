@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from services.stremio_service import StremioPlayResult, StremioService
+from tests.config_fixture import config_for_tests
 
 
 class _Response:
@@ -35,33 +37,40 @@ class StremioServiceTests(unittest.TestCase):
             args=[], returncode=1, stdout="", stderr=""
         )
 
+        # StremioService reads credentials from the environment first, so on a
+        # machine with real ones exported the fixture's stubs are ignored and a
+        # test can reach api.strem.io or TMDB for real. Drop them for the
+        # duration; patch.dict restores the environment on cleanup.
+        env_patcher = patch.dict(os.environ, {}, clear=False)
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        for var in (
+            "STREMIO_EMAIL",
+            "STREMIO_PASSWORD",
+            "TMDB_API_KEY",
+            "TMDB_READ_ACCESS_TOKEN",
+        ):
+            os.environ.pop(var, None)
+
     def _config(self, watch_state_path: Path) -> dict:
-        return {
-            "stremio": {
+        """The real config.yaml, with the cache redirected and waits removed.
+
+        provider_preferences and provider_aliases used to be re-typed here, so
+        a reordering in config.yaml (which is what decides whether Comet or
+        Torrentio is tried first) would not have failed a single test. They now
+        come from the file. The stub credentials are deliberate: TMDB and
+        Stremio calls are mocked per test and must never reach the network.
+        """
+        return config_for_tests(
+            stremio={
                 "watch_state_path": str(watch_state_path),
                 "autoplay_delay_ms": 1,
-                "history_refresh_max_age_minutes": 5,
-                "provider_preferences": ["comet", "mediafusion", "torrent"],
-                "provider_aliases": {
-                    "comet": ["comet"],
-                    "mediafusion": ["mediafusion", "media fusion"],
-                    "torrent": ["torrent", "torrentio"],
-                },
-                "provider_scan_pages": 3,
                 "provider_scan_delay_ms": 1,
-                "provider_fallback_policy": "ask",
+                "email": None,
+                "password": None,
             },
-            "tmdb": {
-                "api_key": "dummy",
-                "read_access_token": None,
-            },
-            "media": {
-                "adb_path": "adb",
-                "adb_timeout_ms": 5000,
-                "mibox_ip": "192.168.1.26",
-                "adb_port": 5555,
-            },
-        }
+            tmdb={"api_key": "dummy", "read_access_token": None},
+        )
 
     def _write_state(self, watch_state: Path, payload: dict):
         watch_state.write_text(json.dumps(payload), encoding="utf-8")

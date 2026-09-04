@@ -223,6 +223,8 @@ california/
 │   ├── validate_youtube_playlists.py # Checks every saved playlist ID still exists (oembed); nonzero exit on failure
 │   └── youtube_http.py             # Shared spoofed-UA fetch for the three YouTube tools
 ├── tests/
+│   ├── config_fixture.py        # THE test fixture base: the real config.yaml, deep-merged
+│   ├── test_config_fixture.py   # Fixture behavior + guard against re-typed config values
 │   ├── test_activation_capture.py # Activation clip naming and pruning
 │   ├── test_activation_phrases.py # Wake tiers, echo stripping, recording trim, dropped turns
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
@@ -1054,8 +1056,38 @@ Run unit tests with:
 uv run python -m unittest discover -s tests -v
 ```
 
+**Test fixtures start from the real `config.yaml`.** `tests/config_fixture.py`
+exposes `config_for_tests(**overrides)`, which loads the committed config and
+deep-merges only what a test must pin down. Anything not overridden is what
+ships, so a renamed key, a moved IP, a repackaged app or a retuned route fails a
+test instead of leaving the suite asserting against a deployment that no longer
+exists.
+
+Only three categories are legitimate to override, and each should say why:
+
+- **paths** — `watch_state.json`, `vpn_state.json`, `tv_state.json` and the
+  Samsung token must go to a tmpdir or a nonexistent file, never the real caches
+- **waits** — autoplay delays, Surfshark settle times and CEC boot timeouts are
+  seconds each and buy nothing against a mocked ADB
+- **a flag the test exists to exercise** — `vpn_routing_enabled` is false in the
+  shipped config, `vad.engine` is `silero` (which would load torch), and
+  `llm.claude.web_search` runs server-side; those get flipped, with a comment
+
+Values that describe the deployment — IP, port, `adb_path`, package names,
+launch components, provider order, route tables, light MACs and aliases — must
+**not** be overridden. Those are exactly the ones worth catching drift in.
+`tests/test_config_fixture.py` fails on a fixture that hardcodes an IP; mark a
+deliberate one with `# config-literal: <reason>`.
+
+Test data that is genuinely synthetic stays synthetic and says so: the prompt
+tests use fake playlists and lights because they test the *injection mechanism*,
+not the data, and `tests/test_playlist_config.py` sweeps the real file.
+
 Current automated coverage exists for:
 
+- That test fixtures derive from the real `config.yaml` rather than re-typing it,
+  that overrides deep-merge without dropping siblings, that each load is an
+  independent copy, and that no fixture feeds the code a hardcoded IP
 - Stremio title resolution and watch-state behavior
 - Power: that `KEYCODE_POWER` is never sent in any state, that `turn_on`
   is a no-op when already awake, that unreachable falls back to Bluetooth,
@@ -1286,6 +1318,27 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
   `subprocess.run` for every test in the file, and
   `test_unit_tests_never_shell_out_to_a_real_adb` fails loudly if that guard is
   removed. **`uv run python -m unittest discover` must never touch the TV.**
+- **A hand-written test fixture can only prove the code agrees with the fixture.**
+  `tests/test_media_service.py` pointed at an IP two moves stale and kept
+  passing; the Surfshark tests pinned a 3-key `quick_connect` route while
+  `surfshark_routes.json` ships 4 — including the leading `DPAD_CENTER` that
+  CLAUDE.md calls out as load-bearing on this box. Neither could ever fail,
+  because nothing in either test referred to what ships. Fixtures now derive
+  from `config.yaml` and override only paths, waits, and the flag under test.
+- **Only fixture *inputs* drift silently; assertions are self-correcting.**
+  A test asserting `"com.google.android.youtube.tv"` appears in a launch command
+  fails the moment the package changes — loud, and fine. A *fixture* feeding the
+  service a stale IP keeps passing forever. That asymmetry is why the guard in
+  `tests/test_config_fixture.py` checks inputs and deliberately ignores the
+  dozens of package literals in assertions: a guard needing 18 opt-out markers
+  is friction, not a guard.
+- **Environment variables outrank config, so a hermetic fixture is not enough.**
+  `StremioService` reads `STREMIO_EMAIL` before `config.stremio.email`, so on a
+  machine with real credentials exported, a test's stub config was ignored and
+  `sync_library()` could reach `api.strem.io` for real. The Stremio tests now
+  drop those vars for the duration, the way the Govee tests already blanked
+  `GOVEE_API_KEY`. Verify with:
+  `STREMIO_EMAIL=x TMDB_API_KEY=y uv run python -m unittest discover -s tests`
 - **A single play attempt cannot tell you which layer broke.** "Stremio didn't
   start" has at least six distinct causes — box asleep, adb unreachable, package
   gone, `stremio://` handler unregistered, `dumpsys media_session` unreadable so

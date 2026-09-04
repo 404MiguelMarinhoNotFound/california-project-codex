@@ -13,6 +13,7 @@ import unittest
 import unittest.mock as mock
 
 from services.llm import LLMService
+from tests.config_fixture import config_for_tests
 
 
 class _Block:
@@ -81,17 +82,17 @@ class _FakeClient:
 
 
 def _config() -> dict:
-    return {
-        "llm": {
-            "provider": "claude",
-            "system_prompt": "BASE PROMPT",
-            "conversation_history_size": 6,
-            "claude": {"model": "m", "max_tokens": 100, "web_search": False},
-        },
-        "media": {"enabled": True},
-        "govee": {"enabled": True, "default_light": "attic",
-                  "lights": {"attic": {"mac": "AA"}}},
-    }
+    """The real config.yaml with web search off and a sentinel prompt.
+
+    web_search is true in the shipped config and runs server-side at Anthropic,
+    so it is never dispatched locally; switching it off here keeps the tool loop
+    under test to the two local tools. The model name and max_tokens come from
+    the file -- the fake client ignores them, but a renamed llm.claude key
+    should still fail here.
+    """
+    return config_for_tests(
+        llm={"system_prompt": "BASE PROMPT", "claude": {"web_search": False}},
+    )
 
 
 class ClaudeStreamingTests(unittest.TestCase):

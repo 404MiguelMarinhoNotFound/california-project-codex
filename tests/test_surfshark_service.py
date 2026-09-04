@@ -7,6 +7,9 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 from services.surfshark_service import SurfsharkService
+from tests.config_fixture import config_for_tests
+
+ROUTE_TABLE_PATH = Path(__file__).resolve().parents[1] / "surfshark_routes.json"
 
 
 CONNECTED_ALBANIA_XML = """
@@ -20,41 +23,37 @@ CONNECTED_ALBANIA_XML = """
 
 class SurfsharkServiceTests(unittest.TestCase):
     def _write_route_table(self, route_path: Path, sequence: list[str] | None = None) -> None:
-        route_path.write_text(
-            json.dumps(
-                {
-                    "routes": {
-                        "restart_autoconnect": {
-                            "launch_mode": "package",
-                            "force_stop_before_launch": True,
-                            "assumed_country": "albania",
-                            "sequence": [],
-                        },
-                        "quick_connect": {
-                            "launch_mode": "package",
-                            "wait_for_ready": True,
-                            "retry_force_stop_on_failure": True,
-                            "assumed_country": "portugal",
-                            "sequence": sequence or ["DPAD_DOWN", "DPAD_DOWN", "DPAD_CENTER"],
-                        },
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
+        """Copy the shipped surfshark_routes.json into the test's tmpdir.
+
+        This used to write its own table with a 3-key quick_connect sequence.
+        The route that actually ships is 4 keys -- the leading DPAD_CENTER
+        exits Surfshark's auto-connect screen before moving down to Portugal,
+        and CLAUDE.md calls it out as deliberate on this Mi Box build. The
+        tests were pinning a route nobody runs. Pass `sequence` only to vary
+        it on purpose.
+        """
+        table = json.loads(ROUTE_TABLE_PATH.read_text(encoding="utf-8"))
+        if sequence is not None:
+            table["routes"]["quick_connect"]["sequence"] = sequence
+        route_path.write_text(json.dumps(table), encoding="utf-8")
 
     def _config(self, state_path: Path, route_path: Path | None = None) -> dict:
-        return {
-            "media": {
+        """The real config.yaml with routing forced on and waits removed.
+
+        vpn_routing_enabled is false in the shipped config (the feature is
+        parked), so it has to be flipped here or every test would assert
+        against a disabled service. Everything that describes the route --
+        country aliases, connected/disconnected markers, route_by_app -- comes
+        from the file, so retuning any of them fails a test instead of quietly
+        diverging from what the tests claim to cover.
+        """
+        return config_for_tests(
+            media={
                 "vpn_routing_enabled": True,
                 "vpn_state_path": str(state_path),
-                "surfshark_route_table_path": str(route_path) if route_path else "surfshark_routes.json",
-                "vpn_status_cache_max_age_minutes": 5,
-                "vpn_failure_policy": "open_anyway",
-                "vpn_route_by_app": {
-                    "youtube": "restart_autoconnect",
-                    "stremio": "quick_connect",
-                },
+                "surfshark_route_table_path": (
+                    str(route_path) if route_path else str(ROUTE_TABLE_PATH)
+                ),
                 "surfshark_launch_delay_ms": 1,
                 "surfshark_connect_timeout_ms": 50,
                 "surfshark_status_poll_interval_ms": 1,
@@ -64,26 +63,9 @@ class SurfsharkServiceTests(unittest.TestCase):
                 "surfshark_restart_autoconnect_wait_ms": 1,
                 "surfshark_ready_timeout_ms": 1,
                 "surfshark_ready_poll_interval_ms": 1,
-                "surfshark_ready_stable_polls": 2,
                 "surfshark_ready_settle_ms": 1,
-                "surfshark_retry_count": 1,
-                "surfshark_debug_capture_enabled": False,
-                "surfshark_debug_capture_dir": "debug/surfshark",
-                "surfshark_quick_connect_aliases": [
-                    "quick_connect",
-                    "quick connect",
-                    "fastest",
-                    "fastest location",
-                ],
-                "surfshark_quick_connect_sequence": ["DPAD_DOWN", "DPAD_DOWN", "DPAD_CENTER"],
-                "surfshark_country_aliases": {
-                    "albania": ["albania"],
-                    "portugal": ["portugal"],
-                },
-                "surfshark_connected_markers": ["connected", "protected"],
-                "surfshark_disconnected_markers": ["disconnected", "not connected", "unprotected"],
             }
-        }
+        )
 
     def _media_service(self) -> Mock:
         media_service = Mock()
@@ -215,7 +197,12 @@ class SurfsharkServiceTests(unittest.TestCase):
             media_service.force_stop_app.assert_not_called()
             media_service.launch_package.assert_called_once_with("surfshark")
             media_service.keyevent.assert_has_calls(
-                [call("DPAD_DOWN"), call("DPAD_DOWN"), call("DPAD_CENTER")]
+                [
+                    call("DPAD_CENTER"),
+                    call("DPAD_DOWN"),
+                    call("DPAD_DOWN"),
+                    call("DPAD_CENTER"),
+                ]
             )
 
     def test_quick_connect_route_retries_with_force_stop_after_first_failure(self):
@@ -223,7 +210,16 @@ class SurfsharkServiceTests(unittest.TestCase):
             route_path = Path(tmp) / "surfshark_routes.json"
             self._write_route_table(route_path)
             media_service = self._media_service()
-            media_service.keyevent.side_effect = [False, True, True, True]
+            # Fail the first key, succeed on everything after. Written as a
+            # counter rather than a fixed list so it does not silently break
+            # (StopIteration) when the shipped route's key count changes.
+            calls = {"n": 0}
+
+            def _keyevent(_key):
+                calls["n"] += 1
+                return calls["n"] > 1
+
+            media_service.keyevent.side_effect = _keyevent
             svc = SurfsharkService(self._config(Path(tmp) / "vpn_state.json", route_path), media_service)
 
             with patch("services.surfshark_service.time.sleep"):
@@ -271,7 +267,10 @@ class SurfsharkServiceTests(unittest.TestCase):
 
             self.assertTrue(result["success"])
             self.assertEqual(result["sequence_name"], "quick_connect")
-            self.assertEqual(result["sequence"], ["DPAD_DOWN", "DPAD_DOWN", "DPAD_CENTER"])
+            self.assertEqual(
+                result["sequence"],
+                ["DPAD_CENTER", "DPAD_DOWN", "DPAD_DOWN", "DPAD_CENTER"],
+            )
             self.assertGreaterEqual(len(result["captures"]), 6)
 
 
