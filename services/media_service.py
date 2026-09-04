@@ -6,14 +6,18 @@ import yaml
 from pathlib import Path
 from urllib.parse import quote_plus
 
+from services.cec_wake import CecWaker
+
 log = logging.getLogger(__name__)
 
 # How long to wait before retrying after a failed connection (seconds)
 _OFFLINE_COOLDOWN = 30
 
+_WAKEFULNESS_RE = re.compile(r"mWakefulness=(\w+)")
+
 
 class MediaService:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, cec_waker: CecWaker | None = None):
         media_cfg = config["media"]
         self.ip   = media_cfg["mibox_ip"]
         self.port = media_cfg["adb_port"]
@@ -30,6 +34,18 @@ class MediaService:
         self.ui_dump_retry_count = max(1, int(media_cfg.get("ui_dump_retry_count", 2)))
         self.ui_dump_retry_delay_s = max(0, int(media_cfg.get("ui_dump_retry_delay_ms", 700)) / 1000)
         self.ui_dump_timeout_s = max(1, int(media_cfg.get("ui_dump_timeout_ms", 6000))) / 1000
+
+        # Wake. ADB can put the box to sleep but can never bring it back, so
+        # turn_on goes through the television over CEC. See services/cec_wake.py.
+        wake_cfg = media_cfg.get("cec_wake", {}) or {}
+        self.wake_settle_s = max(0, int(wake_cfg.get("settle_ms", 25000))) / 1000
+        self.wake_poll_interval_s = max(0.1, int(wake_cfg.get("poll_interval_ms", 2000)) / 1000)
+        self.wake_attempts = max(1, int(wake_cfg.get("wake_attempts", 3)))
+        self.cec_waker = cec_waker if cec_waker is not None else CecWaker(config)
+
+        # Set by _wake_and_wait so the dispatcher can tell a rejected pairing
+        # token (needs a human at the screen) from any other wake failure.
+        self.last_wake_result = None
 
         # Connection state tracking
         self._connected = False
@@ -523,18 +539,98 @@ class MediaService:
         return self._open_youtube_url(url)
 
     # --- Power ---
+    #
+    # Turning the box on and turning it off are NOT symmetric, and nothing here
+    # should pretend they are. Off is one ADB keyevent. On is a Bluetooth pair
+    # request, because the box leaves Wi-Fi entirely in standby and ADB cannot
+    # reach it at all. That asymmetry is why KEYCODE_POWER is never sent blind:
+    # it is a toggle, so firing it at an already-awake box turns the TV off and
+    # ends every other form of control until someone picks up the remote.
+
+    def is_awake(self) -> bool | None:
+        """
+        True if awake, False if asleep but reachable, None if unreachable.
+
+        None is the interesting one: it means the box is in standby with its
+        Wi-Fi radio down, which is the only state that needs the Bluetooth path.
+        """
+        if not self.ensure_connected():
+            return None
+        ok, output = self._adb("shell dumpsys power")
+        if not ok or not output:
+            return None
+        match = _WAKEFULNESS_RE.search(output)
+        if not match:
+            return None
+        return match.group(1).strip().lower() == "awake"
+
+    def turn_on(self) -> bool:
+        state = self.is_awake()
+        if state is True:
+            return True  # Already on. Sending anything here risks turning it off.
+        if state is False:
+            # Reachable but asleep: the screen is off, the radio is not.
+            # KEYCODE_WAKEUP is a no-op when already awake, so it is the safe
+            # choice over KEYCODE_POWER even though we checked the state first.
+            return self._adb("shell input keyevent KEYCODE_WAKEUP")[0]
+        return self._wake_and_wait()
+
+    def turn_off(self) -> bool:
+        if self.is_awake() is None:
+            return True  # Unreachable already means off.
+        return self._adb("shell input keyevent KEYCODE_SLEEP")[0]
+
+    def _wake_and_wait(self) -> bool:
+        """Wake via the TV over CEC, then wait for the box to rejoin the network."""
+        self.last_wake_result = None
+        for attempt in range(1, self.wake_attempts + 1):
+            result = self.cec_waker.wake()
+            self.last_wake_result = result
+            if not result:
+                log.warning("CEC wake did not run: %s", result.detail)
+                # A rejected token will not fix itself on a retry, and it needs a
+                # different fix from every other failure. Stop and say so.
+                if getattr(result, "needs_pairing", False):
+                    return False
+                continue
+
+            log.info("CEC wake sent (%s), waiting up to %.0fs for the box (attempt %d/%d)",
+                     result.detail, self.wake_settle_s, attempt, self.wake_attempts)
+            if self._wait_for_box():
+                log.info("Box back on the network after CEC wake")
+                return True
+
+        log.warning("Box did not rejoin the network after %d CEC wake attempt(s)",
+                    self.wake_attempts)
+        return False
+
+    def _wait_for_box(self) -> bool:
+        deadline = time.monotonic() + self.wake_settle_s
+        while time.monotonic() < deadline:
+            # ensure_connected() stamps _last_fail_time on every miss and then
+            # refuses to retry for _OFFLINE_COOLDOWN. That cooldown is correct
+            # for normal operation and wrong here, where we are deliberately
+            # waiting out a boot, so clear it on each pass.
+            self._last_fail_time = 0
+            if self.ensure_connected():
+                return True
+            time.sleep(self.wake_poll_interval_s)
+        return False
+
+    def switch_hdmi(self, port: int):
+        """Select an HDMI input on the television. Returns a WakeResult."""
+        return self.cec_waker.switch_input(port)
 
     def power_toggle(self) -> bool:
-        return self.ensure_connected() and self._adb(
-            "shell input keyevent KEYCODE_POWER")[0]
+        """State-aware. Never sends a bare KEYCODE_POWER -- see the note above."""
+        return self.turn_off() if self.is_awake() is True else self.turn_on()
 
+    # Back-compat aliases for the older action names.
     def sleep(self) -> bool:
-        return self.ensure_connected() and self._adb(
-            "shell input keyevent KEYCODE_SLEEP")[0]
+        return self.turn_off()
 
     def wake(self) -> bool:
-        return self.ensure_connected() and self._adb(
-            "shell input keyevent KEYCODE_WAKEUP")[0]
+        return self.turn_on()
 
     # --- State awareness ---
 

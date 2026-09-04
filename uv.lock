@@ -308,10 +308,14 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+cec = [
+    { name = "samsungtvws" },
+]
 default = [
     { name = "bleak" },
     { name = "en-core-web-sm" },
     { name = "kokoro" },
+    { name = "samsungtvws" },
     { name = "torch" },
     { name = "torchaudio" },
 ]
@@ -346,6 +350,7 @@ silero = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40.0" },
     { name = "bleak", marker = "extra == 'govee'", specifier = ">=0.22.0" },
+    { name = "california", extras = ["cec"], marker = "extra == 'default'" },
     { name = "california", extras = ["govee"], marker = "extra == 'default'" },
     { name = "california", extras = ["kokoro"], marker = "extra == 'default'" },
     { name = "california", extras = ["silero"], marker = "extra == 'default'" },
@@ -365,12 +370,13 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.31.0" },
+    { name = "samsungtvws", marker = "extra == 'cec'", specifier = ">=3.0.5" },
     { name = "sounddevice", specifier = ">=0.4.6" },
     { name = "soundfile", specifier = ">=0.12.1" },
     { name = "torch", marker = "extra == 'silero'", specifier = ">=2.0.0" },
     { name = "torchaudio", marker = "extra == 'silero'", specifier = ">=2.0.0" },
 ]
-provides-extras = ["kokoro", "piper", "elevenlabs", "openai", "porcupine", "silero", "pi", "govee", "default"]
+provides-extras = ["kokoro", "piper", "elevenlabs", "openai", "porcupine", "silero", "pi", "govee", "default", "cec"]
 
 [[package]]
 name = "catalogue"
@@ -3160,6 +3166,20 @@ wheels = [
 ]
 
 [[package]]
+name = "samsungtvws"
+version = "3.0.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+    { name = "websocket-client" },
+    { name = "yarl" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/35/76/5fe4d57979617208ea50628e395e641e3e2aa3183944047a461ebb96275a/samsungtvws-3.0.5.tar.gz", hash = "sha256:c6f2e1c65736f41e46c24fb95c206b8ac619f6a2bdf1d26186e0f4c4e955105e", size = 46486, upload-time = "2026-05-28T15:30:55.203Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/b0/2dd487ad3ef55059cd82ec557edbfa200b93347bfdebdfc8242d2f1e37e2/samsungtvws-3.0.5-py3-none-any.whl", hash = "sha256:ede66a79011a1fa062a89afc57e2a12d1c475f7b0fd7d5fef4fe4ab8d0ee9fe1", size = 48021, upload-time = "2026-05-28T15:30:54.046Z" },
+]
+
+[[package]]
 name = "scikit-learn"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3956,6 +3976,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ce/e5/e272bb9a045105a1fdf4b798d8086f5932a178f4d738f17a74f5c9e0ae9a/weasel-1.0.0.tar.gz", hash = "sha256:7b129b44c90cc543b760532974ca1e4eb30dad2aa2026f57bdce66354ae610fc", size = 38682, upload-time = "2026-03-20T08:10:25.266Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0a/07/57ebf7a6798b016c064bd0ca81b4c6a99daa4dc377b898bc7b41eb6b5af0/weasel-1.0.0-py3-none-any.whl", hash = "sha256:89518acee027f49d743126c3502d35e6dd14f5768be5c37c9af47c171b6005cc", size = 50713, upload-time = "2026-03-20T08:10:23.637Z" },
+]
+
+[[package]]
+name = "websocket-client"
+version = "1.9.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/cb/a5abcc2891249f393827c650c6296660ce40374ac22d99ab9aea41f9d2a2/websocket_client-1.9.2.tar.gz", hash = "sha256:0fcb57545848be86992e128218fd96dd87a6769ffdb1a968dff79632b85604d0", size = 84110, upload-time = "2026-08-31T14:08:40.964Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d5/d2/cc4dc1271e464942db7ee278baae2daa99ee77cb2af744025c04da585a3e/websocket_client-1.9.2-py3-none-any.whl", hash = "sha256:e1a673830a9c7bfa47b1cd3d5e4178f4c9651d80a4eab02c9c23a1c3ec6250ce", size = 95786, upload-time = "2026-08-31T14:08:39.899Z" },
 ]
 
 [[package]]

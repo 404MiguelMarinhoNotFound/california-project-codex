@@ -19,3 +19,7 @@ debug/
 # Recorded wake-word takes: audio output, and personal voice data
 training/recordings/
 debug/wakeword/
+
+# Samsung TV pairing token, generated on first CEC wake
+samsung_token.txt
+tv_state.json

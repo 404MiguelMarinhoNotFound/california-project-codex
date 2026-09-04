@@ -69,7 +69,13 @@ govee = ["bleak>=0.22.0"]
 # lying about which VAD ran for the life of the project. `default` is defined as
 # exactly what the committed config.yaml selects, and config.yaml selects silero, so
 # it belongs here. This adds torchaudio only, not the full ~2GB — torch is already in.
-default = ["california[kokoro]", "california[govee]", "california[silero]"]
+default = ["california[kokoro]", "california[govee]", "california[silero]", "california[cec]"]
+# cec belongs in default because the committed config.yaml sets
+# media.cec_wake.enabled: true, and turn_on cannot work without samsungtvws.
+# Same rule that put silero here: default == exactly what config.yaml selects.
+cec = [
+    "samsungtvws>=3.0.5",
+]
 
 [tool.uv]
 # Always use uv's own managed CPython. Building .venv on the Windows Store

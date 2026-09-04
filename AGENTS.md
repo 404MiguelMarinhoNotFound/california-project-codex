@@ -187,6 +187,7 @@ california/
 │   └── vad.py                   # Voice activity detection
 ├── services/
 │   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
+│   ├── cec_wake.py              # Wake the box via the TV over HDMI-CEC; ADB cannot turn it on
 │   ├── llm.py                   # Multi-provider LLM streaming + tool calling
 │   ├── govee_service.py         # Govee cloud v2 light control
 │   ├── name_matcher.py          # Shared fuzzy hint -> key matching: exact, despaced, substring, token overlap
@@ -211,6 +212,7 @@ california/
 │   ├── run_stremio_e2e.py          # Live end-to-end Stremio routing and playback test
 │   ├── run_youtube_playlist_e2e.py # Live end-to-end YouTube playlist routing test
 │   ├── probe_govee_devices.py      # Lists Govee devices with sku, device id, and capabilities
+│   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
 │   ├── probe_stremio_sync.py       # Refreshes and inspects Stremio watch-state cache
@@ -223,6 +225,7 @@ california/
 │   ├── test_activation_capture.py # Activation clip naming and pruning
 │   ├── test_activation_phrases.py # Wake tiers, echo stripping, recording trim, dropped turns
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
+│   ├── test_media_power.py      # turn_on/turn_off, BT wake fallback, no blind KEYCODE_POWER
 │   ├── test_media_service.py    # YouTube / ADB unit tests
 │   ├── test_mic_drain.py        # Stale mic-buffer draining after playback
 │   ├── test_orchestrator_lights.py # control_lights dispatch behavior
@@ -497,14 +500,102 @@ Use `queue.Queue(maxsize=2)` for synthesized audio buffering so synthesis and pl
 - App launching for Stremio, YouTube, Surfshark, and Spotify
 - Explicit activity launch when configured, with fallback to plain package launch
 - Navigation commands like home and back
-- Power and wake commands
+- Power commands, which are asymmetric — see the section below
 - Current-app and media-session inspection
 - Current focus inspection, UI dump capture, and screenshot capture for TV debugging
 - Screenshot-byte helpers and UI dump flows reused by Stremio scans so raw ADB calls do not hang indefinitely
 - YouTube playlist and search deep links
 - YouTube warm launch plus one OK press to clear the profile picker on cold starts
 
-### SurfsharkService
+### Power: Off Is ADB, On Is The Television
+
+**Turning the box off and turning it on are not symmetric.** Off is one ADB
+keyevent. On goes through the TV, because the Mi Box suspends in standby and
+`adbd` suspends with it. Measured on the real box 2026-09-03:
+
+```text
+adb shell input keyevent KEYCODE_SLEEP   -> ok, mWakefulness=Asleep
+adb shell input keyevent KEYCODE_WAKEUP  -> error: closed
+adb connect 192.168.1.35:5555            -> WSA 10060, every time
+```
+
+**Ping is not a reachability test here, and believing it wastes an hour.** The
+box answers ICMP intermittently in standby — windows at t=39s, 48s, 54s after
+sleeping, roughly one every 6-15s. That is the Wi-Fi firmware's offload replying
+while the CPU stays suspended. Twelve `adb connect` attempts fired the instant
+ICMP replied gave twelve WSA 10060s. `wifi_sleep_policy` is already `2` ("never
+sleep") and `stay_on_while_plugged_in=3` does not prevent the suspend either —
+both measured.
+
+#### Dead routes, with evidence. Do not retry these.
+
+| Route | Why it is dead |
+|---|---|
+| ADB wake | `adbd` suspends with the box; ICMP replies are firmware offload, not the OS |
+| Wake-on-LAN **to the box** | No Ethernet, and Android randomises the Wi-Fi MAC per network (`16:da:99:37:d0:89` is locally-administered, unstable across reconnects) |
+| BLE / `bleak` | The box does not advertise over BLE at all — a 20s scan beside it while awake sees nothing. The Govee transport is not reusable |
+| Bluetooth Classic from Windows | `AF_BTH` Winsock `bind()` fails against the **local** radio with `WSAEADDRNOTAVAIL`; WinRT `PairAsync` refuses an undiscovered address, and a TV box is never discoverable. Five approaches tried |
+
+The Bluetooth page to `9C:12:21:1C:95:AF` (what MiPower does) is a real mechanism
+and needs a host this project does not have. It was built, then removed.
+
+#### What works
+
+`services/cec_wake.py`, two steps:
+
+1. **Wake-on-LAN the Samsung TV.** Needs no IP and no token — it is a MAC
+   broadcast — which is what makes the whole chain recoverable. Took 2 attempts
+   in testing.
+2. **Toggle the TV's HDMI input** over its WebSocket API. The TV emits
+   `<Routing Change>` + `<Set Stream Path>` on the CEC bus and the box wakes.
+
+**Step 2 is load-bearing.** The box was still unreachable after the TV powered
+on and only woke after the input toggle, so WoL alone is not enough and the
+pairing token is a hard dependency. That is why a rejected token gets its own
+`WakeResult.needs_pairing` and its own spoken line — "approve me on screen" and
+"use the remote" are opposite fixes, and giving the wrong one strands him.
+
+- **`dumpsys hdmi_control` history is a capped ring buffer (~246 entries).**
+  Counting entries to detect new CEC traffic reports `+0` and looks exactly like
+  failure — read the *tail* instead. This nearly caused a working mechanism to be
+  thrown away as broken
+- **Sleeping the box switches the TV off too** (`mAutoTvOff: true`,
+  `hdmi_control_auto_device_off_enabled=1`). Intended — "turn off the TV" means
+  both — but it is why the wake must WoL the TV first
+- The Mi Box is CEC physical address `0x2000` = **HDMI 2**. `KEY_HDMI` toggles
+  HDMI2 <-> HDMI1 on this set, so **odd presses select the box**
+- `tv_ip` is a **cached hint, not configuration.** Identity keys off `tv_mac` and
+  `tv_duid`, both stable. On a miss `resolve_tv_ip()` goes cached -> ARP by MAC ->
+  subnet probe, verifying the duid at every step, and rewrites `tv_state.json`.
+  **The duid check is the point**: without it a stale IP that another device has
+  since taken would answer 200 and be trusted
+- Re-pair with `uv run python tools/pair_samsung_tv.py`. It WoLs the TV first,
+  because approval needs the TV on and a person in front of it
+
+**`KEYCODE_POWER` is never sent, in any state.** It is a *toggle*, so firing it at
+an already-awake box turns the TV off — and on this hardware that ends every other
+form of control until someone picks up the physical remote. `power_toggle` did
+exactly that, three times, during this work. `MediaService` is now state-aware:
+
+| `is_awake()` | meaning | `turn_on()` does |
+|---|---|---|
+| `True` | awake | nothing — returns success |
+| `False` | asleep, radio up | `KEYCODE_WAKEUP` |
+| `None` | unreachable | CEC wake through the TV, then wait |
+
+`None` and `False` take different branches. **Do not collapse them into a
+boolean** — that is the whole wake path.
+
+**The power actions are deliberately absent from `_dispatch_tv`'s `requires_tv`
+set.** That gate returns `"TV is off or unreachable right now"` when
+`ensure_connected()` fails, which is precisely the state `turn_on` exists to fix.
+`wake` used to be listed there, a second and independent reason it was dead code.
+
+`_wait_for_box` clears `_last_fail_time` on every poll, because
+`ensure_connected()` stamps it on each miss and then refuses to retry for
+`_OFFLINE_COOLDOWN` — right in normal operation, wrong while waiting out a boot.
+
+### SurfsharkService### SurfsharkService
 
 _Status: Idle. `media.vpn_routing_enabled` is `false` in `config.yaml`, so the orchestrator never calls `ensure_route()`. The code below is kept in place for easy rollback but does not run in the current setup._
 
@@ -847,7 +938,7 @@ At the time of this update:
 The Claude path supports:
 
 - Anthropic web search via `web_search_20250305`
-- Custom `control_tv` tool for Mi Box control (23 actions)
+- Custom `control_tv` tool for Mi Box and TV control (23 actions)
 - Custom `control_lights` tool for Govee light control (2 actions)
 
 With the committed `config.yaml` that is **3 tools** in every request: `web_search`,
@@ -879,7 +970,7 @@ The `control_tv` schema in `services/llm.py` currently supports these TV-related
 - `fast_forward`, `rewind`
 - `volume_up`, `volume_down`, `volume_set`, `mute`
 - `launch_app`, `go_home`, `go_back`
-- `power_toggle`, `sleep`, `wake`
+- `turn_on`, `turn_off`, `switch_hdmi`
 - `get_status`
 - `stremio_play`, `stremio_continue`, `stremio_get_progress`, `stremio_sync_library`
 - `youtube_playlist`, `youtube_search`
@@ -965,6 +1056,21 @@ uv run python -m unittest discover -s tests -v
 Current automated coverage exists for:
 
 - Stremio title resolution and watch-state behavior
+- Power: that `KEYCODE_POWER` is never sent in any state, that `turn_on`
+  is a no-op when already awake, that unreachable falls back to Bluetooth,
+  that `is_awake()` keeps `None` distinct from `False`, that the wait loop
+  clears the offline cooldown, and that `turn_on` survives the
+  `requires_tv` gate while the TV is unreachable
+- CEC wake: self-disabling without `tv_mac`/`tv_duid`, WoL skipped when the TV
+  already answers and retried when it does not, the input key sent exactly twice,
+  and an auth failure flagged `needs_pairing` while other failures are not
+- TV discovery: a cached IP that verifies skips discovery entirely, a wrong duid
+  at that IP is rejected rather than trusted, ARP then sweep are tried in order,
+  and total failure returns `""` instead of raising
+- That a revoked token produces "approve me on screen" and NOT "use the remote" —
+  they are opposite fixes and the wrong one strands him
+- `_hdmi_inventory()` advertising configured ports and omitting the block entirely
+  when none are named
 - Stremio playback retry logic
 - Surfshark route execution, route cache semantics, and debug route capture
 - Orchestrator VPN preflight routing and warning behavior
@@ -1042,6 +1148,9 @@ Targeted validation used for the latest Stremio resume work:
 
 ```bash
 uv run python -m py_compile services\stremio_service.py core\orchestrator.py services\llm.py services\media_service.py tests\test_stremio_service.py tests\test_media_service.py tests\test_orchestrator_vpn_routing.py
+
+# Power path. Safe against a live box: turn_on is a no-op while already awake.
+uv run python -m unittest tests.test_media_power -v
 uv run python -m unittest tests.test_media_service tests.test_stremio_service tests.test_orchestrator_vpn_routing -v
 ```
 
@@ -1144,6 +1253,20 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
   and had no way at all to measure "would she wake for nothing", so every
   threshold decision was half-blind. `--negatives` and `--sweep` close that, fed
   by clips California records of her own false wakes (`wake_word.capture`)
+- **A device that answers is not a device that is reachable, and "off" can mean
+  off the network.** Every fix for the Mi Box wake assumed the box was still
+  *there* in standby, just not listening — raise a timeout, retry the connect,
+  pick a better keycode. The ARP table settled it in one line: `.32`, `.33` and
+  `.34` answered and `.35` had no entry at all. Once the interface is down, no
+  keycode and no timeout can matter, and the only way out is a radio that stays
+  up. Check whether the target exists on the network before tuning how you talk
+  to it.
+- **A toggle is the wrong primitive for anything with an asymmetric cost.**
+  `KEYCODE_POWER` reads as symmetric and is not: off costs one keyevent, on
+  costs a physical remote. `power_toggle` therefore had a 50% chance of being
+  unrecoverable, which is not a risk profile a voice interface should carry.
+  Explicit `turn_on` / `turn_off` also cost one *fewer* action in the tool
+  schema than the three they replaced.
 - Plain show requests should sync first, then use `watch_state.json` as the resume source of truth for Stremio titles
 - TMDB is the fallback resolver for titles outside the local Stremio cache
 - `state=3` in `dumpsys media_session` is the practical playback signal
@@ -1200,6 +1323,20 @@ Three more were found and fixed on **2026-09-03**, all in the same path:
   wake produced `"Hmm."` from 5.2s of room tone and Claude answered it. Now
   `verbose_json` plus a filler blocklist; a rejected transcript returns `""`,
   which the existing empty-transcript guard already drops.
+
+One more was found and fixed on **2026-09-03**, in the power path:
+
+- ~~**`power_toggle` was a one-way door, and `wake()` was dead code**~~ — the tool
+  sent a bare `KEYCODE_POWER`, a toggle, so "turn on the TV" turned it off
+  whenever it was already on, and nothing could turn it back on. Found the hard
+  way: the box was slept over ADB to test the wake path and could not be
+  recovered without the physical remote, three separate times. `wake()` was
+  doubly unreachable, since `wake` sat in `_dispatch_tv`'s `requires_tv` set
+  behind an `ensure_connected()` gate. Now `turn_on` / `turn_off` with
+  state-aware dispatch and a CEC wake through the television.
+  **Verified end to end**: both devices fully off, recovered by script alone —
+  WoL to the Samsung, HDMI toggle, box awake. See "Power: Off Is ADB, On Is The
+  Television".
 
 Confirmed **High-severity** backlog:
 

@@ -232,7 +232,7 @@ llm:
      #INFO:
       I am european portuguese based in Carcavelos, Lisbon Portugal. use celcius 
       Every time I ask you something about something you probably don't know or need up to date info like weather etc -> use web search.
-      You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, toggle power, and check what's currently playing with get_status. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
+      You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, and check what's currently playing with get_status. Turning the TV on and off is yours too: turn_on and turn_off, and treat "put the TV on", "kill the TV", "turn everything off" as those. Two things to know about them. turn_on takes up to about a minute (measured at forty-seven seconds) because it wakes the television first and then the box, so say you're on it and then wait, never fire the tool twice or call it failed while it's still going. And turn_off puts the television into standby along with the box, which is intended, so mention both in one short line. You can switch the TV's inputs with switch_hdmi; the inputs are listed at the end of this prompt, do not guess at ones that are not. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
       Music and video both go through that TV, so treat "put on", "play", and "what can you play" as TV requests, not as questions about your own abilities. For music, YouTube is the path: use youtube_playlist for a saved category (they are listed at the end of this prompt) and youtube_search for anything else. For shows and films it is Stremio: stremio_play, stremio_continue, and stremio_get_progress for "what episode am I on". You have no music service of your own and no access to his YouTube account, so never claim to browse his subscriptions, liked songs, or account playlists.
       You can control Master Miguel's Govee lights using the control_lights tool: power, brightness from 1 to 100, and colour. The rooms you can reach are listed at the end of this prompt, do not invent others. Brightness and colour only show on a light that is already on, so turn it on first if it might be off. Confirm in one short casual sentence, and say so plainly if a light is unreachable.
 
@@ -445,6 +445,49 @@ media:
   mibox_ip: "192.168.1.35"
   adb_port: 5555
   volume_max_steps: 15            # Mi Box S hardware max — used by volume_set()
+
+  # --- Power / wake ---
+  # ADB can turn the box OFF but never ON. The Mi Box suspends in standby and
+  # adbd suspends with it:
+  #   input keyevent KEYCODE_SLEEP  -> ok, mWakefulness=Asleep
+  #   input keyevent KEYCODE_WAKEUP -> error: closed
+  #   adb connect                   -> WSA 10060, every time
+  # Ping is NOT a reachability test here: the box answers ICMP intermittently
+  # (windows every 6-15s) because the Wi-Fi firmware's offload replies while
+  # the CPU stays suspended. 12 ping-gated connects all failed. wifi_sleep_policy
+  # is already 2 ("never sleep") and stay_on_while_plugged_in=3 does not prevent
+  # the suspend either -- both measured 2026-09-03.
+  #
+  # The wake goes through the TELEVISION instead: Wake-on-LAN the Samsung, then
+  # toggle its HDMI input, which makes it emit <Routing Change> + <Set Stream
+  # Path> on the CEC bus, which wakes the box. Proven end to end 2026-09-03.
+  cec_wake:
+    enabled: true
+    # Identity keys off things that do not move. tv_ip is only a cached hint --
+    # if it goes stale, CecWaker rediscovers by MAC then duid and rewrites
+    # tv_state_path. WoL never needs an IP at all (it is a MAC broadcast), so
+    # only the websocket step is affected by a DHCP move.
+    tv_mac: "54:BD:79:24:45:32"   # Samsung UE49M5505, Tizen
+    tv_duid: "uuid:ce6399e0-8c5a-46f9-86b8-a05754f7a9ea"
+    tv_ip: "192.168.1.34"         # hint only, self-heals
+    tv_state_path: "tv_state.json"
+    tv_port: 8002
+    # Written on first pairing; needs on-screen approval WITH THE TV ON.
+    # Re-pair with: uv run python tools/pair_samsung_tv.py
+    token_path: "samsung_token.txt"
+    input_key: "KEY_HDMI"
+    key_delay_ms: 6000            # settle between the away press and the back press
+    wol_attempts: 5               # the TV took 2 in testing
+    tv_boot_timeout_ms: 40000
+    wake_attempts: 3
+    settle_ms: 25000              # TV must WoL-boot before the box can wake
+    poll_interval_ms: 2000
+    # Mi Box is at CEC physical address 0x2000 == HDMI 2. KEY_HDMI toggles
+    # HDMI2 <-> HDMI1 on this set, so ODD presses select the box. Only HDMI 2
+    # is known; fill in the others as you learn them. Drives the system-prompt
+    # inventory, so a name here is what California will actually offer.
+    hdmi_ports:
+      2: "mi box"
   vpn_routing_enabled: false
   vpn_state_path: "vpn_state.json"
   vpn_status_cache_max_age_minutes: 5

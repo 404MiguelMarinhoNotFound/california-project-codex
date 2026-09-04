@@ -93,7 +93,10 @@ def _dispatch_tv(
         "play_pause", "stop", "next", "prev", "fast_forward", "rewind",
         "volume_up", "volume_down", "volume_set", "mute",
         "launch_app", "go_home", "go_back",
-        "power_toggle", "sleep", "wake",
+        # Deliberately NOT the power actions. This gate returns early when the
+        # TV is unreachable, and unreachable is precisely the state turn_on
+        # exists to fix -- the box drops off Wi-Fi in standby. Listing "wake"
+        # here is part of why it was dead code: the gate answered first.
         "get_status", "youtube_playlist", "youtube_search",
         "stremio_play", "stremio_continue",
     }
@@ -302,22 +305,55 @@ def _dispatch_tv(
         media_svc.go_back()
         return "done"
 
-    # Power
+    # Power. turn_on may take ~20s: it fires a Bluetooth pair request and then
+    # waits for the box to rejoin Wi-Fi. Report what actually happened -- a
+    # failed wake needs the remote and saying otherwise strands Master Miguel.
+    elif action in ("turn_on", "wake"):
+        if not media_svc:
+            return "media service not available"
+        if media_svc.turn_on():
+            return "TV is on"
+        # A rejected pairing token and a dead TV need opposite fixes. Saying
+        # "use the remote" when the real answer is "approve me on screen" sends
+        # Master Miguel to the wrong one, so branch on it.
+        result = getattr(media_svc, "last_wake_result", None)
+        if result is not None and getattr(result, "needs_pairing", False):
+            logger.warning("turn_on failed, pairing needed: %s", result.detail)
+            return "the TV needs me approved on screen again"
+        logger.warning("turn_on failed: %s",
+                       getattr(result, "detail", None) or "no network after wake")
+        return "couldn't turn the TV on, it needs the remote"
+    elif action in ("turn_off", "sleep"):
+        if not media_svc:
+            return "media service not available"
+        if media_svc.turn_off():
+            return "TV going to standby"
+        return "couldn't put the TV to sleep"
     elif action == "power_toggle":
-        media_svc.power_toggle()
-        return "power toggled"
-    elif action == "sleep":
-        media_svc.sleep()
-        return "TV going to standby"
-    elif action == "wake":
-        media_svc.wake()
-        return "wake signal sent"
+        if not media_svc:
+            return "media service not available"
+        return "TV is on" if media_svc.power_toggle() else "couldn't change the TV power state"
+
+    elif action == "switch_hdmi":
+        if not media_svc:
+            return "media service not available"
+        try:
+            port = int(params.get("hdmi_port"))
+        except (TypeError, ValueError):
+            return "which HDMI port?"
+        result = media_svc.switch_hdmi(port)
+        if result:
+            return f"switched to HDMI {port}"
+        if getattr(result, "needs_pairing", False):
+            return "the TV needs me approved on screen again"
+        return f"couldn't switch to HDMI {port}"
 
     # State awareness
     elif action == "get_status":
         app = media_svc.get_current_app()
         session = media_svc.get_media_session()
-        return f"Current app: {app}. Media session: {session}"
+        tv = "on" if media_svc.cec_waker.available and media_svc.cec_waker._tv_is_up() else "unknown"
+        return f"Current app: {app}. Media session: {session}. TV: {tv}"
 
     return "unknown action"
 

@@ -56,7 +56,7 @@ CONTROL_TV_TOOL = {
                     "fast_forward", "rewind",
                     "volume_up", "volume_down", "volume_set", "mute",
                     "launch_app", "go_home", "go_back",
-                    "power_toggle", "sleep", "wake",
+                    "turn_on", "turn_off", "switch_hdmi",
                     "get_status",
                     "stremio_play", "stremio_continue", "stremio_get_progress", "stremio_sync_library",
                     "youtube_playlist", "youtube_search",
@@ -67,6 +67,10 @@ CONTROL_TV_TOOL = {
                 "type": "string",
                 "enum": ["stremio", "youtube", "surfshark", "spotify"],
                 "description": "Required only for launch_app."
+            },
+            "hdmi_port": {
+                "type": "integer",
+                "description": "Required only for switch_hdmi. The TV's HDMI input number."
             },
             "volume_steps": {
                 "type": "integer",
@@ -219,6 +223,17 @@ class LLMService:
         # model cannot answer it from a tool schema that only takes a name. Only
         # categories the resolver would actually accept are advertised, so a key
         # with an empty ID list is never offered.
+        # HDMI inputs on the television, injected for the same reason as the
+        # lights and playlists: which port is which is a fact about his living
+        # room, not about the tool, and hardcoding it in system_prompt is what
+        # goes stale.
+        self.hdmi_ports: dict[int, str] = {
+            int(port): str(name)
+            for port, name in (
+                ((config.get("media") or {}).get("cec_wake") or {}).get("hdmi_ports") or {}
+            ).items()
+        }
+
         self.playlist_names: list[str] = [
             name
             for name, value in (config.get("youtube_playlists") or {}).items()
@@ -288,7 +303,8 @@ class LLMService:
         """Inject current date/time and the live device inventories into the system prompt."""
         now = datetime.now()
         time_info = f"\nCurrent date and time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}."
-        return self.system_prompt + time_info + self._light_inventory() + self._playlist_inventory()
+        return (self.system_prompt + time_info + self._light_inventory()
+                + self._playlist_inventory() + self._hdmi_inventory())
 
     def _light_inventory(self) -> str:
         """
@@ -304,6 +320,20 @@ class LLMService:
         elif len(self.light_names) == 1:
             line += " If a request names no room, use that one."
         return line
+
+    def _hdmi_inventory(self) -> str:
+        """
+        Describe the TV's HDMI inputs so switch_hdmi can be asked for by name.
+
+        Same rule as the lights and playlists: never hardcode these in
+        system_prompt. An unnamed port is not advertised, because offering an
+        input nobody labelled is worse than offering none.
+        """
+        if not self.media_enabled or not self.hdmi_ports:
+            return ""
+        inputs = ", ".join(f"HDMI {port} is the {name}"
+                           for port, name in sorted(self.hdmi_ports.items()))
+        return f"\nTV inputs you can switch between: {inputs}."
 
     def _playlist_inventory(self) -> str:
         """
