@@ -209,6 +209,7 @@ california/
 ├── tools/
 │   ├── debug_surfshark_sequence.py # Runs named Surfshark routes with optional screenshot capture
 │   ├── debug_surfshark_status.py   # Inspects current Surfshark status and route execution
+│   ├── check_stremio_adb.py        # Read-only layered health check of the whole Stremio/ADB path
 │   ├── run_stremio_e2e.py          # Live end-to-end Stremio routing and playback test
 │   ├── run_youtube_playlist_e2e.py # Live end-to-end YouTube playlist routing test
 │   ├── probe_govee_devices.py      # Lists Govee devices with sku, device id, and capabilities
@@ -1111,6 +1112,13 @@ uv run python tools\debug_surfshark_sequence.py quick_connect --capture --debug
 uv run python tools\run_youtube_playlist_e2e.py --prep-app stremio --debug
 uv run python tools\run_stremio_e2e.py --prep-app youtube --debug
 uv run python tools\probe_stremio_sync.py
+
+# Stremio health check. Read-only by default: it never starts playback and
+# never rewrites watch_state.json unless asked. Exits nonzero per failed check.
+uv run python tools\check_stremio_adb.py                    # full sweep
+uv run python tools\check_stremio_adb.py --skip-adb         # offline, no TV needed
+uv run python tools\check_stremio_adb.py --sync --json      # refresh library, machine-readable
+uv run python tools\check_stremio_adb.py --title Fallout --launch   # actually plays
 uv run python tools\probe_govee_devices.py
 uv run python tools\probe_govee_devices.py --transport cloud
 
@@ -1267,6 +1275,23 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
   unrecoverable, which is not a risk profile a voice interface should carry.
   Explicit `turn_on` / `turn_off` also cost one *fewer* action in the tool
   schema than the three they replaced.
+- **A unit test holding a real service object will use a real transport, and only
+  a machine *missing* the binary tells you.** Four tests in
+  `tests/test_stremio_service.py` built a live `StremioService` with
+  `adb_path: "adb"` and patched only `_attempt_provider`, so `_play_deep_link`
+  reached `_launch_uri` and `_keyevent` and fired real `am start` and
+  `input keyevent 23` at whatever device adb was attached to. On Master Miguel's
+  laptop they passed; on a box without adb on PATH they raised `FileNotFoundError`,
+  which is the only reason it was ever visible. The class `setUp` now stubs
+  `subprocess.run` for every test in the file, and
+  `test_unit_tests_never_shell_out_to_a_real_adb` fails loudly if that guard is
+  removed. **`uv run python -m unittest discover` must never touch the TV.**
+- **A single play attempt cannot tell you which layer broke.** "Stremio didn't
+  start" has at least six distinct causes — box asleep, adb unreachable, package
+  gone, `stremio://` handler unregistered, `dumpsys media_session` unreadable so
+  verification is blind, `uiautomator dump` empty so provider scraping falls back
+  to blind OK presses — and they need different fixes. `tools/check_stremio_adb.py`
+  walks them in order and is read-only, so it can be run while something is playing
 - Plain show requests should sync first, then use `watch_state.json` as the resume source of truth for Stremio titles
 - TMDB is the fallback resolver for titles outside the local Stremio cache
 - `state=3` in `dumpsys media_session` is the practical playback signal

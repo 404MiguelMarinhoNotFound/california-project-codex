@@ -523,6 +523,27 @@ class StremioService:
             log.warning("Resume sync failed for %s: %s", title or "Stremio request", exc)
             return False
 
+    def build_deep_link(
+        self,
+        imdb_id: str,
+        media_type: str,
+        season: int | None = None,
+        episode: int | None = None,
+    ) -> tuple[str, str]:
+        """Return (uri, target_mode) for a playback request.
+
+        Split out of _play_deep_link so diagnostics can report the exact URI
+        that would be launched without launching it.
+        """
+        if media_type == "movie":
+            return f"stremio:///detail/movie/{imdb_id}/{imdb_id}", "movie_detail"
+        if season and episode:
+            return (
+                f"stremio:///detail/series/{imdb_id}/{imdb_id}:{season}:{episode}",
+                "episode",
+            )
+        return f"stremio:///detail/series/{imdb_id}/{imdb_id}", "series_detail"
+
     def _play_deep_link(
         self,
         imdb_id: str,
@@ -534,15 +555,7 @@ class StremioService:
         allow_unknown_source: bool = False,
         remembered_source: str | None = None,
     ) -> StremioPlayResult:
-        if media_type == "movie":
-            uri = f"stremio:///detail/movie/{imdb_id}/{imdb_id}"
-            target_mode = "movie_detail"
-        elif season and episode:
-            uri = f"stremio:///detail/series/{imdb_id}/{imdb_id}:{season}:{episode}"
-            target_mode = "episode"
-        else:
-            uri = f"stremio:///detail/series/{imdb_id}/{imdb_id}"
-            target_mode = "series_detail"
+        uri, target_mode = self.build_deep_link(imdb_id, media_type, season, episode)
 
         source_order = self._source_preference_order(remembered_source)
         found_preferred_source = False

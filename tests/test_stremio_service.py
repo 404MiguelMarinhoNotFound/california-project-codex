@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,20 @@ class _Response:
 
 
 class StremioServiceTests(unittest.TestCase):
+    def setUp(self):
+        # These tests build a real StremioService with adb_path "adb". Any code
+        # path that reaches _run_adb_command would otherwise fire a real ADB
+        # command -- `am start`, `input keyevent 23` -- at whatever device the
+        # developer's adb happens to be attached to, and only on a machine
+        # without adb on PATH does that fail loudly. Stub the subprocess
+        # boundary for the whole class so a unit test can never touch the TV.
+        patcher = patch("services.stremio_service.subprocess.run")
+        self.subprocess_run = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.subprocess_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr=""
+        )
+
     def _config(self, watch_state_path: Path) -> dict:
         return {
             "stremio": {
@@ -329,6 +344,36 @@ class StremioServiceTests(unittest.TestCase):
             [candidate.provider_key for candidate in candidates],
             ["comet", "mediafusion", "torrent"],
         )
+
+    def test_build_deep_link_covers_the_three_target_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = StremioService(self._config(Path(tmp) / "watch_state.json"))
+
+            self.assertEqual(
+                svc.build_deep_link("tt1375666", "movie"),
+                ("stremio:///detail/movie/tt1375666/tt1375666", "movie_detail"),
+            )
+            self.assertEqual(
+                svc.build_deep_link("tt13315786", "series", 2, 4),
+                ("stremio:///detail/series/tt13315786/tt13315786:2:4", "episode"),
+            )
+            self.assertEqual(
+                svc.build_deep_link("tt13315786", "series"),
+                ("stremio:///detail/series/tt13315786/tt13315786", "series_detail"),
+            )
+            # A half-known target is a detail page, never episode 1 of season 1.
+            self.assertEqual(
+                svc.build_deep_link("tt13315786", "series", 2, None)[1],
+                "series_detail",
+            )
+
+    def test_unit_tests_never_shell_out_to_a_real_adb(self):
+        # The setUp stub is the guard. If someone removes it, this fails here
+        # rather than by firing keyevents at a live Mi Box mid-test-run.
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = StremioService(self._config(Path(tmp) / "watch_state.json"))
+            svc._run_shell("echo ping")
+        self.subprocess_run.assert_called()
 
     def test_play_returns_confirmation_only_after_all_preferred_providers_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
