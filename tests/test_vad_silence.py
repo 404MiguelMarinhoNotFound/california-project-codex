@@ -15,6 +15,7 @@ from unittest.mock import patch
 import numpy as np
 
 from core.vad import SILERO_WINDOW_16K, VAD
+from tests.config_fixture import config_for_tests
 
 SAMPLE_RATE = 16000
 CHUNK_SAMPLES = 640  # 40ms, matching config audio.chunk_duration_ms
@@ -24,18 +25,17 @@ LOUD = np.full(CHUNK_SAMPLES, 5000, dtype=np.int16)    # him talking
 
 
 def _vad(**overrides):
-    """A VAD on the energy engine, so no model loads and no torch is needed."""
-    cfg = {
-        "engine": "energy",
-        "energy_threshold": 200,
-        "silence_duration": 0.9,
-        "max_recording": 30.0,
-        "min_recording": 0.6,
-        "speech_timeout": 4.0,
-        "speech_start_frames": 2,
-    }
-    cfg.update(overrides)
-    return VAD({"vad": cfg, "audio": {"sample_rate": SAMPLE_RATE}})
+    """The real vad block, forced onto the energy engine.
+
+    config.yaml selects "silero", which would load torch and a model; "energy"
+    is the only override, so every threshold and window below -- energy_threshold,
+    silence_duration, min_recording, speech_timeout, speech_start_frames -- is
+    the value that actually runs. Retuning one in config.yaml now shows up here
+    instead of leaving these tests asserting against numbers nobody ships.
+    """
+    config = config_for_tests(vad={"engine": "energy", **overrides})
+    config["audio"]["sample_rate"] = SAMPLE_RATE
+    return VAD(config)
 
 
 class _Clock:

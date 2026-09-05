@@ -110,10 +110,13 @@ wake_word:
     max_files: 200          # oldest clips are pruned past this
 
 vad:
-  # "silero" is neural and better in noise, but torch/torchaudio only ship in the
-  # `silero` extra, which `default` does not include - so on a normal install this
-  # silently falls back to "energy" and the energy_threshold below is what actually
-  # runs. Set "energy" explicitly if you want to stop pretending otherwise.
+  # "silero" is neural and better in noise. It needs torch AND torchaudio, which
+  # ship in the `silero` extra -- now part of `default`, so `uv sync --extra
+  # default` gives you the engine named here. This comment used to say the
+  # opposite, from when the extra was missing and core/vad.py fell back to
+  # "energy" with a warning nobody read: the config was describing a VAD that
+  # never ran. On any install WITHOUT that extra it still falls back silently,
+  # and the energy_threshold below is what actually runs.
   engine: "silero"
   # Keep these even if your code only uses some of them
   energy_threshold: 200 # lower = more sensitive (try 100–300 for quiet mics)

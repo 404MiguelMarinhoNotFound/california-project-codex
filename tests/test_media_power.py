@@ -14,20 +14,27 @@ from unittest.mock import Mock, patch
 from core.orchestrator import _dispatch_tv
 from services.cec_wake import CecWaker, WakeResult
 from services.media_service import MediaService
+from tests.config_fixture import config_for_tests, real_config
 
 
 def _config(**media_overrides) -> dict:
-    media = {
-        "mibox_ip": "192.168.1.35",
-        "adb_port": 5555,
-        "adb_path": "adb",
-        "adb_timeout_ms": 12000,
-        "apps": {"youtube": "com.google.android.youtube.tv"},
-        "cec_wake": {"enabled": False, "settle_ms": 100, "poll_interval_ms": 100,
-                     "wake_attempts": 1},
-    }
-    media.update(media_overrides)
-    return {"media": media}
+    """The real config.yaml with the wake path made safe and fast.
+
+    cec_wake is disabled so a unit test can never Wake-on-LAN the television,
+    and its waits drop from 25s to 100ms. Everything else -- mibox_ip, adb_path,
+    the app table -- comes from what ships, so a moved box fails here.
+    """
+    return config_for_tests(
+        media={
+            "cec_wake": {
+                "enabled": False,
+                "settle_ms": 100,
+                "poll_interval_ms": 100,
+                "wake_attempts": 1,
+            },
+            **media_overrides,
+        }
+    )
 
 
 def _service(waker=None) -> MediaService:
@@ -242,18 +249,23 @@ class DispatchTests(unittest.TestCase):
 
 
 def _cec_config(**overrides) -> dict:
+    """The real cec_wake block, with waits shortened and caches redirected.
+
+    tv_mac and tv_duid are the TV's identity and come from config.yaml -- they
+    used to be re-typed here, so a test could keep asserting against a set that
+    had been replaced. Only the two paths and the three timings are overridden:
+    the paths so a test never reads or writes the real caches, the timings so a
+    failed-WoL test takes 100ms instead of 40 seconds.
+    """
     cec = {
-        "enabled": True,
-        "tv_mac": "54:BD:79:24:45:32",
-        "tv_duid": "uuid:ce6399e0-8c5a-46f9-86b8-a05754f7a9ea",
-        "tv_ip": "192.168.1.34",
         "tv_state_path": "nonexistent_tv_state.json",
+        "token_path": "nonexistent_samsung_token.txt",
         "key_delay_ms": 10,
         "wol_attempts": 2,
         "tv_boot_timeout_ms": 100,
+        **overrides,
     }
-    cec.update(overrides)
-    return {"media": {"cec_wake": cec}}
+    return config_for_tests(media={"cec_wake": cec})
 
 
 class CecWakerTests(unittest.TestCase):
@@ -328,28 +340,29 @@ class TvDiscoveryTests(unittest.TestCase):
     """A DHCP move must self-heal, not surface as 'couldn't turn the TV on'."""
 
     def test_cached_ip_that_verifies_skips_discovery(self):
+        cached_ip = real_config()["media"]["cec_wake"]["tv_ip"]
         waker = CecWaker(_cec_config())
         with patch.object(CecWaker, "_probe", return_value=True):
             with patch.object(CecWaker, "_arp_lookup") as arp:
-                self.assertEqual(waker.resolve_tv_ip(), "192.168.1.34")
+                self.assertEqual(waker.resolve_tv_ip(), cached_ip)
         arp.assert_not_called()
 
     def test_wrong_duid_at_the_cached_ip_is_rejected(self):
         """Another device taking the address must not be mistaken for the TV."""
         waker = CecWaker(_cec_config())
-        with patch.object(CecWaker, "_probe", side_effect=lambda ip: ip == "192.168.1.77"):
-            with patch.object(CecWaker, "_arp_lookup", return_value="192.168.1.77"):
+        with patch.object(CecWaker, "_probe", side_effect=lambda ip: ip == "192.168.1.77"):  # config-literal: an address the TV moved to, found by ARP
+            with patch.object(CecWaker, "_arp_lookup", return_value="192.168.1.77"):  # config-literal: an address the TV moved to, found by ARP
                 with patch.object(CecWaker, "_remember_ip") as remember:
-                    self.assertEqual(waker.resolve_tv_ip(), "192.168.1.77")
-        remember.assert_called_once_with("192.168.1.77")
+                    self.assertEqual(waker.resolve_tv_ip(), "192.168.1.77")  # config-literal: an address the TV moved to, found by ARP
+        remember.assert_called_once_with("192.168.1.77")  # config-literal: an address the TV moved to, found by ARP
 
     def test_sweep_is_the_last_resort(self):
         waker = CecWaker(_cec_config())
-        with patch.object(CecWaker, "_probe", side_effect=lambda ip: ip == "192.168.1.90"):
+        with patch.object(CecWaker, "_probe", side_effect=lambda ip: ip == "192.168.1.90"):  # config-literal: an address only the subnet sweep finds
             with patch.object(CecWaker, "_arp_lookup", return_value=""):
-                with patch.object(CecWaker, "_sweep", return_value="192.168.1.90"):
+                with patch.object(CecWaker, "_sweep", return_value="192.168.1.90"):  # config-literal: an address only the subnet sweep finds
                     with patch.object(CecWaker, "_remember_ip"):
-                        self.assertEqual(waker.resolve_tv_ip(), "192.168.1.90")
+                        self.assertEqual(waker.resolve_tv_ip(), "192.168.1.90")  # config-literal: an address only the subnet sweep finds
 
     def test_total_failure_returns_empty_not_an_exception(self):
         waker = CecWaker(_cec_config())

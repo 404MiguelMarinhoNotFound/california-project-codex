@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import requests
 
+from tests.config_fixture import config_for_tests, deep_merge, real_config
 from services.govee_service import (
     BLE_POWER_OFF,
     BLE_POWER_ON,
@@ -28,43 +29,58 @@ class _Response:
         return self._payload
 
 
+def _with_govee(lights: dict, **overrides) -> dict:
+    """config.yaml with the govee block overridden, `lights` replaced wholesale.
+
+    lights is the one key that must not deep-merge: a test passing
+    lights={"hall": ...} means "these are the only rooms", and merging the real
+    attic back in would silently break that assertion.
+    """
+    config = config_for_tests(govee=overrides)
+    config["govee"]["lights"] = lights
+    return config
+
+
 def _cloud_config(**overrides) -> dict:
-    govee = {
-        "enabled": True,
-        "transport": "cloud",
-        "api_key": "test-key",
-        "base_url": "https://openapi.api.govee.com",
-        "request_timeout_ms": 5000,
-        "default_light": "attic",
-        "lights": {
-            "attic": {
-                "sku": "H6199",
-                "device": "AA:BB:CC:DD:EE:FF:00:11",
-                "aliases": ["loft", "upstairs", "my lights"],
+    """The real govee block, switched to the cloud transport.
+
+    attic's identity and aliases come from config.yaml. The sku/device pair is
+    added here because the real strip is an H617E -- BLE-only, invisible to the
+    cloud API -- so those fields cannot exist in the shipped file. bedroom is
+    added because resolution between two rooms needs two rooms; the deployment
+    has one.
+    """
+    lights = overrides.pop("lights", None)
+    if lights is None:
+        lights = deep_merge(
+            real_config()["govee"]["lights"],
+            {
+                "attic": {"sku": "H6199", "device": "AA:BB:CC:DD:EE:FF:00:11"},
+                "bedroom": {"sku": "H6143", "device": "11:22:33:44:55:66:77:88"},
             },
-            "bedroom": {"sku": "H6143", "device": "11:22:33:44:55:66:77:88"},
-        },
-    }
-    govee.update(overrides)
-    return {"govee": govee}
+        )
+    settings = {"transport": "cloud", "api_key": "test-key", "request_timeout_ms": 5000}
+    settings.update(overrides)
+    return _with_govee(lights, **settings)
 
 
 def _ble_config(**overrides) -> dict:
-    govee = {
-        "enabled": True,
-        "transport": "ble",
-        "default_light": "attic",
-        "ble": {"scan_timeout_ms": 1000, "connect_timeout_ms": 1000, "retries": 2},
-        "lights": {
-            "attic": {
-                "mac": "EE:2E:01:06:53:0E",
-                "aliases": ["loft", "upstairs", "my lights"],
-            },
-            "bedroom": {"mac": "AA:BB:CC:DD:EE:FF"},
-        },
+    """The real govee block with BLE waits cut and a second room added.
+
+    attic's mac and aliases are the shipped ones, so a re-paired strip or a
+    renamed alias fails a test rather than leaving these asserting against a
+    device that no longer exists.
+    """
+    lights = overrides.pop("lights", None)
+    if lights is None:
+        lights = deep_merge(
+            real_config()["govee"]["lights"], {"bedroom": {"mac": "AA:BB:CC:DD:EE:FF"}}
+        )
+    settings = {
+        "ble": {"scan_timeout_ms": 1000, "connect_timeout_ms": 1000, "retries": 2}
     }
-    govee.update(overrides)
-    return {"govee": govee}
+    settings.update(overrides)
+    return _with_govee(lights, **settings)
 
 
 def _cloud_service(**overrides) -> GoveeService:

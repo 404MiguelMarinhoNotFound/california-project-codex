@@ -2,6 +2,7 @@ import unittest
 import unittest.mock as mock
 
 from services.llm import LLMService
+from tests.config_fixture import config_for_tests
 
 
 def _build(**kwargs) -> LLMService:
@@ -13,20 +14,27 @@ DEFAULT_PLAYLISTS = {"samba": ["RD1", "RD2"], "jazz": "PL1"}
 
 
 def _config(playlists=DEFAULT_PLAYLISTS, media_enabled=True, **govee) -> dict:
-    base = {"enabled": True, "default_light": "attic",
-            "lights": {"attic": {"mac": "AA"}, "bedroom": {"mac": "BB"}}}
-    base.update(govee)
-    return {
-        "llm": {
-            "provider": "groq",
-            "system_prompt": "BASE PROMPT",
-            "conversation_history_size": 6,
-            "groq": {"model": "m", "max_tokens": 10},
-        },
-        "media": {"enabled": media_enabled},
-        "govee": base,
-        "youtube_playlists": playlists,
-    }
+    """The real config.yaml with the two inventories deliberately faked.
+
+    This file tests the *injection mechanism*, not the data: the assertions are
+    "whatever is in the config reaches the prompt, and an empty category does
+    not". So the playlists and lights are small synthetic sets, and
+    system_prompt is a sentinel that makes the appended block easy to see.
+    The real data is covered by tests/test_playlist_config.py, which sweeps
+    config.yaml itself.
+
+    Everything else -- provider, history size, the groq block -- comes from the
+    file, so a renamed llm key fails here rather than at boot.
+    """
+    lights = {"attic": {"mac": "AA"}, "bedroom": {"mac": "BB"}}
+    config = config_for_tests(
+        llm={"provider": "groq", "system_prompt": "BASE PROMPT"},
+        media={"enabled": media_enabled},
+        govee={"enabled": True, "default_light": "attic", **govee},
+    )
+    config["govee"]["lights"] = govee.get("lights", lights)
+    config["youtube_playlists"] = playlists
+    return config
 
 
 class LightInventoryPromptTests(unittest.TestCase):

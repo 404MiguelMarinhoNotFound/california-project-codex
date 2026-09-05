@@ -5,30 +5,18 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 from services.media_service import MediaService
+from tests.config_fixture import config_for_tests
 
 
 class MediaServiceYouTubeTests(unittest.TestCase):
     def setUp(self):
-        self.config = {
-            "media": {
-                "mibox_ip": "192.168.1.26",
-                "adb_port": 5555,
-                "adb_path": "adb",
-                "adb_timeout_ms": 12000,
-                "volume_max_steps": 15,
-                "apps": {
-                    "youtube": "com.google.android.youtube.tv",
-                    "stremio": "com.stremio.one",
-                    "surfshark": "com.surfshark.vpnclient.android",
-                },
-                "app_launch_components": {
-                    "surfshark": "com.surfshark.vpnclient.android/.StartActivity",
-                },
-                "app_launch_categories": {
-                    "surfshark": "android.intent.category.LEANBACK_LAUNCHER",
-                },
-            }
-        }
+        # The real config.yaml. This fixture used to hardcode an IP from two
+        # moves ago plus its own copy of the app table, and kept passing --
+        # it was asserting agreement with itself, not with what ships.
+        # Every ADB call below is mocked, so no deployment value needs pinning.
+        self.config = config_for_tests(
+            media={"cec_wake": {"enabled": False}},
+        )
 
     def test_youtube_playlist_launches_expected_url(self):
         svc = MediaService(self.config)
