@@ -277,6 +277,14 @@ class MediaService:
         Free, because the TCP scan that just ran SYNed every host on the subnet and
         so populated the ARP table for everything that exists.
         """
+        # Something answered on the adb port and was rejected -- the port scan only
+        # yields hosts with 5555 open, so a rejection there means the serial did not
+        # match. Another Android device with wireless debugging on has the address
+        # we expected, which is a different problem from the box being absent.
+        if any(step.rung == "tcp_port_candidates" and step.verdict == "rejected"
+               for step in self._finder.last_trace):
+            return "identity_mismatch"
+
         if not self.mibox_mac:
             return "unknown"
         from services.device_finder import _ips_for_mac, _read_arp_table
