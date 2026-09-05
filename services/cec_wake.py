@@ -209,8 +209,20 @@ class CecWaker:
     # ----------------------------------------------------------------- wake ---
 
     def _tv_is_up(self) -> bool:
+        """
+        Probe the TV, and remember where it answered.
+
+        The assignment is load-bearing. `power_on_tv` returns early on this, so
+        without it `self._tv_ip` stays None on the happy path and `_remote()`
+        builds SamsungTVWS(host=None) -- "Can't build URL with port but without
+        host". That failure only hides while the cached IP is *stale*, because
+        the resulting rediscovery sets `_tv_ip` as a side effect.
+        """
         ip = self._tv_ip or self._cached_ip() or self.tv_ip_hint
-        return bool(ip) and self._probe(ip)
+        if not ip or not self._probe(ip):
+            return False
+        self._tv_ip = ip
+        return True
 
     def _send_wol(self) -> None:
         raw = bytes.fromhex(self.tv_mac.replace(":", "").replace("-", ""))
