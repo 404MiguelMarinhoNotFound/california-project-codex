@@ -8,6 +8,7 @@ turned the TV *off* when asked to turn it on), and `wake` sat behind a
 reachability gate that answered first.
 """
 
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -268,7 +269,33 @@ def _cec_config(**overrides) -> dict:
     return config_for_tests(media={"cec_wake": cec})
 
 
-class CecWakerTests(unittest.TestCase):
+class _NoNetworkScanMixin:
+    """
+    Fail loudly instead of scanning the operator's LAN.
+
+    `CecWaker._arp_lookup` ping-floods all 254 hosts of the subnet and then
+    shells out to `arp -a`. That is correct in production and unacceptable in a
+    unit test, for the same reason StremioService may not reach a live adb: the
+    suite must not touch the network it happens to be run on. This is the
+    guard; individual tests still stub the discovery helpers they exercise.
+    """
+
+    def setUp(self):
+        super().setUp()
+        patcher = patch("services.cec_wake.subprocess.run")
+        self.subprocess_run = patcher.start()
+        self.subprocess_run.return_value = SimpleNamespace(returncode=1, stdout="", stderr="")
+        self.addCleanup(patcher.stop)
+
+
+class CecWakerTests(_NoNetworkScanMixin, unittest.TestCase):
+    def test_unit_tests_never_ping_sweep_the_real_subnet(self):
+        # The setUp stub is the guard. If someone removes it, this fails here
+        # rather than by firing 254 pings at whatever LAN the suite runs on.
+        waker = CecWaker(_cec_config())
+        waker._arp_lookup()
+        self.subprocess_run.assert_called()
+
     def test_self_disables_without_a_mac(self):
         waker = CecWaker(_cec_config(tv_mac=""))
         self.assertFalse(waker.available)
@@ -300,14 +327,37 @@ class CecWakerTests(unittest.TestCase):
         wol.assert_not_called()
 
     def test_wol_is_sent_and_retried_when_the_tv_is_down(self):
+        # _arp_lookup must be stubbed: an unreachable TV sends resolve_tv_ip
+        # into discovery, and the real _arp_lookup ping-floods all 254 hosts of
+        # the operator's subnet before shelling out to `arp -a`. A unit test
+        # must not scan the network any more than it may drive the TV.
         waker = CecWaker(_cec_config())
         with patch.object(CecWaker, "_probe", return_value=False):
-            with patch.object(CecWaker, "_send_wol") as wol:
-                with patch("services.cec_wake.time.sleep"):
-                    result = waker.wake()
+            with patch.object(CecWaker, "_arp_lookup", return_value=""):
+                with patch.object(CecWaker, "_send_wol") as wol:
+                    with patch("services.cec_wake.time.sleep"):
+                        result = waker.wake()
         self.assertFalse(result)
         self.assertIn("did not come up", result.detail)
         self.assertEqual(wol.call_count, 2)  # wol_attempts
+
+    def test_wake_resolves_the_host_when_the_tv_already_answers(self):
+        """
+        The happy path must reach _remote() with a real host.
+
+        `power_on_tv` returns early on `_tv_is_up`, so if that probe does not
+        record where the TV answered, `self._tv_ip` is still None by the time
+        SamsungTVWS is constructed and every wake fails with "Can't build URL
+        with port but without host". Patching _send_keys hides this, so this
+        test deliberately patches one layer lower.
+        """
+        waker = CecWaker(_cec_config())
+        with patch.object(CecWaker, "_probe", return_value=True):
+            with patch.object(CecWaker, "_remote") as remote:
+                result = waker.wake()
+        self.assertTrue(result)
+        self.assertTrue(waker._tv_ip, "wake() built the remote without a host")
+        remote.assert_called()
 
     def test_wake_sends_the_input_key_exactly_twice(self):
         """Away then back. The return press is what emits Set Stream Path."""
@@ -336,7 +386,7 @@ class CecWakerTests(unittest.TestCase):
         self.assertFalse(result.needs_pairing)
 
 
-class TvDiscoveryTests(unittest.TestCase):
+class TvDiscoveryTests(_NoNetworkScanMixin, unittest.TestCase):
     """A DHCP move must self-heal, not surface as 'couldn't turn the TV on'."""
 
     def test_cached_ip_that_verifies_skips_discovery(self):
