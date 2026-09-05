@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from core.orchestrator import _dispatch_tv
+from core.orchestrator import _dispatch_tv, _ensure_playable
 from services.cec_wake import CecWaker, WakeResult
 from services.media_service import MediaService
 from tests.config_fixture import config_for_tests, real_config
@@ -255,6 +255,109 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(self._dispatch("turn_off", media), "TV going to standby")
 
 
+class EnsurePlayableTests(unittest.TestCase):
+    """
+    "Put on show X" with the room asleep must work, not return an error.
+
+    The old gate was binary and gave up; recovery depended on the model deciding
+    to call turn_on and re-issue the action. One tool call, one outcome.
+    """
+
+    def _media(self, *, reachable=True, active_source=True):
+        media = Mock()
+        media.ensure_connected.return_value = reachable
+        # The verified selector; MediaService owns the retry/cycle loop, and
+        # EnsureActiveSourceTests covers it. Here we only care what the
+        # dispatcher does with each answer.
+        media.ensure_active_source.return_value = active_source
+        media.mibox_hdmi_port = 2
+        media.unreachable_reason = ""
+        media.last_wake_result = None
+        return media
+
+    def test_a_ready_room_is_left_alone(self):
+        media = self._media()
+        self.assertEqual(_ensure_playable(media), "")
+        media.turn_on.assert_not_called()
+
+    def test_a_parked_input_is_selected_before_playing(self):
+        """Box awake but the TV is on terrestrial: the one real 'TV is wrong' case."""
+        media = self._media()
+        self.assertEqual(_ensure_playable(media), "")
+        media.ensure_active_source.assert_called_once()
+        media.turn_on.assert_not_called()
+
+    def test_an_input_that_cannot_be_selected_is_admitted_not_faked(self):
+        """
+        Returning "" here would claim success while the TV shows another source.
+        Playback would start off-screen and look like nothing happened.
+        """
+        media = self._media(active_source=False)
+        result = _ensure_playable(media)
+        self.assertIn("remote", result)
+
+    def test_unknown_active_source_still_proceeds(self):
+        """
+        None is "could not tell", not False. Refusing to play because a dumpsys
+        was unreadable would be worse than playing on a screen that is probably
+        already right.
+        """
+        media = self._media(active_source=None)
+        self.assertEqual(_ensure_playable(media), "")
+
+    def test_a_sleeping_room_is_woken_and_then_used(self):
+        media = self._media(reachable=False)
+        media.ensure_connected.side_effect = [False, True]
+        media.turn_on.return_value = True
+        self.assertEqual(_ensure_playable(media), "")
+        media.turn_on.assert_called_once()
+
+    def test_the_wake_is_announced_before_it_blocks(self):
+        """A ~25s tool call that says nothing reads as a hang."""
+        media = self._media(reachable=False)
+        media.ensure_connected.side_effect = [False, True]
+        media.turn_on.return_value = True
+        spoken = []
+        _ensure_playable(media, say_now=spoken.append)
+        self.assertEqual(len(spoken), 1)
+        self.assertTrue(spoken[0].strip())
+
+    def test_a_ready_room_says_nothing(self):
+        spoken = []
+        _ensure_playable(self._media(), say_now=spoken.append)
+        self.assertEqual(spoken, [], "no interim line when there is no wait")
+
+    def test_a_failed_wake_reports_the_classified_reason(self):
+        media = self._media(reachable=False)
+        media.turn_on.return_value = False
+        media.unreachable_reason = "no_adb_port"
+        result = _ensure_playable(media)
+        self.assertIn("ADB over Wi-Fi", result)
+
+    def test_a_rejected_token_says_approve_not_use_the_remote(self):
+        """Opposite fixes: the wrong line strands him."""
+        media = self._media(reachable=False)
+        media.turn_on.return_value = False
+        media.last_wake_result = WakeResult(False, "rejected", needs_pairing=True)
+        result = _ensure_playable(media)
+        self.assertIn("Approve me on screen", result)
+
+    def test_playback_actions_escalate_but_transport_controls_do_not(self):
+        """
+        A 25s wake is right for "put something on" and wrong for "pause" -- there
+        is nothing to pause on a sleeping box, and he did not ask to turn it on.
+        """
+        media = self._media(reachable=False)
+        media.turn_on.return_value = False
+        media.unreachable_reason = "not_on_lan"
+
+        _dispatch_tv({"action": "play_pause"}, media, None, None, {})
+        media.turn_on.assert_not_called()
+
+        _dispatch_tv({"action": "stremio_play", "title": "Fallout"}, media, None, None, {})
+        media.turn_on.assert_called_once()
+
+
 def _cec_config(**overrides) -> dict:
     """The real cec_wake block, with waits shortened and caches redirected.
 
@@ -323,14 +426,25 @@ class CecWakerTests(_NoNetworkScanMixin, unittest.TestCase):
         self.assertFalse(result)
         wol.assert_not_called()
 
-    def test_wol_is_skipped_when_the_tv_already_answers(self):
+    def test_wol_is_sent_even_when_the_tv_answers_at_its_address(self):
+        """
+        This test used to assert the OPPOSITE, and the opposite was the bug.
+
+        The set has two standby depths: in the shallow one :8001/api/v2/ still
+        answers while the screen is off. Skipping Wake-on-LAN because the probe
+        answered therefore skipped the only step that powers the TV on, and
+        wake() reported success against a dark television -- observed on the real
+        set 2026-09-05. The probe verifies the ADDRESS, not the power state (this
+        model exposes no PowerState field at all), and WoL is a harmless no-op on
+        a TV that is already on. So it always goes out.
+        """
         waker = CecWaker(_cec_config())
         with patch.object(CecWaker, "_probe", return_value=True):
             with patch.object(CecWaker, "_send_wol") as wol:
                 with patch.object(CecWaker, "_send_keys",
                                   return_value=WakeResult(True, "sent")):
                     self.assertTrue(waker.wake())
-        wol.assert_not_called()
+        wol.assert_called()
 
     def test_wol_is_sent_and_retried_when_the_tv_is_down(self):
         # _arp_lookup must be stubbed: an unreachable TV sends resolve_tv_ip
@@ -345,7 +459,9 @@ class CecWakerTests(_NoNetworkScanMixin, unittest.TestCase):
                         result = waker.wake()
         self.assertFalse(result)
         self.assertIn("did not come up", result.detail)
-        self.assertEqual(wol.call_count, 2)  # wol_attempts
+        # One unconditional burst (see the shallow-standby note above) plus
+        # wol_attempts retries while the TV stays unreachable.
+        self.assertEqual(wol.call_count, 3)
 
     def test_wake_resolves_the_host_when_the_tv_already_answers(self):
         """

@@ -239,8 +239,33 @@ class CecWaker:
                     log.debug("WoL to %s:%s failed: %s", target, port, exc)
 
     def power_on_tv(self) -> bool:
-        """WoL the TV and wait for its REST endpoint. Needs no token."""
-        if self._tv_is_up():
+        """
+        Wake-on-LAN the TV and wait for it to answer. Needs no token.
+
+        **"Answers REST" is NOT "powered on", and this used to assume it was.**
+        This set has two standby depths, measured 2026-09-05:
+
+          shallow -- :8001/api/v2/ still answers while the screen is off
+          deep    -- the endpoint stops answering entirely
+
+        In shallow standby the old `if self._tv_is_up(): return True` short-circuit
+        skipped Wake-on-LAN, which is the only step that would have powered the TV
+        on -- so wake() reported success against a television that stayed dark.
+        Three WoL bursts did nothing while it answered REST; one burst woke it once
+        it had dropped into deep standby.
+
+        The set exposes no PowerState field at all, so `_probe` cannot be taught to
+        tell on from off -- it verifies the *address*, nothing more. WoL is a
+        broadcast and a no-op against a TV that is already on, so the cheapest
+        correct thing is to always send it and let the probe confirm reachability.
+        """
+        # Resolve first: the address is still needed, and this populates _tv_ip
+        # for _remote(). What we must NOT do is treat the answer as "powered on".
+        reachable = self._tv_is_up()
+        log.info("WoL to %s (TV %s at its address)", self.tv_mac,
+                 "answers" if reachable else "does not answer")
+        self._send_wol()
+        if reachable:
             return True
         for attempt in range(1, self.wol_attempts + 1):
             log.info("WoL to %s (attempt %d/%d)", self.tv_mac, attempt, self.wol_attempts)
@@ -304,6 +329,26 @@ class CecWaker:
         if direct:
             return WakeResult(True, f"selected HDMI {port}")
         return direct if direct.needs_pairing else self._send_keys([self.input_key])
+
+    def cycle_input(self) -> WakeResult:
+        """
+        Advance the TV to its next input. Proven on this set, unlike KEY_HDMI<n>.
+
+        `switch_input`'s fallback to this is unreachable in practice: the
+        websocket accepts KEY_HDMI2 and reports success while the TV ignores it,
+        so `direct` is always truthy. Verified 2026-09-05 -- three switch_input(2)
+        calls left the set on HDMI 1, with the CEC log showing
+        <Set Stream Path> 0F:86:10:00 (0x1000 == HDMI 1) each time.
+
+        Cycling is only safe with an external check on where it landed, because
+        it is not idempotent. MediaService.ensure_active_source owns that loop --
+        it can see the box's own mIsActiveSource, which is the only honest witness.
+        """
+        if not self.available:
+            return WakeResult(False, self.unavailable_reason)
+        if not self.resolve_tv_ip():
+            return WakeResult(False, "TV not reachable")
+        return self._send_keys([self.input_key])
 
 
 def _looks_like_auth_failure(exc: Exception) -> bool:

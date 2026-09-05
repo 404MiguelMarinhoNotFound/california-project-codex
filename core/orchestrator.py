@@ -98,6 +98,54 @@ def _unreachable_line(media_svc) -> str:
     }.get(reason, "TV is off or unreachable right now")
 
 
+def _ensure_playable(media_svc, say_now=None) -> str:
+    """
+    Get the room ready to show something. Returns "" on success, else a spoken line.
+
+    The old gate was binary: if ensure_connected() failed it said "TV is off or
+    unreachable right now" and stopped, so "put on Fallout" with the room asleep
+    simply did not work -- recovery depended on the model deciding to call turn_on
+    and re-issue the action, two extra round trips. One tool call should produce
+    one outcome.
+
+    The escalation is shorter than it looks, because CEC does most of it:
+
+      reachable   -> the box's own wake already sent <Text View On> + <Active
+                     Source>, so the TV is on and showing HDMI 2. Only check that
+                     the input has not been parked elsewhere since.
+      unreachable -> ensure_connected() has already tried rediscovery by now, so
+                     the address is not the problem: wake through the television.
+
+    `say_now` speaks an interim line without ending the turn. A CEC wake takes ~25s
+    and a tool call that blocks that long in silence reads as a hang.
+    """
+    if not media_svc:
+        return "media service not available"
+
+    if media_svc.ensure_connected():
+        # Verified, not fire-and-forget: switch_input reports success on a key the
+        # TV accepted and ignored. None is "could not tell" and never switches.
+        if media_svc.ensure_active_source() is False:
+            return ("The box is awake but I can't get the TV onto its input. "
+                    "Switch to it with the remote and I'll take it from there.")
+        return ""
+
+    if say_now:
+        say_now("Hold on, waking everything up.")
+    logger.info("Box unreachable for a playback action; attempting a wake")
+    if media_svc.turn_on() and media_svc.ensure_connected():
+        # A CEC wake selects the box on its way up (One Touch Play), so this is
+        # normally already true and costs one dumpsys.
+        media_svc.ensure_active_source()
+        return ""
+
+    result = getattr(media_svc, "last_wake_result", None)
+    if result is not None and getattr(result, "needs_pairing", False):
+        return ("The TV rejected my pairing token. Approve me on screen and I'll "
+                "try again.")
+    return _unreachable_line(media_svc)
+
+
 def _dispatch_tv(
     params: dict,
     media_svc,
@@ -105,6 +153,7 @@ def _dispatch_tv(
     surfshark_svc,
     youtube_playlists: dict,
     youtube_playlist_aliases: dict | None = None,
+    say_now=None,
 ) -> str:
     action = params.get("action")
     route_warning = None
@@ -121,7 +170,20 @@ def _dispatch_tv(
         "stremio_play", "stremio_continue",
     }
 
-    if action in requires_tv:
+    # Actions that put something on the screen escalate instead of giving up: a
+    # dark room is a fixable state, not an error.
+    needs_screen = {
+        "launch_app", "youtube_playlist", "youtube_search",
+        "stremio_play", "stremio_continue",
+    }
+
+    if action in needs_screen:
+        problem = _ensure_playable(media_svc, say_now)
+        if problem:
+            return problem
+    elif action in requires_tv:
+        # Everything else -- transport controls, volume, status -- is meaningless
+        # against a sleeping box and is not worth a 25s wake unasked.
         if not media_svc:
             return "media service not available"
         if not media_svc.ensure_connected():
@@ -556,6 +618,9 @@ class Orchestrator:
         # State
         self._running = False
         self._interrupted = False  # Barge-in flag
+        # The current turn's TTS queue, set only while _generate_and_speak runs.
+        # _say_now uses it to speak from inside a long tool call.
+        self._active_tts_queue = None
         self._last_record_outcome = "ok"  # "ok" | "no_speech" | "short"
 
         logger.info("All components initialized successfully")
@@ -892,6 +957,12 @@ class Orchestrator:
         tts_queue: queue.Queue[str | None] = queue.Queue()
         full_response_parts = []
 
+        # A tool call runs synchronously on THIS thread inside the LLM stream,
+        # while _tts_worker drains tts_queue on its own. So a long-running tool
+        # can speak by pushing here: the audio plays while it is still blocked.
+        # Nothing else can reach the queue, hence the handoff on self.
+        self._active_tts_queue = tts_queue
+
         # Start TTS worker thread
         tts_thread = threading.Thread(
             target=self._tts_worker,
@@ -925,6 +996,9 @@ class Orchestrator:
             tts_queue.put("Sorry, something went wrong.")
 
         finally:
+            # Drop the handoff before the queue is closed, so a stray say_now
+            # from a later thread cannot push into a finished turn.
+            self._active_tts_queue = None
             # Signal TTS worker to stop
             tts_queue.put(None)
             tts_thread.join(timeout=30)
@@ -1006,6 +1080,21 @@ class Orchestrator:
                 logger.error(f"TTS playback error: {e}")
 
 
+    def _say_now(self, text: str) -> None:
+        """
+        Speak a line mid-turn, without ending it.
+
+        For tool calls that block long enough to read as a hang -- a CEC wake is
+        ~25s. The sentence is appended to the turn's live TTS queue, so it plays
+        in order after whatever the LLM already said and before whatever it says
+        once the tool returns. No-op outside a streaming turn.
+        """
+        active = getattr(self, "_active_tts_queue", None)
+        if active is None or not text:
+            return
+        logger.info("Interim line while a tool call runs: %s", text)
+        active.put(text)
+
     def _handle_tool_call(self, tool_name: str, tool_input: dict) -> str:
         """Dispatch tool calls from the LLM."""
         if tool_name == "control_tv":
@@ -1016,6 +1105,7 @@ class Orchestrator:
                 self.surfshark_service,
                 self.config.get("youtube_playlists", {}),
                 self.config.get("youtube_playlist_aliases") or {},
+                say_now=self._say_now,
             )
         if tool_name == "control_lights":
             return _dispatch_lights(tool_input, self.govee_service)

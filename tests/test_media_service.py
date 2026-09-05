@@ -372,6 +372,138 @@ class MediaServiceYouTubeTests(unittest.TestCase):
         self.assertIn("marker_found", source)
 
 
+class HdmiStateTests(unittest.TestCase):
+    """
+    Parsed from a REAL `dumpsys hdmi_control` capture, not a hand-written string.
+
+    tests/fixtures/hdmi_control_dump.txt was taken off the live Mi Box on
+    2026-09-05, so a firmware change to the format fails here instead of silently
+    reporting "cannot tell" forever.
+    """
+
+    FIXTURE = Path(__file__).parent / "fixtures" / "hdmi_control_dump.txt"
+
+    def _service(self, dump: str | None, connected: bool = True):
+        cfg = config_for_tests(
+            media={"cec_wake": {"enabled": False}, "discovery": {"enabled": False}},
+        )
+        svc = MediaService(cfg)
+        svc.ensure_connected = Mock(return_value=connected)
+        svc._adb = Mock(return_value=(dump is not None, dump or ""))
+        return svc
+
+    def test_active_source_is_read_from_a_real_dump(self):
+        svc = self._service(self.FIXTURE.read_text(encoding="utf-8"))
+        self.assertIs(svc.is_active_source(), True)
+
+    def test_active_source_is_false_when_the_input_is_parked_elsewhere(self):
+        dump = self.FIXTURE.read_text(encoding="utf-8").replace(
+            "mIsActiveSource: true", "mIsActiveSource: false")
+        self.assertIs(self._service(dump).is_active_source(), False)
+
+    def test_unreadable_dump_is_none_not_false(self):
+        """
+        None means "could not tell". Collapsing it to False would fire an HDMI
+        switch on every unreadable dump, and switch_input cycles inputs.
+        """
+        self.assertIsNone(self._service(None).is_active_source())
+        self.assertIsNone(self._service("some unrelated output").is_active_source())
+
+    def test_active_source_is_none_when_the_box_is_unreachable(self):
+        self.assertIsNone(self._service("irrelevant", connected=False).is_active_source())
+
+    def test_tv_power_comes_from_the_last_report_not_the_first(self):
+        """
+        The CEC log is a capped ring (~246 entries), so the FIRST match can be
+        days old. Reading the head during this work returned entries from two
+        days earlier and looked exactly like "nothing happened".
+        """
+        dump = """
+    [R] time=2026-09-04 00:08:08 message=<Report Power Status> 04:90:01
+    [R] time=2026-09-05 14:18:51 message=<Report Power Status> 04:90:00
+"""
+        self.assertEqual(self._service(dump).tv_power_status(), "on")
+
+    def test_tv_power_reads_standby(self):
+        dump = """
+    [R] time=2026-09-05 14:18:51 message=<Report Power Status> 04:90:01
+"""
+        self.assertEqual(self._service(dump).tv_power_status(), "standby")
+
+    def test_tv_power_ignores_our_own_sent_reports(self):
+        """
+        [S] is the box answering the TV about ITSELF. Counting those would report
+        the box's power as the television's.
+        """
+        dump = """
+    [S] time=2026-09-05 14:18:51 message=<Report Power Status> 40:90:00
+"""
+        self.assertIsNone(self._service(dump).tv_power_status())
+
+    def test_tv_power_on_a_real_dump(self):
+        svc = self._service(self.FIXTURE.read_text(encoding="utf-8"))
+        self.assertIn(svc.tv_power_status(), {"on", "standby"})
+
+
+class EnsureActiveSourceTests(unittest.TestCase):
+    """
+    Selecting the box's input must be VERIFIED, because the TV lies by omission.
+
+    switch_input sends KEY_HDMI<n>, the websocket accepts it, and this set
+    ignores it -- so "the send succeeded" says nothing about what is on screen.
+    Measured 2026-09-05: three switch_hdmi(2) calls left the TV on HDMI 1.
+    """
+
+    def _service(self):
+        cfg = config_for_tests(
+            media={"cec_wake": {"enabled": False}, "discovery": {"enabled": False}},
+        )
+        svc = MediaService(cfg, cec_waker=Mock())
+        svc.switch_hdmi = Mock()
+        return svc
+
+    def test_already_on_screen_changes_nothing(self):
+        svc = self._service()
+        svc.is_active_source = Mock(return_value=True)
+        self.assertIs(svc.ensure_active_source(), True)
+        svc.switch_hdmi.assert_not_called()
+        svc.cec_waker.cycle_input.assert_not_called()
+
+    def test_unknown_state_never_touches_the_input(self):
+        """Cycling from an unknown input is not idempotent -- do not guess."""
+        svc = self._service()
+        svc.is_active_source = Mock(return_value=None)
+        self.assertIsNone(svc.ensure_active_source())
+        svc.switch_hdmi.assert_not_called()
+        svc.cec_waker.cycle_input.assert_not_called()
+
+    def test_it_escalates_from_direct_addressing_to_cycling(self):
+        """
+        Direct first (one deterministic press when it works), then cycling, which
+        is the mechanism actually proven on this set. A direct-only loop never
+        converges here.
+        """
+        svc = self._service()
+        svc.is_active_source = Mock(side_effect=[False, False, True])
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc.ensure_active_source(), True)
+        svc.switch_hdmi.assert_called_once_with(svc.mibox_hdmi_port)
+        svc.cec_waker.cycle_input.assert_called_once()
+
+    def test_it_gives_up_rather_than_cycling_forever(self):
+        svc = self._service()
+        svc.is_active_source = Mock(return_value=False)
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc.ensure_active_source(attempts=3), False)
+        self.assertEqual(svc.cec_waker.cycle_input.call_count, 2)
+
+    def test_a_dumpsys_that_stops_answering_mid_loop_returns_none(self):
+        svc = self._service()
+        svc.is_active_source = Mock(side_effect=[False, None])
+        with patch("services.media_service.time.sleep"):
+            self.assertIsNone(svc.ensure_active_source())
+
+
 class BoxDiscoveryTests(unittest.TestCase):
     """
     A DHCP move must self-heal instead of surfacing as "TV is off or unreachable".
