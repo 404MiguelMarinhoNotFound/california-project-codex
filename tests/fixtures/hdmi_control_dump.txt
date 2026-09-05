@@ -1,0 +1,40 @@
+mProhibitMode: false
+mPowerStatus: 0
+System_settings:
+  mHdmiControlEnabled: true
+  mMhlInputChangeEnabled: true
+  mSystemAudioActivated: false
+  mHdmiCecVolumeControlEnabled true
+mMhlController: 
+mPortInfo:
+  port_id: 0, type: HDMI_OUT, address: 0x2000, cec: true, arc: true, mhl: false
+mCecController: 
+  HdmiCecLocalDevice #4:
+    mDeviceType: 4
+    mAddress: 4
+    mPreferredAddress: 4
+    mDeviceInfo: CEC: logical_address: 0x04 device_type: 4 vendor_id: 0x00EC0A display_name: Xiaomi TV Box power_status: 0 physical_address: 0x2000 port_id: 0
+    mActiveSource: (0x04, 0x2000)
+    mActiveRoutingPath: 0x0000
+    mRoutingControlFeatureEnabled: true
+    mIsActiveSource: true
+    mAutoTvOff:true
+    mOneTouchPlayEnabed:true
+    mAutoLanguageChange:false
+  CEC message history:
+    [R] time=2026-09-03 20:55:25 message=<Give Osd Name> 04:46
+    [ ... ring buffer truncated for the fixture ... ]
+    [S] time=2026-09-05 14:18:48 message=<Give System Audio Mode Status> 45:7D
+    [S] time=2026-09-05 14:18:48 message=<Text View On> 40:0D
+    [S] time=2026-09-05 14:18:48 message=<Active Source> 4F:82:20:00
+    [S] time=2026-09-05 14:18:48 message=<Menu Status> 40:8E:00
+    [S] time=2026-09-05 14:18:48 message=<Give Device Power Status> 40:8F
+    [R] time=2026-09-05 14:18:49 message=<Report Power Status> 04:90:00
+    [R] time=2026-09-05 14:18:49 message=<Device Vendor Id> 0F:87:00:00:F0
+    [R] time=2026-09-05 14:18:50 message=<Report Physical Address> 3F:84:10:00:03
+    [R] time=2026-09-05 14:18:50 message=<Give Physical Address> 04:83
+    [S] time=2026-09-05 14:18:50 message=<Report Physical Address> 4F:84:20:00:04
+    [R] time=2026-09-05 14:18:51 message=<Report Power Status> 04:90:00
+    [S] time=2026-09-05 14:18:51 message=<Feature Abort> 40:00:90:00
+    [R] time=2026-09-05 14:18:55 message=<Give Device Power Status> 04:8F
+    [S] time=2026-09-05 14:18:55 message=<Report Power Status> 40:90:00

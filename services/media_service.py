@@ -21,6 +21,16 @@ _OFFLINE_COOLDOWN = 30
 
 _WAKEFULNESS_RE = re.compile(r"mWakefulness=(\w+)")
 
+# dumpsys hdmi_control: "    mIsActiveSource: true"
+_ACTIVE_SOURCE_RE = re.compile(r"mIsActiveSource:\s*(\w+)")
+
+# A CEC <Report Power Status> the box RECEIVED from the television. The header
+# nibbles are source/destination, so "04" is source 0 (the TV) to us; the trailing
+# byte is 00=on, 01=standby. finditer + take the last: the log is a capped ring.
+_TV_POWER_RE = re.compile(
+    r"\[R\][^\n]*<Report Power Status>\s*0[0-9A-Fa-f]:90:([0-9A-Fa-f]{2})"
+)
+
 
 class MediaService:
     def __init__(self, config: dict, cec_waker: CecWaker | None = None):
@@ -49,6 +59,7 @@ class MediaService:
         self.wake_settle_s = max(0, int(wake_cfg.get("settle_ms", 25000))) / 1000
         self.wake_poll_interval_s = max(0.1, int(wake_cfg.get("poll_interval_ms", 2000)) / 1000)
         self.wake_attempts = max(1, int(wake_cfg.get("wake_attempts", 3)))
+        self.mibox_hdmi_port = int(wake_cfg.get("mibox_hdmi_port", 2))
         self.cec_waker = cec_waker if cec_waker is not None else CecWaker(config)
 
         # Set by _wake_and_wait so the dispatcher can tell a rejected pairing
@@ -779,6 +790,101 @@ class MediaService:
         # exactly once, after the wait, never during it.
         self._last_fail_time = 0
         return self._rediscover_and_connect()
+
+    def is_active_source(self) -> bool | None:
+        """
+        Is the box what the television is actually showing?
+
+        True/False/None, and **None is not False**. None means "could not tell"
+        (dumpsys unreadable, CEC disabled, box unreachable) and must never trigger
+        an HDMI switch: switch_input falls back to *cycling* inputs, which is not
+        idempotent, so guessing costs Master Miguel the picture he already had.
+
+        The box turns the TV on and selects itself on wake, via CEC One Touch Play
+        (<Text View On> + <Active Source>, observed on the real box). So this is
+        only false in one real situation: the input was parked somewhere else --
+        terrestrial TV, a console -- while the box stayed awake.
+        """
+        if not self.ensure_connected():
+            return None
+        ok, output = self._adb("shell dumpsys hdmi_control")
+        if not ok or not output:
+            return None
+        match = _ACTIVE_SOURCE_RE.search(output)
+        if not match:
+            return None
+        return match.group(1).strip().lower() == "true"
+
+    def tv_power_status(self) -> str | None:
+        """
+        The TV's own power state, as the box last heard it over CEC.
+
+        The television has no usable API for this -- its REST payload carries no
+        PowerState field at all on this model, and it answers that endpoint in
+        standby anyway. The box is the only oracle, because the TV reports its
+        status on the CEC bus: <Report Power Status> 04:90:00 means source 0 (the
+        TV) told the box "on"; :01 is standby.
+
+        Returns "on" | "standby" | None.
+
+        **Read the tail, never the head.** dumpsys keeps a capped ring of ~246
+        entries, so the first matching line can be days old -- grepping the head
+        during this work returned entries from two days earlier and looked exactly
+        like "nothing happened".
+        """
+        if not self.ensure_connected():
+            return None
+        ok, output = self._adb("shell dumpsys hdmi_control")
+        if not ok or not output:
+            return None
+        last = None
+        for match in _TV_POWER_RE.finditer(output):
+            last = match.group(1)
+        if last is None:
+            return None
+        return {"00": "on", "01": "standby"}.get(last)
+
+    def ensure_active_source(self, attempts: int = 3, settle_s: float = 2.0) -> bool | None:
+        """
+        Make the television actually show the box. Verified, not assumed.
+
+        `switch_input` cannot verify itself: it sends KEY_HDMI<n> and falls back to
+        cycling only if the *send* failed -- but the websocket accepts every key,
+        so the send always "succeeds" while KEY_HDMI2 has no observable effect on
+        this set (already noted in its own docstring). Measured 2026-09-05: parking
+        the TV on HDMI1 and calling switch_hdmi(2) left it on HDMI1, with the CEC
+        log showing <Set Stream Path> 0F:86:10:00 (0x1000 == HDMI 1) four times.
+
+        The box is the only honest witness, so drive the loop from its
+        mIsActiveSource rather than from what the TV said it accepted.
+
+        Returns True (we are on screen), False (gave up), or None (cannot tell --
+        never guess, cycling from an unknown input is not idempotent).
+        """
+        state = self.is_active_source()
+        if state is not True:
+            log.info("Box is not the active source (state=%s), selecting its input", state)
+        if state is None or state is True:
+            return state
+
+        for attempt in range(1, attempts + 1):
+            # Direct addressing first because it is a single deterministic press
+            # when it works; then cycling, which is the mechanism actually proven
+            # on this set. Do not "simplify" to direct-only -- the TV accepts
+            # KEY_HDMI2 and ignores it, so that loop never converges.
+            if attempt == 1:
+                self.switch_hdmi(self.mibox_hdmi_port)
+            else:
+                self.cec_waker.cycle_input()
+            time.sleep(settle_s)
+            state = self.is_active_source()
+            if state is True:
+                log.info("Box is on screen again after %d input change(s)", attempt)
+                return True
+            if state is None:
+                return None
+        log.warning("Could not select the box's HDMI input after %d attempts", attempts)
+        return False
 
     def switch_hdmi(self, port: int):
         """Select an HDMI input on the television. Returns a WakeResult."""

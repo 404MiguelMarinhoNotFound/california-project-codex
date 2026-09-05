@@ -522,6 +522,10 @@ media:
     # inventory, so a name here is what California will actually offer.
     hdmi_ports:
       2: "mi box"
+    # Which HDMI input the box is plugged into. Matches its CEC physical address
+    # 0x2000 (== HDMI 2), which the box reports itself in `dumpsys hdmi_control`.
+    # Used to re-select the box when the TV has been parked on another source.
+    mibox_hdmi_port: 2
   vpn_routing_enabled: false
   vpn_state_path: "vpn_state.json"
   vpn_status_cache_max_age_minutes: 5
