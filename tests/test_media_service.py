@@ -476,6 +476,27 @@ class BoxDiscoveryTests(unittest.TestCase):
                 self.assertFalse(svc._verify_box(self.MOVED_TO))
         self.assertIn("disconnect", adb.call_args[0][0])
 
+    def test_a_stranger_on_the_adb_port_is_not_reported_as_box_is_off(self):
+        """
+        "The box is off" and "another device took its address" need opposite
+        responses. The port scan only yields hosts with 5555 open, so a rejection
+        at that rung means the serial did not match -- not that nothing is there.
+        """
+        from services.device_finder import TraceStep
+
+        svc = self._service()
+        svc._finder.last_trace = [
+            TraceStep(rung="tcp_port_candidates", ip=self.MOVED_TO,
+                      verdict="rejected", elapsed_s=0.4),
+        ]
+        self.assertEqual(svc._classify_failure(), "identity_mismatch")
+
+    def test_nothing_on_the_lan_is_reported_as_box_is_off(self):
+        svc = self._service()
+        svc._finder.last_trace = []
+        self.subprocess_run.return_value = Mock(returncode=0, stdout="", stderr="")
+        self.assertEqual(svc._classify_failure(), "not_on_lan")
+
     def test_verify_box_never_reaches_adb_on_a_closed_port(self):
         svc = self._service()
         with patch("services.media_service.port_open", return_value=False):

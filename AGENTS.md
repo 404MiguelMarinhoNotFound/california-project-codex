@@ -188,6 +188,7 @@ california/
 ├── services/
 │   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
 │   ├── cec_wake.py              # Wake the box via the TV over HDMI-CEC; ADB cannot turn it on
+│   ├── device_finder.py         # Shared find-by-MAC / verify-by-identity / cache-the-IP ladder
 │   ├── llm.py                   # Multi-provider LLM streaming + tool calling
 │   ├── govee_service.py         # Govee cloud v2 light control
 │   ├── name_matcher.py          # Shared fuzzy hint -> key matching: exact, despaced, substring, token overlap
@@ -228,6 +229,7 @@ california/
 │   ├── test_activation_capture.py # Activation clip naming and pruning
 │   ├── test_activation_phrases.py # Wake tiers, echo stripping, recording trim, dropped turns
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
+│   ├── test_device_discovery.py # DeviceFinder ladder, cache, ARP parsing; no-network guard
 │   ├── test_media_power.py      # turn_on/turn_off, BT wake fallback, no blind KEYCODE_POWER
 │   ├── test_media_service.py    # YouTube / ADB unit tests
 │   ├── test_mic_drain.py        # Stale mic-buffer draining after playback
@@ -245,14 +247,17 @@ california/
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
 ├── deprecated/                  # Retired files kept for reference, see deprecated/README.md
+├── device_state.json            # Generated locally, discovered device addresses
 ├── vpn_state.json               # Generated locally, Surfshark diagnostic cache
 └── watch_state.json             # Generated locally, cached Stremio progress
 ```
 
 Important runtime note:
 
-- `watch_state.json` and `vpn_state.json` are generated cache files and should stay local;
-  both are gitignored, so they will not show up as pending changes
+- `watch_state.json`, `vpn_state.json`, `tv_state.json` and `device_state.json` are
+  generated cache files and should stay local; all are gitignored, so they will not
+  show up as pending changes. `device_state.json` is the one that makes a moved box
+  self-heal -- deleting it costs one rediscovery (~2s), never a failure
 - `sounds/bootup/`, `sounds/california_activations/`, `sounds/chime.wav`, and
   `sounds/error.wav` are generated audio and are **not** committed. This repo carries
   audio sources, not audio output. Run `generate_bootup_sounds.py` and
@@ -535,7 +540,7 @@ both measured.
 | Route | Why it is dead |
 |---|---|
 | ADB wake | `adbd` suspends with the box; ICMP replies are firmware offload, not the OS |
-| Wake-on-LAN **to the box** | No Ethernet, and Android randomises the Wi-Fi MAC per network (`16:da:99:37:d0:89` is locally-administered, unstable across reconnects) |
+| Wake-on-LAN **to the box** | No Ethernet. (The MAC caveat that used to sit here was wrong -- see the correction under "Finding the box" below. WoL is dead because there is no wired NIC, not because of the MAC) |
 | BLE / `bleak` | The box does not advertise over BLE at all — a 20s scan beside it while awake sees nothing. The Govee transport is not reusable |
 | Bluetooth Classic from Windows | `AF_BTH` Winsock `bind()` fails against the **local** radio with `WSAEADDRNOTAVAIL`; WinRT `PairAsync` refuses an undiscovered address, and a TV box is never discoverable. Five approaches tried |
 
@@ -572,6 +577,8 @@ pairing token is a hard dependency. That is why a rejected token gets its own
   subnet probe, verifying the duid at every step, and rewrites `tv_state.json`.
   **The duid check is the point**: without it a stale IP that another device has
   since taken would answer 200 and be trusted
+- **`mibox_ip` is now the same kind of hint**, for the same reason. See "Finding the
+  box (and the TV) when the address moves" below
 - Re-pair with `uv run python tools/pair_samsung_tv.py`. It WoLs the TV first,
   because approval needs the TV on and a person in front of it
 
@@ -597,6 +604,121 @@ set.** That gate returns `"TV is off or unreachable right now"` when
 `_wait_for_box` clears `_last_fail_time` on every poll, because
 `ensure_connected()` stamps it on each miss and then refuses to retry for
 `_OFFLINE_COOLDOWN` — right in normal operation, wrong while waiting out a boot.
+
+### Finding The Box (And The TV) When The Address Moves
+
+**No address in `config.yaml` is authoritative.** `media.mibox_ip` and
+`media.cec_wake.tv_ip` are *hints* that seed a cache. Identity keys off things that do
+not move -- MAC plus `ro.serialno` for the box, MAC plus duid for the TV -- and nothing
+at runtime ever rewrites `config.yaml`.
+
+This exists because the box drifted `192.168.1.35` -> `.40` on a plain DHCP renewal
+(no reboot, 9.6 days of uptime) on **2026-09-05**, and every `control_tv` call started
+returning "TV is off or unreachable right now" until the file was hand-edited.
+
+`services/device_finder.py` is the shared ladder for both devices:
+
+```text
+memory -> cache (device_state.json) -> config hint -> candidate sources
+                                          ^ every rung verified before it is believed
+```
+
+The two devices differ only in **`verify`** and **candidate sources**, both injected --
+there is no `if device == "tv"` in the module:
+
+| | verify | candidate sources |
+|---|---|---|
+| Box | TCP 5555 open -> `adb connect` -> `ro.serialno` matches | warm ARP -> TCP scan on 5555 |
+| TV | HTTP `:8001/api/v2/` -> `duid` matches | warm ARP -> ping+ARP -> probe every host |
+
+#### The 21-second rule. This is the load-bearing constraint.
+
+Measured on the real box, 2026-09-05:
+
+| operation | cost |
+|---|---|
+| `adb connect` to a host with 5555 **closed** | **21.1s** — adb's own timeout, not tunable |
+| `adb connect` + `getprop ro.serialno` (right box) | 0.37s |
+| `adb -s <target>` with no open transport | 0.21s |
+| parallel TCP connect scan of a whole /24 on 5555 | 1.55s -> exactly 1 candidate |
+| `arp -a` grep for a known MAC, warm | 0.16s |
+
+**Discovery must never hand an unverified host to `adb connect`.** A 0.3s socket probe
+(`device_finder.port_open`) gates every rung; without it a /24 sweep costs 254 x 21s.
+Never raise `media.discovery.port_probe_timeout_ms` toward adb's own timeout "to be
+safe" — that reintroduces exactly the cost the gate exists to prevent.
+
+`MediaService.connect()` carries the same gate, which independently fixed
+`_wait_for_box`: it is meant to poll ~12 times across `settle_ms: 25000` and was
+managing one or two, because every failed poll burned 21s.
+
+#### Corrections to what this file used to say
+
+- **The box's Wi-Fi MAC is stable within an SSID.** The dead-routes table called
+  `16:da:99:37:d0:89` "unstable across reconnects". Android randomises per *network*,
+  not per *reconnect*: the value measured on 2026-09-05 is byte-identical to the one
+  recorded weeks earlier and to the live ARP entry. It changes on a new SSID or a
+  factory reset — not on a DHCP renewal, which is the only case discovery exists for.
+  **Nothing depends on it anyway**: the MAC is one fast rung, and the port scan finds
+  the box by serial with no MAC at all.
+- **`self.target` is no longer frozen.** It is a property over a mutable `self.ip`, so
+  the ~30 `ensure_connected`-gated call sites follow a rediscovery with no edits.
+  `StremioService.adb_target` is likewise a property delegating to the injected media
+  service — it used to snapshot config at construction, so a rediscovered box would
+  never have reached its standalone ADB path.
+
+#### Cache file
+
+`device_state.json` (gitignored), keyed by device, read-modify-write via `os.replace`:
+
+```json
+{"version": 1,
+ "devices": {"mibox": {"ip": "...", "mac": "...", "verified_at": "..."}}}
+```
+
+**Do not make `_remember` a full overwrite.** The old `cec_wake._remember_ip` wrote
+`{"tv_ip": ip}` over the whole file; pointed at a shared cache, each rediscovery would
+erase the other device's entry. A cached entry whose stored MAC no longer matches
+config is discarded rather than probed — a new SSID invalidates the address for the
+same reason it changes the MAC.
+
+#### "Unreachable" is four different problems
+
+They need opposite responses, and they used to produce one identical sentence.
+`MediaService.unreachable_reason` feeds `core.orchestrator._unreachable_line`:
+
+| reason | meaning | spoken |
+|---|---|---|
+| `cooldown` | a connect failed seconds ago | "unreachable a moment ago, give me a few seconds" |
+| `not_on_lan` | MAC absent from ARP after a full scan | "the box is off, I can't see it on the network" |
+| `no_adb_port` | on the LAN, nothing listening on 5555 | "ADB over Wi-Fi needs turning back on" |
+| `identity_mismatch` | something answers 5555, wrong serial | "something else has the box's address" |
+
+Telling `not_on_lan` from `no_adb_port` is free: the TCP scan SYNs every host, which
+populates the ARP table for everything that exists, so classification is one 0.16s
+re-read.
+
+**`no_adb_port` is the `persist.adb.tcp.port` case and discovery cannot fix it.**
+`service.adb.tcp.port` is `5555` on this box but `persist.adb.tcp.port` is empty, so
+ADB over TCP may not survive a reboot. No amount of rediscovery re-enables it — it
+needs Developer options or `adb tcpip 5555` over USB. Say that instead of blaming the
+network.
+
+#### Two cooldowns, and they are not the same cooldown
+
+`_OFFLINE_COOLDOWN` (30s) answers "don't retry a connect that just failed".
+`media.discovery.rescan_cooldown_ms` (120s) answers "don't rescan a LAN we just
+scanned". They compose rather than override: on the **first** miss after a drift there
+is no offline cooldown yet, so the call falls straight through to discovery and
+self-heals. Do not merge them.
+
+`_wait_for_box` suppresses discovery for the duration of a boot wait -- the box is at
+a known address and scanning each poll is waste -- then rediscovers **exactly once**
+after the wait times out, because a box that rebooted may have come back on a new
+lease. The flag is an instance attribute rather than a parameter, because the loop must
+keep calling the *public* `ensure_connected()` that tests patch by name.
+
+-----
 
 ### SurfsharkService### SurfsharkService
 
@@ -1065,13 +1187,20 @@ exists.
 
 Only three categories are legitimate to override, and each should say why:
 
-- **paths** — `watch_state.json`, `vpn_state.json`, `tv_state.json` and the
-  Samsung token must go to a tmpdir or a nonexistent file, never the real caches
+- **paths** — `watch_state.json`, `vpn_state.json`, `tv_state.json`,
+  `device_state.json` and the Samsung token must go to a tmpdir or a nonexistent
+  file, never the real caches
 - **waits** — autoplay delays, Surfshark settle times and CEC boot timeouts are
   seconds each and buy nothing against a mocked ADB
 - **a flag the test exists to exercise** — `vpn_routing_enabled` is false in the
   shipped config, `vad.engine` is `silero` (which would load torch), and
   `llm.claude.web_search` runs server-side; those get flipped, with a comment
+- **`media.discovery.enabled: false`, for the same reason `cec_wake.enabled` is
+  false** — a live `DeviceFinder` socket-probes the operator's whole subnet, and
+  `MediaService.__init__` reads the real `device_state.json` out of the CWD. This
+  is not optional hygiene: `_wait_for_box` rediscovers after its timeout, and with
+  the flag left on a routine `test_media_power` run found the actual Mi Box on the
+  real LAN. Tests that *exercise* discovery turn it back on and stub the finder
 
 Values that describe the deployment — IP, port, `adb_path`, package names,
 launch components, provider order, route tables, light MACs and aliases — must
@@ -1100,6 +1229,19 @@ Current automated coverage exists for:
 - TV discovery: a cached IP that verifies skips discovery entirely, a wrong duid
   at that IP is rejected rather than trusted, ARP then sweep are tried in order,
   and total failure returns `""` instead of raising
+- Box discovery (`tests/test_device_discovery.py`): the ladder's rung order and
+  short-circuiting, that a hint hit is persisted (the old code only wrote on a
+  discovery hit), that a cache entry for a different MAC is discarded, that
+  remembering one device does not clobber its sibling, that a raising candidate
+  source does not abort the ladder, and that `arp -a` parses on **both** Windows
+  (`-` separated) and Linux (`:` separated, address in parentheses)
+- The 21-second guard: that `connect()` and `_verify_box` never reach adb when the
+  port probe says 5555 is closed, and that a serial mismatch disconnects the
+  stranger rather than leaving its transport open
+- Drift recovery: that `target` follows a rediscovered `ip`, that a drift self-heals
+  through `ensure_connected`, that repeated failures scan only once (rescan
+  cooldown), and that `_wait_for_box` rediscovers once **after** its timeout rather
+  than on every poll
 - That a revoked token produces "approve me on screen" and NOT "use the remote" —
   they are opposite fixes and the wrong one strands him
 - `_hdmi_inventory()` advertising configured ports and omitting the block entirely
@@ -1318,6 +1460,23 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
   `subprocess.run` for every test in the file, and
   `test_unit_tests_never_shell_out_to_a_real_adb` fails loudly if that guard is
   removed. **`uv run python -m unittest discover` must never touch the TV.**
+- **A device that is merely *addressed* is not a device that is *found*.** Every
+  address in this project was config until the box moved on a DHCP renewal and broke
+  every tool call. The fix is not a better default -- it is to stop treating an
+  address as identity. Identity is the MAC and the serial; the address is a cache.
+- **The cheap check must come before the expensive one, and here the ratio is 70x.**
+  `adb connect` to a closed port takes 21.1s and the timeout is not tunable, while a
+  raw socket probe answers in 0.3s. That single ordering is the difference between a
+  1.55s subnet scan and a 90-minute one. Any "verify" that wraps a slow tool needs a
+  fast gate in front of it.
+- **A test suite that passes is not a test suite that stayed in its lane.** An audit
+  hook over `subprocess.Popen` *and* `socket.connect` caught three things a green run
+  did not: a new `_wait_for_box` code path socket-probing the real LAN and finding the
+  actual box, `_classify_failure` shelling out to a live `arp -a`, and -- separately --
+  a `arp -a` parser that worked on Windows and would have silently returned nothing on
+  the Pi, because Linux prints the address as `(192.168.1.41)` with parentheses.
+  Guards must be pointed at the boundary the code actually crosses: every previous
+  guard here patched `subprocess` only, which cannot stop a SYN scan.
 - **A hand-written test fixture can only prove the code agrees with the fixture.**
   `tests/test_media_service.py` pointed at an IP two moves stale and kept
   passing; the Surfshark tests pinned a 3-key `quick_connect` route while
