@@ -78,6 +78,26 @@ def _append_route_warning(message: str, warning_suffix: str | None) -> str:
     return base + warning_suffix
 
 
+def _unreachable_line(media_svc) -> str:
+    """
+    Say WHICH kind of unreachable. These need opposite responses from him.
+
+    "The box is off" and "the box is fine but ADB over Wi-Fi got turned off by a
+    reboot" used to produce the identical sentence, and only one of them is fixed
+    by waiting or retrying.
+    """
+    reason = getattr(media_svc, "unreachable_reason", "") or ""
+    return {
+        "cooldown": "The box was unreachable a moment ago, give me a few seconds.",
+        "not_on_lan": "The box is off, I can't see it on the network at all.",
+        "no_adb_port": (
+            "I can see the box but it isn't accepting commands. ADB over Wi-Fi "
+            "needs turning back on in developer options."
+        ),
+        "identity_mismatch": "Something else has the box's address, I can't find the box itself.",
+    }.get(reason, "TV is off or unreachable right now")
+
+
 def _dispatch_tv(
     params: dict,
     media_svc,
@@ -105,7 +125,7 @@ def _dispatch_tv(
         if not media_svc:
             return "media service not available"
         if not media_svc.ensure_connected():
-            return "TV is off or unreachable right now"
+            return _unreachable_line(media_svc)
 
     routing_enabled = bool(getattr(surfshark_svc, "enabled", False)) if surfshark_svc else False
     route_by_app = getattr(surfshark_svc, "route_by_app", None) if routing_enabled else None

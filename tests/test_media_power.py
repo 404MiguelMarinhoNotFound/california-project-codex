@@ -24,6 +24,11 @@ def _config(**media_overrides) -> dict:
     cec_wake is disabled so a unit test can never Wake-on-LAN the television,
     and its waits drop from 25s to 100ms. Everything else -- mibox_ip, adb_path,
     the app table -- comes from what ships, so a moved box fails here.
+
+    discovery is disabled for the same reason cec_wake is: _wait_for_box
+    rediscovers once after it times out, and a live DeviceFinder would socket-probe
+    the operator's whole subnet from a unit test. Tests that exercise discovery
+    turn it back on and stub the finder.
     """
     return config_for_tests(
         media={
@@ -33,6 +38,7 @@ def _config(**media_overrides) -> dict:
                 "poll_interval_ms": 100,
                 "wake_attempts": 1,
             },
+            "discovery": {"enabled": False},
             **media_overrides,
         }
     )

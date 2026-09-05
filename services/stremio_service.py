@@ -94,7 +94,8 @@ class StremioService:
 
         media_cfg = config.get("media", {})
         self.adb_path = media_cfg.get("adb_path", "adb")
-        self.adb_target = f"{media_cfg.get('mibox_ip', '')}:{media_cfg.get('adb_port', 5555)}"
+        self._adb_ip_hint = media_cfg.get("mibox_ip", "")
+        self._adb_port = media_cfg.get("adb_port", 5555)
         self.adb_timeout_s = max(1, int(media_cfg.get("adb_timeout_ms", 15000))) / 1000
 
         self._auth_key: str | None = None
@@ -905,6 +906,20 @@ class StremioService:
     def _is_playing(self) -> bool:
         _, output = self._run_shell("dumpsys media_session")
         return "state=3" in (output or "").lower()
+
+    @property
+    def adb_target(self) -> str:
+        """
+        Follow MediaService's address rather than snapshotting config.
+
+        This used to be a plain attribute built from media.mibox_ip at
+        construction, so a rediscovered box would not reach the standalone adb
+        path. The fallback keeps that path alive for tools and for the guard test
+        that constructs a StremioService with no media service.
+        """
+        if self.media_service is not None:
+            return self.media_service.target
+        return f"{self._adb_ip_hint}:{self._adb_port}"
 
     def _run_adb_command(self, *args, capture_text: bool = True) -> tuple[bool, str | bytes]:
         cmd = [self.adb_path]

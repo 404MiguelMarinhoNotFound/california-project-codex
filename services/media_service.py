@@ -7,6 +7,12 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from services.cec_wake import CecWaker
+from services.device_finder import (
+    DeviceFinder,
+    arp_table_candidates,
+    port_open,
+    tcp_port_candidates,
+)
 
 log = logging.getLogger(__name__)
 
@@ -19,12 +25,14 @@ _WAKEFULNESS_RE = re.compile(r"mWakefulness=(\w+)")
 class MediaService:
     def __init__(self, config: dict, cec_waker: CecWaker | None = None):
         media_cfg = config["media"]
-        self.ip   = media_cfg["mibox_ip"]
+        # mibox_ip is a HINT, not the address. The box moved .35 -> .40 on a DHCP
+        # renewal and broke every tool call; self.ip is what we currently believe
+        # and self.target follows it, so a rediscovery propagates everywhere.
+        self.ip_hint = media_cfg["mibox_ip"]
         self.port = media_cfg["adb_port"]
         self.apps = media_cfg["apps"]
         self.app_launch_components = media_cfg.get("app_launch_components", {})
         self.app_launch_categories = media_cfg.get("app_launch_categories", {})
-        self.target = f"{self.ip}:{self.port}"
         self.adb_path = media_cfg.get("adb_path", "adb")
         self.adb_timeout_s = max(1, int(media_cfg.get("adb_timeout_ms", 15000))) / 1000
         self.volume_max_steps = media_cfg.get("volume_max_steps", 15)
@@ -47,12 +55,53 @@ class MediaService:
         # token (needs a human at the screen) from any other wake failure.
         self.last_wake_result = None
 
+        # Discovery. Identity keys off the MAC and ro.serialno, both stable; the
+        # address is cached, never written back to config.yaml.
+        disc_cfg = media_cfg.get("discovery", {}) or {}
+        self.discovery_enabled = bool(disc_cfg.get("enabled", False))
+        self.mibox_mac = str(disc_cfg.get("mibox_mac") or "").strip()
+        self.mibox_serial = str(disc_cfg.get("mibox_serial") or "").strip()
+        self.port_probe_timeout_s = max(0.05, int(disc_cfg.get("port_probe_timeout_ms", 300)) / 1000)
+        self.rescan_cooldown_s = max(0, int(disc_cfg.get("rescan_cooldown_ms", 120000)) / 1000)
+        self._finder = DeviceFinder(
+            key="mibox",
+            label="Mi Box",
+            mac=self.mibox_mac,
+            hint=self.ip_hint,
+            cache_path=Path(str(disc_cfg.get("state_path") or "device_state.json")),
+            verify=self._verify_box,
+            candidate_sources=[
+                # Warm ARP first (0.16s, and warm right after a DHCP renewal), then
+                # a TCP scan of the /24 (1.55s). No ping flood: the scan's SYNs warm
+                # the ARP table anyway, which is what the failure classifier reads.
+                arp_table_candidates(self.mibox_mac),
+                tcp_port_candidates(
+                    self.port,
+                    timeout_s=self.port_probe_timeout_s,
+                    workers=max(1, int(disc_cfg.get("scan_workers", 64))),
+                ),
+            ],
+        )
+        # Believed address. Reads the cache file only -- construction never
+        # touches the network, matching CecWaker's contract.
+        self.ip = self._finder.cached_or_hint() if self.discovery_enabled else self.ip_hint
+        self._last_discovery_t: float = 0
+        self._discovery_suppressed = False
+        # Why the box is unreachable, for the dispatcher's spoken line. "off",
+        # "moved" and "ADB disabled" need different answers from Master Miguel.
+        self.unreachable_reason = ""
+
         # Connection state tracking
         self._connected = False
         self._last_fail_time: float = 0  # monotonic timestamp of last failed reconnect
 
         # Cleared once per YouTube cold start; see _prepare_youtube_launch.
         self._youtube_profile_cleared: bool = False
+
+    @property
+    def target(self) -> str:
+        """`ip:port` for the address we currently believe in. Never assigned."""
+        return f"{self.ip}:{self.port}"
 
     def _adb(self, command: str, use_target: bool = True, timeout_s: float | None = None) -> tuple[bool, str]:
         adb = self.adb_path
@@ -125,7 +174,41 @@ class MediaService:
         log.info("[timing] ADB exec %s took %.3fs ok=%s", args[:2], elapsed, ok)
         return ok, output
 
+    def _verify_box(self, ip: str) -> bool:
+        """
+        Is the box at `ip`? Port probe first, THEN adb. Never the other way round.
+
+        Measured 2026-09-05: `adb connect` to a host with 5555 closed takes 21.1s
+        and the timeout is not tunable from the command line. The 0.3s socket probe
+        is the only thing that keeps a /24 sweep from costing 254 * 21s.
+
+        ro.serialno is the duid-equivalent: a stale address that another Android
+        device with wireless debugging on has taken would `adb connect` happily and
+        then accept keyevents.
+        """
+        if not ip or not port_open(ip, self.port, self.port_probe_timeout_s):
+            return False
+        target = f"{ip}:{self.port}"
+        _, output = self._adb(f"connect {target}", use_target=False)
+        if "connected" not in (output or "").lower():
+            return False
+        ok, serial = self._adb(f"-s {target} shell getprop ro.serialno", use_target=False)
+        if ok and (serial or "").strip() == self.mibox_serial:
+            return True
+        # Leaving a stranger's transport open pollutes `adb devices` and makes an
+        # unqualified `adb shell` ambiguous for anything else on this machine.
+        self._adb(f"disconnect {target}", use_target=False)
+        return False
+
     def connect(self) -> bool:
+        # Gate on the cheap socket probe first: see _verify_box for why. This also
+        # turns every failed poll in _wait_for_box from 21s into 0.3s, which is what
+        # lets that loop actually poll across its settle window.
+        if self.discovery_enabled and not port_open(self.ip, self.port, self.port_probe_timeout_s):
+            self._connected = False
+            self._last_fail_time = time.monotonic()
+            log.info("ADB connect skipped: %s has no listener on %s", self.ip, self.port)
+            return False
         # adb connect doesn't need -s, it's a global command
         _, output = self._adb(f"connect {self.target}", use_target=False)
         success = "connected" in output.lower()
@@ -134,24 +217,84 @@ class MediaService:
             self._last_fail_time = time.monotonic()
         else:
             self._youtube_profile_cleared = False
+            self.unreachable_reason = ""
         log.info(f"ADB connect -> '{output}' (success={success})")
         return success
 
     def ensure_connected(self) -> bool:
-        # If we recently failed, don't waste time retrying — fail fast
-        if not self._connected and self._last_fail_time:
-            elapsed = time.monotonic() - self._last_fail_time
-            if elapsed < _OFFLINE_COOLDOWN:
-                log.debug(f"TV offline, skipping reconnect ({_OFFLINE_COOLDOWN - elapsed:.0f}s cooldown remaining)")
-                return False
-
+        # 1. Warm transport. `adb -s` against a target with no open transport errors
+        #    out in 0.21s (measured), so this stays cheap even when the box is gone.
         ok, output = self._adb("shell echo ping")
         if ok:
             self._connected = True
+            self.unreachable_reason = ""
             return True
+        self._connected = False
+
+        # 2. Reconnect at the address we currently believe in, behind the existing
+        #    cooldown. Unchanged behaviour, just no longer 21s per attempt.
+        if self._last_fail_time:
+            elapsed = time.monotonic() - self._last_fail_time
+            if elapsed < _OFFLINE_COOLDOWN:
+                log.debug(f"TV offline, skipping reconnect ({_OFFLINE_COOLDOWN - elapsed:.0f}s cooldown remaining)")
+                self.unreachable_reason = "cooldown"
+                return False
 
         log.info(f"ADB ping failed (output='{output}'), reconnecting...")
+        if self.connect():
+            return True
+
+        # 3. It may simply have moved. Separate gate and separate budget from the
+        #    offline cooldown, because they answer different questions: "don't retry
+        #    a connect that just failed" vs "don't rescan a LAN we just scanned".
+        return self._rediscover_and_connect()
+
+    def _rediscover_and_connect(self) -> bool:
+        if not self.discovery_enabled or self._discovery_suppressed:
+            return False
+        now = time.monotonic()
+        if self._last_discovery_t and now - self._last_discovery_t < self.rescan_cooldown_s:
+            return False
+        self._last_discovery_t = now
+
+        found = self._finder.resolve(force=True)
+        if not found:
+            self.unreachable_reason = self._classify_failure()
+            return False
+        if found != self.ip:
+            log.warning(
+                "Mi Box moved from %s to %s. media.mibox_ip (%s) is only a hint; "
+                "the discovery cache has been updated and config needs no edit.",
+                self.ip, found, self.ip_hint,
+            )
+        self.ip = found
         return self.connect()
+
+    def _classify_failure(self) -> str:
+        """
+        Why is the box unreachable? These need different answers from Master Miguel.
+
+        Free, because the TCP scan that just ran SYNed every host on the subnet and
+        so populated the ARP table for everything that exists.
+        """
+        if not self.mibox_mac:
+            return "unknown"
+        from services.device_finder import _ips_for_mac, _read_arp_table
+
+        addresses = _ips_for_mac(_read_arp_table(), self.mibox_mac)
+        if not addresses:
+            return "not_on_lan"
+        # It is on the network but nothing answered on the adb port. This is the
+        # persist.adb.tcp.port case: ADB over TCP does not survive a reboot, and no
+        # amount of retrying or rediscovery can fix it.
+        log.warning(
+            "Mi Box is on the LAN at %s but nothing is listening on %s. ADB over "
+            "Wi-Fi does not survive a reboot on this box (persist.adb.tcp.port is "
+            "unset). Re-enable it in Developer options, or run `adb tcpip 5555` "
+            "over USB. Discovery cannot fix this.",
+            ", ".join(addresses), self.port,
+        )
+        return "no_adb_port"
 
     # --- Playback ---
 
@@ -605,17 +748,29 @@ class MediaService:
         return False
 
     def _wait_for_box(self) -> bool:
+        # The box is booting at an address we already know, so a subnet scan on
+        # every poll would be pure waste. Suppress discovery for the duration --
+        # as an instance flag, not a parameter, because the loop must keep calling
+        # the *public* ensure_connected() that tests patch by name.
+        self._discovery_suppressed = True
         deadline = time.monotonic() + self.wake_settle_s
-        while time.monotonic() < deadline:
-            # ensure_connected() stamps _last_fail_time on every miss and then
-            # refuses to retry for _OFFLINE_COOLDOWN. That cooldown is correct
-            # for normal operation and wrong here, where we are deliberately
-            # waiting out a boot, so clear it on each pass.
-            self._last_fail_time = 0
-            if self.ensure_connected():
-                return True
-            time.sleep(self.wake_poll_interval_s)
-        return False
+        try:
+            while time.monotonic() < deadline:
+                # ensure_connected() stamps _last_fail_time on every miss and then
+                # refuses to retry for _OFFLINE_COOLDOWN. That cooldown is correct
+                # for normal operation and wrong here, where we are deliberately
+                # waiting out a boot, so clear it on each pass.
+                self._last_fail_time = 0
+                if self.ensure_connected():
+                    return True
+                time.sleep(self.wake_poll_interval_s)
+        finally:
+            self._discovery_suppressed = False
+        # The wait timed out. A box that rebooted may have come back on a new
+        # lease, and this is the one moment that is likely -- so rediscover
+        # exactly once, after the wait, never during it.
+        self._last_fail_time = 0
+        return self._rediscover_and_connect()
 
     def switch_hdmi(self, port: int):
         """Select an HDMI input on the television. Returns a WakeResult."""

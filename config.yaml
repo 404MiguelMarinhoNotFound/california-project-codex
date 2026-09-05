@@ -445,9 +445,40 @@ media:
   enabled: true
   adb_path: "C:\\platform-tools\\adb.exe"
   adb_timeout_ms: 15000
-  mibox_ip: "192.168.1.35"
+  # mibox_ip is a cached HINT, not configuration -- the same contract as
+  # cec_wake.tv_ip. Identity keys off discovery.mibox_mac + mibox_serial, both
+  # stable. A DHCP move self-heals into the discovery cache and NOTHING at runtime
+  # rewrites this line; it only matters on a first run with an empty cache.
+  # It drifted .35 -> .40 on a renewal (no reboot, 9.6 days uptime) and broke every
+  # TV tool call, which is why discovery exists.
+  mibox_ip: "192.168.1.40"
   adb_port: 5555
   volume_max_steps: 15            # Mi Box S hardware max — used by volume_set()
+
+  # --- Finding the box when its address moves ---
+  discovery:
+    enabled: true
+    # wlan0 MAC. The dead-routes note calls this "randomised, unstable across
+    # reconnects" -- true of Android's per-NETWORK randomisation, false within one
+    # SSID: measured byte-identical weeks apart and in the live ARP table. It
+    # changes on a new SSID or a factory reset, not on a DHCP renewal, which is the
+    # only case this exists for. Nothing DEPENDS on it -- if it changes, the ARP
+    # rung goes dead and the port scan still finds the box by serial.
+    mibox_mac: "16:da:99:37:d0:89"
+    # ro.serialno. Permanent, and the duid-equivalent. Without it a stale address
+    # that another device with wireless debugging on has taken would accept
+    # `adb connect` and then accept keyevents.
+    mibox_serial: "40152700001181340"
+    state_path: "device_state.json"
+    # NEVER raise this toward adb's own connect timeout. Measured 2026-09-05:
+    # verifying the right box is 0.37s, but `adb connect` to a host with 5555
+    # closed is 21.1s -- which is the whole reason no unverified host is ever
+    # handed to adb. A /24 scan at 0.3s is 1.55s; at 21s it would be 90 minutes.
+    port_probe_timeout_ms: 300
+    scan_workers: 64
+    # Don't rescan a LAN we just scanned. Distinct from the 30s offline cooldown,
+    # which answers "don't retry a connect that just failed".
+    rescan_cooldown_ms: 120000
 
   # --- Power / wake ---
   # ADB can turn the box OFF but never ON. The Mi Box suspends in standby and
