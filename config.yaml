@@ -514,7 +514,16 @@ media:
     wol_attempts: 5               # the TV took 2 in testing
     tv_boot_timeout_ms: 40000
     wake_attempts: 3
-    settle_ms: 25000              # TV must WoL-boot before the box can wake
+    # How long to wait for the box to rejoin the network after the CEC wake.
+    # MEASURED 2026-09-05 over three clean cold wakes: 32.4s, 32.4s, 31.1s from
+    # wake() returning to port 5555 accepting. At the old 25000 the first attempt
+    # ALWAYS timed out and the second one did the work, which is why a cold "put
+    # on Fallout" took 105s end to end. 45s clears the observed max by ~40% and
+    # lets attempt 1 succeed, roughly halving the cold path.
+    # Re-measure before changing: a run whose log says "asleep after -1s" is not
+    # a sample -- the box refuses to sleep straight after waking, so it never
+    # went down and the rejoin time is meaninglessly small.
+    settle_ms: 45000
     poll_interval_ms: 2000
     # Mi Box is at CEC physical address 0x2000 == HDMI 2. KEY_HDMI toggles
     # HDMI2 <-> HDMI1 on this set, so ODD presses select the box. Only HDMI 2
