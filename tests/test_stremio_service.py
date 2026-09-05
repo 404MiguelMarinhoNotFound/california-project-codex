@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from services.stremio_service import StremioPlayResult, StremioService
-from tests.config_fixture import config_for_tests
+from tests.config_fixture import config_for_tests, real_config
 
 
 class _Response:
@@ -383,6 +383,27 @@ class StremioServiceTests(unittest.TestCase):
             svc = StremioService(self._config(Path(tmp) / "watch_state.json"))
             svc._run_shell("echo ping")
         self.subprocess_run.assert_called()
+
+    def test_adb_target_follows_a_rediscovered_box(self):
+        """
+        This used to be a plain attribute snapshotted from config at construction,
+        so a box that moved would keep being addressed at its old address on the
+        standalone path.
+        """
+        moved_to = "192.168.1.41:5555"  # config-literal: where discovery moved the box
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Mock()
+            media.target = moved_to
+            svc = StremioService(self._config(Path(tmp) / "watch_state.json"),
+                                 media_service=media)
+            self.assertEqual(svc.adb_target, moved_to)
+
+    def test_adb_target_falls_back_to_the_config_hint_without_a_media_service(self):
+        """The standalone path stays alive -- the adb guard test depends on it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = StremioService(self._config(Path(tmp) / "watch_state.json"))
+            expected = real_config()["media"]["mibox_ip"]
+            self.assertTrue(svc.adb_target.startswith(expected))
 
     def test_play_returns_confirmation_only_after_all_preferred_providers_fail(self):
         with tempfile.TemporaryDirectory() as tmp:

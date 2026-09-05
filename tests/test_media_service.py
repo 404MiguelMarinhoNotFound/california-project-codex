@@ -14,8 +14,10 @@ class MediaServiceYouTubeTests(unittest.TestCase):
         # moves ago plus its own copy of the app table, and kept passing --
         # it was asserting agreement with itself, not with what ships.
         # Every ADB call below is mocked, so no deployment value needs pinning.
+        # discovery off too: with it on, construction reads the real
+        # device_state.json out of the CWD and connect() socket-probes the LAN.
         self.config = config_for_tests(
-            media={"cec_wake": {"enabled": False}},
+            media={"cec_wake": {"enabled": False}, "discovery": {"enabled": False}},
         )
 
     def test_youtube_playlist_launches_expected_url(self):
@@ -368,6 +370,118 @@ class MediaServiceYouTubeTests(unittest.TestCase):
             should_press, source = svc._detect_youtube_profile_picker()
         self.assertTrue(should_press)
         self.assertIn("marker_found", source)
+
+
+class BoxDiscoveryTests(unittest.TestCase):
+    """
+    A DHCP move must self-heal instead of surfacing as "TV is off or unreachable".
+
+    Discovery is ON in these fixtures -- that is the point -- so every test stubs
+    both `port_open` and the finder. Nothing here may touch the network.
+    """
+
+    MOVED_TO = "192.168.1.41"  # config-literal: the address discovery must find
+
+    def setUp(self):
+        # _classify_failure shells out to `arp -a` to tell "box is off" from "box
+        # is up but ADB is disabled". Correct in production, not from a unit test.
+        run = patch("services.device_finder.subprocess.run")
+        self.subprocess_run = run.start()
+        self.subprocess_run.return_value = Mock(returncode=1, stdout="", stderr="")
+        self.addCleanup(run.stop)
+
+    def _service(self, **discovery):
+        cfg = config_for_tests(
+            media={
+                "cec_wake": {"enabled": False, "settle_ms": 10,
+                             "poll_interval_ms": 10, "wake_attempts": 1},
+                "discovery": {
+                    "enabled": True,
+                    "state_path": "nonexistent_device_state.json",
+                    **discovery,
+                },
+            },
+        )
+        return MediaService(cfg)
+
+    def test_connect_never_calls_adb_when_the_port_is_closed(self):
+        """
+        The 21-second guard, and the single most valuable test in this file.
+
+        `adb connect` to a host with 5555 closed takes 21.1s and the timeout is
+        not tunable. If this gate is ever removed, a subnet sweep costs 254*21s.
+        """
+        svc = self._service()
+        with patch("services.media_service.port_open", return_value=False):
+            with patch.object(svc, "_adb") as adb:
+                self.assertFalse(svc.connect())
+        adb.assert_not_called()
+
+    def test_target_follows_a_rediscovered_address(self):
+        svc = self._service()
+        svc.ip = self.MOVED_TO
+        self.assertEqual(svc.target, f"{self.MOVED_TO}:{svc.port}")
+        with patch("services.media_service.port_open", return_value=True):
+            with patch.object(svc, "_adb", return_value=(True, "connected to x")) as adb:
+                svc.connect()
+        self.assertIn(self.MOVED_TO, adb.call_args[0][0])
+
+    def test_a_drift_self_heals_through_ensure_connected(self):
+        svc = self._service()
+        # ping fails, the believed address has no listener, discovery finds the box
+        # connect() fails at the stale address, then succeeds once discovery has
+        # moved svc.ip -- which is the whole sequence being asserted.
+        with patch.object(svc, "_adb", return_value=(False, "not found")):
+            with patch("services.media_service.port_open", side_effect=lambda ip, *a: ip == self.MOVED_TO):
+                with patch.object(svc._finder, "resolve", return_value=self.MOVED_TO):
+                    with patch.object(svc, "connect", side_effect=[False, True]):
+                        self.assertTrue(svc.ensure_connected())
+        self.assertEqual(svc.ip, self.MOVED_TO)
+
+    def test_repeated_failures_scan_only_once(self):
+        """The rescan cooldown: don't re-sweep a LAN we just swept."""
+        svc = self._service()
+        with patch.object(svc, "_adb", return_value=(False, "not found")):
+            with patch("services.media_service.port_open", return_value=False):
+                with patch.object(svc._finder, "resolve", return_value="") as resolve:
+                    svc.ensure_connected()
+                    svc._last_fail_time = 0  # defeat the offline cooldown, not the rescan one
+                    svc.ensure_connected()
+        self.assertEqual(resolve.call_count, 1)
+
+    def test_the_wait_loop_does_not_rediscover_on_every_poll(self):
+        """
+        A booting box is at a known address. Scanning each poll would be waste --
+        so discovery is suppressed during the wait and runs exactly once after it.
+        """
+        svc = self._service()
+        with patch.object(svc, "ensure_connected", return_value=False):
+            with patch("services.media_service.time.sleep"):
+                with patch.object(svc._finder, "resolve", return_value="") as resolve:
+                    self.assertFalse(svc._wait_for_box())
+        self.assertEqual(resolve.call_count, 1)
+        self.assertFalse(svc._discovery_suppressed, "the flag must be cleared again")
+
+    def test_a_serial_mismatch_disconnects_the_stranger(self):
+        """
+        Leaving someone else's transport open pollutes `adb devices` and makes an
+        unqualified `adb shell` ambiguous for everything else on the machine.
+        """
+        svc = self._service()
+        with patch("services.media_service.port_open", return_value=True):
+            with patch.object(svc, "_adb") as adb:
+                # connect, getprop (wrong serial), then the disconnect being asserted
+                adb.side_effect = [(True, "connected to x"), (True, "SOMEONE-ELSE"),
+                                   (True, "disconnected")]
+                self.assertFalse(svc._verify_box(self.MOVED_TO))
+        self.assertIn("disconnect", adb.call_args[0][0])
+
+    def test_verify_box_never_reaches_adb_on_a_closed_port(self):
+        svc = self._service()
+        with patch("services.media_service.port_open", return_value=False):
+            with patch.object(svc, "_adb") as adb:
+                self.assertFalse(svc._verify_box(self.MOVED_TO))
+        adb.assert_not_called()
 
 
 if __name__ == "__main__":

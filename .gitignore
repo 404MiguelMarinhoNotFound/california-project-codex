@@ -23,3 +23,4 @@ debug/wakeword/
 # Samsung TV pairing token, generated on first CEC wake
 samsung_token.txt
 tv_state.json
+device_state.json
