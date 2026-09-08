@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 from core.orchestrator import _dispatch_tv, _ensure_playable
 from services.cec_wake import CecWaker, WakeResult
 from services.media_service import MediaService, RoomStatus
+from services.now_playing import NowPlaying
 from tests.config_fixture import config_for_tests, real_config
 
 
@@ -641,6 +642,128 @@ class StatusDispatchTests(unittest.TestCase):
         media.unreachable_reason = "not_on_lan"
         _dispatch_tv({"action": "get_status"}, media, None, None, {})
         media.turn_on.assert_not_called()
+
+
+
+class NowPlayingDispatchTests(unittest.TestCase):
+    """
+    She launched it, so she can name it -- but only while the box still agrees
+    the app is up, and only if she actually played it rather than opening a
+    search. Both rules exist so "now playing" cannot become the next confident
+    wrong answer.
+    """
+
+    def _media(self, app, playing=True):
+        media = Mock()
+        media.ensure_connected.return_value = True
+        media.room_status.return_value = RoomStatus(
+            reachable=True, awake=True, app=app, playing=playing
+        )
+        return media
+
+    def _status(self, media, store):
+        return _dispatch_tv(
+            {"action": "get_status"}, media, None, None, {}, now_playing=store
+        )
+
+    def test_she_names_what_she_put_on(self):
+        store = NowPlaying()
+        store.remember("stremio", "Fallout")
+        self.assertIn("Fallout", self._status(self._media("stremio"), store))
+
+    def test_the_memory_is_dropped_when_he_switched_apps(self):
+        store = NowPlaying()
+        store.remember("stremio", "Fallout")
+        reply = self._status(self._media("youtube"), store)
+        self.assertNotIn("Fallout", reply)
+        self.assertIn("youtube", reply)
+
+    def test_she_admits_it_when_he_started_it_himself(self):
+        reply = self._status(self._media("stremio"), NowPlaying())
+        self.assertIn("didn't start it", reply)
+
+    def test_a_search_is_never_reported_as_playing_something(self):
+        # She opened a results page. What he then picked is not hers to claim.
+        store = NowPlaying()
+        store.remember("youtube", "bossa nova", "opened")
+        reply = self._status(self._media("youtube"), store)
+        self.assertNotIn("bossa nova", reply)
+        self.assertIn("didn't start it", reply)
+
+    def test_dispatch_without_a_store_still_answers(self):
+        # The 11 older _dispatch_tv tests pass no store at all.
+        reply = _dispatch_tv({"action": "get_status"}, self._media("stremio"), None, None, {})
+        self.assertIn("stremio", reply)
+
+
+class LaunchMemoryRecordingTests(unittest.TestCase):
+    """What gets remembered, and what deliberately does not."""
+
+    def _media(self):
+        media = Mock()
+        media.ensure_connected.return_value = True
+        return media
+
+    def _stremio(self, success=True, target_mode="episode"):
+        svc = Mock()
+        svc.play.return_value = SimpleNamespace(
+            success=success, requires_confirmation=False,
+            target_mode=target_mode, message="nope",
+        )
+        return svc
+
+    def test_a_successful_stremio_play_is_remembered(self):
+        store = NowPlaying()
+        _dispatch_tv(
+            {"action": "stremio_play", "title": "Fallout"},
+            self._media(), self._stremio(), None, {}, now_playing=store,
+        )
+        self.assertEqual(store.current("stremio").label, "Fallout")
+
+    def test_a_failed_stremio_play_is_not_remembered(self):
+        # Never claim playback that did not happen. Same rule as the autoplay
+        # verification: media_session decides, not optimism.
+        store = NowPlaying()
+        _dispatch_tv(
+            {"action": "stremio_play", "title": "Fallout"},
+            self._media(), self._stremio(success=False), None, {}, now_playing=store,
+        )
+        self.assertIsNone(store.current("stremio"))
+
+    def test_a_series_page_is_remembered_as_opened_not_playing(self):
+        store = NowPlaying()
+        _dispatch_tv(
+            {"action": "stremio_play", "title": "Fallout"},
+            self._media(), self._stremio(target_mode="detail"), None, {},
+            now_playing=store,
+        )
+        self.assertEqual(store.current("stremio").kind, "opened")
+
+    def test_a_youtube_playlist_remembers_the_category_he_asked_for(self):
+        store = NowPlaying()
+        _dispatch_tv(
+            {"action": "youtube_playlist", "playlist_name": "samba"},
+            self._media(), None, None, {"samba": ["RD1"]}, now_playing=store,
+        )
+        self.assertIn("samba", store.current("youtube").label)
+
+    def test_go_home_forgets(self):
+        store = NowPlaying()
+        store.remember("stremio", "Fallout")
+        _dispatch_tv({"action": "go_home"}, self._media(), None, None, {}, now_playing=store)
+        self.assertIsNone(store.current("stremio"))
+
+    def test_launching_a_bare_app_forgets(self):
+        # "Open Stremio" puts nothing specific on, so the old label is now wrong.
+        store = NowPlaying()
+        store.remember("stremio", "Fallout")
+        media = self._media()
+        media.launch_app.return_value = (True, "opened stremio")
+        _dispatch_tv(
+            {"action": "launch_app", "app_name": "stremio"},
+            media, None, None, {}, now_playing=store,
+        )
+        self.assertIsNone(store.current("stremio"))
 
 if __name__ == "__main__":
     unittest.main()
