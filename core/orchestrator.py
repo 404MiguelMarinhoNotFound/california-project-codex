@@ -170,7 +170,13 @@ def _status_line(status, launch=None) -> str:
         else:
             parts.append(f"{status.app} playing, and I didn't start it so I can't say what")
     elif status.app and status.playing is False:
-        parts.append(f"{status.app} open, nothing playing")
+        # Stremio keeps its metadata across a pause, so it still knows what is
+        # loaded. Saying "nothing playing" and dropping the title throws away
+        # the more useful half of what was read.
+        if named:
+            parts.append(f"{status.app} paused on {named}")
+        else:
+            parts.append(f"{status.app} open, nothing playing")
     elif status.app:
         parts.append(f"{status.app} open")
     elif status.playing is True:

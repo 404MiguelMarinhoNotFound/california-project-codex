@@ -39,6 +39,13 @@ _SESSION_STATE_RE = re.compile(r"state=PlaybackState\s*\{state=(\d+)")
 # dumpsys media_session: "metadata: size=4, description=Fallout, The Strip, null"
 _SESSION_METADATA_RE = re.compile(r"metadata:.*?\bdescription=(.*)$")
 
+# The TV broadcasting that it is going off: <Standby> 0F:36, source 0 (the TV)
+# to F (everyone). Unlike <Report Power Status> this is VOLUNTEERED, so it is
+# the only evidence that survives Master Miguel using the television's own
+# remote. Confirmed on the real box 2026-09-08 and captured in
+# tests/fixtures/hdmi_control_standby_dump.txt.
+_TV_STANDBY_RE = re.compile(r"\[R\][^\n]*<Standby>\s*0[0-9A-Fa-f]:36")
+
 # Every CEC line carries the BOX's own clock: "time=2026-09-05 14:18:51".
 _CEC_TIME_RE = re.compile(r"time=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
@@ -80,12 +87,26 @@ def _stamp_age_s(stamp: str, newest: str) -> float:
 
 def _parse_tv_power(dump: str) -> str | None:
     """
-    The TV's power state as the box last HEARD it: "on" | "standby" | None.
+    The TV's power state as the box last heard it: "on" | "standby" | None.
+
+    TWO kinds of evidence, and whichever came LAST wins:
+
+    - `<Report Power Status>` is an ANSWER. The only thing that asks is the
+      box's own wake sequence, so on its own it goes stale the moment Master
+      Miguel touches the television's remote.
+    - `<Standby>` is VOLUNTEERED. The TV broadcasts it on its way off, and the
+      box logs it even though it was not addressed to us. That is what makes
+      "he turned it off himself" observable at all.
+
+    Without the second, a dump whose last report says "on" from four hours ago
+    and carries three <Standby> broadcasts since reads as either a confident
+    lie or, with the age check, an unnecessary "I cannot tell".
 
     Read the tail, never the head: dumpsys keeps a capped ring of ~246 entries,
     so the first match can be days old. Then check that the tail is not itself
-    stale, see _TV_POWER_MAX_AGE_S. Both timestamps come off the same box, so
-    this never touches the host clock or timezone.
+    stale, see _TV_POWER_MAX_AGE_S -- a television can be switched on again at
+    an input the box never hears about. Both timestamps come off the same box,
+    so this never touches the host clock or timezone.
 
     A missing or unparseable timestamp is trusted rather than discarded. The age
     check is an extra guard, not a new way to answer "I cannot tell".
@@ -99,9 +120,12 @@ def _parse_tv_power(dump: str) -> str | None:
         # Lexical compare is chronological for this fixed-width format.
         if stamp and (newest_stamp is None or stamp > newest_stamp):
             newest_stamp = stamp
-        value_match = _TV_POWER_RE.search(line)
-        if value_match:
-            last_value = value_match.group(1)
+        report = _TV_POWER_RE.search(line)
+        if report:
+            last_value = {"00": "on", "01": "standby"}.get(report.group(1))
+            last_stamp = stamp
+        elif _TV_STANDBY_RE.search(line):
+            last_value = "standby"
             last_stamp = stamp
 
     if last_value is None:
@@ -112,7 +136,7 @@ def _parse_tv_power(dump: str) -> str | None:
         and _stamp_age_s(last_stamp, newest_stamp) > _TV_POWER_MAX_AGE_S
     ):
         return None
-    return {"00": "on", "01": "standby"}.get(last_value)
+    return last_value
 
 
 @dataclass(frozen=True)

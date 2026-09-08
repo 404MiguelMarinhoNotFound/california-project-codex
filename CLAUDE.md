@@ -1125,17 +1125,31 @@ said not to: "The set exposes no PowerState field at all... What we must NOT do
 is treat the answer as 'powered on'." `_tv_is_up` verifies an *address*. It is
 not, and can never be made into, a power check.
 
-`MediaService.tv_power_status()` is the real oracle, and **its answer has an
-expiry date**. The TV does not broadcast its power state, it answers when asked,
-and the only thing that asks is the box's own wake sequence -- in
-`tests/fixtures/hdmi_control_dump.txt` every `<Report Power Status>` sits one
-second after a `<Give Device Power Status>`, and nothing polls periodically. So
-the last report can be hours stale, and if the TV is then killed with its own
-remote there may be no newer line at all. `_parse_tv_power` compares the
-report's timestamp against the newest line in the log -- both off the box's own
-clock, so no host timezone is involved -- and returns `None` past
-`_TV_POWER_MAX_AGE_S`. A stale confident answer is the same bug as the REST
-probe, only quieter.
+`MediaService.tv_power_status()` is the real oracle, and it reads **two kinds of
+evidence, whichever came last**:
+
+- `<Report Power Status>` is an **answer**. The only thing that asks is the
+  box's own wake sequence -- in `tests/fixtures/hdmi_control_dump.txt` every one
+  sits a second after a `<Give Device Power Status>`, and nothing polls
+  periodically. On its own it therefore cannot see Master Miguel reaching for
+  the television's remote, and goes hours stale.
+- `<Standby> 0F:36` is **volunteered**. The TV broadcasts it on its way off and
+  the box logs it even though it was not addressed to us. Confirmed on the real
+  box 2026-09-08: nine power-off cycles in one capture, every one logged
+  (`tests/fixtures/hdmi_control_standby_dump.txt`). This is the only thing that
+  makes "he turned it off himself" observable, and without it that capture reads
+  as `on` from four hours earlier with three `<Standby>` broadcasts after it.
+
+`[S]` is the box talking, never the television -- counting our own `<Standby>`
+or `<Report Power Status>` reports the box's state as the TV's.
+
+The staleness gate stays as a backstop, because a television can be switched on
+again at an input the box never hears about. `_parse_tv_power` compares the
+winning line's timestamp against the newest line in the log -- both off the
+box's own clock, so no host timezone is involved -- and returns `None` past
+`_TV_POWER_MAX_AGE_S`. In practice it does not fire during normal operation: an
+idle CEC bus is silent, so the newest line IS the wake burst that carries the
+power report.
 
 ### `ensure_connected()` is a live ADB ping, which is why `room_status()` exists
 
@@ -1379,7 +1393,9 @@ Current automated coverage exists for:
   still gets the four-way classified line
 - `room_status()` pinging the box exactly once, skipping the app and session
   reads on a sleeping box, and reporting `None` rather than `False` throughout
-- That a CEC power report far older than the live log is not trusted
+- That a CEC power report far older than the live log is not trusted, that a
+  `<Standby>` broadcast after the last report wins and a newer report wins back,
+  and that a `[S]` standby the box sent is not read as the television's state
 - Media sessions parsed from a real capture: that Stremio's show and episode
   are read out of the metadata, that `metadata: null` is no title rather than
   the word "null", that playback is scoped to the foreground app so an idle

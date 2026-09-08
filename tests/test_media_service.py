@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from services.media_service import (
     MediaService,
+    _parse_active_source,
     _parse_media_sessions,
     _parse_playing,
     _parse_tv_power,
@@ -844,6 +845,51 @@ class MediaSessionParsingTests(unittest.TestCase):
             "      metadata: size=3, description=Some Film, null, null\n"
         )
         self.assertEqual(_parse_media_sessions(dump)[0].title, "Some Film")
+
+
+
+class TvStandbyBroadcastTests(unittest.TestCase):
+    """
+    Parsed from a REAL capture taken 2026-09-08 with the television off
+    (tests/fixtures/hdmi_control_standby_dump.txt).
+
+    It answered the one open question in the power path. `<Report Power Status>`
+    is an ANSWER, and the only thing that asks is the box's own wake sequence --
+    so on its own it cannot see Master Miguel reaching for the TV remote. But the
+    television BROADCASTS `<Standby> 0F:36` on its way off, and the box logs it
+    even though it was not addressed to us. Nine power-off cycles in that one
+    capture, every single one of them logged.
+    """
+
+    ON = Path(__file__).parent / "fixtures" / "hdmi_control_dump.txt"
+    STANDBY = Path(__file__).parent / "fixtures" / "hdmi_control_standby_dump.txt"
+
+    def test_a_standby_broadcast_after_the_last_report_wins(self):
+        # In this capture the last <Report Power Status> says "on" at 18:54:37
+        # and three <Standby> broadcasts follow it at 22:06:43.
+        self.assertEqual(_parse_tv_power(self.STANDBY.read_text(encoding="utf-8")), "standby")
+
+    def test_the_on_capture_is_unaffected(self):
+        self.assertEqual(_parse_tv_power(self.ON.read_text(encoding="utf-8")), "on")
+
+    def test_a_report_after_a_standby_wins_in_turn(self):
+        # Waking the room asks the question again, and that answer is newer.
+        dump = (
+            "    [R] time=2026-09-08 22:06:43 message=<Standby> 0F:36\n"
+            "    [R] time=2026-09-08 22:30:00 message=<Report Power Status> 04:90:00\n"
+        )
+        self.assertEqual(_parse_tv_power(dump), "on")
+
+    def test_a_standby_we_sent_is_not_the_television_speaking(self):
+        # [S] is the box talking. Counting our own traffic as the TV's state is
+        # the same mistake as reading [S] <Report Power Status>.
+        dump = "    [S] time=2026-09-08 22:06:43 message=<Standby> 0F:36"
+        self.assertIsNone(_parse_tv_power(dump))
+
+    def test_the_box_is_not_the_active_source_while_the_tv_is_off(self):
+        self.assertIs(
+            _parse_active_source(self.STANDBY.read_text(encoding="utf-8")), False
+        )
 
 if __name__ == "__main__":
     unittest.main()

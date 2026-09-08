@@ -612,6 +612,33 @@ class StatusDispatchTests(unittest.TestCase):
         self.assertNotIn("state=", reply)
         self.assertNotIn("mIsActiveSource", reply)
 
+    def test_a_paused_title_is_still_named(self):
+        # Stremio keeps its metadata across a pause, so it still knows what is
+        # loaded. Saying "nothing playing" and dropping the title throws away
+        # the more useful half of what was read.
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=False,
+            title="Fallout, The Strip",
+        )
+        self.assertIn("paused on Fallout, The Strip", reply)
+
+    def test_the_session_title_beats_the_launch_memory(self):
+        # The box saw it. She only remembers launching it, which is weaker
+        # evidence and does not survive him using the remote.
+        media = Mock()
+        media.ensure_connected.return_value = True
+        media.room_status.return_value = RoomStatus(
+            reachable=True, awake=True, app="stremio", playing=True,
+            title="Fallout, The Strip",
+        )
+        store = NowPlaying()
+        store.remember("stremio", "something else entirely")
+        reply = _dispatch_tv(
+            {"action": "get_status"}, media, None, None, {}, now_playing=store
+        )
+        self.assertIn("Fallout, The Strip", reply)
+        self.assertNotIn("something else entirely", reply)
+
     def test_it_names_the_app_and_whether_anything_is_playing(self):
         _, reply = self._status(reachable=True, awake=True, app="youtube", playing=False)
         self.assertIn("youtube", reply)
