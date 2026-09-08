@@ -22,6 +22,7 @@ import numpy as np
 from services.activation_phrases import EchoGate, resolve_tier, strip_activation_echo
 from services.govee_service import GoveeService, clamp_percent, resolve_color
 from services.media_service import MediaService
+from services.light_shadow import LightShadow
 from services.now_playing import NowPlaying
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
 from services.surfshark_service import SurfsharkService
@@ -577,13 +578,51 @@ def _prune_clips(directory: str, max_files: int) -> list[str]:
     return doomed
 
 
-def _dispatch_lights(params: dict, govee_svc) -> str:
+def _light_memory_line(key: str, memory) -> str:
+    """
+    Say what she last sent the light, and say that it is what she SENT.
+
+    The hedge lives in this string rather than in the system prompt because
+    the string is what gets spoken. A prompt instruction can be forgotten six
+    exchanges later; the tool result cannot.
+    """
+    if memory is None:
+        return (
+            f"I haven't touched the {key} light since I started up, and the strip "
+            "can't tell me anything back, so I honestly don't know."
+        )
+
+    bits = []
+    if memory.power is not None:
+        bits.append("on" if memory.power else "off")
+    if memory.percent is not None:
+        bits.append(f"{memory.percent} percent")
+    if memory.color_word:
+        bits.append(memory.color_word)
+
+    if not bits:
+        return f"I don't have anything recorded for the {key} light."
+    return (
+        f"Last thing I sent the {key} light was {', '.join(bits)}, "
+        "and I can't read the strip back so that's memory, not a reading."
+    )
+
+
+def _dispatch_lights(params: dict, govee_svc, light_shadow=None) -> str:
     """
     Govee light control. Module-level and service-injected for the same reason
     _dispatch_tv is: it keeps the tool layer testable without an Orchestrator.
 
     No ADB check and no VPN preflight here on purpose. These are cloud calls to
     Govee and have nothing to do with the Mi Box or Surfshark.
+
+    light_shadow is injected rather than living on GoveeService on purpose.
+    The dispatcher is the only layer that holds the words worth saying back:
+    the CLAMPED percent and the colour Master Miguel actually said. The
+    service sees an rgb tuple, and nothing in this project maps rgb back to a
+    name. It also keeps the existing tests honest -- _svc() there is a bare
+    Mock, so a GoveeService.get_state() would auto-stub truthy and pass on
+    nothing at all.
     """
     action = params.get("action")
 
@@ -597,10 +636,20 @@ def _dispatch_lights(params: dict, govee_svc) -> str:
             return f"I don't have a light called {hint} saved."
         return "I don't have any lights saved yet."
 
+    if action == "light_status":
+        # Nothing to ask the service: the characteristic is write-only.
+        remembered = light_shadow.remembered(key) if light_shadow else None
+        return _light_memory_line(key, remembered)
+
     if action in ("light_on", "light_off"):
-        result = govee_svc.set_power(key, on=(action == "light_on"))
+        on = action == "light_on"
+        result = govee_svc.set_power(key, on=on)
         if result:
-            return f"{key} lights on." if action == "light_on" else f"{key} lights off."
+            # `if result:` is a SUCCESS check. GoveeCommandResult defines
+            # __bool__, so a failure is falsy and must not update memory.
+            if light_shadow:
+                light_shadow.record_power(key, on)
+            return f"{key} lights on." if on else f"{key} lights off."
         return result.message or _LIGHTS_UNREACHABLE
 
     if action == "light_brightness":
@@ -610,6 +659,10 @@ def _dispatch_lights(params: dict, govee_svc) -> str:
         percent = clamp_percent(raw)
         result = govee_svc.set_brightness(key, percent)
         if result:
+            # The clamped value, because that is what the strip was sent.
+            # Brightness does NOT imply power: the strip accepts this while off.
+            if light_shadow:
+                light_shadow.record_brightness(key, percent)
             return f"{key} lights at {percent} percent."
         return result.message or _LIGHTS_UNREACHABLE
 
@@ -622,6 +675,9 @@ def _dispatch_lights(params: dict, govee_svc) -> str:
             return f"I don't know the colour {requested}."
         result = govee_svc.set_color(key, rgb)
         if result:
+            # The spoken word, not the rgb. There is no rgb-to-name map here.
+            if light_shadow:
+                light_shadow.record_color(key, requested)
             return f"{key} lights set to {requested}."
         return result.message or _LIGHTS_UNREACHABLE
 
@@ -664,6 +720,10 @@ class Orchestrator:
         # whether something is playing, but never what -- she is the only one
         # who knows that, because she launched it.
         self.now_playing = NowPlaying()
+
+        # What she last told the lights. The Govee characteristic is
+        # write-only, so this is the only answer that exists for them.
+        self.light_shadow = LightShadow()
 
         # Govee lights. Constructed unconditionally — the service self-disables
         # when config is off or GOVEE_API_KEY is missing, so there is no None branch.
@@ -1216,7 +1276,7 @@ class Orchestrator:
                 now_playing=self.now_playing,
             )
         if tool_name == "control_lights":
-            return _dispatch_lights(tool_input, self.govee_service)
+            return _dispatch_lights(tool_input, self.govee_service, self.light_shadow)
         return "unknown tool"
 
     def _stremio_sync_loop(self, interval_minutes: int):

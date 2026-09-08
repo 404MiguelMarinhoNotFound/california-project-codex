@@ -131,14 +131,16 @@ CONTROL_LIGHTS_TOOL = {
         "Use when asked to turn lights on or off, dim or brighten them, or change "
         "their colour, in any room. If no room is named, the default light is used. "
         "Brightness and colour only show on a light that is already on, so call "
-        "light_on first if it might be off. Do not use this for the TV."
+        "light_on first if it might be off. light_status reports the last command "
+        "sent, not a live reading, because the strip cannot be read back. "
+        "Do not use this for the TV."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["light_on", "light_off", "light_brightness", "light_color"],
+                "enum": ["light_on", "light_off", "light_brightness", "light_color", "light_status"],
                 "description": "What to do to the light."
             },
             "light": {

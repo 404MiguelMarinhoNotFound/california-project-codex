@@ -312,6 +312,7 @@ truth. `requirements.txt` has been deleted and must not be reintroduced.
 - **Run `uv sync` after pulling** so the environment matches the lockfile.
 - **Optional/heavy providers go in `[project.optional-dependencies]`,** not in the core
   `dependencies` list. Current extras: `kokoro`, `piper`, `elevenlabs`, `openai`,
+  `cec`,
   `porcupine`, `silero`, `pi`, `govee`, and the aggregate `default`.
 - **`uv sync --extra <name>` syncs ONLY that extra and uninstalls everything else.**
   It is not additive. Running `uv sync --extra govee` on this project removes kokoro,
@@ -1064,7 +1065,7 @@ The Claude path supports:
 
 - Anthropic web search via `web_search_20250305`
 - Custom `control_tv` tool for Mi Box and TV control (23 actions)
-- Custom `control_lights` tool for Govee light control (2 actions)
+- Custom `control_lights` tool for Govee light control (5 actions)
 
 With the committed `config.yaml` that is **3 tools** in every request: `web_search`,
 `control_tv`, `control_lights`. Each custom tool's full schema is sent on every turn, so
@@ -1079,6 +1080,7 @@ Widening that check to any `tool_use` block would break web search.
 `control_lights` supports these actions:
 
 - `light_on`, `light_off`
+- `light_status` (answers from shadow state, never a reading -- see Reading State Back)
 - `light_brightness` (needs `brightness_percent`, 1-100, clamped not rejected)
 - `light_color` (needs `color`)
 
@@ -1106,6 +1108,106 @@ When tools are active:
 - Do not read raw `tool_use` or `tool_result` structures aloud
 - Keep tool confirmations short and natural
 - Treat plain show requests for `stremio_play` as "sync the library, then resume the latest tracked episode"
+
+-----
+
+## Reading State Back
+
+She could control all three devices and read almost nothing back. What she can
+read, and what she deliberately does not pretend to, is now the point.
+
+### The television's power is on the CEC bus, never in its REST reply
+
+`get_status` used to report TV power from `cec_waker._tv_is_up()`. That probes
+`:8001/api/v2/`, **which this set answers in standby**, so a television that was
+off came back as "TV: on" for the life of the feature. `cec_wake.py` already
+said not to: "The set exposes no PowerState field at all... What we must NOT do
+is treat the answer as 'powered on'." `_tv_is_up` verifies an *address*. It is
+not, and can never be made into, a power check.
+
+`MediaService.tv_power_status()` is the real oracle, and **its answer has an
+expiry date**. The TV does not broadcast its power state, it answers when asked,
+and the only thing that asks is the box's own wake sequence -- in
+`tests/fixtures/hdmi_control_dump.txt` every `<Report Power Status>` sits one
+second after a `<Give Device Power Status>`, and nothing polls periodically. So
+the last report can be hours stale, and if the TV is then killed with its own
+remote there may be no newer line at all. `_parse_tv_power` compares the
+report's timestamp against the newest line in the log -- both off the box's own
+clock, so no host timezone is involved -- and returns `None` past
+`_TV_POWER_MAX_AGE_S`. A stale confident answer is the same bug as the REST
+probe, only quieter.
+
+### `ensure_connected()` is a live ADB ping, which is why `room_status()` exists
+
+Every public reader starts with `ensure_connected()`, and that fires a real
+`adb shell echo ping` **every call**. Composing status out of `is_awake()` +
+`hdmi_state()` + `get_current_app()` + `is_playing()` therefore costs eight round
+trips to answer one question. `room_status()` is the one method allowed to read
+dumpsys without re-entering the gate, and short-circuits on a sleeping box
+because nothing is on screen to ask about. Do not "tidy" it into calls to the
+four public readers.
+
+`is_active_source()` and `tv_power_status()` used to run their own
+`dumpsys hdmi_control` over identical output. Both now delegate to
+`hdmi_state()` and keep their names, signatures and `None` semantics, because
+`ensure_active_source()` and `_ensure_playable()` call them.
+
+**`None` means "could not tell", and a field she could not read is a clause she
+does not say.** The old branch printed "unknown" for exactly the fields it had
+failed to read, which is the least useful thing to say out loud.
+
+### She knows what she put on, because she is the one who put it on
+
+`dumpsys media_session` gives a playback state and no title on this hardware, and
+a UI dump costs 6-12s, which is not a thing to do inside a voice turn. So
+`services/now_playing.py` remembers the one thing she launched, in the words she
+used, under two rules:
+
+- **Corroborated.** `current()` returns nothing unless the live foreground app
+  still matches, so a memory of a Stremio episode is dropped the moment he moves
+  to YouTube rather than narrated over it.
+- **`kind` separates "playing" from "opened".** A YouTube search and a Stremio
+  series page were put on screen, not played. With no matching memory she says
+  she did not start it, rather than guessing.
+
+Recording happens in `_dispatch_tv`, not in the services, because the speakable
+label only exists there: `StremioService` holds an IMDb id and a deep link, and
+`youtube_playlist()` holds an opaque `PL...` id. An opaque id is deliberately
+not remembered at all rather than read out loud later.
+
+### The lights cannot be read, and saying so is the feature
+
+The Govee characteristic `00010203-...-2b11` is **Write Without Response**, with
+no notify characteristic beside it, and the attic H617E is absent from Govee's
+cloud whitelist, so `GET /user/devices` returns an empty array with a valid key.
+There is no reading to be had by any route.
+
+`services/light_shadow.py` therefore stores what she last *sent*, and
+`_light_memory_line` says so in the returned string. **The hedge lives in the
+string, not the system prompt**, because the string is what gets spoken and a
+prompt instruction is forgotten six exchanges later. Two rules:
+
+- It stores the **clamped percent** and the **spoken colour word**, not rgb.
+  Nothing in this project maps rgb back to a name and nothing should; the
+  dispatcher already holds the word Master Miguel actually said.
+- **Brightness and colour do not imply power.** The strip accepts both while it
+  is off, so inferring "on" from them would be a guess dressed as a fact.
+
+Both stores are **in memory only**. A restart is the moment either is least
+trustworthy, and persisting would mean answering confidently about a room that
+had hours to change. They are also deliberately **two modules, not one**: the
+now-playing memory is corroborated against a live reading and the light memory
+can never be, and a shared base class would carry the contract "sometimes
+verifiable", which is the exact ambiguity that produced the TV bug above.
+
+Both are injected as **trailing defaulted parameters** (`now_playing` on
+`_dispatch_tv`, `light_shadow` on `_dispatch_lights`) so the existing call sites
+that pass five and two positionals keep working, and `None` keeps meaning "no
+memory available". Neither is a module-level singleton: a shared store would
+leak a label from one test into the next. `light_shadow` is injected rather than
+living on `GoveeService` for a second reason -- `_svc()` in
+`tests/test_orchestrator_lights.py` is a bare `Mock`, so a `get_state()` method
+would auto-stub **truthy** and the tests would pass while reading nothing.
 
 -----
 
@@ -1246,6 +1348,20 @@ Current automated coverage exists for:
   they are opposite fixes and the wrong one strands him
 - `_hdmi_inventory()` advertising configured ports and omitting the block entirely
   when none are named
+- That `get_status` reports a standby television as off rather than on, never
+  touches the CEC waker, says nothing it could not read, and returns one line
+  with no dumpsys text in it
+- That a status question never wakes the room, and that an unreachable box
+  still gets the four-way classified line
+- `room_status()` pinging the box exactly once, skipping the app and session
+  reads on a sleeping box, and reporting `None` rather than `False` throughout
+- That a CEC power report far older than the live log is not trusted
+- Now-playing memory: quoted only while the foreground app still matches,
+  dropped when he switched apps, never claiming a search was played, and not
+  recorded at all when the launch failed
+- Light shadow state: recorded only on success, brightness stored clamped,
+  colour stored as the spoken word, brightness never implying power, and
+  `light_status` never asking the service for state
 - Stremio playback retry logic
 - Surfshark route execution, route cache semantics, and debug route capture
 - Orchestrator VPN preflight routing and warning behavior
