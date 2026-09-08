@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock
 from unittest.mock import patch
 
-from services.media_service import MediaService
+from services.media_service import MediaService, _parse_tv_power
 from tests.config_fixture import config_for_tests
 
 
@@ -636,6 +636,126 @@ class BoxDiscoveryTests(unittest.TestCase):
                 self.assertFalse(svc._verify_box(self.MOVED_TO))
         adb.assert_not_called()
 
+
+
+
+class TvPowerStalenessTests(unittest.TestCase):
+    """
+    The TV does not volunteer its power state, it answers when ASKED, and the
+    only thing that asks is the box's own wake sequence. So the last
+    <Report Power Status> can be hours old, and if the TV is then switched off
+    with its own remote there is no newer line at all. Trusting it blind is the
+    same lie as the REST probe this replaced, only quieter.
+    """
+
+    def test_a_report_from_the_live_tail_is_trusted(self):
+        dump = """
+    [R] time=2026-09-05 14:18:51 message=<Report Power Status> 04:90:00
+    [R] time=2026-09-05 14:18:55 message=<Give Device Power Status> 04:8F
+"""
+        self.assertEqual(_parse_tv_power(dump), "on")
+
+    def test_a_report_far_older_than_the_log_is_not_trusted(self):
+        dump = """
+    [R] time=2026-09-05 09:00:00 message=<Report Power Status> 04:90:00
+    [R] time=2026-09-05 14:18:55 message=<Give Device Power Status> 04:8F
+"""
+        self.assertIsNone(_parse_tv_power(dump))
+
+    def test_a_dump_without_timestamps_is_still_read(self):
+        # The age check is an extra guard, not a new way to say "cannot tell".
+        dump = "    [R] message=<Report Power Status> 04:90:01"
+        self.assertEqual(_parse_tv_power(dump), "standby")
+
+
+class IsPlayingTests(unittest.TestCase):
+    def _service(self, dump, ok=True, connected=True):
+        cfg = config_for_tests(
+            media={"cec_wake": {"enabled": False}, "discovery": {"enabled": False}},
+        )
+        svc = MediaService(cfg)
+        svc.ensure_connected = Mock(return_value=connected)
+        svc._adb = Mock(return_value=(ok, dump))
+        return svc
+
+    def test_state_3_is_playing(self):
+        self.assertIs(self._service("  state=3 (PLAYING)").is_playing(), True)
+
+    def test_an_idle_session_is_not_playing(self):
+        self.assertIs(self._service("  state=2 (PAUSED)").is_playing(), False)
+
+    def test_unreachable_is_none_not_false(self):
+        # None means "could not tell". False would let her say "nothing's
+        # playing" about a box she never reached.
+        self.assertIsNone(self._service("", connected=False).is_playing())
+
+    def test_a_failed_dumpsys_is_none_not_false(self):
+        self.assertIsNone(self._service("", ok=False).is_playing())
+
+
+class RoomStatusTests(unittest.TestCase):
+    """
+    room_status() is the one reader allowed to skip ensure_connected() per call,
+    and that is the whole reason it exists: ensure_connected() fires a live ADB
+    ping every time, so composing this from the four public readers would cost
+    eight round trips to answer one question.
+    """
+
+    POWER = "mWakefulness=Awake"
+    HDMI = """
+    mIsActiveSource: true
+    [R] time=2026-09-05 14:18:51 message=<Report Power Status> 04:90:00
+"""
+    FOCUS = "mCurrentFocus=Window{a u0 com.stremio.one/com.stremio.MainActivity}"
+    SESSION = "state=3"
+
+    def _service(self, replies, connected=True):
+        cfg = config_for_tests(
+            media={"cec_wake": {"enabled": False}, "discovery": {"enabled": False}},
+        )
+        svc = MediaService(cfg)
+        svc.ensure_connected = Mock(return_value=connected)
+        svc._adb = Mock(side_effect=[(True, r) for r in replies])
+        return svc
+
+    def test_a_full_read_reports_every_field(self):
+        svc = self._service([self.POWER, self.HDMI, self.FOCUS, self.SESSION])
+        status = svc.room_status()
+        self.assertTrue(status.reachable)
+        self.assertIs(status.awake, True)
+        self.assertEqual(status.tv_power, "on")
+        self.assertIs(status.on_the_box, True)
+        self.assertEqual(status.app, "stremio")
+        self.assertIs(status.playing, True)
+
+    def test_the_box_is_pinged_exactly_once(self):
+        svc = self._service([self.POWER, self.HDMI, self.FOCUS, self.SESSION])
+        svc.room_status()
+        svc.ensure_connected.assert_called_once()
+
+    def test_a_sleeping_box_skips_the_app_and_session_reads(self):
+        # Nothing is on screen, so asking would cost two round trips for two Nones.
+        svc = self._service(["mWakefulness=Asleep", self.HDMI])
+        status = svc.room_status()
+        self.assertIs(status.awake, False)
+        self.assertIsNone(status.app)
+        self.assertIsNone(status.playing)
+        self.assertEqual(svc._adb.call_count, 2)
+
+    def test_an_unreachable_box_reports_reachable_false_without_reading(self):
+        svc = self._service([], connected=False)
+        status = svc.room_status()
+        self.assertFalse(status.reachable)
+        svc._adb.assert_not_called()
+
+    def test_unparseable_output_is_none_not_false(self):
+        svc = self._service(["junk", "junk", "junk", "junk"])
+        status = svc.room_status()
+        self.assertTrue(status.reachable)
+        self.assertIsNone(status.awake)
+        self.assertIsNone(status.tv_power)
+        self.assertIsNone(status.on_the_box)
+        self.assertIsNone(status.app)
 
 if __name__ == "__main__":
     unittest.main()

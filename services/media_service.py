@@ -3,6 +3,8 @@ import re
 import subprocess
 import time
 import yaml
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -30,6 +32,117 @@ _ACTIVE_SOURCE_RE = re.compile(r"mIsActiveSource:\s*(\w+)")
 _TV_POWER_RE = re.compile(
     r"\[R\][^\n]*<Report Power Status>\s*0[0-9A-Fa-f]:90:([0-9A-Fa-f]{2})"
 )
+
+# Every CEC line carries the BOX's own clock: "time=2026-09-05 14:18:51".
+_CEC_TIME_RE = re.compile(r"time=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+# How old a <Report Power Status> may be before it stops meaning anything.
+#
+# The TV does not volunteer its power state, it answers when ASKED, and the only
+# thing that asks is the box's own wake sequence (<Give Device Power Status> ->
+# <Report Power Status> one second later, visible in the fixture). So the last
+# report can be hours stale, and if Master Miguel kills the TV with its own
+# remote afterwards there may be no newer line at all. Reporting that as "on" is
+# the same lie as the REST probe this replaced, only quieter.
+_TV_POWER_MAX_AGE_S = 300
+
+
+def _parse_wakefulness(dump: str) -> bool | None:
+    """True awake, False asleep, None when the dump does not say."""
+    match = _WAKEFULNESS_RE.search(dump or "")
+    if not match:
+        return None
+    return match.group(1).strip().lower() == "awake"
+
+
+def _parse_active_source(dump: str) -> bool | None:
+    """True when the box is what the TV is showing. None is not False."""
+    match = _ACTIVE_SOURCE_RE.search(dump or "")
+    if not match:
+        return None
+    return match.group(1).strip().lower() == "true"
+
+
+def _stamp_age_s(stamp: str, newest: str) -> float:
+    """Seconds between two CEC log timestamps. 0.0 when either will not parse."""
+    fmt = "%Y-%m-%d %H:%M:%S"
+    try:
+        return (datetime.strptime(newest, fmt) - datetime.strptime(stamp, fmt)).total_seconds()
+    except ValueError:
+        return 0.0
+
+
+def _parse_tv_power(dump: str) -> str | None:
+    """
+    The TV's power state as the box last HEARD it: "on" | "standby" | None.
+
+    Read the tail, never the head: dumpsys keeps a capped ring of ~246 entries,
+    so the first match can be days old. Then check that the tail is not itself
+    stale, see _TV_POWER_MAX_AGE_S. Both timestamps come off the same box, so
+    this never touches the host clock or timezone.
+
+    A missing or unparseable timestamp is trusted rather than discarded. The age
+    check is an extra guard, not a new way to answer "I cannot tell".
+    """
+    last_value = None
+    last_stamp = None
+    newest_stamp = None
+    for line in (dump or "").splitlines():
+        stamp_match = _CEC_TIME_RE.search(line)
+        stamp = stamp_match.group(1) if stamp_match else None
+        # Lexical compare is chronological for this fixed-width format.
+        if stamp and (newest_stamp is None or stamp > newest_stamp):
+            newest_stamp = stamp
+        value_match = _TV_POWER_RE.search(line)
+        if value_match:
+            last_value = value_match.group(1)
+            last_stamp = stamp
+
+    if last_value is None:
+        return None
+    if (
+        last_stamp
+        and newest_stamp
+        and _stamp_age_s(last_stamp, newest_stamp) > _TV_POWER_MAX_AGE_S
+    ):
+        return None
+    return {"00": "on", "01": "standby"}.get(last_value)
+
+
+def _parse_playing(dump: str) -> bool:
+    """
+    Is something actually playing? `state=3` is PlaybackState.STATE_PLAYING.
+
+    StremioService._is_playing does the same check and deliberately keeps doing
+    it: it has a standalone-ADB path for when no MediaService exists, and its
+    bool return is load-bearing in the autoplay retry. Two lines of duplication
+    is the cheaper half of that trade.
+    """
+    return "state=3" in (dump or "").lower()
+
+
+@dataclass(frozen=True)
+class HdmiState:
+    """Both facts `dumpsys hdmi_control` carries, from one round trip."""
+    active_source: bool | None
+    tv_power: str | None
+
+
+@dataclass(frozen=True)
+class RoomStatus:
+    """
+    Everything readable about the room, as DATA. The sentence is built in the
+    orchestrator, the same split as unreachable_reason / _unreachable_line.
+
+    Every field but `reachable` is optional, and None means "could not tell"
+    rather than "no". Callers drop a clause rather than guess at it.
+    """
+    reachable: bool
+    awake: bool | None = None
+    tv_power: str | None = None
+    on_the_box: bool | None = None
+    app: str | None = None
+    playing: bool | None = None
 
 
 class MediaService:
@@ -721,10 +834,7 @@ class MediaService:
         ok, output = self._adb("shell dumpsys power")
         if not ok or not output:
             return None
-        match = _WAKEFULNESS_RE.search(output)
-        if not match:
-            return None
-        return match.group(1).strip().lower() == "awake"
+        return _parse_wakefulness(output)
 
     def turn_on(self) -> bool:
         state = self.is_awake()
@@ -805,15 +915,7 @@ class MediaService:
         only false in one real situation: the input was parked somewhere else --
         terrestrial TV, a console -- while the box stayed awake.
         """
-        if not self.ensure_connected():
-            return None
-        ok, output = self._adb("shell dumpsys hdmi_control")
-        if not ok or not output:
-            return None
-        match = _ACTIVE_SOURCE_RE.search(output)
-        if not match:
-            return None
-        return match.group(1).strip().lower() == "true"
+        return self.hdmi_state().active_source
 
     def tv_power_status(self) -> str | None:
         """
@@ -832,17 +934,24 @@ class MediaService:
         during this work returned entries from two days earlier and looked exactly
         like "nothing happened".
         """
+        return self.hdmi_state().tv_power
+
+    def hdmi_state(self) -> HdmiState:
+        """
+        Both hdmi_control facts from ONE round trip.
+
+        is_active_source() and tv_power_status() each ran their own `dumpsys
+        hdmi_control` over identical output, so asking for both cost two of them.
+        They now delegate here and keep their own names, signatures and None
+        semantics, because ensure_active_source() and _ensure_playable() call
+        them and must not change.
+        """
         if not self.ensure_connected():
-            return None
+            return HdmiState(None, None)
         ok, output = self._adb("shell dumpsys hdmi_control")
         if not ok or not output:
-            return None
-        last = None
-        for match in _TV_POWER_RE.finditer(output):
-            last = match.group(1)
-        if last is None:
-            return None
-        return {"00": "on", "01": "standby"}.get(last)
+            return HdmiState(None, None)
+        return HdmiState(_parse_active_source(output), _parse_tv_power(output))
 
     def ensure_active_source(self, attempts: int = 3, settle_s: float = 2.0) -> bool | None:
         """
@@ -910,17 +1019,20 @@ class MediaService:
         ok, output = self._adb("shell dumpsys window displays")
         if ok and output:
             try:
-                pkg = self._parse_focus_package(output)
-                if not pkg:
-                    return "unknown"
-                # Reverse-lookup friendly name
-                for name, package in self.apps.items():
-                    if package in pkg:
-                        return name
-                return pkg
+                return self._friendly_app(output) or "unknown"
             except Exception:
                 return output
         return "unknown"
+
+    def _friendly_app(self, dumpsys_output: str) -> str | None:
+        """The foreground app under its configured name, else its package."""
+        pkg = self._parse_focus_package(dumpsys_output)
+        if not pkg:
+            return None
+        for name, package in self.apps.items():
+            if package in pkg:
+                return name
+        return pkg
 
     def _parse_focus_package(self, dumpsys_output: str) -> str:
         """Best-effort foreground package extraction.
@@ -960,27 +1072,53 @@ class MediaService:
             return stripped.split("mCurrentFocus=", 1)[-1].strip()
         return ""
 
-    def get_media_session(self) -> str:
-        """Return active media session info (track/show if the app exposes it)."""
+    def is_playing(self) -> bool | None:
+        """
+        Is something playing right now? None means "could not tell".
+
+        This replaced get_media_session(), which returned up to 15 raw lines of
+        dumpsys straight into the LLM's context to be read out loud.
+        """
         if not self.ensure_connected():
-            return "TV unreachable"
+            return None
         ok, output = self._adb("shell dumpsys media_session")
-        if ok and output:
-            # Extract the useful bits — metadata and playback state
-            lines = output.splitlines()
-            relevant = []
-            capture = False
-            for line in lines:
-                if "metadata:" in line.lower() or "state=" in line.lower():
-                    capture = True
-                if capture:
-                    relevant.append(line.strip())
-                    if len(relevant) > 15:
-                        break
-                if capture and line.strip() == "":
-                    capture = False
-            return "\n".join(relevant) if relevant else "no active media session"
-        return "couldn't query media session"
+        if not ok or not output:
+            return None
+        return _parse_playing(output)
+
+    def room_status(self) -> RoomStatus:
+        """
+        Everything readable about the room, in as few round trips as possible.
+
+        This is the ONE method allowed to read dumpsys without going back through
+        ensure_connected(), and that is the whole reason it exists.
+        ensure_connected() fires a live `adb shell echo ping` on EVERY call, so
+        composing this from is_awake() + hdmi_state() + get_current_app() +
+        is_playing() would cost eight round trips to answer one question. Here it
+        is one ping and two to four dumpsys reads.
+
+        A sleeping box short-circuits: there is nothing on screen to ask about.
+        """
+        if not self.ensure_connected():
+            return RoomStatus(reachable=False)
+
+        ok, power_dump = self._adb("shell dumpsys power")
+        awake = _parse_wakefulness(power_dump) if ok else None
+
+        ok, hdmi_dump = self._adb("shell dumpsys hdmi_control")
+        tv_power = _parse_tv_power(hdmi_dump) if ok else None
+        on_the_box = _parse_active_source(hdmi_dump) if ok else None
+
+        if awake is False:
+            return RoomStatus(True, awake, tv_power, on_the_box)
+
+        ok, focus_dump = self._adb("shell dumpsys window displays")
+        app = self._friendly_app(focus_dump) if ok else None
+
+        ok, session_dump = self._adb("shell dumpsys media_session")
+        playing = _parse_playing(session_dump) if ok else None
+
+        return RoomStatus(True, awake, tv_power, on_the_box, app, playing)
 
 
 if __name__ == "__main__":

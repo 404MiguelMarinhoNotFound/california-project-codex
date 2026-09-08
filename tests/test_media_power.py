@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 from core.orchestrator import _dispatch_tv, _ensure_playable
 from services.cec_wake import CecWaker, WakeResult
-from services.media_service import MediaService
+from services.media_service import MediaService, RoomStatus
 from tests.config_fixture import config_for_tests, real_config
 
 
@@ -564,6 +564,83 @@ class HdmiInventoryTests(unittest.TestCase):
     def test_media_disabled_advertises_nothing(self):
         self.assertEqual(self._svc({2: "mi box"}, media_enabled=False)._hdmi_inventory(), "")
 
+
+
+
+class StatusDispatchTests(unittest.TestCase):
+    """
+    get_status used to report TV power from cec_waker._tv_is_up(), a REST
+    reachability probe. This set answers that endpoint in standby, so she said
+    "TV: on" about a television that was off. cec_wake.py already said not to:
+    "What we must NOT do is treat the answer as 'powered on'."
+
+    It also stapled up to 15 raw lines of `dumpsys media_session` into the reply,
+    which then went to a voice model to be read out loud.
+    """
+
+    def _status(self, **fields):
+        media = Mock()
+        fields.setdefault("reachable", True)
+        media.ensure_connected.return_value = fields["reachable"]
+        media.room_status.return_value = RoomStatus(**fields)
+        return media, _dispatch_tv({"action": "get_status"}, media, None, None, {})
+
+    def test_a_television_in_standby_is_reported_off(self):
+        # The regression. Before this, a standby TV came back as "TV: on".
+        _, reply = self._status(reachable=True, awake=True, tv_power="standby")
+        self.assertIn("TV off", reply)
+        self.assertNotIn("TV on", reply)
+
+    def test_power_comes_from_cec_and_never_from_the_rest_probe(self):
+        media, _ = self._status(reachable=True, awake=True, tv_power="on")
+        media.cec_waker._tv_is_up.assert_not_called()
+
+    def test_a_field_it_could_not_read_is_a_clause_it_does_not_say(self):
+        # None means "could not tell". The old branch printed "unknown" for
+        # exactly the fields it had failed to read.
+        _, reply = self._status(reachable=True, awake=True)
+        self.assertNotIn("unknown", reply.lower())
+        self.assertNotIn("None", reply)
+
+    def test_the_reply_is_one_line_with_no_dumpsys_in_it(self):
+        _, reply = self._status(
+            reachable=True, awake=True, tv_power="on", on_the_box=True,
+            app="stremio", playing=True,
+        )
+        self.assertNotIn("\n", reply)
+        self.assertNotIn("state=", reply)
+        self.assertNotIn("mIsActiveSource", reply)
+
+    def test_it_names_the_app_and_whether_anything_is_playing(self):
+        _, reply = self._status(reachable=True, awake=True, app="youtube", playing=False)
+        self.assertIn("youtube", reply)
+        self.assertIn("nothing playing", reply)
+
+    def test_an_input_parked_elsewhere_is_worth_saying(self):
+        _, reply = self._status(reachable=True, awake=True, tv_power="on", on_the_box=False)
+        self.assertIn("another input", reply)
+
+    def test_a_sleeping_box_says_so_and_stops(self):
+        _, reply = self._status(reachable=True, awake=False, tv_power="standby")
+        self.assertIn("asleep", reply)
+        self.assertNotIn("playing", reply)
+
+    def test_an_unreachable_box_gets_the_classified_line_not_a_status(self):
+        media = Mock()
+        media.ensure_connected.return_value = False
+        media.unreachable_reason = "no_adb_port"
+        reply = _dispatch_tv({"action": "get_status"}, media, None, None, {})
+        self.assertIn("developer options", reply)
+        media.room_status.assert_not_called()
+
+    def test_asking_what_is_on_never_wakes_the_room(self):
+        # get_status is in requires_tv, deliberately NOT needs_screen. A question
+        # about the room must not turn the room on for 25 seconds.
+        media = Mock()
+        media.ensure_connected.return_value = False
+        media.unreachable_reason = "not_on_lan"
+        _dispatch_tv({"action": "get_status"}, media, None, None, {})
+        media.turn_on.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

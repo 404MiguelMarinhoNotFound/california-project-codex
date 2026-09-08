@@ -98,6 +98,59 @@ def _unreachable_line(media_svc) -> str:
     }.get(reason, "TV is off or unreachable right now")
 
 
+def _status_line(status) -> str:
+    """
+    Turn a RoomStatus into something speakable.
+
+    Data lives in MediaService, speech lives here -- the same split as
+    unreachable_reason / _unreachable_line.
+
+    The rule that matters: **a field we could not read is a clause we do not
+    say.** None means "could not tell", never "no", and the old version of this
+    printed "unknown" for exactly the fields it had failed to read. Three
+    readable facts make a shorter answer, not a worse one.
+    """
+    if not status.reachable:
+        return "I can't reach the box right now."
+
+    parts = []
+
+    if status.tv_power == "standby":
+        parts.append("TV off")
+    elif status.tv_power == "on":
+        if status.on_the_box is True:
+            parts.append("TV on and showing the box")
+        elif status.on_the_box is False:
+            parts.append("TV on but showing another input")
+        else:
+            parts.append("TV on")
+    elif status.on_the_box is False:
+        # Power unreadable, but "he is on another input" still answers the
+        # question he actually asked.
+        parts.append("TV showing another input")
+
+    if status.awake is False:
+        # Asleep means nothing is on screen, so app and playback were never read.
+        parts.append("box asleep")
+        return ". ".join(parts) + "."
+
+    if status.app and status.playing is True:
+        parts.append(f"{status.app} playing")
+    elif status.app and status.playing is False:
+        parts.append(f"{status.app} open, nothing playing")
+    elif status.app:
+        parts.append(f"{status.app} open")
+    elif status.playing is True:
+        parts.append("something playing")
+
+    if status.awake is True:
+        parts.append("box awake")
+
+    if not parts:
+        return "I can't tell what the box is doing right now."
+    return ". ".join(parts) + "."
+
+
 def _ensure_playable(media_svc, say_now=None) -> str:
     """
     Get the room ready to show something. Returns "" on success, else a spoken line.
@@ -432,10 +485,12 @@ def _dispatch_tv(
 
     # State awareness
     elif action == "get_status":
-        app = media_svc.get_current_app()
-        session = media_svc.get_media_session()
-        tv = "on" if media_svc.cec_waker.available and media_svc.cec_waker._tv_is_up() else "unknown"
-        return f"Current app: {app}. Media session: {session}. TV: {tv}"
+        # NOT cec_waker._tv_is_up(). That probes the TV's REST endpoint, which
+        # this set answers in standby -- cec_wake.py says so in as many words:
+        # "What we must NOT do is treat the answer as 'powered on'." This branch
+        # did exactly that and reported a sleeping television as on. Power now
+        # comes off the CEC bus, where the TV actually said it.
+        return _status_line(media_svc.room_status())
 
     return "unknown action"
 
