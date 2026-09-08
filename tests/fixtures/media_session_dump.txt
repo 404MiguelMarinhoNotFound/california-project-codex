@@ -1,0 +1,32 @@
+MEDIA SESSION SERVICE (dumpsys media_session)
+
+5 sessions listeners.
+Global priority session is null
+User Records:
+Record for full_user=0, profile_user=10
+  Volume key long-press listener: null
+  Volume key long-press listener package: 
+  Media key listener: null
+  Media key listener package: 
+  OnMediaKeyEventDispatchedListener: added 0 listener(s)
+  OnMediaKeyEventSessionChangedListener: added 1 listener(s)
+    from com.mi.bluetooth
+  Last MediaButtonReceiver: MBR {pi=PendingIntent{b19ccbb: PendingIntentRecord{c4950b2 com.stremio.one broadcastIntent}}, type=1}
+  Media button session is com.stremio.one/PlayerMediaSession (userId=0)
+  Sessions Stack - have 1 sessions:
+    PlayerMediaSession com.stremio.one/PlayerMediaSession (userId=0)
+      ownerPid=1978, ownerUid=10090, userId=0
+      package=com.stremio.one
+      launchIntent=null
+      mediaButtonReceiver=MBR {pi=PendingIntent{b19ccbb: PendingIntentRecord{c4950b2 com.stremio.one broadcastIntent}}, type=1}
+      active=true
+      flags=3
+      rating type=0
+      controllers: 3
+      state=PlaybackState {state=3, position=240301, buffered position=0, speed=1.0, updated=1129216195, actions=770, custom actions=[], active item id=-1, error=null}
+      audioAttrs=AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_UNKNOWN flags=0x800 tags= bundle=null
+      volumeType=1, controlType=2, max=0, current=0
+      metadata: size=4, description=Fallout, The Strip, null
+      queueTitle=null, size=0
+Audio playback (lastly played comes first)
+  uid=10090 packages=com.stremio.one

@@ -33,6 +33,12 @@ _TV_POWER_RE = re.compile(
     r"\[R\][^\n]*<Report Power Status>\s*0[0-9A-Fa-f]:90:([0-9A-Fa-f]{2})"
 )
 
+# dumpsys media_session: "state=PlaybackState {state=3, position=240301, ..."
+_SESSION_STATE_RE = re.compile(r"state=PlaybackState\s*\{state=(\d+)")
+
+# dumpsys media_session: "metadata: size=4, description=Fallout, The Strip, null"
+_SESSION_METADATA_RE = re.compile(r"metadata:.*?\bdescription=(.*)$")
+
 # Every CEC line carries the BOX's own clock: "time=2026-09-05 14:18:51".
 _CEC_TIME_RE = re.compile(r"time=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
@@ -109,16 +115,100 @@ def _parse_tv_power(dump: str) -> str | None:
     return {"00": "on", "01": "standby"}.get(last_value)
 
 
-def _parse_playing(dump: str) -> bool:
+@dataclass(frozen=True)
+class MediaSession:
+    """One entry from the "Sessions Stack" of `dumpsys media_session`."""
+    package: str
+    state: int | None
+    title: str | None
+
+
+def _parse_media_sessions(dump: str) -> list[MediaSession]:
+    """
+    Every media session the box is holding, in order.
+
+    There is usually more than one. Captured off the live box with Stremio
+    playing, Spotify ALSO held an active session sitting at state=0, so a flat
+    "is state=3 anywhere in this dump" answers a different question than the
+    one being asked and would report Spotify's playback as Stremio's.
+    """
+    sessions: list[MediaSession] = []
+    package = None
+    state = None
+    title = None
+
+    def flush():
+        if package is not None:
+            sessions.append(MediaSession(package, state, title))
+
+    for line in (dump or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("package="):
+            flush()
+            package = stripped.split("=", 1)[1].strip()
+            state = None
+            title = None
+            continue
+        if package is None:
+            continue
+        match = _SESSION_STATE_RE.search(stripped)
+        if match:
+            state = int(match.group(1))
+            continue
+        match = _SESSION_METADATA_RE.search(stripped)
+        if match:
+            title = _clean_description(match.group(1))
+    flush()
+    return sessions
+
+
+def _clean_description(raw: str) -> str | None:
+    """
+    MediaDescription prints as "title, subtitle, iconUri", and Stremio fills
+    the first two: "Fallout, The Strip" is the show and the episode. Unset
+    fields print as the literal "null", so drop those and keep the rest as he
+    would want to hear it.
+    """
+    parts = [p.strip() for p in (raw or "").split(",")]
+    parts = [p for p in parts if p and p != "null"]
+    return ", ".join(parts) or None
+
+
+def _parse_playing(dump: str, package: str | None = None) -> bool:
     """
     Is something actually playing? `state=3` is PlaybackState.STATE_PLAYING.
 
-    StremioService._is_playing does the same check and deliberately keeps doing
+    Scoped to `package` when one is given, because more than one app holds a
+    session at a time. Falls back to the flat scan only for dumps with no
+    session block at all.
+
+    StremioService._is_playing does the flat check and deliberately keeps doing
     it: it has a standalone-ADB path for when no MediaService exists, and its
-    bool return is load-bearing in the autoplay retry. Two lines of duplication
-    is the cheaper half of that trade.
+    bool return is load-bearing in the autoplay retry.
     """
-    return "state=3" in (dump or "").lower()
+    sessions = _parse_media_sessions(dump)
+    if not sessions:
+        return "state=3" in (dump or "").lower()
+    if package:
+        # Asked about a specific app: no session of its own means it is not
+        # playing. Falling back to "is anything playing" here would hand it
+        # another app's playback, which is the bug this scoping exists to close.
+        scoped = _session_for(sessions, package)
+        return scoped is not None and scoped.state == 3
+    return any(session.state == 3 for session in sessions)
+
+
+def _session_for(sessions: list, package: str | None):
+    """The named app's session, else whichever one is actually playing."""
+    if package:
+        for session in sessions:
+            if package in session.package:
+                return session
+        return None
+    for session in sessions:
+        if session.state == 3:
+            return session
+    return None
 
 
 @dataclass(frozen=True)
@@ -143,6 +233,7 @@ class RoomStatus:
     on_the_box: bool | None = None
     app: str | None = None
     playing: bool | None = None
+    title: str | None = None
 
 
 class MediaService:
@@ -1116,9 +1207,17 @@ class MediaService:
         app = self._friendly_app(focus_dump) if ok else None
 
         ok, session_dump = self._adb("shell dumpsys media_session")
-        playing = _parse_playing(session_dump) if ok else None
+        # Scope playback to the app that is actually in front. Spotify holds
+        # a session of its own even while idle, so an unscoped answer would
+        # hand its state to whatever happens to be on screen.
+        package = self.apps.get(app) if app else None
+        playing = _parse_playing(session_dump, package) if ok else None
+        session = (
+            _session_for(_parse_media_sessions(session_dump), package) if ok else None
+        )
+        title = session.title if session is not None else None
 
-        return RoomStatus(True, awake, tv_power, on_the_box, app, playing)
+        return RoomStatus(True, awake, tv_power, on_the_box, app, playing, title)
 
 
 if __name__ == "__main__":

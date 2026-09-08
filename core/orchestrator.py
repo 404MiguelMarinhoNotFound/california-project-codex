@@ -152,10 +152,17 @@ def _status_line(status, launch=None) -> str:
         parts.append("box asleep")
         return ". ".join(parts) + "."
 
-    # Only a launch she made HERSELF, and only one she actually played, can
-    # name what is on. A search or a series page was opened, not played, and
-    # calling that playing is the same class of lie as a standby TV read as on.
-    named = launch.label if launch is not None and launch.kind == "playing" else None
+    # What the box itself reports wins. Stremio publishes the show AND the
+    # episode in its session metadata ("Fallout, The Strip"), and unlike the
+    # launch memory that survives him starting something with the remote.
+    #
+    # The memory is the fallback, and only a launch she made HERSELF and
+    # actually played may name anything: a search or a series page was opened,
+    # not played, and calling that playing is the same class of lie as a
+    # standby television read as on.
+    named = status.title or (
+        launch.label if launch is not None and launch.kind == "playing" else None
+    )
 
     if status.app and status.playing is True:
         if named:

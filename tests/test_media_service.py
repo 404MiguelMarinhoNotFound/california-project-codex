@@ -4,7 +4,12 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock
 from unittest.mock import patch
 
-from services.media_service import MediaService, _parse_tv_power
+from services.media_service import (
+    MediaService,
+    _parse_media_sessions,
+    _parse_playing,
+    _parse_tv_power,
+)
 from tests.config_fixture import config_for_tests
 
 
@@ -756,6 +761,89 @@ class RoomStatusTests(unittest.TestCase):
         self.assertIsNone(status.tv_power)
         self.assertIsNone(status.on_the_box)
         self.assertIsNone(status.app)
+
+
+
+# Two sessions at once, reproducing what came off the live box on 2026-09-08:
+# Stremio playing Fallout while Spotify sat on an idle session of its own. This
+# one is written out rather than captured, because Spotify's session had expired
+# by the time the fixture file was saved -- the single-session capture in
+# tests/fixtures/media_session_dump.txt is the real one.
+TWO_SESSIONS = """  Sessions Stack - have 2 sessions:
+    PlayerMediaSession com.stremio.one/PlayerMediaSession (userId=0)
+      package=com.stremio.one
+      active=true
+      state=PlaybackState {state=3, position=240301, buffered position=0, speed=1.0}
+      metadata: size=4, description=Fallout, The Strip, null
+    androidx.media3.session.id. com.spotify.tv.android/androidx.media3.session.id.
+      package=com.spotify.tv.android
+      active=true
+      state=PlaybackState {state=0, position=-1, buffered position=-1, speed=0.0}
+      metadata: null
+"""
+
+
+class MediaSessionParsingTests(unittest.TestCase):
+    """
+    Parsed from a REAL `dumpsys media_session` capture taken off the live box on
+    2026-09-08 with Stremio playing Fallout, so an app or firmware change to the
+    format fails here rather than quietly reporting "nothing playing" forever.
+
+    That capture is why this parser exists. It settled two things the design had
+    assumed were unavailable: Stremio DOES publish the show and the episode in
+    its session metadata, and more than one app holds a session at a time.
+    """
+
+    FIXTURE = Path(__file__).parent / "fixtures" / "media_session_dump.txt"
+
+    def _dump(self):
+        return self.FIXTURE.read_text(encoding="utf-8")
+
+    def test_stremio_publishes_the_show_and_the_episode(self):
+        sessions = _parse_media_sessions(self._dump())
+        stremio = next(s for s in sessions if s.package == "com.stremio.one")
+        self.assertEqual(stremio.title, "Fallout, The Strip")
+
+    def test_the_real_capture_reads_as_playing(self):
+        self.assertTrue(_parse_playing(self._dump(), "com.stremio.one"))
+
+    def test_every_session_is_found(self):
+        packages = [s.package for s in _parse_media_sessions(TWO_SESSIONS)]
+        self.assertEqual(packages, ["com.stremio.one", "com.spotify.tv.android"])
+
+    def test_an_empty_metadata_line_is_no_title_not_the_word_null(self):
+        # Spotify prints "metadata: null". Reading that out loud would be worse
+        # than saying nothing at all.
+        sessions = _parse_media_sessions(TWO_SESSIONS)
+        spotify = next(s for s in sessions if s.package == "com.spotify.tv.android")
+        self.assertIsNone(spotify.title)
+
+    def test_playback_is_scoped_to_the_app_in_front(self):
+        """
+        The bug this closes. Spotify holds an active session even while idle, so
+        a flat "is state=3 anywhere in this dump" hands one app's playback to
+        whichever app happens to be on screen.
+        """
+        paused = TWO_SESSIONS.replace("{state=3", "{state=2", 1)
+        self.assertFalse(_parse_playing(paused, "com.stremio.one"))
+        # Unscoped, the same dump cannot tell the two apart.
+        self.assertTrue(_parse_playing(TWO_SESSIONS, "com.stremio.one"))
+
+    def test_an_app_holding_no_session_is_not_playing(self):
+        self.assertFalse(_parse_playing(TWO_SESSIONS, "com.example.nothing"))
+
+    def test_a_dump_with_no_session_block_falls_back_to_the_flat_scan(self):
+        # StremioService's own check works on output shaped like this.
+        self.assertTrue(_parse_playing("  state=3 (PLAYING)"))
+        self.assertFalse(_parse_playing("  state=2 (PAUSED)"))
+
+    def test_a_title_with_no_subtitle_keeps_just_the_title(self):
+        dump = (
+            "      package=com.stremio.one\n"
+            "      state=PlaybackState {state=3, position=1,\n"
+            "      metadata: size=3, description=Some Film, null, null\n"
+        )
+        self.assertEqual(_parse_media_sessions(dump)[0].title, "Some Film")
 
 if __name__ == "__main__":
     unittest.main()

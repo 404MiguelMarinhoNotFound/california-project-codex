@@ -1156,12 +1156,34 @@ four public readers.
 does not say.** The old branch printed "unknown" for exactly the fields it had
 failed to read, which is the least useful thing to say out loud.
 
-### She knows what she put on, because she is the one who put it on
+### The box does publish a title, and there is more than one session
 
-`dumpsys media_session` gives a playback state and no title on this hardware, and
-a UI dump costs 6-12s, which is not a thing to do inside a voice turn. So
-`services/now_playing.py` remembers the one thing she launched, in the words she
-used, under two rules:
+Captured off the live box on 2026-09-08 with Stremio playing
+(`tests/fixtures/media_session_dump.txt`), and it corrected two assumptions this
+feature was designed around:
+
+- **Stremio publishes the show AND the episode.**
+  `metadata: size=4, description=Fallout, The Strip, null` -- a MediaDescription
+  printed as "title, subtitle, iconUri", with unset fields as the literal
+  "null". So "what is playing" is readable after all, and unlike the launch
+  memory it survives him starting something with the remote. YouTube still
+  publishes nothing, which is why the memory below still earns its place.
+- **Sessions are plural.** Spotify held an active session at `state=0` the whole
+  time Stremio was playing. A flat `"state=3" in dump` therefore answers a
+  different question than the one asked and would hand Spotify's playback to
+  whatever is on screen. `_parse_media_sessions` splits the stack on `package=`
+  and `room_status()` scopes to the foreground app's package. An app holding no
+  session of its own is not playing -- do NOT reintroduce an `any(...)` fallback
+  there, that is the bug.
+
+`StremioService._is_playing` keeps its own flat check on purpose: it has a
+standalone-ADB path for when no MediaService exists, and its bool return is
+load-bearing in the autoplay retry.
+
+### She also knows what she put on, as a fallback
+
+For everything that publishes no metadata, `services/now_playing.py` remembers
+the one thing she launched, in the words she used, under two rules:
 
 - **Corroborated.** `current()` returns nothing unless the live foreground app
   still matches, so a memory of a Stremio episode is dropped the moment he moves
@@ -1169,6 +1191,8 @@ used, under two rules:
 - **`kind` separates "playing" from "opened".** A YouTube search and a Stremio
   series page were put on screen, not played. With no matching memory she says
   she did not start it, rather than guessing.
+
+The session title wins where both exist; the memory is the fallback.
 
 Recording happens in `_dispatch_tv`, not in the services, because the speakable
 label only exists there: `StremioService` holds an IMDb id and a deep link, and
@@ -1356,6 +1380,11 @@ Current automated coverage exists for:
 - `room_status()` pinging the box exactly once, skipping the app and session
   reads on a sleeping box, and reporting `None` rather than `False` throughout
 - That a CEC power report far older than the live log is not trusted
+- Media sessions parsed from a real capture: that Stremio's show and episode
+  are read out of the metadata, that `metadata: null` is no title rather than
+  the word "null", that playback is scoped to the foreground app so an idle
+  Spotify session cannot be mistaken for it, and that an app holding no session
+  is reported as not playing
 - Now-playing memory: quoted only while the foreground app still matches,
   dropped when he switched apps, never claiming a search was played, and not
   recorded at all when the launch failed

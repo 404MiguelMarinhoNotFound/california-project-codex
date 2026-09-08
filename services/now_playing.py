@@ -1,14 +1,17 @@
 """
 What California put on the screen, and when.
 
-The box will tell you which app is in front and whether something is playing.
-It will not tell you *what* -- `dumpsys media_session` carries no title from
-Stremio or YouTube on this hardware, and scraping the UI costs 6 to 12 seconds,
-which is not a thing to do inside a voice turn.
+This is the FALLBACK, not the primary source. Measured on the real box on
+2026-09-08, Stremio publishes the show and the episode in its media session
+("Fallout, The Strip"), and `MediaService.room_status()` reads it -- which
+beats memory outright, because it survives Master Miguel starting something
+with the remote.
 
-But she fired the deep link herself, so she already knows. This remembers the
-one thing she launched, in the words she used, and hands it back only when a
-live reading still agrees.
+This still earns its place for everything that does not publish metadata.
+YouTube exposes only its package, so without this she can say YouTube is
+playing and nothing more. She fired the deep link herself, so she knows what
+she put on, and this remembers that one thing in the words she used -- handed
+back only when a live reading still agrees.
 
 Two rules make the difference between memory and a lie:
 
