@@ -713,7 +713,20 @@ class RoomStatusTests(unittest.TestCase):
     [R] time=2026-09-05 14:18:51 message=<Report Power Status> 04:90:00
 """
     FOCUS = "mCurrentFocus=Window{a u0 com.stremio.one/com.stremio.MainActivity}"
-    SESSION = "state=3"
+    SESSION = """    Sessions Stack - have 1 sessions:
+      package=com.stremio.one
+      state=PlaybackState {state=3, position=240301, speed=1.0}
+      metadata: size=4, description=Fallout, The Strip, null
+"""
+    AUDIO = """- STREAM_MUSIC:
+   Muted: false
+   Max: 15
+   streamVolume:8
+- STREAM_ALARM:
+"""
+
+    def _replies(self):
+        return [self.POWER, self.HDMI, self.FOCUS, self.SESSION, self.AUDIO]
 
     def _service(self, replies, connected=True):
         cfg = config_for_tests(
@@ -725,7 +738,7 @@ class RoomStatusTests(unittest.TestCase):
         return svc
 
     def test_a_full_read_reports_every_field(self):
-        svc = self._service([self.POWER, self.HDMI, self.FOCUS, self.SESSION])
+        svc = self._service(self._replies())
         status = svc.room_status()
         self.assertTrue(status.reachable)
         self.assertIs(status.awake, True)
@@ -733,11 +746,19 @@ class RoomStatusTests(unittest.TestCase):
         self.assertIs(status.on_the_box, True)
         self.assertEqual(status.app, "stremio")
         self.assertIs(status.playing, True)
+        self.assertEqual(status.title, "Fallout, The Strip")
+        self.assertEqual(status.playback, "playing")
+        self.assertEqual(status.position_s, 240)
+        self.assertEqual((status.volume, status.volume_max), (8, 15))
+        self.assertIs(status.muted, False)
 
     def test_the_box_is_pinged_exactly_once(self):
-        svc = self._service([self.POWER, self.HDMI, self.FOCUS, self.SESSION])
+        # Five dumpsys reads behind ONE ensure_connected(). Going through the
+        # public readers instead would ping the box five separate times.
+        svc = self._service(self._replies())
         svc.room_status()
         svc.ensure_connected.assert_called_once()
+        self.assertEqual(svc._adb.call_count, 5)
 
     def test_a_sleeping_box_skips_the_app_and_session_reads(self):
         # Nothing is on screen, so asking would cost two round trips for two Nones.
@@ -755,13 +776,16 @@ class RoomStatusTests(unittest.TestCase):
         svc._adb.assert_not_called()
 
     def test_unparseable_output_is_none_not_false(self):
-        svc = self._service(["junk", "junk", "junk", "junk"])
+        svc = self._service(["junk"] * 5)
         status = svc.room_status()
         self.assertTrue(status.reachable)
         self.assertIsNone(status.awake)
         self.assertIsNone(status.tv_power)
         self.assertIsNone(status.on_the_box)
         self.assertIsNone(status.app)
+        self.assertIsNone(status.volume)
+        self.assertIsNone(status.position_s)
+        self.assertIsNone(status.playback)
 
 
 

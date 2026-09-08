@@ -1194,6 +1194,39 @@ feature was designed around:
 standalone-ADB path for when no MediaService exists, and its bool return is
 load-bearing in the autoplay retry.
 
+### What else the box will tell you, and what it will not
+
+Measured on the real box 2026-09-09. `room_status()` reads five dumpsys in
+one connection, ~0.9s of ADB in total:
+
+| read | costs | gives |
+|---|---|---|
+| `dumpsys power` | 0.30s | `mWakefulness` |
+| `dumpsys hdmi_control` | 0.11s | active source + TV power |
+| `dumpsys window displays` | 0.11s | foreground app |
+| `dumpsys media_session` | 0.11s | playback state, title, position |
+| `dumpsys audio` | 0.13s | STREAM_MUSIC volume and mute |
+
+**Position yes, duration no.** The session prints
+`position=240301` in ms, but `metadata: size=4` prints only the description
+-- there is no length anywhere in the dump. So elapsed time is available and
+**a percentage or a "time left" is not**, and nothing may imply otherwise.
+`position=-1` means stopped, not the start of the film, and is discarded.
+
+**The playback word is read, never guessed.** The session state is an int
+(`_PLAYBACK_WORDS`): 0, 2 and 3 observed on this box, the rest documented
+Android values. Without it the title is dropped rather than pinned to a
+guessed verb -- "paused on X" must mean the box said paused.
+
+**Volume is the BOX's, not the television's.** `_parse_volume` scopes to the
+`- STREAM_MUSIC:` block, which matters: `STREAM_VOICE_CALL` sits above it
+with a Max of 5 and `- VOLUME GROUP AUDIO_STREAM_MUSIC` below with its own
+numbers, so a loose scan picks up whichever it meets first. This is the
+volume `volume_set` moves, which is what makes it worth reporting. The
+Samsung's own volume is not readable over ADB, and on this setup the box
+often sits pinned at 15/15 while the room's loudness is ridden from the TV
+remote -- so treat a box volume of max as "not the reason it is quiet".
+
 ### She also knows what she put on, as a fallback
 
 For everything that publishes no metadata, `services/now_playing.py` remembers
@@ -1396,6 +1429,12 @@ Current automated coverage exists for:
 - That a CEC power report far older than the live log is not trusted, that a
   `<Standby>` broadcast after the last report wins and a newer report wins back,
   and that a `[S]` standby the box sent is not read as the television's state
+- Volume parsed from a real `dumpsys audio` capture, scoped past
+  STREAM_VOICE_CALL and the VOLUME GROUP block; that muted replaces the
+  level rather than joining it, and an unreadable volume is not mentioned
+- That elapsed position is reported but never a percentage or time left,
+  and that the paused/buffering word is read from the session state rather
+  than guessed
 - Media sessions parsed from a real capture: that Stremio's show and episode
   are read out of the metadata, that `metadata: null` is no title rather than
   the word "null", that playback is scoped to the foreground app so an idle

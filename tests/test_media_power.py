@@ -618,9 +618,63 @@ class StatusDispatchTests(unittest.TestCase):
         # the more useful half of what was read.
         _, reply = self._status(
             reachable=True, awake=True, app="stremio", playing=False,
-            title="Fallout, The Strip",
+            title="Fallout, The Strip", playback="paused",
         )
         self.assertIn("paused on Fallout, The Strip", reply)
+
+    def test_the_pause_word_is_read_not_guessed(self):
+        # Without a session state there is no way to know it is paused rather
+        # than stopped or buffering, so the title is dropped instead of being
+        # attached to a guessed verb.
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=False,
+            title="Fallout, The Strip", playback=None,
+        )
+        self.assertIn("nothing playing", reply)
+        self.assertNotIn("paused", reply)
+
+    def test_a_buffering_session_says_buffering(self):
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=False,
+            title="Fallout, The Strip", playback="buffering",
+        )
+        self.assertIn("buffering on Fallout, The Strip", reply)
+
+    def test_elapsed_time_is_reported_when_something_is_named(self):
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=True,
+            title="Fallout, The Strip", position_s=732,
+        )
+        self.assertIn("12 minutes in", reply)
+
+    def test_elapsed_time_is_never_a_percentage_or_time_left(self):
+        # dumpsys media_session prints no duration, so there is nothing to
+        # measure against and nothing may imply there is.
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=True,
+            title="Fallout, The Strip", position_s=732,
+        )
+        self.assertNotIn("%", reply)
+        self.assertNotIn("left", reply)
+
+    def test_the_box_volume_is_reported(self):
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=True,
+            volume=8, volume_max=15, muted=False,
+        )
+        self.assertIn("box volume 8 of 15", reply)
+
+    def test_muted_replaces_the_level_rather_than_joining_it(self):
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=True,
+            volume=8, volume_max=15, muted=True,
+        )
+        self.assertIn("box muted", reply)
+        self.assertNotIn("8 of 15", reply)
+
+    def test_an_unreadable_volume_is_simply_not_mentioned(self):
+        _, reply = self._status(reachable=True, awake=True, app="stremio", playing=True)
+        self.assertNotIn("volume", reply)
 
     def test_the_session_title_beats_the_launch_memory(self):
         # The box saw it. She only remembers launching it, which is weaker

@@ -100,6 +100,27 @@ def _unreachable_line(media_svc) -> str:
     }.get(reason, "TV is off or unreachable right now")
 
 
+def _human_position(seconds) -> str | None:
+    """
+    How far into it he is, in words. None when the box did not say.
+
+    There is no duration to measure against -- `dumpsys media_session` prints
+    the description and no length -- so this is elapsed time, never a
+    percentage and never "time left".
+    """
+    if seconds is None or seconds < 0:
+        return None
+    minutes, hours = seconds // 60, seconds // 3600
+    if minutes < 1:
+        return "just started"
+    if hours < 1:
+        return f"{minutes} minute{'' if minutes == 1 else 's'} in"
+    minutes -= hours * 60
+    if minutes == 0:
+        return f"{hours} hour{'' if hours == 1 else 's'} in"
+    return f"{hours}h{minutes:02d} in"
+
+
 def _remember_launch(now_playing, app: str, label: str, kind: str = "playing") -> None:
     """
     Record what she just put on. A None store is a no-op, which is what the
@@ -164,23 +185,37 @@ def _status_line(status, launch=None) -> str:
         launch.label if launch is not None and launch.kind == "playing" else None
     )
 
+    clause = None
     if status.app and status.playing is True:
-        if named:
-            parts.append(f"{status.app} playing {named}")
-        else:
-            parts.append(f"{status.app} playing, and I didn't start it so I can't say what")
+        clause = (
+            f"{status.app} playing {named}" if named
+            else f"{status.app} playing, and I didn't start it so I can't say what"
+        )
     elif status.app and status.playing is False:
         # Stremio keeps its metadata across a pause, so it still knows what is
         # loaded. Saying "nothing playing" and dropping the title throws away
-        # the more useful half of what was read.
-        if named:
-            parts.append(f"{status.app} paused on {named}")
+        # the more useful half of what was read. The word comes from the
+        # session state, so paused / stopped / buffering are never guessed at.
+        if named and status.playback:
+            clause = f"{status.app} {status.playback} on {named}"
         else:
-            parts.append(f"{status.app} open, nothing playing")
+            clause = f"{status.app} open, nothing playing"
     elif status.app:
-        parts.append(f"{status.app} open")
+        clause = f"{status.app} open"
     elif status.playing is True:
-        parts.append("something playing")
+        clause = "something playing"
+
+    if clause:
+        # Elapsed time only belongs on a clause that named something.
+        where = _human_position(status.position_s) if named else None
+        parts.append(f"{clause}, {where}" if where else clause)
+
+    # The box's own volume, which is the one volume_set moves. NOT the
+    # television's -- that lives on the Samsung and ADB cannot see it.
+    if status.muted:
+        parts.append("box muted")
+    elif status.volume is not None and status.volume_max:
+        parts.append(f"box volume {status.volume} of {status.volume_max}")
 
     if status.awake is True:
         parts.append("box awake")

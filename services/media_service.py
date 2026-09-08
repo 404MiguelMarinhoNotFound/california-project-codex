@@ -35,6 +35,26 @@ _TV_POWER_RE = re.compile(
 
 # dumpsys media_session: "state=PlaybackState {state=3, position=240301, ..."
 _SESSION_STATE_RE = re.compile(r"state=PlaybackState\s*\{state=(\d+)")
+_SESSION_POSITION_RE = re.compile(r"state=PlaybackState\s*\{[^}]*?position=(-?\d+)")
+
+# PlaybackState constants. 0, 2 and 3 observed on the real box; the rest are
+# the documented Android values and fall back to the plain wording if they
+# ever turn up.
+_PLAYBACK_WORDS = {
+    1: "stopped",
+    2: "paused",
+    3: "playing",
+    6: "buffering",
+}
+
+# dumpsys audio, the STREAM_MUSIC block:
+#   - STREAM_MUSIC:
+#      Muted: false
+#      Max: 15
+#      streamVolume:15
+_VOLUME_MUTED_RE = re.compile(r"^Muted:\s*(\w+)")
+_VOLUME_MAX_RE = re.compile(r"^Max:\s*(\d+)")
+_VOLUME_LEVEL_RE = re.compile(r"^streamVolume:\s*(\d+)")
 
 # dumpsys media_session: "metadata: size=4, description=Fallout, The Strip, null"
 _SESSION_METADATA_RE = re.compile(r"metadata:.*?\bdescription=(.*)$")
@@ -145,6 +165,7 @@ class MediaSession:
     package: str
     state: int | None
     title: str | None
+    position_ms: int | None = None
 
 
 def _parse_media_sessions(dump: str) -> list[MediaSession]:
@@ -160,10 +181,11 @@ def _parse_media_sessions(dump: str) -> list[MediaSession]:
     package = None
     state = None
     title = None
+    position = None
 
     def flush():
         if package is not None:
-            sessions.append(MediaSession(package, state, title))
+            sessions.append(MediaSession(package, state, title, position))
 
     for line in (dump or "").splitlines():
         stripped = line.strip()
@@ -172,12 +194,18 @@ def _parse_media_sessions(dump: str) -> list[MediaSession]:
             package = stripped.split("=", 1)[1].strip()
             state = None
             title = None
+            position = None
             continue
         if package is None:
             continue
         match = _SESSION_STATE_RE.search(stripped)
         if match:
             state = int(match.group(1))
+            spot = _SESSION_POSITION_RE.search(stripped)
+            # A stopped session reports position=-1, which is not a place in
+            # the film and must not be read back as one.
+            if spot and int(spot.group(1)) >= 0:
+                position = int(spot.group(1))
             continue
         match = _SESSION_METADATA_RE.search(stripped)
         if match:
@@ -236,6 +264,54 @@ def _session_for(sessions: list, package: str | None):
 
 
 @dataclass(frozen=True)
+class VolumeState:
+    """The box's own STREAM_MUSIC volume. Not the television's."""
+    level: int
+    maximum: int
+    muted: bool
+
+
+def _parse_volume(dump: str) -> VolumeState | None:
+    """
+    STREAM_MUSIC out of `dumpsys audio`.
+
+    Scoped to that one block on purpose: STREAM_VOICE_CALL sits above it with
+    a Max of 5, and "- VOLUME GROUP AUDIO_STREAM_MUSIC" sits below with its own
+    numbers, so a loose scan picks up whichever it meets first.
+
+    This is the volume `volume_set` moves, which is what makes it worth
+    reporting. It is NOT the television's volume -- that lives on the Samsung
+    and is not readable over ADB.
+    """
+    level = maximum = None
+    muted = False
+    inside = False
+    for line in (dump or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            if inside:  # left the block we wanted
+                break
+            inside = stripped == "- STREAM_MUSIC:"
+            continue
+        if not inside:
+            continue
+        match = _VOLUME_MUTED_RE.match(stripped)
+        if match:
+            muted = match.group(1).strip().lower() == "true"
+            continue
+        match = _VOLUME_MAX_RE.match(stripped)
+        if match:
+            maximum = int(match.group(1))
+            continue
+        match = _VOLUME_LEVEL_RE.match(stripped)
+        if match:
+            level = int(match.group(1))
+    if level is None or maximum is None:
+        return None
+    return VolumeState(level, maximum, muted)
+
+
+@dataclass(frozen=True)
 class HdmiState:
     """Both facts `dumpsys hdmi_control` carries, from one round trip."""
     active_source: bool | None
@@ -258,6 +334,11 @@ class RoomStatus:
     app: str | None = None
     playing: bool | None = None
     title: str | None = None
+    playback: str | None = None      # paused / buffering / stopped, when known
+    position_s: int | None = None
+    volume: int | None = None
+    volume_max: int | None = None
+    muted: bool | None = None
 
 
 class MediaService:
@@ -1240,8 +1321,20 @@ class MediaService:
             _session_for(_parse_media_sessions(session_dump), package) if ok else None
         )
         title = session.title if session is not None else None
+        playback = _PLAYBACK_WORDS.get(session.state) if session is not None else None
+        position_ms = session.position_ms if session is not None else None
+        position_s = position_ms // 1000 if position_ms is not None else None
 
-        return RoomStatus(True, awake, tv_power, on_the_box, app, playing, title)
+        ok, audio_dump = self._adb("shell dumpsys audio")
+        volume = _parse_volume(audio_dump) if ok else None
+
+        return RoomStatus(
+            True, awake, tv_power, on_the_box, app, playing, title,
+            playback, position_s,
+            volume.level if volume else None,
+            volume.maximum if volume else None,
+            volume.muted if volume else None,
+        )
 
 
 if __name__ == "__main__":
