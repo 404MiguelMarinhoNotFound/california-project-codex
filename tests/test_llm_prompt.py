@@ -1,7 +1,13 @@
 import unittest
 import unittest.mock as mock
 
-from services.llm import LLMService
+from services.llm import (
+    CONTROL_LIGHTS_TOOL,
+    CONTROL_LIGHTS_TOOL_OPENAI,
+    CONTROL_TV_TOOL,
+    CONTROL_TV_TOOL_OPENAI,
+    LLMService,
+)
 from tests.config_fixture import config_for_tests
 
 
@@ -109,6 +115,42 @@ class PlaylistInventoryPromptTests(unittest.TestCase):
         self.assertIn("pick one at random", prompt)
         self.assertIn("youtube_search", prompt)
 
+
+
+
+class ToolSchemaTests(unittest.TestCase):
+    """
+    Every custom schema is sent on EVERY turn, so what is in them is a running
+    cost, not a one-off.
+    """
+
+    def test_light_status_is_offered(self):
+        actions = CONTROL_LIGHTS_TOOL["input_schema"]["properties"]["action"]["enum"]
+        self.assertIn("light_status", actions)
+
+    def test_the_description_says_it_is_not_a_live_reading(self):
+        # The model must not offer a reading the hardware cannot give.
+        self.assertIn("not a live reading", CONTROL_LIGHTS_TOOL["description"])
+
+    def test_the_openai_mirror_shares_the_same_schema_object(self):
+        # It is built FROM the same dict, so schema edits flow automatically.
+        # If that ever became a copy, an action could be added to one provider
+        # and silently missing on the other.
+        self.assertIs(
+            CONTROL_LIGHTS_TOOL_OPENAI["function"]["parameters"],
+            CONTROL_LIGHTS_TOOL["input_schema"],
+        )
+        self.assertIs(
+            CONTROL_TV_TOOL_OPENAI["function"]["parameters"],
+            CONTROL_TV_TOOL["input_schema"],
+        )
+
+    def test_control_tv_gained_no_new_action(self):
+        # get_status already existed. Reading state back cost one enum value in
+        # total, on the lights side.
+        actions = CONTROL_TV_TOOL["input_schema"]["properties"]["action"]["enum"]
+        self.assertIn("get_status", actions)
+        self.assertEqual(len(actions), 23)
 
 if __name__ == "__main__":
     unittest.main()

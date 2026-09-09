@@ -22,6 +22,8 @@ import numpy as np
 from services.activation_phrases import EchoGate, resolve_tier, strip_activation_echo
 from services.govee_service import GoveeService, clamp_percent, resolve_color
 from services.media_service import MediaService
+from services.light_shadow import LightShadow
+from services.now_playing import NowPlaying
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
 from services.surfshark_service import SurfsharkService
 from services.youtube_playlist_resolver import resolve_playlist_choice
@@ -98,6 +100,131 @@ def _unreachable_line(media_svc) -> str:
     }.get(reason, "TV is off or unreachable right now")
 
 
+def _human_position(seconds) -> str | None:
+    """
+    How far into it he is, in words. None when the box did not say.
+
+    There is no duration to measure against -- `dumpsys media_session` prints
+    the description and no length -- so this is elapsed time, never a
+    percentage and never "time left".
+    """
+    if seconds is None or seconds < 0:
+        return None
+    minutes, hours = seconds // 60, seconds // 3600
+    if minutes < 1:
+        return "just started"
+    if hours < 1:
+        return f"{minutes} minute{'' if minutes == 1 else 's'} in"
+    minutes -= hours * 60
+    if minutes == 0:
+        return f"{hours} hour{'' if hours == 1 else 's'} in"
+    return f"{hours}h{minutes:02d} in"
+
+
+def _remember_launch(now_playing, app: str, label: str, kind: str = "playing") -> None:
+    """
+    Record what she just put on. A None store is a no-op, which is what the
+    11 existing _dispatch_tv tests pass and what keeps them honest: no memory
+    means she admits she does not know, rather than a shared global leaking a
+    label from one test into the next.
+    """
+    if now_playing is not None:
+        now_playing.remember(app, label, kind)
+
+
+def _forget_launch(now_playing) -> None:
+    if now_playing is not None:
+        now_playing.forget()
+
+
+def _status_line(status, launch=None) -> str:
+    """
+    Turn a RoomStatus into something speakable.
+
+    Data lives in MediaService, speech lives here -- the same split as
+    unreachable_reason / _unreachable_line.
+
+    The rule that matters: **a field we could not read is a clause we do not
+    say.** None means "could not tell", never "no", and the old version of this
+    printed "unknown" for exactly the fields it had failed to read. Three
+    readable facts make a shorter answer, not a worse one.
+    """
+    if not status.reachable:
+        return "I can't reach the box right now."
+
+    parts = []
+
+    if status.tv_power == "standby":
+        parts.append("TV off")
+    elif status.tv_power == "on":
+        if status.on_the_box is True:
+            parts.append("TV on and showing the box")
+        elif status.on_the_box is False:
+            parts.append("TV on but showing another input")
+        else:
+            parts.append("TV on")
+    elif status.on_the_box is False:
+        # Power unreadable, but "he is on another input" still answers the
+        # question he actually asked.
+        parts.append("TV showing another input")
+
+    if status.awake is False:
+        # Asleep means nothing is on screen, so app and playback were never read.
+        parts.append("box asleep")
+        return ". ".join(parts) + "."
+
+    # What the box itself reports wins. Stremio publishes the show AND the
+    # episode in its session metadata ("Fallout, The Strip"), and unlike the
+    # launch memory that survives him starting something with the remote.
+    #
+    # The memory is the fallback, and only a launch she made HERSELF and
+    # actually played may name anything: a search or a series page was opened,
+    # not played, and calling that playing is the same class of lie as a
+    # standby television read as on.
+    named = status.title or (
+        launch.label if launch is not None and launch.kind == "playing" else None
+    )
+
+    clause = None
+    if status.app and status.playing is True:
+        clause = (
+            f"{status.app} playing {named}" if named
+            else f"{status.app} playing, and I didn't start it so I can't say what"
+        )
+    elif status.app and status.playing is False:
+        # Stremio keeps its metadata across a pause, so it still knows what is
+        # loaded. Saying "nothing playing" and dropping the title throws away
+        # the more useful half of what was read. The word comes from the
+        # session state, so paused / stopped / buffering are never guessed at.
+        if named and status.playback:
+            clause = f"{status.app} {status.playback} on {named}"
+        else:
+            clause = f"{status.app} open, nothing playing"
+    elif status.app:
+        clause = f"{status.app} open"
+    elif status.playing is True:
+        clause = "something playing"
+
+    if clause:
+        # Elapsed time only belongs on a clause that named something.
+        where = _human_position(status.position_s) if named else None
+        parts.append(f"{clause}, {where}" if where else clause)
+
+    # The box's own volume, which is the one volume_set moves. NOT the
+    # television's -- that lives on the Samsung and ADB cannot see it.
+    if status.muted:
+        parts.append("box muted")
+    elif status.volume is not None and status.volume_max:
+        parts.append(f"box volume {status.volume} of {status.volume_max}")
+
+    if status.awake is True:
+        parts.append("box awake")
+
+    if not parts:
+        return "I can't tell what the box is doing right now."
+    return ". ".join(parts) + "."
+
+
 def _ensure_playable(media_svc, say_now=None) -> str:
     """
     Get the room ready to show something. Returns "" on success, else a spoken line.
@@ -154,6 +281,7 @@ def _dispatch_tv(
     youtube_playlists: dict,
     youtube_playlist_aliases: dict | None = None,
     say_now=None,
+    now_playing=None,
 ) -> str:
     action = params.get("action")
     route_warning = None
@@ -229,6 +357,7 @@ def _dispatch_tv(
     if action == "play_pause":
         return "done" if media_svc.play_pause() else "command failed"
     elif action == "stop":
+        _forget_launch(now_playing)
         return "done" if media_svc.stop() else "command failed"
     elif action == "next":
         media_svc.next_track()
@@ -261,6 +390,10 @@ def _dispatch_tv(
     # App launching
     elif action == "launch_app":
         ok, msg = media_svc.launch_app(params.get("app_name", ""))
+        if ok:
+            # A bare app launch puts nothing specific on, so whatever she
+            # remembers is now wrong.
+            _forget_launch(now_playing)
         return _append_route_warning(msg, route_warning) if ok else msg
 
     # Stremio
@@ -313,6 +446,10 @@ def _dispatch_tv(
                 response = f"Continuing {title}."
             else:
                 response = f"Opening {title} on Stremio."
+            _remember_launch(
+                now_playing, "stremio", title,
+                "playing" if result.target_mode == "episode" else "opened",
+            )
             return _append_route_warning(response, route_warning)
         return result.message or AUTOPLAY_FALLBACK_LINE
 
@@ -338,6 +475,10 @@ def _dispatch_tv(
             return result.message or AUTOPLAY_FALLBACK_LINE
         if result.success:
             response = f"Opening {title} on Stremio."
+            _remember_launch(
+                now_playing, "stremio", title,
+                "playing" if result.target_mode == "episode" else "opened",
+            )
             return _append_route_warning(response, route_warning)
         return result.message or AUTOPLAY_FALLBACK_LINE
 
@@ -362,8 +503,12 @@ def _dispatch_tv(
         if not ok:
             return "I couldn't open that YouTube playlist right now."
         if matched_key:
+            _remember_launch(now_playing, "youtube", f"your {matched_key} playlist")
             response = f"Opening your {matched_key} playlist on YouTube."
             return _append_route_warning(response, route_warning)
+        # An opaque PL... id has no speakable name, so remember nothing rather
+        # than reading an id out loud later.
+        _forget_launch(now_playing)
         response = "Opening that YouTube playlist."
         return _append_route_warning(response, route_warning)
 
@@ -376,12 +521,14 @@ def _dispatch_tv(
         logger.info("[timing] youtube_search dispatch took %.3fs ok=%s", time.monotonic() - t_yt, ok)
         if not ok:
             return "I couldn't open YouTube search right now."
+        _remember_launch(now_playing, "youtube", query, "opened")
         response = f"Searching YouTube for {query}."
         return _append_route_warning(response, route_warning)
 
     # Navigation
     elif action == "go_home":
         media_svc.go_home()
+        _forget_launch(now_playing)
         return "done"
     elif action == "go_back":
         media_svc.go_back()
@@ -432,10 +579,14 @@ def _dispatch_tv(
 
     # State awareness
     elif action == "get_status":
-        app = media_svc.get_current_app()
-        session = media_svc.get_media_session()
-        tv = "on" if media_svc.cec_waker.available and media_svc.cec_waker._tv_is_up() else "unknown"
-        return f"Current app: {app}. Media session: {session}. TV: {tv}"
+        # NOT cec_waker._tv_is_up(). That probes the TV's REST endpoint, which
+        # this set answers in standby -- cec_wake.py says so in as many words:
+        # "What we must NOT do is treat the answer as 'powered on'." This branch
+        # did exactly that and reported a sleeping television as on. Power now
+        # comes off the CEC bus, where the TV actually said it.
+        status = media_svc.room_status()
+        launch = now_playing.current(status.app or "") if now_playing else None
+        return _status_line(status, launch)
 
     return "unknown action"
 
@@ -475,13 +626,51 @@ def _prune_clips(directory: str, max_files: int) -> list[str]:
     return doomed
 
 
-def _dispatch_lights(params: dict, govee_svc) -> str:
+def _light_memory_line(key: str, memory) -> str:
+    """
+    Say what she last sent the light, and say that it is what she SENT.
+
+    The hedge lives in this string rather than in the system prompt because
+    the string is what gets spoken. A prompt instruction can be forgotten six
+    exchanges later; the tool result cannot.
+    """
+    if memory is None:
+        return (
+            f"I haven't touched the {key} light since I started up, and the strip "
+            "can't tell me anything back, so I honestly don't know."
+        )
+
+    bits = []
+    if memory.power is not None:
+        bits.append("on" if memory.power else "off")
+    if memory.percent is not None:
+        bits.append(f"{memory.percent} percent")
+    if memory.color_word:
+        bits.append(memory.color_word)
+
+    if not bits:
+        return f"I don't have anything recorded for the {key} light."
+    return (
+        f"Last thing I sent the {key} light was {', '.join(bits)}, "
+        "and I can't read the strip back so that's memory, not a reading."
+    )
+
+
+def _dispatch_lights(params: dict, govee_svc, light_shadow=None) -> str:
     """
     Govee light control. Module-level and service-injected for the same reason
     _dispatch_tv is: it keeps the tool layer testable without an Orchestrator.
 
     No ADB check and no VPN preflight here on purpose. These are cloud calls to
     Govee and have nothing to do with the Mi Box or Surfshark.
+
+    light_shadow is injected rather than living on GoveeService on purpose.
+    The dispatcher is the only layer that holds the words worth saying back:
+    the CLAMPED percent and the colour Master Miguel actually said. The
+    service sees an rgb tuple, and nothing in this project maps rgb back to a
+    name. It also keeps the existing tests honest -- _svc() there is a bare
+    Mock, so a GoveeService.get_state() would auto-stub truthy and pass on
+    nothing at all.
     """
     action = params.get("action")
 
@@ -495,10 +684,20 @@ def _dispatch_lights(params: dict, govee_svc) -> str:
             return f"I don't have a light called {hint} saved."
         return "I don't have any lights saved yet."
 
+    if action == "light_status":
+        # Nothing to ask the service: the characteristic is write-only.
+        remembered = light_shadow.remembered(key) if light_shadow else None
+        return _light_memory_line(key, remembered)
+
     if action in ("light_on", "light_off"):
-        result = govee_svc.set_power(key, on=(action == "light_on"))
+        on = action == "light_on"
+        result = govee_svc.set_power(key, on=on)
         if result:
-            return f"{key} lights on." if action == "light_on" else f"{key} lights off."
+            # `if result:` is a SUCCESS check. GoveeCommandResult defines
+            # __bool__, so a failure is falsy and must not update memory.
+            if light_shadow:
+                light_shadow.record_power(key, on)
+            return f"{key} lights on." if on else f"{key} lights off."
         return result.message or _LIGHTS_UNREACHABLE
 
     if action == "light_brightness":
@@ -508,6 +707,10 @@ def _dispatch_lights(params: dict, govee_svc) -> str:
         percent = clamp_percent(raw)
         result = govee_svc.set_brightness(key, percent)
         if result:
+            # The clamped value, because that is what the strip was sent.
+            # Brightness does NOT imply power: the strip accepts this while off.
+            if light_shadow:
+                light_shadow.record_brightness(key, percent)
             return f"{key} lights at {percent} percent."
         return result.message or _LIGHTS_UNREACHABLE
 
@@ -520,6 +723,9 @@ def _dispatch_lights(params: dict, govee_svc) -> str:
             return f"I don't know the colour {requested}."
         result = govee_svc.set_color(key, rgb)
         if result:
+            # The spoken word, not the rgb. There is no rgb-to-name map here.
+            if light_shadow:
+                light_shadow.record_color(key, requested)
             return f"{key} lights set to {requested}."
         return result.message or _LIGHTS_UNREACHABLE
 
@@ -557,6 +763,15 @@ class Orchestrator:
         else:
             self.media_service = None
             self.surfshark_service = None
+
+        # What she last put on the screen. The box knows which app is up and
+        # whether something is playing, but never what -- she is the only one
+        # who knows that, because she launched it.
+        self.now_playing = NowPlaying()
+
+        # What she last told the lights. The Govee characteristic is
+        # write-only, so this is the only answer that exists for them.
+        self.light_shadow = LightShadow()
 
         # Govee lights. Constructed unconditionally — the service self-disables
         # when config is off or GOVEE_API_KEY is missing, so there is no None branch.
@@ -1106,9 +1321,10 @@ class Orchestrator:
                 self.config.get("youtube_playlists", {}),
                 self.config.get("youtube_playlist_aliases") or {},
                 say_now=self._say_now,
+                now_playing=self.now_playing,
             )
         if tool_name == "control_lights":
-            return _dispatch_lights(tool_input, self.govee_service)
+            return _dispatch_lights(tool_input, self.govee_service, self.light_shadow)
         return "unknown tool"
 
     def _stremio_sync_loop(self, interval_minutes: int):

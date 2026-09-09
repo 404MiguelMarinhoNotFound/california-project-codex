@@ -1,0 +1,132 @@
+Excerpt of `adb shell dumpsys audio` from the live Mi Box, 2026-09-09.
+Stream volume section only: the full dump is ~39 KB and the rest is not parsed.
+
+- STREAM_VOICE_CALL:
+   Muted: false
+   Muted Internally: false
+   Min: 1
+   Max: 5
+   streamVolume:5
+   Current: 2 (speaker): 5, 4 (headset): 4, 8 (headphone): 4, 400 (hdmi): 5, 4000000 (usb_headset): 2, 40000000 (default): 5
+   Devices: hdmi
+- STREAM_SYSTEM:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 7
+   streamVolume:7
+   Current: 2 (speaker): 7, 4 (headset): 5, 8 (headphone): 5, 400 (hdmi): 7, 4000000 (usb_headset): 1, 40000000 (default): 7
+   Devices: hdmi
+- STREAM_RING:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 7
+   streamVolume:7
+   Current: 2 (speaker): 7, 4 (headset): 5, 8 (headphone): 5, 400 (hdmi): 7, 4000000 (usb_headset): 1, 40000000 (default): 7
+   Devices: speaker
+- STREAM_MUSIC:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 15
+   streamVolume:15
+   Current: 2 (speaker): 15, 4 (headset): 10, 8 (headphone): 10, 400 (hdmi): 15, 4000000 (usb_headset): 3, 40000000 (default): 15
+   Devices: hdmi
+- STREAM_ALARM:
+   Muted: false
+   Muted Internally: false
+   Min: 1
+   Max: 7
+   streamVolume:7
+   Current: 2 (speaker): 7, 4 (headset): 5, 8 (headphone): 5, 400 (hdmi): 7, 4000000 (usb_headset): 2, 40000000 (default): 7
+   Devices: speaker
+- STREAM_NOTIFICATION:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 7
+   streamVolume:7
+   Current: 2 (speaker): 7, 4 (headset): 5, 8 (headphone): 5, 400 (hdmi): 7, 4000000 (usb_headset): 1, 40000000 (default): 7
+   Devices: hdmi
+- STREAM_BLUETOOTH_SCO:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 15
+   streamVolume:7
+   Current: 2 (speaker): 7, 400 (hdmi): 7, 40000000 (default): 7
+   Devices: hdmi
+- STREAM_SYSTEM_ENFORCED:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 7
+   streamVolume:7
+   Current: 2 (speaker): 7, 4 (headset): 5, 8 (headphone): 5, 400 (hdmi): 7, 4000000 (usb_headset): 1, 40000000 (default): 7
+   Devices: hdmi
+- STREAM_DTMF:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 15
+   streamVolume:15
+   Current: 2 (speaker): 15, 4 (headset): 10, 8 (headphone): 10, 400 (hdmi): 15, 4000000 (usb_headset): 3, 40000000 (default): 15
+   Devices: hdmi
+- STREAM_TTS:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 15
+   streamVolume:15
+   Current: 2 (speaker): 15, 4 (headset): 10, 8 (headphone): 10, 400 (hdmi): 15, 4000000 (usb_headset): 3, 40000000 (default): 15
+   Devices: speaker
+- STREAM_ACCESSIBILITY:
+   Muted: false
+   Muted Internally: false
+   Min: 1
+   Max: 15
+   streamVolume:15
+   Current: 2 (speaker): 15, 4 (headset): 10, 8 (headphone): 10, 400 (hdmi): 15, 4000000 (usb_headset): 4, 40000000 (default): 15
+   Devices: hdmi
+- STREAM_ASSISTANT:
+   Muted: false
+   Muted Internally: false
+   Min: 0
+   Max: 15
+   streamVolume:15
+   Current: 2 (speaker): 15, 4 (headset): 10, 8 (headphone): 10, 400 (hdmi): 15, 4000000 (usb_headset): 3, 40000000 (default): 15
+   Devices: hdmi
+
+- mute affected streams = 0x6f
+
+Volume Groups (device: index)
+- VOLUME GROUP AUDIO_STREAM_ACCESSIBILITY:
+   Min: 1
+   Max: 15
+   Current: 40000000 (default): 15
+   Devices: hdmi
+- VOLUME GROUP AUDIO_STREAM_ALARM:
+   Min: 1
+   Max: 7
+   Current: 40000000 (default): 7
+   Devices: speaker
+- VOLUME GROUP AUDIO_STREAM_DTMF:
+   Min: 0
+   Max: 15
+   Current: 40000000 (default): 15
+   Devices: hdmi
+- VOLUME GROUP AUDIO_STREAM_ENFORCED_AUDIBLE:
+   Min: 0
+   Max: 7
+   Current: 40000000 (default): 7
+   Devices: hdmi
+- VOLUME GROUP AUDIO_STREAM_MUSIC:
+   Min: 0
+   Max: 15
+   Current: 40000000 (default): 15
+   Devices: hdmi
+- VOLUME GROUP AUDIO_STREAM_NOTIFICATION:
+   Min: 0
+   Max: 7
+   Current: 40000000 (default): 7

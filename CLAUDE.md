@@ -312,6 +312,7 @@ truth. `requirements.txt` has been deleted and must not be reintroduced.
 - **Run `uv sync` after pulling** so the environment matches the lockfile.
 - **Optional/heavy providers go in `[project.optional-dependencies]`,** not in the core
   `dependencies` list. Current extras: `kokoro`, `piper`, `elevenlabs`, `openai`,
+  `cec`,
   `porcupine`, `silero`, `pi`, `govee`, and the aggregate `default`.
 - **`uv sync --extra <name>` syncs ONLY that extra and uninstalls everything else.**
   It is not additive. Running `uv sync --extra govee` on this project removes kokoro,
@@ -600,6 +601,24 @@ boolean** — that is the whole wake path.
 set.** That gate returns `"TV is off or unreachable right now"` when
 `ensure_connected()` fails, which is precisely the state `turn_on` exists to fix.
 `wake` used to be listed there, a second and independent reason it was dead code.
+
+**Reachable is not ready, and this is the difference between a wake that
+works and one that quietly does nothing.** `adbd` comes up early in boot, so
+`ensure_connected()` succeeds against a box that cannot launch an app yet --
+and a Stremio deep link fired into that window is a launch that fails
+silently. `_wait_for_box` therefore polls `getprop sys.boot_completed` once
+the connection returns, and only reports success when Android says it is up.
+Verified present on the real box (Android 11, SDK 30).
+
+That also changes what `settle_ms` means: it is an **upper bound**, not a
+fixed wait. A fast boot returns early instead of spending the whole budget.
+
+**The check fails open on purpose.** An unreadable `getprop` returns `None`
+and is accepted, because the previous behaviour accepted the connection by
+itself -- a box that will not answer the property must never end up worse off
+than before the check existed. `None` is "cannot tell", never "still
+booting": treating it as the latter would burn the entire settle window
+waiting for something that already happened.
 
 `_wait_for_box` clears `_last_fail_time` on every poll, because
 `ensure_connected()` stamps it on each miss and then refuses to retry for
@@ -1064,7 +1083,7 @@ The Claude path supports:
 
 - Anthropic web search via `web_search_20250305`
 - Custom `control_tv` tool for Mi Box and TV control (23 actions)
-- Custom `control_lights` tool for Govee light control (2 actions)
+- Custom `control_lights` tool for Govee light control (5 actions)
 
 With the committed `config.yaml` that is **3 tools** in every request: `web_search`,
 `control_tv`, `control_lights`. Each custom tool's full schema is sent on every turn, so
@@ -1079,6 +1098,7 @@ Widening that check to any `tool_use` block would break web search.
 `control_lights` supports these actions:
 
 - `light_on`, `light_off`
+- `light_status` (answers from shadow state, never a reading -- see Reading State Back)
 - `light_brightness` (needs `brightness_percent`, 1-100, clamped not rejected)
 - `light_color` (needs `color`)
 
@@ -1106,6 +1126,177 @@ When tools are active:
 - Do not read raw `tool_use` or `tool_result` structures aloud
 - Keep tool confirmations short and natural
 - Treat plain show requests for `stremio_play` as "sync the library, then resume the latest tracked episode"
+
+-----
+
+## Reading State Back
+
+She could control all three devices and read almost nothing back. What she can
+read, and what she deliberately does not pretend to, is now the point.
+
+### The television's power is on the CEC bus, never in its REST reply
+
+`get_status` used to report TV power from `cec_waker._tv_is_up()`. That probes
+`:8001/api/v2/`, **which this set answers in standby**, so a television that was
+off came back as "TV: on" for the life of the feature. `cec_wake.py` already
+said not to: "The set exposes no PowerState field at all... What we must NOT do
+is treat the answer as 'powered on'." `_tv_is_up` verifies an *address*. It is
+not, and can never be made into, a power check.
+
+`MediaService.tv_power_status()` is the real oracle, and it reads **two kinds of
+evidence, whichever came last**:
+
+- `<Report Power Status>` is an **answer**. The only thing that asks is the
+  box's own wake sequence -- in `tests/fixtures/hdmi_control_dump.txt` every one
+  sits a second after a `<Give Device Power Status>`, and nothing polls
+  periodically. On its own it therefore cannot see Master Miguel reaching for
+  the television's remote, and goes hours stale.
+- `<Standby> 0F:36` is **volunteered**. The TV broadcasts it on its way off and
+  the box logs it even though it was not addressed to us. Confirmed on the real
+  box 2026-09-08: nine power-off cycles in one capture, every one logged
+  (`tests/fixtures/hdmi_control_standby_dump.txt`). This is the only thing that
+  makes "he turned it off himself" observable, and without it that capture reads
+  as `on` from four hours earlier with three `<Standby>` broadcasts after it.
+
+`[S]` is the box talking, never the television -- counting our own `<Standby>`
+or `<Report Power Status>` reports the box's state as the TV's.
+
+The staleness gate stays as a backstop, because a television can be switched on
+again at an input the box never hears about. `_parse_tv_power` compares the
+winning line's timestamp against the newest line in the log -- both off the
+box's own clock, so no host timezone is involved -- and returns `None` past
+`_TV_POWER_MAX_AGE_S`. In practice it does not fire during normal operation: an
+idle CEC bus is silent, so the newest line IS the wake burst that carries the
+power report.
+
+### `ensure_connected()` is a live ADB ping, which is why `room_status()` exists
+
+Every public reader starts with `ensure_connected()`, and that fires a real
+`adb shell echo ping` **every call**. Composing status out of `is_awake()` +
+`hdmi_state()` + `get_current_app()` + `is_playing()` therefore costs eight round
+trips to answer one question. `room_status()` is the one method allowed to read
+dumpsys without re-entering the gate, and short-circuits on a sleeping box
+because nothing is on screen to ask about. Do not "tidy" it into calls to the
+four public readers.
+
+`is_active_source()` and `tv_power_status()` used to run their own
+`dumpsys hdmi_control` over identical output. Both now delegate to
+`hdmi_state()` and keep their names, signatures and `None` semantics, because
+`ensure_active_source()` and `_ensure_playable()` call them.
+
+**`None` means "could not tell", and a field she could not read is a clause she
+does not say.** The old branch printed "unknown" for exactly the fields it had
+failed to read, which is the least useful thing to say out loud.
+
+### The box does publish a title, and there is more than one session
+
+Captured off the live box on 2026-09-08 with Stremio playing
+(`tests/fixtures/media_session_dump.txt`), and it corrected two assumptions this
+feature was designed around:
+
+- **Stremio publishes the show AND the episode.**
+  `metadata: size=4, description=Fallout, The Strip, null` -- a MediaDescription
+  printed as "title, subtitle, iconUri", with unset fields as the literal
+  "null". So "what is playing" is readable after all, and unlike the launch
+  memory it survives him starting something with the remote. YouTube still
+  publishes nothing, which is why the memory below still earns its place.
+- **Sessions are plural.** Spotify held an active session at `state=0` the whole
+  time Stremio was playing. A flat `"state=3" in dump` therefore answers a
+  different question than the one asked and would hand Spotify's playback to
+  whatever is on screen. `_parse_media_sessions` splits the stack on `package=`
+  and `room_status()` scopes to the foreground app's package. An app holding no
+  session of its own is not playing -- do NOT reintroduce an `any(...)` fallback
+  there, that is the bug.
+
+`StremioService._is_playing` keeps its own flat check on purpose: it has a
+standalone-ADB path for when no MediaService exists, and its bool return is
+load-bearing in the autoplay retry.
+
+### What else the box will tell you, and what it will not
+
+Measured on the real box 2026-09-09. `room_status()` reads five dumpsys in
+one connection, ~0.9s of ADB in total:
+
+| read | costs | gives |
+|---|---|---|
+| `dumpsys power` | 0.30s | `mWakefulness` |
+| `dumpsys hdmi_control` | 0.11s | active source + TV power |
+| `dumpsys window displays` | 0.11s | foreground app |
+| `dumpsys media_session` | 0.11s | playback state, title, position |
+| `dumpsys audio` | 0.13s | STREAM_MUSIC volume and mute |
+
+**Position yes, duration no.** The session prints
+`position=240301` in ms, but `metadata: size=4` prints only the description
+-- there is no length anywhere in the dump. So elapsed time is available and
+**a percentage or a "time left" is not**, and nothing may imply otherwise.
+`position=-1` means stopped, not the start of the film, and is discarded.
+
+**The playback word is read, never guessed.** The session state is an int
+(`_PLAYBACK_WORDS`): 0, 2 and 3 observed on this box, the rest documented
+Android values. Without it the title is dropped rather than pinned to a
+guessed verb -- "paused on X" must mean the box said paused.
+
+**Volume is the BOX's, not the television's.** `_parse_volume` scopes to the
+`- STREAM_MUSIC:` block, which matters: `STREAM_VOICE_CALL` sits above it
+with a Max of 5 and `- VOLUME GROUP AUDIO_STREAM_MUSIC` below with its own
+numbers, so a loose scan picks up whichever it meets first. This is the
+volume `volume_set` moves, which is what makes it worth reporting. The
+Samsung's own volume is not readable over ADB, and on this setup the box
+often sits pinned at 15/15 while the room's loudness is ridden from the TV
+remote -- so treat a box volume of max as "not the reason it is quiet".
+
+### She also knows what she put on, as a fallback
+
+For everything that publishes no metadata, `services/now_playing.py` remembers
+the one thing she launched, in the words she used, under two rules:
+
+- **Corroborated.** `current()` returns nothing unless the live foreground app
+  still matches, so a memory of a Stremio episode is dropped the moment he moves
+  to YouTube rather than narrated over it.
+- **`kind` separates "playing" from "opened".** A YouTube search and a Stremio
+  series page were put on screen, not played. With no matching memory she says
+  she did not start it, rather than guessing.
+
+The session title wins where both exist; the memory is the fallback.
+
+Recording happens in `_dispatch_tv`, not in the services, because the speakable
+label only exists there: `StremioService` holds an IMDb id and a deep link, and
+`youtube_playlist()` holds an opaque `PL...` id. An opaque id is deliberately
+not remembered at all rather than read out loud later.
+
+### The lights cannot be read, and saying so is the feature
+
+The Govee characteristic `00010203-...-2b11` is **Write Without Response**, with
+no notify characteristic beside it, and the attic H617E is absent from Govee's
+cloud whitelist, so `GET /user/devices` returns an empty array with a valid key.
+There is no reading to be had by any route.
+
+`services/light_shadow.py` therefore stores what she last *sent*, and
+`_light_memory_line` says so in the returned string. **The hedge lives in the
+string, not the system prompt**, because the string is what gets spoken and a
+prompt instruction is forgotten six exchanges later. Two rules:
+
+- It stores the **clamped percent** and the **spoken colour word**, not rgb.
+  Nothing in this project maps rgb back to a name and nothing should; the
+  dispatcher already holds the word Master Miguel actually said.
+- **Brightness and colour do not imply power.** The strip accepts both while it
+  is off, so inferring "on" from them would be a guess dressed as a fact.
+
+Both stores are **in memory only**. A restart is the moment either is least
+trustworthy, and persisting would mean answering confidently about a room that
+had hours to change. They are also deliberately **two modules, not one**: the
+now-playing memory is corroborated against a live reading and the light memory
+can never be, and a shared base class would carry the contract "sometimes
+verifiable", which is the exact ambiguity that produced the TV bug above.
+
+Both are injected as **trailing defaulted parameters** (`now_playing` on
+`_dispatch_tv`, `light_shadow` on `_dispatch_lights`) so the existing call sites
+that pass five and two positionals keep working, and `None` keeps meaning "no
+memory available". Neither is a module-level singleton: a shared store would
+leak a label from one test into the next. `light_shadow` is injected rather than
+living on `GoveeService` for a second reason -- `_svc()` in
+`tests/test_orchestrator_lights.py` is a bare `Mock`, so a `get_state()` method
+would auto-stub **truthy** and the tests would pass while reading nothing.
 
 -----
 
@@ -1218,6 +1409,12 @@ Current automated coverage exists for:
   that overrides deep-merge without dropping siblings, that each load is an
   independent copy, and that no fixture feeds the code a hardcoded IP
 - Stremio title resolution and watch-state behavior
+- The boot gate: that `sys.boot_completed` is read from the right property,
+  that `1`/`0` map to booted/booting, that a failed or empty read is `None`
+  rather than `False`, that the wait loop keeps polling while the box is
+  still booting and accepts an unreadable flag, that the check short-circuits
+  while the box is unreachable, and that the loop never shells out to a real
+  adb
 - Power: that `KEYCODE_POWER` is never sent in any state, that `turn_on`
   is a no-op when already awake, that unreachable falls back to Bluetooth,
   that `is_awake()` keeps `None` distinct from `False`, that the wait loop
@@ -1246,6 +1443,33 @@ Current automated coverage exists for:
   they are opposite fixes and the wrong one strands him
 - `_hdmi_inventory()` advertising configured ports and omitting the block entirely
   when none are named
+- That `get_status` reports a standby television as off rather than on, never
+  touches the CEC waker, says nothing it could not read, and returns one line
+  with no dumpsys text in it
+- That a status question never wakes the room, and that an unreachable box
+  still gets the four-way classified line
+- `room_status()` pinging the box exactly once, skipping the app and session
+  reads on a sleeping box, and reporting `None` rather than `False` throughout
+- That a CEC power report far older than the live log is not trusted, that a
+  `<Standby>` broadcast after the last report wins and a newer report wins back,
+  and that a `[S]` standby the box sent is not read as the television's state
+- Volume parsed from a real `dumpsys audio` capture, scoped past
+  STREAM_VOICE_CALL and the VOLUME GROUP block; that muted replaces the
+  level rather than joining it, and an unreadable volume is not mentioned
+- That elapsed position is reported but never a percentage or time left,
+  and that the paused/buffering word is read from the session state rather
+  than guessed
+- Media sessions parsed from a real capture: that Stremio's show and episode
+  are read out of the metadata, that `metadata: null` is no title rather than
+  the word "null", that playback is scoped to the foreground app so an idle
+  Spotify session cannot be mistaken for it, and that an app holding no session
+  is reported as not playing
+- Now-playing memory: quoted only while the foreground app still matches,
+  dropped when he switched apps, never claiming a search was played, and not
+  recorded at all when the launch failed
+- Light shadow state: recorded only on success, brightness stored clamped,
+  colour stored as the spoken word, brightness never implying power, and
+  `light_status` never asking the service for state
 - Stremio playback retry logic
 - Surfshark route execution, route cache semantics, and debug route capture
 - Orchestrator VPN preflight routing and warning behavior
@@ -1449,6 +1673,15 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
   unrecoverable, which is not a risk profile a voice interface should carry.
   Explicit `turn_on` / `turn_off` also cost one *fewer* action in the tool
   schema than the three they replaced.
+- **This one recurs, so the guard has to be at the boundary, not in a habit.**
+  Adding a `getprop` inside `_wait_for_box` made two existing power tests fire
+  a real `getprop` at whatever box adb was attached to, and they kept passing.
+  They patched `ensure_connected`, which used to be everything the loop
+  touched. The rule that falls out: anything the wait loop asks the box must
+  be a **named, patchable method**, never a bare `_adb` call --
+  `test_the_wait_loop_never_shells_out_to_a_real_adb` pins it by patching
+  `subprocess.run` to raise. Audit with an interpreter-level patch after
+  touching that path; a green run proves nothing here.
 - **A unit test holding a real service object will use a real transport, and only
   a machine *missing* the binary tells you.** Four tests in
   `tests/test_stremio_service.py` built a live `StremioService` with
