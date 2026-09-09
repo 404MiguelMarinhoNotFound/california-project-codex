@@ -1072,6 +1072,26 @@ class MediaService:
                     self.wake_attempts)
         return False
 
+    def is_boot_completed(self) -> bool | None:
+        """
+        Has Android finished booting? True / False / None, and None is "cannot tell".
+
+        `sys.boot_completed` flips to 1 when the system is actually up. This is
+        NOT the same question as "is ADB answering": adbd comes up early in boot,
+        so ensure_connected() can succeed against a box that cannot yet launch an
+        app. Firing a Stremio deep link into that window is a launch that quietly
+        does nothing.
+
+        Verified present on the real box (Android 11, SDK 30).
+        """
+        ok, output = self._adb("shell getprop sys.boot_completed")
+        if not ok:
+            return None
+        answer = (output or "").strip()
+        if not answer:
+            return None
+        return answer == "1"
+
     def _wait_for_box(self) -> bool:
         # The box is booting at an address we already know, so a subnet scan on
         # every poll would be pure waste. Suppress discovery for the duration --
@@ -1086,7 +1106,15 @@ class MediaService:
                 # for normal operation and wrong here, where we are deliberately
                 # waiting out a boot, so clear it on each pass.
                 self._last_fail_time = 0
-                if self.ensure_connected():
+                # Reachable is not the same as ready. adbd answers early in boot,
+                # so returning here on connection alone hands back a box that
+                # cannot launch anything yet -- and settle_ms exists as a fixed
+                # budget precisely because there was no better signal.
+                #
+                # `is not False` is the fail-open: an unreadable getprop must
+                # never be worse than the old behaviour, which accepted the
+                # connection by itself.
+                if self.ensure_connected() and self.is_boot_completed() is not False:
                     return True
                 time.sleep(self.wake_poll_interval_s)
         finally:

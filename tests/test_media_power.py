@@ -75,7 +75,8 @@ class TurnOnTests(unittest.TestCase):
         svc = _service(waker)
         with patch.object(svc, "is_awake", return_value=None):
             with patch.object(svc, "ensure_connected", return_value=True):
-                self.assertTrue(svc.turn_on())
+                with patch.object(svc, "is_boot_completed", return_value=True):
+                    self.assertTrue(svc.turn_on())
         waker.wake.assert_called_once()
 
     def test_wake_failure_is_reported_not_swallowed(self):
@@ -117,8 +118,12 @@ class TurnOnTests(unittest.TestCase):
 
         with patch.object(svc, "is_awake", return_value=None):
             with patch.object(svc, "ensure_connected", side_effect=record):
-                with patch("services.media_service.time.sleep"):
-                    self.assertTrue(svc.turn_on())
+                # The wait loop asks the box whether it has finished booting once
+                # the connection comes back. Unpatched that is a real getprop at
+                # whatever adb is attached to.
+                with patch.object(svc, "is_boot_completed", return_value=True):
+                    with patch("services.media_service.time.sleep"):
+                        self.assertTrue(svc.turn_on())
 
         self.assertEqual(seen, [0, 0], "cooldown was not cleared before each retry")
 
@@ -153,7 +158,8 @@ class PowerToggleTests(unittest.TestCase):
         svc = _service(waker)
         with patch.object(svc, "is_awake", return_value=None):
             with patch.object(svc, "ensure_connected", return_value=True):
-                svc.power_toggle()
+                with patch.object(svc, "is_boot_completed", return_value=True):
+                    svc.power_toggle()
         waker.wake.assert_called_once()
 
     def test_keycode_power_is_never_sent(self):
@@ -845,6 +851,96 @@ class LaunchMemoryRecordingTests(unittest.TestCase):
             media, None, None, {}, now_playing=store,
         )
         self.assertIsNone(store.current("stremio"))
+
+
+
+class BootCompletedTests(unittest.TestCase):
+    """
+    Reachable is not ready. adbd comes up early in boot, so ensure_connected()
+    can succeed against a box that cannot yet launch an app -- and a Stremio deep
+    link fired into that window is a launch that quietly does nothing.
+
+    `sys.boot_completed` is the signal for it. Verified present on the real box
+    (Android 11, SDK 30).
+    """
+
+    def _svc(self, reply):
+        svc = _service()
+        svc._adb = Mock(return_value=reply)
+        return svc
+
+    def test_one_means_booted(self):
+        self.assertIs(self._svc((True, "1")).is_boot_completed(), True)
+
+    def test_zero_means_still_booting(self):
+        self.assertIs(self._svc((True, "0")).is_boot_completed(), False)
+
+    def test_a_failed_getprop_is_none_not_false(self):
+        # None is "cannot tell". False would mean "still booting" and would burn
+        # the whole settle window waiting for something that already happened.
+        self.assertIsNone(self._svc((False, "")).is_boot_completed())
+
+    def test_an_empty_answer_is_none_not_false(self):
+        # The property is unset early in boot, and unset is not the same claim
+        # as a read that came back saying zero.
+        self.assertIsNone(self._svc((True, "")).is_boot_completed())
+
+    def test_it_asks_for_the_right_property(self):
+        svc = self._svc((True, "1"))
+        svc.is_boot_completed()
+        self.assertIn("sys.boot_completed", svc._adb.call_args[0][0])
+
+
+class WaitForBootTests(unittest.TestCase):
+    def test_the_loop_keeps_waiting_while_the_box_is_still_booting(self):
+        """
+        The point of the change. Returning on connection alone handed back a box
+        that answered ADB but could not launch anything yet.
+        """
+        svc = _service()
+        booted = [False, False, True]
+        with patch.object(svc, "ensure_connected", return_value=True):
+            with patch.object(svc, "is_boot_completed", side_effect=booted):
+                with patch("services.media_service.time.sleep"):
+                    self.assertTrue(svc._wait_for_box())
+
+    def test_an_unreadable_boot_flag_is_accepted_rather_than_waited_out(self):
+        """
+        Fail open. Before this change the loop returned on the connection alone,
+        so a box that will not answer getprop must not become WORSE than that.
+        """
+        svc = _service()
+        with patch.object(svc, "ensure_connected", return_value=True):
+            with patch.object(svc, "is_boot_completed", return_value=None):
+                with patch("services.media_service.time.sleep"):
+                    self.assertTrue(svc._wait_for_box())
+
+    def test_the_boot_check_is_skipped_while_the_box_is_unreachable(self):
+        # No point asking a box that is not answering, and `and` must short-circuit
+        # so the poll stays one round trip while the box is still down.
+        svc = _service()
+        with patch.object(svc, "ensure_connected", return_value=False):
+            with patch.object(svc, "is_boot_completed") as boot:
+                with patch("services.media_service.time.sleep"):
+                    with patch.object(svc._finder, "resolve", return_value=""):
+                        svc._wait_for_box()
+        boot.assert_not_called()
+
+    def test_the_wait_loop_never_shells_out_to_a_real_adb(self):
+        """
+        Regression guard, and it is here because this exact thing happened.
+
+        Adding the boot read inside the loop made two existing tests fire a real
+        `getprop` at whatever box adb happened to be attached to, and they went
+        on passing. Anything the loop asks the box must be a named, patchable
+        method rather than a bare _adb call.
+        """
+        svc = _service()
+        with patch("services.media_service.subprocess.run",
+                   side_effect=AssertionError("the wait loop reached a real adb")):
+            with patch.object(svc, "ensure_connected", return_value=True):
+                with patch.object(svc, "is_boot_completed", return_value=True):
+                    self.assertTrue(svc._wait_for_box())
 
 if __name__ == "__main__":
     unittest.main()

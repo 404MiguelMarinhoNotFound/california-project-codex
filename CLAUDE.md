@@ -602,6 +602,24 @@ set.** That gate returns `"TV is off or unreachable right now"` when
 `ensure_connected()` fails, which is precisely the state `turn_on` exists to fix.
 `wake` used to be listed there, a second and independent reason it was dead code.
 
+**Reachable is not ready, and this is the difference between a wake that
+works and one that quietly does nothing.** `adbd` comes up early in boot, so
+`ensure_connected()` succeeds against a box that cannot launch an app yet --
+and a Stremio deep link fired into that window is a launch that fails
+silently. `_wait_for_box` therefore polls `getprop sys.boot_completed` once
+the connection returns, and only reports success when Android says it is up.
+Verified present on the real box (Android 11, SDK 30).
+
+That also changes what `settle_ms` means: it is an **upper bound**, not a
+fixed wait. A fast boot returns early instead of spending the whole budget.
+
+**The check fails open on purpose.** An unreadable `getprop` returns `None`
+and is accepted, because the previous behaviour accepted the connection by
+itself -- a box that will not answer the property must never end up worse off
+than before the check existed. `None` is "cannot tell", never "still
+booting": treating it as the latter would burn the entire settle window
+waiting for something that already happened.
+
 `_wait_for_box` clears `_last_fail_time` on every poll, because
 `ensure_connected()` stamps it on each miss and then refuses to retry for
 `_OFFLINE_COOLDOWN` — right in normal operation, wrong while waiting out a boot.
@@ -1391,6 +1409,12 @@ Current automated coverage exists for:
   that overrides deep-merge without dropping siblings, that each load is an
   independent copy, and that no fixture feeds the code a hardcoded IP
 - Stremio title resolution and watch-state behavior
+- The boot gate: that `sys.boot_completed` is read from the right property,
+  that `1`/`0` map to booted/booting, that a failed or empty read is `None`
+  rather than `False`, that the wait loop keeps polling while the box is
+  still booting and accepts an unreadable flag, that the check short-circuits
+  while the box is unreachable, and that the loop never shells out to a real
+  adb
 - Power: that `KEYCODE_POWER` is never sent in any state, that `turn_on`
   is a no-op when already awake, that unreachable falls back to Bluetooth,
   that `is_awake()` keeps `None` distinct from `False`, that the wait loop
@@ -1649,6 +1673,15 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
   unrecoverable, which is not a risk profile a voice interface should carry.
   Explicit `turn_on` / `turn_off` also cost one *fewer* action in the tool
   schema than the three they replaced.
+- **This one recurs, so the guard has to be at the boundary, not in a habit.**
+  Adding a `getprop` inside `_wait_for_box` made two existing power tests fire
+  a real `getprop` at whatever box adb was attached to, and they kept passing.
+  They patched `ensure_connected`, which used to be everything the loop
+  touched. The rule that falls out: anything the wait loop asks the box must
+  be a **named, patchable method**, never a bare `_adb` call --
+  `test_the_wait_loop_never_shells_out_to_a_real_adb` pins it by patching
+  `subprocess.run` to raise. Audit with an interpreter-level patch after
+  touching that path; a green run proves nothing here.
 - **A unit test holding a real service object will use a real transport, and only
   a machine *missing* the binary tells you.** Four tests in
   `tests/test_stremio_service.py` built a live `StremioService` with

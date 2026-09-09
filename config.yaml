@@ -523,6 +523,9 @@ media:
     # Re-measure before changing: a run whose log says "asleep after -1s" is not
     # a sample -- the box refuses to sleep straight after waking, so it never
     # went down and the rejoin time is meaninglessly small.
+    # This is an UPPER BOUND now, not a fixed wait. _wait_for_box polls
+    # sys.boot_completed and returns as soon as Android says it is up, so a
+    # fast boot no longer costs the whole budget.
     settle_ms: 45000
     poll_interval_ms: 2000
     # Mi Box is at CEC physical address 0x2000 == HDMI 2. KEY_HDMI toggles
