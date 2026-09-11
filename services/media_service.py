@@ -3,6 +3,8 @@ import re
 import subprocess
 import time
 import yaml
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -30,6 +32,313 @@ _ACTIVE_SOURCE_RE = re.compile(r"mIsActiveSource:\s*(\w+)")
 _TV_POWER_RE = re.compile(
     r"\[R\][^\n]*<Report Power Status>\s*0[0-9A-Fa-f]:90:([0-9A-Fa-f]{2})"
 )
+
+# dumpsys media_session: "state=PlaybackState {state=3, position=240301, ..."
+_SESSION_STATE_RE = re.compile(r"state=PlaybackState\s*\{state=(\d+)")
+_SESSION_POSITION_RE = re.compile(r"state=PlaybackState\s*\{[^}]*?position=(-?\d+)")
+
+# PlaybackState constants. 0, 2 and 3 observed on the real box; the rest are
+# the documented Android values and fall back to the plain wording if they
+# ever turn up.
+_PLAYBACK_WORDS = {
+    1: "stopped",
+    2: "paused",
+    3: "playing",
+    6: "buffering",
+}
+
+# dumpsys audio, the STREAM_MUSIC block:
+#   - STREAM_MUSIC:
+#      Muted: false
+#      Max: 15
+#      streamVolume:15
+_VOLUME_MUTED_RE = re.compile(r"^Muted:\s*(\w+)")
+_VOLUME_MAX_RE = re.compile(r"^Max:\s*(\d+)")
+_VOLUME_LEVEL_RE = re.compile(r"^streamVolume:\s*(\d+)")
+
+# dumpsys media_session: "metadata: size=4, description=Fallout, The Strip, null"
+_SESSION_METADATA_RE = re.compile(r"metadata:.*?\bdescription=(.*)$")
+
+# The TV broadcasting that it is going off: <Standby> 0F:36, source 0 (the TV)
+# to F (everyone). Unlike <Report Power Status> this is VOLUNTEERED, so it is
+# the only evidence that survives Master Miguel using the television's own
+# remote. Confirmed on the real box 2026-09-08 and captured in
+# tests/fixtures/hdmi_control_standby_dump.txt.
+_TV_STANDBY_RE = re.compile(r"\[R\][^\n]*<Standby>\s*0[0-9A-Fa-f]:36")
+
+# Every CEC line carries the BOX's own clock: "time=2026-09-05 14:18:51".
+_CEC_TIME_RE = re.compile(r"time=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+# How old a <Report Power Status> may be before it stops meaning anything.
+#
+# The TV does not volunteer its power state, it answers when ASKED, and the only
+# thing that asks is the box's own wake sequence (<Give Device Power Status> ->
+# <Report Power Status> one second later, visible in the fixture). So the last
+# report can be hours stale, and if Master Miguel kills the TV with its own
+# remote afterwards there may be no newer line at all. Reporting that as "on" is
+# the same lie as the REST probe this replaced, only quieter.
+_TV_POWER_MAX_AGE_S = 300
+
+
+def _parse_wakefulness(dump: str) -> bool | None:
+    """True awake, False asleep, None when the dump does not say."""
+    match = _WAKEFULNESS_RE.search(dump or "")
+    if not match:
+        return None
+    return match.group(1).strip().lower() == "awake"
+
+
+def _parse_active_source(dump: str) -> bool | None:
+    """True when the box is what the TV is showing. None is not False."""
+    match = _ACTIVE_SOURCE_RE.search(dump or "")
+    if not match:
+        return None
+    return match.group(1).strip().lower() == "true"
+
+
+def _stamp_age_s(stamp: str, newest: str) -> float:
+    """Seconds between two CEC log timestamps. 0.0 when either will not parse."""
+    fmt = "%Y-%m-%d %H:%M:%S"
+    try:
+        return (datetime.strptime(newest, fmt) - datetime.strptime(stamp, fmt)).total_seconds()
+    except ValueError:
+        return 0.0
+
+
+def _parse_tv_power(dump: str) -> str | None:
+    """
+    The TV's power state as the box last heard it: "on" | "standby" | None.
+
+    TWO kinds of evidence, and whichever came LAST wins:
+
+    - `<Report Power Status>` is an ANSWER. The only thing that asks is the
+      box's own wake sequence, so on its own it goes stale the moment Master
+      Miguel touches the television's remote.
+    - `<Standby>` is VOLUNTEERED. The TV broadcasts it on its way off, and the
+      box logs it even though it was not addressed to us. That is what makes
+      "he turned it off himself" observable at all.
+
+    Without the second, a dump whose last report says "on" from four hours ago
+    and carries three <Standby> broadcasts since reads as either a confident
+    lie or, with the age check, an unnecessary "I cannot tell".
+
+    Read the tail, never the head: dumpsys keeps a capped ring of ~246 entries,
+    so the first match can be days old. Then check that the tail is not itself
+    stale, see _TV_POWER_MAX_AGE_S -- a television can be switched on again at
+    an input the box never hears about. Both timestamps come off the same box,
+    so this never touches the host clock or timezone.
+
+    A missing or unparseable timestamp is trusted rather than discarded. The age
+    check is an extra guard, not a new way to answer "I cannot tell".
+    """
+    last_value = None
+    last_stamp = None
+    newest_stamp = None
+    for line in (dump or "").splitlines():
+        stamp_match = _CEC_TIME_RE.search(line)
+        stamp = stamp_match.group(1) if stamp_match else None
+        # Lexical compare is chronological for this fixed-width format.
+        if stamp and (newest_stamp is None or stamp > newest_stamp):
+            newest_stamp = stamp
+        report = _TV_POWER_RE.search(line)
+        if report:
+            last_value = {"00": "on", "01": "standby"}.get(report.group(1))
+            last_stamp = stamp
+        elif _TV_STANDBY_RE.search(line):
+            last_value = "standby"
+            last_stamp = stamp
+
+    if last_value is None:
+        return None
+    if (
+        last_stamp
+        and newest_stamp
+        and _stamp_age_s(last_stamp, newest_stamp) > _TV_POWER_MAX_AGE_S
+    ):
+        return None
+    return last_value
+
+
+@dataclass(frozen=True)
+class MediaSession:
+    """One entry from the "Sessions Stack" of `dumpsys media_session`."""
+    package: str
+    state: int | None
+    title: str | None
+    position_ms: int | None = None
+
+
+def _parse_media_sessions(dump: str) -> list[MediaSession]:
+    """
+    Every media session the box is holding, in order.
+
+    There is usually more than one. Captured off the live box with Stremio
+    playing, Spotify ALSO held an active session sitting at state=0, so a flat
+    "is state=3 anywhere in this dump" answers a different question than the
+    one being asked and would report Spotify's playback as Stremio's.
+    """
+    sessions: list[MediaSession] = []
+    package = None
+    state = None
+    title = None
+    position = None
+
+    def flush():
+        if package is not None:
+            sessions.append(MediaSession(package, state, title, position))
+
+    for line in (dump or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("package="):
+            flush()
+            package = stripped.split("=", 1)[1].strip()
+            state = None
+            title = None
+            position = None
+            continue
+        if package is None:
+            continue
+        match = _SESSION_STATE_RE.search(stripped)
+        if match:
+            state = int(match.group(1))
+            spot = _SESSION_POSITION_RE.search(stripped)
+            # A stopped session reports position=-1, which is not a place in
+            # the film and must not be read back as one.
+            if spot and int(spot.group(1)) >= 0:
+                position = int(spot.group(1))
+            continue
+        match = _SESSION_METADATA_RE.search(stripped)
+        if match:
+            title = _clean_description(match.group(1))
+    flush()
+    return sessions
+
+
+def _clean_description(raw: str) -> str | None:
+    """
+    MediaDescription prints as "title, subtitle, iconUri", and Stremio fills
+    the first two: "Fallout, The Strip" is the show and the episode. Unset
+    fields print as the literal "null", so drop those and keep the rest as he
+    would want to hear it.
+    """
+    parts = [p.strip() for p in (raw or "").split(",")]
+    parts = [p for p in parts if p and p != "null"]
+    return ", ".join(parts) or None
+
+
+def _parse_playing(dump: str, package: str | None = None) -> bool:
+    """
+    Is something actually playing? `state=3` is PlaybackState.STATE_PLAYING.
+
+    Scoped to `package` when one is given, because more than one app holds a
+    session at a time. Falls back to the flat scan only for dumps with no
+    session block at all.
+
+    StremioService._is_playing does the flat check and deliberately keeps doing
+    it: it has a standalone-ADB path for when no MediaService exists, and its
+    bool return is load-bearing in the autoplay retry.
+    """
+    sessions = _parse_media_sessions(dump)
+    if not sessions:
+        return "state=3" in (dump or "").lower()
+    if package:
+        # Asked about a specific app: no session of its own means it is not
+        # playing. Falling back to "is anything playing" here would hand it
+        # another app's playback, which is the bug this scoping exists to close.
+        scoped = _session_for(sessions, package)
+        return scoped is not None and scoped.state == 3
+    return any(session.state == 3 for session in sessions)
+
+
+def _session_for(sessions: list, package: str | None):
+    """The named app's session, else whichever one is actually playing."""
+    if package:
+        for session in sessions:
+            if package in session.package:
+                return session
+        return None
+    for session in sessions:
+        if session.state == 3:
+            return session
+    return None
+
+
+@dataclass(frozen=True)
+class VolumeState:
+    """The box's own STREAM_MUSIC volume. Not the television's."""
+    level: int
+    maximum: int
+    muted: bool
+
+
+def _parse_volume(dump: str) -> VolumeState | None:
+    """
+    STREAM_MUSIC out of `dumpsys audio`.
+
+    Scoped to that one block on purpose: STREAM_VOICE_CALL sits above it with
+    a Max of 5, and "- VOLUME GROUP AUDIO_STREAM_MUSIC" sits below with its own
+    numbers, so a loose scan picks up whichever it meets first.
+
+    This is the volume `volume_set` moves, which is what makes it worth
+    reporting. It is NOT the television's volume -- that lives on the Samsung
+    and is not readable over ADB.
+    """
+    level = maximum = None
+    muted = False
+    inside = False
+    for line in (dump or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            if inside:  # left the block we wanted
+                break
+            inside = stripped == "- STREAM_MUSIC:"
+            continue
+        if not inside:
+            continue
+        match = _VOLUME_MUTED_RE.match(stripped)
+        if match:
+            muted = match.group(1).strip().lower() == "true"
+            continue
+        match = _VOLUME_MAX_RE.match(stripped)
+        if match:
+            maximum = int(match.group(1))
+            continue
+        match = _VOLUME_LEVEL_RE.match(stripped)
+        if match:
+            level = int(match.group(1))
+    if level is None or maximum is None:
+        return None
+    return VolumeState(level, maximum, muted)
+
+
+@dataclass(frozen=True)
+class HdmiState:
+    """Both facts `dumpsys hdmi_control` carries, from one round trip."""
+    active_source: bool | None
+    tv_power: str | None
+
+
+@dataclass(frozen=True)
+class RoomStatus:
+    """
+    Everything readable about the room, as DATA. The sentence is built in the
+    orchestrator, the same split as unreachable_reason / _unreachable_line.
+
+    Every field but `reachable` is optional, and None means "could not tell"
+    rather than "no". Callers drop a clause rather than guess at it.
+    """
+    reachable: bool
+    awake: bool | None = None
+    tv_power: str | None = None
+    on_the_box: bool | None = None
+    app: str | None = None
+    playing: bool | None = None
+    title: str | None = None
+    playback: str | None = None      # paused / buffering / stopped, when known
+    position_s: int | None = None
+    volume: int | None = None
+    volume_max: int | None = None
+    muted: bool | None = None
 
 
 class MediaService:
@@ -720,10 +1029,7 @@ class MediaService:
         ok, output = self._adb("shell dumpsys power")
         if not ok or not output:
             return None
-        match = _WAKEFULNESS_RE.search(output)
-        if not match:
-            return None
-        return match.group(1).strip().lower() == "awake"
+        return _parse_wakefulness(output)
 
     def turn_on(self) -> bool:
         state = self.is_awake()
@@ -765,6 +1071,26 @@ class MediaService:
                     self.wake_attempts)
         return False
 
+    def is_boot_completed(self) -> bool | None:
+        """
+        Has Android finished booting? True / False / None, and None is "cannot tell".
+
+        `sys.boot_completed` flips to 1 when the system is actually up. This is
+        NOT the same question as "is ADB answering": adbd comes up early in boot,
+        so ensure_connected() can succeed against a box that cannot yet launch an
+        app. Firing a Stremio deep link into that window is a launch that quietly
+        does nothing.
+
+        Verified present on the real box (Android 11, SDK 30).
+        """
+        ok, output = self._adb("shell getprop sys.boot_completed")
+        if not ok:
+            return None
+        answer = (output or "").strip()
+        if not answer:
+            return None
+        return answer == "1"
+
     def _wait_for_box(self) -> bool:
         # Every miss rediscovers, then retries. The loop used to suppress
         # discovery for the whole settle window on the theory that a booting box
@@ -783,7 +1109,15 @@ class MediaService:
             # boot, so clear both before each pass.
             self._last_fail_time = 0
             self._last_discovery_t = 0
-            if self.ensure_connected():
+            # Reachable is not the same as ready. adbd answers early in boot,
+            # so returning here on connection alone hands back a box that
+            # cannot launch anything yet -- and settle_ms exists as a fixed
+            # budget precisely because there was no better signal.
+            #
+            # `is not False` is the fail-open: an unreadable getprop must
+            # never be worse than the old behaviour, which accepted the
+            # connection by itself.
+            if self.ensure_connected() and self.is_boot_completed() is not False:
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -803,15 +1137,7 @@ class MediaService:
         only false in one real situation: the input was parked somewhere else --
         terrestrial TV, a console -- while the box stayed awake.
         """
-        if not self.ensure_connected():
-            return None
-        ok, output = self._adb("shell dumpsys hdmi_control")
-        if not ok or not output:
-            return None
-        match = _ACTIVE_SOURCE_RE.search(output)
-        if not match:
-            return None
-        return match.group(1).strip().lower() == "true"
+        return self.hdmi_state().active_source
 
     def tv_power_status(self) -> str | None:
         """
@@ -830,17 +1156,24 @@ class MediaService:
         during this work returned entries from two days earlier and looked exactly
         like "nothing happened".
         """
+        return self.hdmi_state().tv_power
+
+    def hdmi_state(self) -> HdmiState:
+        """
+        Both hdmi_control facts from ONE round trip.
+
+        is_active_source() and tv_power_status() each ran their own `dumpsys
+        hdmi_control` over identical output, so asking for both cost two of them.
+        They now delegate here and keep their own names, signatures and None
+        semantics, because ensure_active_source() and _ensure_playable() call
+        them and must not change.
+        """
         if not self.ensure_connected():
-            return None
+            return HdmiState(None, None)
         ok, output = self._adb("shell dumpsys hdmi_control")
         if not ok or not output:
-            return None
-        last = None
-        for match in _TV_POWER_RE.finditer(output):
-            last = match.group(1)
-        if last is None:
-            return None
-        return {"00": "on", "01": "standby"}.get(last)
+            return HdmiState(None, None)
+        return HdmiState(_parse_active_source(output), _parse_tv_power(output))
 
     def ensure_active_source(self, attempts: int = 3, settle_s: float = 2.0) -> bool | None:
         """
@@ -908,17 +1241,20 @@ class MediaService:
         ok, output = self._adb("shell dumpsys window displays")
         if ok and output:
             try:
-                pkg = self._parse_focus_package(output)
-                if not pkg:
-                    return "unknown"
-                # Reverse-lookup friendly name
-                for name, package in self.apps.items():
-                    if package in pkg:
-                        return name
-                return pkg
+                return self._friendly_app(output) or "unknown"
             except Exception:
                 return output
         return "unknown"
+
+    def _friendly_app(self, dumpsys_output: str) -> str | None:
+        """The foreground app under its configured name, else its package."""
+        pkg = self._parse_focus_package(dumpsys_output)
+        if not pkg:
+            return None
+        for name, package in self.apps.items():
+            if package in pkg:
+                return name
+        return pkg
 
     def _parse_focus_package(self, dumpsys_output: str) -> str:
         """Best-effort foreground package extraction.
@@ -958,27 +1294,73 @@ class MediaService:
             return stripped.split("mCurrentFocus=", 1)[-1].strip()
         return ""
 
-    def get_media_session(self) -> str:
-        """Return active media session info (track/show if the app exposes it)."""
+    def is_playing(self) -> bool | None:
+        """
+        Is something playing right now? None means "could not tell".
+
+        This replaced get_media_session(), which returned up to 15 raw lines of
+        dumpsys straight into the LLM's context to be read out loud.
+        """
         if not self.ensure_connected():
-            return "TV unreachable"
+            return None
         ok, output = self._adb("shell dumpsys media_session")
-        if ok and output:
-            # Extract the useful bits — metadata and playback state
-            lines = output.splitlines()
-            relevant = []
-            capture = False
-            for line in lines:
-                if "metadata:" in line.lower() or "state=" in line.lower():
-                    capture = True
-                if capture:
-                    relevant.append(line.strip())
-                    if len(relevant) > 15:
-                        break
-                if capture and line.strip() == "":
-                    capture = False
-            return "\n".join(relevant) if relevant else "no active media session"
-        return "couldn't query media session"
+        if not ok or not output:
+            return None
+        return _parse_playing(output)
+
+    def room_status(self) -> RoomStatus:
+        """
+        Everything readable about the room, in as few round trips as possible.
+
+        This is the ONE method allowed to read dumpsys without going back through
+        ensure_connected(), and that is the whole reason it exists.
+        ensure_connected() fires a live `adb shell echo ping` on EVERY call, so
+        composing this from is_awake() + hdmi_state() + get_current_app() +
+        is_playing() would cost eight round trips to answer one question. Here it
+        is one ping and two to four dumpsys reads.
+
+        A sleeping box short-circuits: there is nothing on screen to ask about.
+        """
+        if not self.ensure_connected():
+            return RoomStatus(reachable=False)
+
+        ok, power_dump = self._adb("shell dumpsys power")
+        awake = _parse_wakefulness(power_dump) if ok else None
+
+        ok, hdmi_dump = self._adb("shell dumpsys hdmi_control")
+        tv_power = _parse_tv_power(hdmi_dump) if ok else None
+        on_the_box = _parse_active_source(hdmi_dump) if ok else None
+
+        if awake is False:
+            return RoomStatus(True, awake, tv_power, on_the_box)
+
+        ok, focus_dump = self._adb("shell dumpsys window displays")
+        app = self._friendly_app(focus_dump) if ok else None
+
+        ok, session_dump = self._adb("shell dumpsys media_session")
+        # Scope playback to the app that is actually in front. Spotify holds
+        # a session of its own even while idle, so an unscoped answer would
+        # hand its state to whatever happens to be on screen.
+        package = self.apps.get(app) if app else None
+        playing = _parse_playing(session_dump, package) if ok else None
+        session = (
+            _session_for(_parse_media_sessions(session_dump), package) if ok else None
+        )
+        title = session.title if session is not None else None
+        playback = _PLAYBACK_WORDS.get(session.state) if session is not None else None
+        position_ms = session.position_ms if session is not None else None
+        position_s = position_ms // 1000 if position_ms is not None else None
+
+        ok, audio_dump = self._adb("shell dumpsys audio")
+        volume = _parse_volume(audio_dump) if ok else None
+
+        return RoomStatus(
+            True, awake, tv_power, on_the_box, app, playing, title,
+            playback, position_s,
+            volume.level if volume else None,
+            volume.maximum if volume else None,
+            volume.muted if volume else None,
+        )
 
 
 if __name__ == "__main__":

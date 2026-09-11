@@ -14,7 +14,8 @@ from unittest.mock import Mock, patch
 
 from core.orchestrator import _dispatch_tv, _ensure_playable
 from services.cec_wake import CecWaker, WakeResult
-from services.media_service import MediaService
+from services.media_service import MediaService, RoomStatus
+from services.now_playing import NowPlaying
 from tests.config_fixture import config_for_tests, real_config
 
 
@@ -74,7 +75,8 @@ class TurnOnTests(unittest.TestCase):
         svc = _service(waker)
         with patch.object(svc, "is_awake", return_value=None):
             with patch.object(svc, "ensure_connected", return_value=True):
-                self.assertTrue(svc.turn_on())
+                with patch.object(svc, "is_boot_completed", return_value=True):
+                    self.assertTrue(svc.turn_on())
         waker.wake.assert_called_once()
 
     def test_wake_failure_is_reported_not_swallowed(self):
@@ -116,8 +118,12 @@ class TurnOnTests(unittest.TestCase):
 
         with patch.object(svc, "is_awake", return_value=None):
             with patch.object(svc, "ensure_connected", side_effect=record):
-                with patch("services.media_service.time.sleep"):
-                    self.assertTrue(svc.turn_on())
+                # The wait loop asks the box whether it has finished booting once
+                # the connection comes back. Unpatched that is a real getprop at
+                # whatever adb is attached to.
+                with patch.object(svc, "is_boot_completed", return_value=True):
+                    with patch("services.media_service.time.sleep"):
+                        self.assertTrue(svc.turn_on())
 
         self.assertEqual(seen, [0, 0], "cooldown was not cleared before each retry")
 
@@ -152,7 +158,8 @@ class PowerToggleTests(unittest.TestCase):
         svc = _service(waker)
         with patch.object(svc, "is_awake", return_value=None):
             with patch.object(svc, "ensure_connected", return_value=True):
-                svc.power_toggle()
+                with patch.object(svc, "is_boot_completed", return_value=True):
+                    svc.power_toggle()
         waker.wake.assert_called_once()
 
     def test_keycode_power_is_never_sent(self):
@@ -647,6 +654,376 @@ class HdmiInventoryTests(unittest.TestCase):
     def test_media_disabled_advertises_nothing(self):
         self.assertEqual(self._svc({2: "mi box"}, media_enabled=False)._hdmi_inventory(), "")
 
+
+
+
+class StatusDispatchTests(unittest.TestCase):
+    """
+    get_status used to report TV power from cec_waker._tv_is_up(), a REST
+    reachability probe. This set answers that endpoint in standby, so she said
+    "TV: on" about a television that was off. cec_wake.py already said not to:
+    "What we must NOT do is treat the answer as 'powered on'."
+
+    It also stapled up to 15 raw lines of `dumpsys media_session` into the reply,
+    which then went to a voice model to be read out loud.
+    """
+
+    def _status(self, **fields):
+        media = Mock()
+        fields.setdefault("reachable", True)
+        media.ensure_connected.return_value = fields["reachable"]
+        media.room_status.return_value = RoomStatus(**fields)
+        return media, _dispatch_tv({"action": "get_status"}, media, None, None, {})
+
+    def test_a_television_in_standby_is_reported_off(self):
+        # The regression. Before this, a standby TV came back as "TV: on".
+        _, reply = self._status(reachable=True, awake=True, tv_power="standby")
+        self.assertIn("TV off", reply)
+        self.assertNotIn("TV on", reply)
+
+    def test_power_comes_from_cec_and_never_from_the_rest_probe(self):
+        media, _ = self._status(reachable=True, awake=True, tv_power="on")
+        media.cec_waker._tv_is_up.assert_not_called()
+
+    def test_a_field_it_could_not_read_is_a_clause_it_does_not_say(self):
+        # None means "could not tell". The old branch printed "unknown" for
+        # exactly the fields it had failed to read.
+        _, reply = self._status(reachable=True, awake=True)
+        self.assertNotIn("unknown", reply.lower())
+        self.assertNotIn("None", reply)
+
+    def test_the_reply_is_one_line_with_no_dumpsys_in_it(self):
+        _, reply = self._status(
+            reachable=True, awake=True, tv_power="on", on_the_box=True,
+            app="stremio", playing=True,
+        )
+        self.assertNotIn("\n", reply)
+        self.assertNotIn("state=", reply)
+        self.assertNotIn("mIsActiveSource", reply)
+
+    def test_a_paused_title_is_still_named(self):
+        # Stremio keeps its metadata across a pause, so it still knows what is
+        # loaded. Saying "nothing playing" and dropping the title throws away
+        # the more useful half of what was read.
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=False,
+            title="Fallout, The Strip", playback="paused",
+        )
+        self.assertIn("paused on Fallout, The Strip", reply)
+
+    def test_the_pause_word_is_read_not_guessed(self):
+        # Without a session state there is no way to know it is paused rather
+        # than stopped or buffering, so the title is dropped instead of being
+        # attached to a guessed verb.
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=False,
+            title="Fallout, The Strip", playback=None,
+        )
+        self.assertIn("nothing playing", reply)
+        self.assertNotIn("paused", reply)
+
+    def test_a_buffering_session_says_buffering(self):
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=False,
+            title="Fallout, The Strip", playback="buffering",
+        )
+        self.assertIn("buffering on Fallout, The Strip", reply)
+
+    def test_elapsed_time_is_reported_when_something_is_named(self):
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=True,
+            title="Fallout, The Strip", position_s=732,
+        )
+        self.assertIn("12 minutes in", reply)
+
+    def test_elapsed_time_is_never_a_percentage_or_time_left(self):
+        # dumpsys media_session prints no duration, so there is nothing to
+        # measure against and nothing may imply there is.
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=True,
+            title="Fallout, The Strip", position_s=732,
+        )
+        self.assertNotIn("%", reply)
+        self.assertNotIn("left", reply)
+
+    def test_the_box_volume_is_reported(self):
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=True,
+            volume=8, volume_max=15, muted=False,
+        )
+        self.assertIn("box volume 8 of 15", reply)
+
+    def test_muted_replaces_the_level_rather_than_joining_it(self):
+        _, reply = self._status(
+            reachable=True, awake=True, app="stremio", playing=True,
+            volume=8, volume_max=15, muted=True,
+        )
+        self.assertIn("box muted", reply)
+        self.assertNotIn("8 of 15", reply)
+
+    def test_an_unreadable_volume_is_simply_not_mentioned(self):
+        _, reply = self._status(reachable=True, awake=True, app="stremio", playing=True)
+        self.assertNotIn("volume", reply)
+
+    def test_the_session_title_beats_the_launch_memory(self):
+        # The box saw it. She only remembers launching it, which is weaker
+        # evidence and does not survive him using the remote.
+        media = Mock()
+        media.ensure_connected.return_value = True
+        media.room_status.return_value = RoomStatus(
+            reachable=True, awake=True, app="stremio", playing=True,
+            title="Fallout, The Strip",
+        )
+        store = NowPlaying()
+        store.remember("stremio", "something else entirely")
+        reply = _dispatch_tv(
+            {"action": "get_status"}, media, None, None, {}, now_playing=store
+        )
+        self.assertIn("Fallout, The Strip", reply)
+        self.assertNotIn("something else entirely", reply)
+
+    def test_it_names_the_app_and_whether_anything_is_playing(self):
+        _, reply = self._status(reachable=True, awake=True, app="youtube", playing=False)
+        self.assertIn("youtube", reply)
+        self.assertIn("nothing playing", reply)
+
+    def test_an_input_parked_elsewhere_is_worth_saying(self):
+        _, reply = self._status(reachable=True, awake=True, tv_power="on", on_the_box=False)
+        self.assertIn("another input", reply)
+
+    def test_a_sleeping_box_says_so_and_stops(self):
+        _, reply = self._status(reachable=True, awake=False, tv_power="standby")
+        self.assertIn("asleep", reply)
+        self.assertNotIn("playing", reply)
+
+    def test_an_unreachable_box_gets_the_classified_line_not_a_status(self):
+        media = Mock()
+        media.ensure_connected.return_value = False
+        media.unreachable_reason = "no_adb_port"
+        reply = _dispatch_tv({"action": "get_status"}, media, None, None, {})
+        self.assertIn("developer options", reply)
+        media.room_status.assert_not_called()
+
+    def test_asking_what_is_on_never_wakes_the_room(self):
+        # get_status is in requires_tv, deliberately NOT needs_screen. A question
+        # about the room must not turn the room on for 25 seconds.
+        media = Mock()
+        media.ensure_connected.return_value = False
+        media.unreachable_reason = "not_on_lan"
+        _dispatch_tv({"action": "get_status"}, media, None, None, {})
+        media.turn_on.assert_not_called()
+
+
+
+class NowPlayingDispatchTests(unittest.TestCase):
+    """
+    She launched it, so she can name it -- but only while the box still agrees
+    the app is up, and only if she actually played it rather than opening a
+    search. Both rules exist so "now playing" cannot become the next confident
+    wrong answer.
+    """
+
+    def _media(self, app, playing=True):
+        media = Mock()
+        media.ensure_connected.return_value = True
+        media.room_status.return_value = RoomStatus(
+            reachable=True, awake=True, app=app, playing=playing
+        )
+        return media
+
+    def _status(self, media, store):
+        return _dispatch_tv(
+            {"action": "get_status"}, media, None, None, {}, now_playing=store
+        )
+
+    def test_she_names_what_she_put_on(self):
+        store = NowPlaying()
+        store.remember("stremio", "Fallout")
+        self.assertIn("Fallout", self._status(self._media("stremio"), store))
+
+    def test_the_memory_is_dropped_when_he_switched_apps(self):
+        store = NowPlaying()
+        store.remember("stremio", "Fallout")
+        reply = self._status(self._media("youtube"), store)
+        self.assertNotIn("Fallout", reply)
+        self.assertIn("youtube", reply)
+
+    def test_she_admits_it_when_he_started_it_himself(self):
+        reply = self._status(self._media("stremio"), NowPlaying())
+        self.assertIn("didn't start it", reply)
+
+    def test_a_search_is_never_reported_as_playing_something(self):
+        # She opened a results page. What he then picked is not hers to claim.
+        store = NowPlaying()
+        store.remember("youtube", "bossa nova", "opened")
+        reply = self._status(self._media("youtube"), store)
+        self.assertNotIn("bossa nova", reply)
+        self.assertIn("didn't start it", reply)
+
+    def test_dispatch_without_a_store_still_answers(self):
+        # The 11 older _dispatch_tv tests pass no store at all.
+        reply = _dispatch_tv({"action": "get_status"}, self._media("stremio"), None, None, {})
+        self.assertIn("stremio", reply)
+
+
+class LaunchMemoryRecordingTests(unittest.TestCase):
+    """What gets remembered, and what deliberately does not."""
+
+    def _media(self):
+        media = Mock()
+        media.ensure_connected.return_value = True
+        return media
+
+    def _stremio(self, success=True, target_mode="episode"):
+        svc = Mock()
+        svc.play.return_value = SimpleNamespace(
+            success=success, requires_confirmation=False,
+            target_mode=target_mode, message="nope",
+        )
+        return svc
+
+    def test_a_successful_stremio_play_is_remembered(self):
+        store = NowPlaying()
+        _dispatch_tv(
+            {"action": "stremio_play", "title": "Fallout"},
+            self._media(), self._stremio(), None, {}, now_playing=store,
+        )
+        self.assertEqual(store.current("stremio").label, "Fallout")
+
+    def test_a_failed_stremio_play_is_not_remembered(self):
+        # Never claim playback that did not happen. Same rule as the autoplay
+        # verification: media_session decides, not optimism.
+        store = NowPlaying()
+        _dispatch_tv(
+            {"action": "stremio_play", "title": "Fallout"},
+            self._media(), self._stremio(success=False), None, {}, now_playing=store,
+        )
+        self.assertIsNone(store.current("stremio"))
+
+    def test_a_series_page_is_remembered_as_opened_not_playing(self):
+        store = NowPlaying()
+        _dispatch_tv(
+            {"action": "stremio_play", "title": "Fallout"},
+            self._media(), self._stremio(target_mode="detail"), None, {},
+            now_playing=store,
+        )
+        self.assertEqual(store.current("stremio").kind, "opened")
+
+    def test_a_youtube_playlist_remembers_the_category_he_asked_for(self):
+        store = NowPlaying()
+        _dispatch_tv(
+            {"action": "youtube_playlist", "playlist_name": "samba"},
+            self._media(), None, None, {"samba": ["RD1"]}, now_playing=store,
+        )
+        self.assertIn("samba", store.current("youtube").label)
+
+    def test_go_home_forgets(self):
+        store = NowPlaying()
+        store.remember("stremio", "Fallout")
+        _dispatch_tv({"action": "go_home"}, self._media(), None, None, {}, now_playing=store)
+        self.assertIsNone(store.current("stremio"))
+
+    def test_launching_a_bare_app_forgets(self):
+        # "Open Stremio" puts nothing specific on, so the old label is now wrong.
+        store = NowPlaying()
+        store.remember("stremio", "Fallout")
+        media = self._media()
+        media.launch_app.return_value = (True, "opened stremio")
+        _dispatch_tv(
+            {"action": "launch_app", "app_name": "stremio"},
+            media, None, None, {}, now_playing=store,
+        )
+        self.assertIsNone(store.current("stremio"))
+
+
+
+class BootCompletedTests(unittest.TestCase):
+    """
+    Reachable is not ready. adbd comes up early in boot, so ensure_connected()
+    can succeed against a box that cannot yet launch an app -- and a Stremio deep
+    link fired into that window is a launch that quietly does nothing.
+
+    `sys.boot_completed` is the signal for it. Verified present on the real box
+    (Android 11, SDK 30).
+    """
+
+    def _svc(self, reply):
+        svc = _service()
+        svc._adb = Mock(return_value=reply)
+        return svc
+
+    def test_one_means_booted(self):
+        self.assertIs(self._svc((True, "1")).is_boot_completed(), True)
+
+    def test_zero_means_still_booting(self):
+        self.assertIs(self._svc((True, "0")).is_boot_completed(), False)
+
+    def test_a_failed_getprop_is_none_not_false(self):
+        # None is "cannot tell". False would mean "still booting" and would burn
+        # the whole settle window waiting for something that already happened.
+        self.assertIsNone(self._svc((False, "")).is_boot_completed())
+
+    def test_an_empty_answer_is_none_not_false(self):
+        # The property is unset early in boot, and unset is not the same claim
+        # as a read that came back saying zero.
+        self.assertIsNone(self._svc((True, "")).is_boot_completed())
+
+    def test_it_asks_for_the_right_property(self):
+        svc = self._svc((True, "1"))
+        svc.is_boot_completed()
+        self.assertIn("sys.boot_completed", svc._adb.call_args[0][0])
+
+
+class WaitForBootTests(unittest.TestCase):
+    def test_the_loop_keeps_waiting_while_the_box_is_still_booting(self):
+        """
+        The point of the change. Returning on connection alone handed back a box
+        that answered ADB but could not launch anything yet.
+        """
+        svc = _service()
+        booted = [False, False, True]
+        with patch.object(svc, "ensure_connected", return_value=True):
+            with patch.object(svc, "is_boot_completed", side_effect=booted):
+                with patch("services.media_service.time.sleep"):
+                    self.assertTrue(svc._wait_for_box())
+
+    def test_an_unreadable_boot_flag_is_accepted_rather_than_waited_out(self):
+        """
+        Fail open. Before this change the loop returned on the connection alone,
+        so a box that will not answer getprop must not become WORSE than that.
+        """
+        svc = _service()
+        with patch.object(svc, "ensure_connected", return_value=True):
+            with patch.object(svc, "is_boot_completed", return_value=None):
+                with patch("services.media_service.time.sleep"):
+                    self.assertTrue(svc._wait_for_box())
+
+    def test_the_boot_check_is_skipped_while_the_box_is_unreachable(self):
+        # No point asking a box that is not answering, and `and` must short-circuit
+        # so the poll stays one round trip while the box is still down.
+        svc = _service()
+        with patch.object(svc, "ensure_connected", return_value=False):
+            with patch.object(svc, "is_boot_completed") as boot:
+                with patch("services.media_service.time.sleep"):
+                    with patch.object(svc._finder, "resolve", return_value=""):
+                        svc._wait_for_box()
+        boot.assert_not_called()
+
+    def test_the_wait_loop_never_shells_out_to_a_real_adb(self):
+        """
+        Regression guard, and it is here because this exact thing happened.
+
+        Adding the boot read inside the loop made two existing tests fire a real
+        `getprop` at whatever box adb happened to be attached to, and they went
+        on passing. Anything the loop asks the box must be a named, patchable
+        method rather than a bare _adb call.
+        """
+        svc = _service()
+        with patch("services.media_service.subprocess.run",
+                   side_effect=AssertionError("the wait loop reached a real adb")):
+            with patch.object(svc, "ensure_connected", return_value=True):
+                with patch.object(svc, "is_boot_completed", return_value=True):
+                    self.assertTrue(svc._wait_for_box())
 
 if __name__ == "__main__":
     unittest.main()

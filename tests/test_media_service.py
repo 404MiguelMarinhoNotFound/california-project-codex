@@ -4,7 +4,13 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock
 from unittest.mock import patch
 
-from services.media_service import MediaService
+from services.media_service import (
+    MediaService,
+    _parse_active_source,
+    _parse_media_sessions,
+    _parse_playing,
+    _parse_tv_power,
+)
 from tests.config_fixture import config_for_tests
 
 
@@ -659,6 +665,278 @@ class BoxDiscoveryTests(unittest.TestCase):
                 self.assertFalse(svc._verify_box(self.MOVED_TO))
         adb.assert_not_called()
 
+
+
+
+class TvPowerStalenessTests(unittest.TestCase):
+    """
+    The TV does not volunteer its power state, it answers when ASKED, and the
+    only thing that asks is the box's own wake sequence. So the last
+    <Report Power Status> can be hours old, and if the TV is then switched off
+    with its own remote there is no newer line at all. Trusting it blind is the
+    same lie as the REST probe this replaced, only quieter.
+    """
+
+    def test_a_report_from_the_live_tail_is_trusted(self):
+        dump = """
+    [R] time=2026-09-05 14:18:51 message=<Report Power Status> 04:90:00
+    [R] time=2026-09-05 14:18:55 message=<Give Device Power Status> 04:8F
+"""
+        self.assertEqual(_parse_tv_power(dump), "on")
+
+    def test_a_report_far_older_than_the_log_is_not_trusted(self):
+        dump = """
+    [R] time=2026-09-05 09:00:00 message=<Report Power Status> 04:90:00
+    [R] time=2026-09-05 14:18:55 message=<Give Device Power Status> 04:8F
+"""
+        self.assertIsNone(_parse_tv_power(dump))
+
+    def test_a_dump_without_timestamps_is_still_read(self):
+        # The age check is an extra guard, not a new way to say "cannot tell".
+        dump = "    [R] message=<Report Power Status> 04:90:01"
+        self.assertEqual(_parse_tv_power(dump), "standby")
+
+
+class IsPlayingTests(unittest.TestCase):
+    def _service(self, dump, ok=True, connected=True):
+        cfg = config_for_tests(
+            media={"cec_wake": {"enabled": False}, "discovery": {"enabled": False}},
+        )
+        svc = MediaService(cfg)
+        svc.ensure_connected = Mock(return_value=connected)
+        svc._adb = Mock(return_value=(ok, dump))
+        return svc
+
+    def test_state_3_is_playing(self):
+        self.assertIs(self._service("  state=3 (PLAYING)").is_playing(), True)
+
+    def test_an_idle_session_is_not_playing(self):
+        self.assertIs(self._service("  state=2 (PAUSED)").is_playing(), False)
+
+    def test_unreachable_is_none_not_false(self):
+        # None means "could not tell". False would let her say "nothing's
+        # playing" about a box she never reached.
+        self.assertIsNone(self._service("", connected=False).is_playing())
+
+    def test_a_failed_dumpsys_is_none_not_false(self):
+        self.assertIsNone(self._service("", ok=False).is_playing())
+
+
+class RoomStatusTests(unittest.TestCase):
+    """
+    room_status() is the one reader allowed to skip ensure_connected() per call,
+    and that is the whole reason it exists: ensure_connected() fires a live ADB
+    ping every time, so composing this from the four public readers would cost
+    eight round trips to answer one question.
+    """
+
+    POWER = "mWakefulness=Awake"
+    HDMI = """
+    mIsActiveSource: true
+    [R] time=2026-09-05 14:18:51 message=<Report Power Status> 04:90:00
+"""
+    FOCUS = "mCurrentFocus=Window{a u0 com.stremio.one/com.stremio.MainActivity}"
+    SESSION = """    Sessions Stack - have 1 sessions:
+      package=com.stremio.one
+      state=PlaybackState {state=3, position=240301, speed=1.0}
+      metadata: size=4, description=Fallout, The Strip, null
+"""
+    AUDIO = """- STREAM_MUSIC:
+   Muted: false
+   Max: 15
+   streamVolume:8
+- STREAM_ALARM:
+"""
+
+    def _replies(self):
+        return [self.POWER, self.HDMI, self.FOCUS, self.SESSION, self.AUDIO]
+
+    def _service(self, replies, connected=True):
+        cfg = config_for_tests(
+            media={"cec_wake": {"enabled": False}, "discovery": {"enabled": False}},
+        )
+        svc = MediaService(cfg)
+        svc.ensure_connected = Mock(return_value=connected)
+        svc._adb = Mock(side_effect=[(True, r) for r in replies])
+        return svc
+
+    def test_a_full_read_reports_every_field(self):
+        svc = self._service(self._replies())
+        status = svc.room_status()
+        self.assertTrue(status.reachable)
+        self.assertIs(status.awake, True)
+        self.assertEqual(status.tv_power, "on")
+        self.assertIs(status.on_the_box, True)
+        self.assertEqual(status.app, "stremio")
+        self.assertIs(status.playing, True)
+        self.assertEqual(status.title, "Fallout, The Strip")
+        self.assertEqual(status.playback, "playing")
+        self.assertEqual(status.position_s, 240)
+        self.assertEqual((status.volume, status.volume_max), (8, 15))
+        self.assertIs(status.muted, False)
+
+    def test_the_box_is_pinged_exactly_once(self):
+        # Five dumpsys reads behind ONE ensure_connected(). Going through the
+        # public readers instead would ping the box five separate times.
+        svc = self._service(self._replies())
+        svc.room_status()
+        svc.ensure_connected.assert_called_once()
+        self.assertEqual(svc._adb.call_count, 5)
+
+    def test_a_sleeping_box_skips_the_app_and_session_reads(self):
+        # Nothing is on screen, so asking would cost two round trips for two Nones.
+        svc = self._service(["mWakefulness=Asleep", self.HDMI])
+        status = svc.room_status()
+        self.assertIs(status.awake, False)
+        self.assertIsNone(status.app)
+        self.assertIsNone(status.playing)
+        self.assertEqual(svc._adb.call_count, 2)
+
+    def test_an_unreachable_box_reports_reachable_false_without_reading(self):
+        svc = self._service([], connected=False)
+        status = svc.room_status()
+        self.assertFalse(status.reachable)
+        svc._adb.assert_not_called()
+
+    def test_unparseable_output_is_none_not_false(self):
+        svc = self._service(["junk"] * 5)
+        status = svc.room_status()
+        self.assertTrue(status.reachable)
+        self.assertIsNone(status.awake)
+        self.assertIsNone(status.tv_power)
+        self.assertIsNone(status.on_the_box)
+        self.assertIsNone(status.app)
+        self.assertIsNone(status.volume)
+        self.assertIsNone(status.position_s)
+        self.assertIsNone(status.playback)
+
+
+
+# Two sessions at once, reproducing what came off the live box on 2026-09-08:
+# Stremio playing Fallout while Spotify sat on an idle session of its own. This
+# one is written out rather than captured, because Spotify's session had expired
+# by the time the fixture file was saved -- the single-session capture in
+# tests/fixtures/media_session_dump.txt is the real one.
+TWO_SESSIONS = """  Sessions Stack - have 2 sessions:
+    PlayerMediaSession com.stremio.one/PlayerMediaSession (userId=0)
+      package=com.stremio.one
+      active=true
+      state=PlaybackState {state=3, position=240301, buffered position=0, speed=1.0}
+      metadata: size=4, description=Fallout, The Strip, null
+    androidx.media3.session.id. com.spotify.tv.android/androidx.media3.session.id.
+      package=com.spotify.tv.android
+      active=true
+      state=PlaybackState {state=0, position=-1, buffered position=-1, speed=0.0}
+      metadata: null
+"""
+
+
+class MediaSessionParsingTests(unittest.TestCase):
+    """
+    Parsed from a REAL `dumpsys media_session` capture taken off the live box on
+    2026-09-08 with Stremio playing Fallout, so an app or firmware change to the
+    format fails here rather than quietly reporting "nothing playing" forever.
+
+    That capture is why this parser exists. It settled two things the design had
+    assumed were unavailable: Stremio DOES publish the show and the episode in
+    its session metadata, and more than one app holds a session at a time.
+    """
+
+    FIXTURE = Path(__file__).parent / "fixtures" / "media_session_dump.txt"
+
+    def _dump(self):
+        return self.FIXTURE.read_text(encoding="utf-8")
+
+    def test_stremio_publishes_the_show_and_the_episode(self):
+        sessions = _parse_media_sessions(self._dump())
+        stremio = next(s for s in sessions if s.package == "com.stremio.one")
+        self.assertEqual(stremio.title, "Fallout, The Strip")
+
+    def test_the_real_capture_reads_as_playing(self):
+        self.assertTrue(_parse_playing(self._dump(), "com.stremio.one"))
+
+    def test_every_session_is_found(self):
+        packages = [s.package for s in _parse_media_sessions(TWO_SESSIONS)]
+        self.assertEqual(packages, ["com.stremio.one", "com.spotify.tv.android"])
+
+    def test_an_empty_metadata_line_is_no_title_not_the_word_null(self):
+        # Spotify prints "metadata: null". Reading that out loud would be worse
+        # than saying nothing at all.
+        sessions = _parse_media_sessions(TWO_SESSIONS)
+        spotify = next(s for s in sessions if s.package == "com.spotify.tv.android")
+        self.assertIsNone(spotify.title)
+
+    def test_playback_is_scoped_to_the_app_in_front(self):
+        """
+        The bug this closes. Spotify holds an active session even while idle, so
+        a flat "is state=3 anywhere in this dump" hands one app's playback to
+        whichever app happens to be on screen.
+        """
+        paused = TWO_SESSIONS.replace("{state=3", "{state=2", 1)
+        self.assertFalse(_parse_playing(paused, "com.stremio.one"))
+        # Unscoped, the same dump cannot tell the two apart.
+        self.assertTrue(_parse_playing(TWO_SESSIONS, "com.stremio.one"))
+
+    def test_an_app_holding_no_session_is_not_playing(self):
+        self.assertFalse(_parse_playing(TWO_SESSIONS, "com.example.nothing"))
+
+    def test_a_dump_with_no_session_block_falls_back_to_the_flat_scan(self):
+        # StremioService's own check works on output shaped like this.
+        self.assertTrue(_parse_playing("  state=3 (PLAYING)"))
+        self.assertFalse(_parse_playing("  state=2 (PAUSED)"))
+
+    def test_a_title_with_no_subtitle_keeps_just_the_title(self):
+        dump = (
+            "      package=com.stremio.one\n"
+            "      state=PlaybackState {state=3, position=1,\n"
+            "      metadata: size=3, description=Some Film, null, null\n"
+        )
+        self.assertEqual(_parse_media_sessions(dump)[0].title, "Some Film")
+
+
+
+class TvStandbyBroadcastTests(unittest.TestCase):
+    """
+    Parsed from a REAL capture taken 2026-09-08 with the television off
+    (tests/fixtures/hdmi_control_standby_dump.txt).
+
+    It answered the one open question in the power path. `<Report Power Status>`
+    is an ANSWER, and the only thing that asks is the box's own wake sequence --
+    so on its own it cannot see Master Miguel reaching for the TV remote. But the
+    television BROADCASTS `<Standby> 0F:36` on its way off, and the box logs it
+    even though it was not addressed to us. Nine power-off cycles in that one
+    capture, every single one of them logged.
+    """
+
+    ON = Path(__file__).parent / "fixtures" / "hdmi_control_dump.txt"
+    STANDBY = Path(__file__).parent / "fixtures" / "hdmi_control_standby_dump.txt"
+
+    def test_a_standby_broadcast_after_the_last_report_wins(self):
+        # In this capture the last <Report Power Status> says "on" at 18:54:37
+        # and three <Standby> broadcasts follow it at 22:06:43.
+        self.assertEqual(_parse_tv_power(self.STANDBY.read_text(encoding="utf-8")), "standby")
+
+    def test_the_on_capture_is_unaffected(self):
+        self.assertEqual(_parse_tv_power(self.ON.read_text(encoding="utf-8")), "on")
+
+    def test_a_report_after_a_standby_wins_in_turn(self):
+        # Waking the room asks the question again, and that answer is newer.
+        dump = (
+            "    [R] time=2026-09-08 22:06:43 message=<Standby> 0F:36\n"
+            "    [R] time=2026-09-08 22:30:00 message=<Report Power Status> 04:90:00\n"
+        )
+        self.assertEqual(_parse_tv_power(dump), "on")
+
+    def test_a_standby_we_sent_is_not_the_television_speaking(self):
+        # [S] is the box talking. Counting our own traffic as the TV's state is
+        # the same mistake as reading [S] <Report Power Status>.
+        dump = "    [S] time=2026-09-08 22:06:43 message=<Standby> 0F:36"
+        self.assertIsNone(_parse_tv_power(dump))
+
+    def test_the_box_is_not_the_active_source_while_the_tv_is_off(self):
+        self.assertIs(
+            _parse_active_source(self.STANDBY.read_text(encoding="utf-8")), False
+        )
 
 if __name__ == "__main__":
     unittest.main()

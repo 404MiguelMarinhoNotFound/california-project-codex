@@ -235,9 +235,9 @@ llm:
      #INFO:
       I am european portuguese based in Carcavelos, Lisbon Portugal. use celcius 
       Every time I ask you something about something you probably don't know or need up to date info like weather etc -> use web search.
-      You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, and check what's currently playing with get_status. Turning the TV on and off is yours too: turn_on and turn_off, and treat "put the TV on", "kill the TV", "turn everything off" as those. Two things to know about them. turn_on takes up to about a minute (measured at forty-seven seconds) because it wakes the television first and then the box, so say you're on it and then wait, never fire the tool twice or call it failed while it's still going. And turn_off puts the television into standby along with the box, which is intended, so mention both in one short line. You can switch the TV's inputs with switch_hdmi; the inputs are listed at the end of this prompt, do not guess at ones that are not. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
+      You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, and check the room with get_status, which reports the TV's power and input, the box, and what is up and playing. Say only what it gives you, never fill in a detail it left out, and trust it over anything you remember putting on earlier. Turning the TV on and off is yours too: turn_on and turn_off, and treat "put the TV on", "kill the TV", "turn everything off" as those. Two things to know about them. turn_on takes up to about a minute (measured at forty-seven seconds) because it wakes the television first and then the box, so say you're on it and then wait, never fire the tool twice or call it failed while it's still going. And turn_off puts the television into standby along with the box, which is intended, so mention both in one short line. You can switch the TV's inputs with switch_hdmi; the inputs are listed at the end of this prompt, do not guess at ones that are not. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
       Music and video both go through that TV, so treat "put on", "play", and "what can you play" as TV requests, not as questions about your own abilities. For music, YouTube is the path: use youtube_playlist for a saved category (they are listed at the end of this prompt) and youtube_search for anything else. For shows and films it is Stremio: stremio_play, stremio_continue, and stremio_get_progress for "what episode am I on". You have no music service of your own and no access to his YouTube account, so never claim to browse his subscriptions, liked songs, or account playlists.
-      You can control Master Miguel's Govee lights using the control_lights tool: power, brightness from 1 to 100, and colour. The rooms you can reach are listed at the end of this prompt, do not invent others. Brightness and colour only show on a light that is already on, so turn it on first if it might be off. Confirm in one short casual sentence, and say so plainly if a light is unreachable.
+      You can control Master Miguel's Govee lights using the control_lights tool: power, brightness from 1 to 100, and colour. The rooms you can reach are listed at the end of this prompt, do not invent others. Brightness and colour only show on a light that is already on, so turn it on first if it might be off. Use light_status for what a light is set to, and keep its wording that this is the last command you sent rather than a live reading, because the strip cannot be read back. Confirm in one short casual sentence, and say so plainly if a light is unreachable.
 
   conversation_history_size: 6  # Number of exchanges to keep (1 exchange = user + assistant)
 
@@ -261,7 +261,16 @@ tts:
   kokoro:
     voice: "af_bella"   # British: bm_george, bf_emma | American: am_echo, af_sky
     speed: 1
-    lang_code: "a"       # "a" = British English, "a" = American English
+    lang_code: "a"       # "a" = American English, "b" = British English
+    # Kokoro pads every clip: ~400ms of silence on the front, ~550ms on the
+    # back, regardless of what was said (measured 2026-09-08). The front pad
+    # lands between every pair of chunks as dead air, so it is trimmed on both
+    # ends before playback. Same trim generate_activation_phrases.py applies.
+    trim:
+      silence_floor: 0.02   # fraction of the clip's own peak that still counts as silence
+      lead_in_ms: 20        # keep this much before the first sound
+      tail_ms: 120          # and this much decay after the last: the gap between chunks
+      fade_ms: 5            # fade the cut edges so they do not click
 
 # --- LED Feedback ---
 leds:
@@ -516,7 +525,19 @@ media:
     wol_attempts: 5               # the TV took 2 in testing
     tv_boot_timeout_ms: 40000
     wake_attempts: 3
-    settle_ms: 25000              # TV must WoL-boot before the box can wake
+    # How long to wait for the box to rejoin the network after the CEC wake.
+    # MEASURED 2026-09-05 over three clean cold wakes: 32.4s, 32.4s, 31.1s from
+    # wake() returning to port 5555 accepting. At the old 25000 the first attempt
+    # ALWAYS timed out and the second one did the work, which is why a cold "put
+    # on Fallout" took 105s end to end. 45s clears the observed max by ~40% and
+    # lets attempt 1 succeed, roughly halving the cold path.
+    # Re-measure before changing: a run whose log says "asleep after -1s" is not
+    # a sample -- the box refuses to sleep straight after waking, so it never
+    # went down and the rejoin time is meaninglessly small.
+    # This is an UPPER BOUND now, not a fixed wait. _wait_for_box polls
+    # sys.boot_completed and returns as soon as Android says it is up, so a
+    # fast boot no longer costs the whole budget.
+    settle_ms: 45000
     poll_interval_ms: 2000
     # Mi Box is at CEC physical address 0x2000 == HDMI 2. KEY_HDMI toggles
     # HDMI2 <-> HDMI1 on this set, so ODD presses select the box. Only HDMI 2

@@ -27,28 +27,82 @@ ABBREVIATIONS = {
 # Minimum characters before we consider splitting (avoids splitting on "Dr. ")
 MIN_SENTENCE_LENGTH = 8
 
+# How much text to hand the TTS engine in one synthesis call.
+#
+# Every call is expensive twice over. Kokoro bakes ~400ms of silence onto the
+# front of every clip it returns, so N chunks cost N lead-ins of dead air --
+# measured at ~4.7s injected into a single paragraph when this module was
+# splitting on every semicolon, colon and dash it could find. And a fragment
+# gives the model no sentence-level context to shape prosody from, so it sounds
+# worse than the same words inside a whole sentence would.
+#
+# The first chunk is the deliberate exception: it is the one Master Miguel is
+# actually waiting on, so it ships as soon as a sentence exists. Everything
+# after it plays behind audio that is already queued, so it can afford to be
+# longer. Short first fragment for latency, larger ones after, is the same
+# trade every streaming-TTS layer lands on.
+MIN_CHUNK_CHARS = 100
+FIRST_CHUNK_CHARS = 25
+
+# ...and the first chunk must not be allowed to grow long either. Kokoro runs
+# at roughly real time on this hardware, so time-to-first-audio IS the first
+# chunk's length: a 150-character opening sentence measured 9.4s of synthesis
+# before anything was heard. Below this ceiling, an unfinished first sentence
+# is soft-split at a comma and shipped as a fragment; the sanitizer marks it as
+# a continuation and the rest follows as a normal chunk. max_chars stays the
+# ceiling once something is playing.
+FIRST_CHUNK_MAX_CHARS = 60
+
 
 def chunk_sentences(
     token_stream: Generator[str, None, None],
     *,
     max_chars: int = 240,
+    min_chunk_chars: int = MIN_CHUNK_CHARS,
+    first_chunk_chars: int = FIRST_CHUNK_CHARS,
+    first_chunk_max_chars: int = FIRST_CHUNK_MAX_CHARS,
     prefer_period_breaks: bool = True,
 ) -> Generator[str, None, None]:
     """
-    Accumulate streaming tokens into complete sentences.
+    Accumulate streaming tokens into speakable chunks.
 
-    Yields sentences as soon as a boundary is detected.
-    The final fragment (without a sentence-ending punctuation) is yielded at the end.
+    Sentences are detected as they complete, then held until the chunk is worth
+    synthesizing -- see MIN_CHUNK_CHARS for why one sentence per call is a bad
+    deal. Short sentences therefore travel together, keeping their own terminal
+    punctuation, so "Stremio's up now. Your call." is one call rather than two.
 
     Args:
         token_stream: Generator yielding text chunks from LLM
         max_chars: If the buffer gets this big without a hard boundary, force a "soft" split
+        min_chunk_chars: Hold sentences back until a chunk reaches this length
+        first_chunk_chars: Lower bar for the first chunk, which sets perceived latency
+        first_chunk_max_chars: Soft-split ceiling for the first chunk, for the same reason
         prefer_period_breaks: Kept for compatibility / future tweaks (currently unused)
 
     Yields:
-        Complete sentences (or final fragment)
+        Speakable chunks of one or more complete sentences (or a final fragment)
     """
-    buffer = ""
+    buffer = ""          # raw tokens not yet resolved into a sentence
+    pending: list[str] = []   # finished sentences waiting for the chunk to fill
+    pending_len = 0
+    spoke = False        # has anything been yielded yet this response
+
+    def _hold(clean: str) -> bool:
+        """Add a finished sentence; report whether the chunk is now big enough."""
+        nonlocal pending_len
+        pending.append(clean)
+        pending_len += len(clean) + 1
+        return pending_len >= (min_chunk_chars if spoke else first_chunk_chars)
+
+    def _flush() -> str | None:
+        nonlocal pending_len, spoke
+        if not pending:
+            return None
+        chunk = " ".join(pending)
+        pending.clear()
+        pending_len = 0
+        spoke = True
+        return chunk
 
     for token in token_stream:
         buffer += token
@@ -57,29 +111,45 @@ def chunk_sentences(
         while True:
             sentence, remaining = _try_split(buffer)
             if sentence is None:
-                # If buffer is huge, force a soft split for low-latency TTS
-                if len(buffer) >= max_chars:
+                # If buffer is huge, force a soft split for low-latency TTS.
+                # "Huge" is much smaller before anything has been said.
+                ceiling = max_chars if spoke else first_chunk_max_chars
+                if len(buffer) >= ceiling:
                     forced, rest = _force_soft_split(buffer)
                     if forced:
                         clean = sanitize_for_tts(forced.strip())
-                        if clean:
-                            yield clean
                         buffer = rest
+                        if clean and _hold(clean):
+                            chunk = _flush()
+                            if chunk:
+                                logger.debug(f"Sentence chunk: '{chunk}'")
+                                yield chunk
                         continue
                 break
 
             clean = sanitize_for_tts(sentence.strip())
-            if clean:
-                logger.debug(f"Sentence chunk: '{clean}'")
-                yield clean
             buffer = remaining
+            if clean and _hold(clean):
+                chunk = _flush()
+                if chunk:
+                    logger.debug(f"Sentence chunk: '{chunk}'")
+                    yield chunk
 
-    # Yield any remaining text
+    # Whatever is left is the end of the response: speak it regardless of length
     if buffer.strip():
         clean = sanitize_for_tts(buffer.strip())
         if clean:
-            logger.debug(f"Final chunk: '{clean}'")
-            yield clean
+            _hold(clean)
+
+    chunk = _flush()
+    if chunk:
+        # The sanitizer marks an unterminated fragment with a comma, meaning
+        # "more is coming". Nothing is coming: this is the end of the response,
+        # so it resolves with a full stop instead of hanging on a rising tone.
+        if chunk.endswith(","):
+            chunk = chunk[:-1] + "."
+        logger.debug(f"Final chunk: '{chunk}'")
+        yield chunk
 
 
 def _try_split(text: str) -> tuple[str | None, str]:
@@ -90,8 +160,13 @@ def _try_split(text: str) -> tuple[str | None, str]:
     if len(text) < MIN_SENTENCE_LENGTH:
         return None, text
 
-    # Look for sentence boundaries: . ! ? followed by space or end
-    # Also split on semicolons, colons, and em-dashes for natural speech breaks
+    # Look for sentence boundaries: . ! ? followed by space or end.
+    #
+    # Semicolons, colons and dashes are deliberately NOT boundaries any more.
+    # They used to be, and it cut one paragraph into eight synthesis calls. The
+    # sanitizer softens them to commas, which Kokoro handles fine inside a
+    # single call; a chunk that runs long without a full stop is bounded by
+    # max_chars and _force_soft_split instead.
     for i, char in enumerate(text):
         # Handle ellipsis "..." as a boundary once complete
         # Do this before the general ".!?" handling so it doesn't get swallowed.
@@ -124,21 +199,6 @@ def _try_split(text: str) -> tuple[str | None, str]:
                 # But we wait for more tokens to be sure (next token might be more text)
                 # Only yield if this is the final flush (handled by caller)
                 pass
-
-        # Split on semicolons if the chunk is long enough
-        elif char == ";" and i >= MIN_SENTENCE_LENGTH - 1:
-            if i + 1 < len(text) and text[i + 1] == " ":
-                return text[: i + 1], text[i + 2 :]
-
-        # NEW: Split on colons (great for "California: ..." style prefixes)
-        elif char == ":" and i >= MIN_SENTENCE_LENGTH - 1:
-            if i + 1 < len(text) and text[i + 1] == " ":
-                return text[: i + 1], text[i + 2 :]
-
-        # Split on em-dash / dash for natural speech breaks (only when followed by space)
-        elif char in "—-" and i >= MIN_SENTENCE_LENGTH - 1:
-            if i + 1 < len(text) and text[i + 1] == " ":
-                return text[: i + 1], text[i + 2 :]
 
     return None, text
 

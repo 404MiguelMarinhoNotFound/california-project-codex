@@ -3,6 +3,7 @@ from unittest.mock import Mock
 
 from core.orchestrator import _dispatch_lights
 from services.govee_service import GoveeCommandResult
+from services.light_shadow import LightShadow
 
 
 def _svc(resolve=("attic", {"sku": "H6199", "device": "D1", "aliases": []}), power=None):
@@ -168,6 +169,101 @@ class DispatchLightsTests(unittest.TestCase):
 
         self.assertEqual(response, "I couldn't reach your lights just now.")
 
+
+
+
+class LightStatusTests(unittest.TestCase):
+    """
+    The Govee characteristic is Write Without Response and there is no notify
+    beside it, so the strip's real state is not obtainable by any means. The
+    only honest answer is what she last SENT, said as what she last sent.
+    """
+
+    def test_it_reports_the_last_command_and_says_it_is_memory(self):
+        shadow = LightShadow()
+        shadow.record_power("attic", True)
+        shadow.record_brightness("attic", 40)
+        shadow.record_color("attic", "warm white")
+
+        reply = _dispatch_lights({"action": "light_status"}, _svc(), shadow)
+
+        self.assertIn("on", reply)
+        self.assertIn("40 percent", reply)
+        self.assertIn("warm white", reply)
+        self.assertIn("memory", reply)
+
+    def test_an_untouched_light_admits_it_does_not_know(self):
+        reply = _dispatch_lights({"action": "light_status"}, _svc(), LightShadow())
+        self.assertIn("don't know", reply)
+
+    def test_it_never_asks_the_service_for_state(self):
+        """
+        Guards the fixture, not the feature. _svc() is a bare Mock, so a
+        GoveeService.get_state() would auto-stub TRUTHY and this whole class
+        would pass while reading nothing. Resolving the light is the only call
+        that may reach the service.
+        """
+        service = _svc()
+        _dispatch_lights({"action": "light_status"}, service, LightShadow())
+
+        service.resolve_light.assert_called_once()
+        service.set_power.assert_not_called()
+        service.set_brightness.assert_not_called()
+        service.set_color.assert_not_called()
+
+    def test_an_unknown_room_still_says_so(self):
+        reply = _dispatch_lights(
+            {"action": "light_status", "light": "garage"},
+            _svc(resolve=(None, None)),
+            LightShadow(),
+        )
+        self.assertIn("garage", reply)
+
+    def test_dispatch_without_a_store_still_answers(self):
+        # The 18 older _dispatch_lights call sites pass two positionals.
+        reply = _dispatch_lights({"action": "light_status"}, _svc())
+        self.assertIn("don't know", reply)
+
+
+class LightMemoryRecordingTests(unittest.TestCase):
+    def test_a_successful_command_is_remembered(self):
+        shadow = LightShadow()
+        _dispatch_lights({"action": "light_on"}, _svc(), shadow)
+        self.assertIs(shadow.remembered("attic").power, True)
+
+    def test_a_failed_command_is_not_remembered(self):
+        """
+        `if result:` is a SUCCESS check. GoveeCommandResult defines __bool__, so
+        a failed write is falsy -- and a light that never got the command must
+        not be reported as if it had.
+        """
+        failed = GoveeCommandResult(False, "I couldn't reach your lights.")
+        shadow = LightShadow()
+        _dispatch_lights({"action": "light_on"}, _svc(power=failed), shadow)
+        self.assertIsNone(shadow.remembered("attic"))
+
+    def test_brightness_is_remembered_clamped_not_as_asked(self):
+        shadow = LightShadow()
+        _dispatch_lights(
+            {"action": "light_brightness", "brightness_percent": 400}, _svc(), shadow
+        )
+        self.assertEqual(shadow.remembered("attic").percent, 100)
+
+    def test_colour_is_remembered_as_the_spoken_word_not_rgb(self):
+        # Nothing in this project maps rgb back to a name, so the word Master
+        # Miguel said is the only thing worth reading back to him.
+        shadow = LightShadow()
+        _dispatch_lights({"action": "light_color", "color": "warm white"}, _svc(), shadow)
+        self.assertEqual(shadow.remembered("attic").color_word, "warm white")
+
+    def test_brightness_does_not_imply_the_light_is_on(self):
+        # The strip accepts brightness while it is off. Inferring power from it
+        # would be a guess wearing the clothes of a fact.
+        shadow = LightShadow()
+        _dispatch_lights(
+            {"action": "light_brightness", "brightness_percent": 50}, _svc(), shadow
+        )
+        self.assertIsNone(shadow.remembered("attic").power)
 
 if __name__ == "__main__":
     unittest.main()
