@@ -52,6 +52,11 @@ class TTSService:
             self.kokoro_voice = kokoro_cfg.get("voice", "bm_george")
             self.kokoro_speed = kokoro_cfg.get("speed", 1.0)
             self.kokoro_lang_code = kokoro_cfg.get("lang_code", "b")
+            trim_cfg = kokoro_cfg.get("trim") or {}
+            self.kokoro_trim_floor = float(trim_cfg.get("silence_floor", 0.02))
+            self.kokoro_trim_lead_ms = int(trim_cfg.get("lead_in_ms", 20))
+            self.kokoro_trim_tail_ms = int(trim_cfg.get("tail_ms", 120))
+            self.kokoro_trim_fade_ms = int(trim_cfg.get("fade_ms", 5))
             self._init_kokoro()
             logger.info(f"TTS initialized: Kokoro ({self.kokoro_voice})")
 
@@ -233,51 +238,61 @@ class TTSService:
 
         audio = np.concatenate(parts).astype(np.float32)
 
-        # Trim trailing silence — Kokoro bakes in long pauses after punctuation
-        audio = self._trim_trailing_silence(audio, sample_rate=24000)
+        # Kokoro pads both ends of every clip. Strip it, or the front pad plays
+        # as dead air between every pair of chunks.
+        audio = self._trim_silence(audio, sample_rate=24000)
 
         logger.debug(f"_synthesize_kokoro final audio_shape={audio.shape}")
         return audio, 24000
 
-    def _trim_trailing_silence(
-        self,
-        audio: np.ndarray,
-        sample_rate: int = 24000,
-        threshold: float = 0.01,
-        max_tail_ms: int = 200,
-    ) -> np.ndarray:
+    def _trim_silence(self, audio: np.ndarray, sample_rate: int = 24000) -> np.ndarray:
         """
-        Trim excessive trailing silence from TTS audio.
+        Strip the synthesiser's padding from BOTH ends of a clip.
 
-        Keeps at most `max_tail_ms` of silence at the end.
-        Silence = samples whose absolute amplitude < `threshold`.
+        Measured on this project's own Kokoro output: ~400ms of silence on the
+        front and ~550-600ms on the back of every clip, independent of what was
+        said. The predecessor of this method only trimmed the tail, so the
+        leading 400ms went straight to the speaker once per chunk -- on a reply
+        cut into eight chunks that is over three seconds of nothing, spread
+        through the answer as hesitations. `generate_activation_phrases.trim_silence`
+        has done the two-sided trim for the activation lines since they were
+        generated; this is the same operation on the live path.
+
+        The floor is relative to the clip's own peak so a quiet line is not read
+        as silence. The cut edges are faded so they do not click.
         """
         if audio.size == 0:
             return audio
 
-        abs_audio = np.abs(audio)
+        amplitude = np.abs(audio)
+        peak = float(amplitude.max())
+        if peak <= 0:
+            return audio
 
-        # Find last sample above threshold
-        above = np.where(abs_audio > threshold)[0]
-        if above.size == 0:
-            # Entire clip is silence — return a tiny silent buffer
-            keep = int(sample_rate * (max_tail_ms / 1000.0))
-            return audio[:min(keep, audio.size)]
+        loud = np.flatnonzero(amplitude > peak * self.kokoro_trim_floor)
+        if loud.size == 0:
+            return audio
 
-        last_voice = above[-1]
+        lead = sample_rate * self.kokoro_trim_lead_ms // 1000
+        tail = sample_rate * self.kokoro_trim_tail_ms // 1000
+        start = max(0, int(loud[0]) - lead)
+        end = min(audio.size, int(loud[-1]) + tail)
+        trimmed = audio[start:end].copy()
 
-        # Allow max_tail_ms of silence after the last voiced sample
-        tail_samples = int(sample_rate * (max_tail_ms / 1000.0))
-        cut_at = min(last_voice + tail_samples, audio.size)
+        fade = min(sample_rate * self.kokoro_trim_fade_ms // 1000, trimmed.size // 2)
+        if fade > 0:
+            trimmed[:fade] *= np.linspace(0.0, 1.0, fade, dtype=trimmed.dtype)
+            trimmed[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=trimmed.dtype)
 
-        if cut_at < audio.size:
-            trimmed = audio.size - cut_at
+        removed = audio.size - trimmed.size
+        if removed > 0:
             logger.debug(
-                f"_trim_trailing_silence trimmed {trimmed} samples "
-                f"({trimmed / sample_rate * 1000:.0f}ms)"
+                f"_trim_silence removed {removed} samples "
+                f"({removed / sample_rate * 1000:.0f}ms: "
+                f"{start / sample_rate * 1000:.0f}ms front, "
+                f"{(audio.size - end) / sample_rate * 1000:.0f}ms back)"
             )
-
-        return audio[:cut_at]
+        return trimmed
 
     def _silence(self, sr: int, ms: int) -> np.ndarray:
         logger.debug(f"_silence sr={sr} ms={ms}")
