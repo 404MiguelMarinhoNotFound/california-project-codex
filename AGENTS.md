@@ -237,6 +237,7 @@ california/
 │   ├── test_orchestrator_vpn_routing.py # VPN preflight routing behavior
 │   ├── test_stremio_service.py  # Stremio / TMDB / playback unit tests
 │   ├── test_stt_hallucination.py # Whisper non-speech filler and segment-probability gating
+│   ├── test_tts_chunking.py     # Terminal punctuation kept, fewer/longer chunks, two-sided audio trim
 │   ├── test_surfshark_service.py # Surfshark route execution and cache behavior
 │   ├── test_vad_silence.py      # Grace window, saw-speech flag, Silero framing
 │   ├── test_wake_word_framing.py # openWakeWord native-frame buffering, consecutive frames, dither floor
@@ -731,11 +732,18 @@ scanned". They compose rather than override: on the **first** miss after a drift
 is no offline cooldown yet, so the call falls straight through to discovery and
 self-heals. Do not merge them.
 
-`_wait_for_box` suppresses discovery for the duration of a boot wait -- the box is at
-a known address and scanning each poll is waste -- then rediscovers **exactly once**
-after the wait times out, because a box that rebooted may have come back on a new
-lease. The flag is an instance attribute rather than a parameter, because the loop must
-keep calling the *public* `ensure_connected()` that tests patch by name.
+`_wait_for_box` rediscovers on **every** miss, then retries. It used to suppress
+discovery for the whole settle window -- "the box is at a known address, scanning each
+poll is waste" -- and rediscover once after the timeout. On **2026-09-11** that cost
+47s: the box came back from a CEC wake on a new lease (`.47` -> `.60`) and the loop
+polled the dead address until its deadline, then found the box in 2s. The suppression
+was justified when the expensive step was `adb connect` (21s); with the port-probe gate
+a full rediscovery is ~1.7s against a 2s poll interval, cheaper than one wasted poll.
+The loop clears **both** cooldowns (`_last_fail_time` and `_last_discovery_t`) before
+each pass, for the same reason it always cleared the first, and keeps calling the
+*public* `ensure_connected()` that tests patch by name. On this router a lease change
+after sleep is the common case, not the edge case -- a DHCP reservation for the box's
+MAC is the real fix, and it costs no code.
 
 -----
 
@@ -1318,6 +1326,46 @@ TTS output is sensitive to punctuation. Avoid text that causes long pauses:
 
 `services/tts_text_sanitizer.py` is the place for normalization logic, and TTS output should stay optimized for the ear, not the page.
 
+**Terminal `.` `!` `?` must reach Kokoro. Do not strip them.** Kokoro is
+StyleTTS2-based, and phrase-final punctuation is the cue its duration predictor
+learned to drop pitch and close a clause on. The sanitizer used to strip it on
+the theory that it only bought silence at the tail, so every chunk rendered on a
+rising, unresolved contour — "I am not finished" over text that was. Reported
+2026-09-08 as long replies "sounding like it's gonna stop entirely then
+continuing", fixed 2026-09-11. The contract now: a chunk ends in `.!?` when it is
+a finished sentence and in a single `,` (the continuation cue) when it is a
+fragment; the last chunk of a response always resolves to a full stop.
+
+### Chunk Size: Fewer, Longer Calls
+
+`services/sentence_chunker.py` used to split on `;` `:` and dashes from eight
+characters up, and one paragraph became **eight** synthesis calls. Each one is
+paid for twice: Kokoro bakes **~400ms of silence onto the front** of every clip
+(measured 390–420ms, independent of text) and a fragment gives the model no
+sentence to shape prosody from. Measured live on a twelve-second reply:
+**~4.7s of injected dead air**, which is where the hesitations lived.
+
+- `MIN_CHUNK_CHARS: 100` — finished sentences are held and travel together,
+  each keeping its own punctuation, until the chunk is worth a call
+- `FIRST_CHUNK_CHARS: 25` / `FIRST_CHUNK_MAX_CHARS: 60` — the first chunk is the
+  exception in both directions. It ships as soon as a sentence exists, and an
+  opening sentence that runs long is soft-split at a comma instead: Kokoro is
+  roughly real time on this laptop, so **time-to-first-audio IS the first
+  chunk's length** — a 153-char opener measured 9.4s before anything was heard
+- `tts.kokoro.trim` in `config.yaml` now strips **both** ends of every clip on
+  the live path, with fades, the same trim `generate_activation_phrases.py` has
+  always applied. `tail_ms` is the gap between chunks
+- Same reply after: 4 calls, 563ms of padding, first audio at 3.3s, every chunk
+  resolved. Pinned by `tests/test_tts_chunking.py`
+
+**None of this changes the real-time factor, and on the Pi that is the
+remaining problem.** Kokoro measures RTF 0.8–1.5 on the dev laptop and is
+documented slower than real time on a Pi 4. At RTF ≥ 1 no queue depth keeps
+playback fed: `maxsize=2` only postpones the first underrun, and a long sentence
+drains it. Piper measures ~0.03 RTF on a Pi 5 and is already a supported
+provider. Decide the Pi's `tts.provider` from a measurement on the actual box,
+not from the laptop.
+
 -----
 
 ## California's Personality
@@ -1437,8 +1485,8 @@ Current automated coverage exists for:
   stranger rather than leaving its transport open
 - Drift recovery: that `target` follows a rediscovered `ip`, that a drift self-heals
   through `ensure_connected`, that repeated failures scan only once (rescan
-  cooldown), and that `_wait_for_box` rediscovers once **after** its timeout rather
-  than on every poll
+  cooldown), and that `_wait_for_box` rediscovers on every miss with the rescan
+  cooldown cleared, so a box that came back on a new lease is found on the next poll
 - That a revoked token produces "approve me on screen" and NOT "use the remote" —
   they are opposite fixes and the wrong one strands him
 - `_hdmi_inventory()` advertising configured ports and omitting the block entirely
@@ -1607,6 +1655,17 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 
 - Streaming is non-negotiable for a responsive assistant
 - Sentence-level TTS overlap is the right pattern for voice latency
+- **A prosody cue looks like dead time if you only measure duration.** The
+  sanitizer stripped terminal periods because the tail of the clip was silence,
+  and it was — but the silence was the model closing the clause, and without the
+  cue it never did. Two independent problems, "sounds unfinished" and "pauses
+  between chunks", came out of one line and could not be told apart by ear.
+  The measurement that separated them was the contour, not the clock
+- **The cheapest chunk is not the smallest one.** Eight-character splits looked
+  like the aggressive low-latency choice, and every one of them bought 400ms of
+  Kokoro's front padding plus a fresh model call. Fixed per-call overhead means
+  the optimum is few, whole sentences — with the first chunk the only place
+  where small is worth paying for
 - **A wake-word eval measured on synthetic audio predicts nothing about a real
   microphone, and it fails optimistically.** Run 1 reported 92.4% recall and caught
   **25%** of real English utterances and **0%** of Portuguese ones. Run 2 reported 93.3%
