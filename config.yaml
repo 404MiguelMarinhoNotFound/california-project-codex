@@ -498,13 +498,15 @@ media:
   cec_wake:
     enabled: true
     # Identity keys off things that do not move. tv_ip is only a cached hint --
-    # if it goes stale, CecWaker rediscovers by MAC then duid and rewrites
-    # tv_state_path. WoL never needs an IP at all (it is a MAC broadcast), so
-    # only the websocket step is affected by a DHCP move.
+    # if it goes stale, CecWaker rediscovers by MAC then duid through the same
+    # DeviceFinder ladder as the box (discovery.* above sets the port-probe
+    # timeout and scan width for both) and caches the answer under "tv" in
+    # discovery.state_path. WoL never needs an IP at all (it is a MAC broadcast),
+    # so only the websocket step is affected by a DHCP move.
     tv_mac: "54:BD:79:24:45:32"   # Samsung UE49M5505, Tizen
     tv_duid: "uuid:ce6399e0-8c5a-46f9-86b8-a05754f7a9ea"
     tv_ip: "192.168.1.34"         # hint only, self-heals
-    tv_state_path: "tv_state.json"
+    # tv_state_path: "tv_state.json"   # override to keep the TV in its own file; default is discovery.state_path
     tv_port: 8002
     # Written on first pairing; needs on-screen approval WITH THE TV ON.
     # Re-pair with: uv run python tools/pair_samsung_tv.py

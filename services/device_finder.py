@@ -284,6 +284,11 @@ class DeviceFinder:
     def forget(self) -> None:
         self._ip = ""
 
+    @property
+    def ip(self) -> str:
+        """Last verified address, or "" -- never touches the network."""
+        return self._ip
+
     # ------------------------------------------------------------------ probe ---
 
     def _try(self, rung: str, ip: str) -> bool:
@@ -299,12 +304,17 @@ class DeviceFinder:
     def subnet(self) -> str:
         return subnet_base(self._ip, self.cached_ip(), self.hint)
 
-    def resolve(self, force: bool = False) -> str:
+    def resolve(self, force: bool = False, discover: bool = True) -> str:
         """
         Cached -> hint -> candidate sources, verified at every rung.
 
         The happy path is one probe. Discovery only runs on a miss, which is what
         makes a DHCP move self-heal instead of surfacing as "unreachable".
+
+        `discover=False` stops after the known addresses. CecWaker uses it for the
+        one check that happens BEFORE Wake-on-LAN: a television that is off cannot
+        be found by any scan, so spending one on it only delays the packet that
+        turns it on.
         """
         with self._lock:
             if self._ip and not force:
@@ -322,6 +332,10 @@ class DeviceFinder:
                         self.remember(candidate)
                     self.last_verdict = "verified"
                     return candidate
+
+            if not discover:
+                self.last_verdict = "not-found"
+                return ""
 
             log.info("%s not at its known address, rediscovering by MAC %s",
                      self.label, self.mac)

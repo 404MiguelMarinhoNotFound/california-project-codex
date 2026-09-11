@@ -17,8 +17,9 @@ replied all failed. `wifi_sleep_policy` is already 2 ("never sleep") and
 
 Routes that are dead, with evidence, so nobody burns an evening re-deriving them:
 
-  - Wake-on-LAN *to the box*: no Ethernet, and Android randomises the Wi-Fi MAC
-    per network (16:da:99:37:d0:89 is locally-administered, unstable).
+  - Wake-on-LAN *to the box*: no Ethernet. (Its Wi-Fi MAC 16:da:99:37:d0:89 is
+    stable within an SSID -- see AGENTS.md -- WoL is dead for lack of a wired
+    NIC, not because of the MAC. The radio is off in standby anyway.)
   - BLE: the box does not advertise at all. A 20s scan beside it, awake, sees
     nothing. `bleak` and the Govee transport are useless here.
   - Bluetooth Classic from Windows: AF_BTH Winsock `bind()` fails against the
@@ -41,17 +42,25 @@ result type instead of being flattened into a generic failure.
 import json
 import logging
 import socket
-import subprocess
-import sys
 import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+from services.device_finder import (
+    DeviceFinder,
+    arp_table_candidates,
+    port_open,
+    tcp_port_candidates,
+)
+
 log = logging.getLogger(__name__)
 
-_REST_TIMEOUT_S = 4
+# The Samsung REST endpoint. Only reached once `port_open` says something is
+# listening, so this timeout is for a host that accepts TCP and then stalls --
+# a TV part-way through boot -- not for a TV that is off. Off never gets here.
+_REST_PORT = 8001
+_REST_TIMEOUT_S = 2
 
 
 @dataclass
@@ -87,14 +96,41 @@ class CecWaker:
         self.tv_ip_hint = str(cfg.get("tv_ip") or "").strip()
         self.tv_port = int(cfg.get("tv_port", 8002))
         self.token_path = str(cfg.get("token_path") or "samsung_token.txt")
-        self.state_path = Path(str(cfg.get("tv_state_path") or "tv_state.json"))
         self.input_key = str(cfg.get("input_key") or "KEY_HDMI")
         self.key_delay_s = max(0.1, int(cfg.get("key_delay_ms", 6000)) / 1000)
         self.wol_attempts = max(1, int(cfg.get("wol_attempts", 5)))
         self.tv_boot_timeout_s = max(1, int(cfg.get("tv_boot_timeout_ms", 40000))) / 1000
+        # Same key MediaService reads for the box: how often to re-check a device
+        # that is booting. One rediscovery per miss costs ~2s, so polling faster
+        # than this buys nothing.
+        self.poll_interval_s = max(0.1, int(cfg.get("poll_interval_ms", 2000)) / 1000)
         self.hdmi_ports = {int(k): str(v) for k, v in (cfg.get("hdmi_ports") or {}).items()}
 
-        self._tv_ip: str | None = None
+        # The same ladder the box uses -- memory -> cache -> hint -> ARP by MAC ->
+        # TCP scan -- with the duid probe as `verify`. This replaced a private
+        # copy that HTTP-probed with a 4s timeout, tried cached and hint in series,
+        # ping-flooded the /24 and then HTTP-probed all 254 hosts: ~35s per miss
+        # on a TV that was off, measured 2026-09-11. Port-gated, a miss is ~2s.
+        disc_cfg = ((config.get("media") or {}).get("discovery") or {})
+        self.port_probe_timeout_s = max(0.05, int(disc_cfg.get("port_probe_timeout_ms", 300)) / 1000)
+        state_path = cfg.get("tv_state_path") or disc_cfg.get("state_path") or "device_state.json"
+        self._finder = DeviceFinder(
+            key="tv",
+            label="TV",
+            mac=self.tv_mac,
+            hint=self.tv_ip_hint,
+            cache_path=Path(str(state_path)),
+            # Late-bound on purpose: tests patch CecWaker._probe on the class.
+            verify=lambda ip: self._probe(ip),
+            candidate_sources=[
+                arp_table_candidates(self.tv_mac),
+                tcp_port_candidates(
+                    _REST_PORT,
+                    timeout_s=self.port_probe_timeout_s,
+                    workers=max(1, int(disc_cfg.get("scan_workers", 64))),
+                ),
+            ],
+        )
         self.unavailable_reason = self._resolve_availability(bool(cfg.get("enabled", False)))
         if self.unavailable_reason:
             log.warning("CEC wake disabled: %s", self.unavailable_reason)
@@ -119,13 +155,26 @@ class CecWaker:
     def available(self) -> bool:
         return not self.unavailable_reason
 
+    @property
+    def _tv_ip(self) -> str | None:
+        """Where the TV last verified. `_remote()` needs this to be non-empty."""
+        return self._finder.ip or None
+
     # ------------------------------------------------------------ discovery ---
 
     def _probe(self, ip: str) -> bool:
-        """True when `ip` answers the Samsung REST endpoint AS THIS TV."""
+        """
+        True when `ip` answers the Samsung REST endpoint AS THIS TV.
+
+        Port probe first, then HTTP -- the same ordering as the box's adb verify,
+        for the same reason: a host that is off does not refuse quickly, it stays
+        silent until the timeout. 0.3s to learn that instead of 4s, on every rung.
+        """
+        if not ip or not port_open(ip, _REST_PORT, self.port_probe_timeout_s):
+            return False
         try:
             with urllib.request.urlopen(
-                f"http://{ip}:8001/api/v2/", timeout=_REST_TIMEOUT_S
+                f"http://{ip}:{_REST_PORT}/api/v2/", timeout=_REST_TIMEOUT_S
             ) as response:
                 payload = json.loads(response.read().decode("utf-8", "replace"))
         except Exception:
@@ -134,100 +183,37 @@ class CecWaker:
         # device has since taken would answer 200 and be used happily.
         return str(payload.get("device", {}).get("duid", "")) == self.tv_duid
 
-    def _cached_ip(self) -> str:
-        try:
-            return str(json.loads(self.state_path.read_text("utf-8")).get("tv_ip") or "")
-        except Exception:
-            return ""
-
-    def _remember_ip(self, ip: str) -> None:
-        try:
-            self.state_path.write_text(json.dumps({"tv_ip": ip}, indent=2), "utf-8")
-        except OSError as exc:
-            log.debug("Could not write %s: %s", self.state_path, exc)
-
-    def _arp_lookup(self) -> str:
-        """Find the TV's current IP by MAC, after nudging the ARP cache."""
-        wanted = self.tv_mac.lower().replace(":", "-")
-        base = ".".join((self._cached_ip() or self.tv_ip_hint or "192.168.1.1").split(".")[:3])
-
-        # `arp -a` only lists recently-contacted hosts, so provoke the subnet first.
-        flag = "-n" if sys.platform == "win32" else "-c"
-        with ThreadPoolExecutor(max_workers=64) as pool:
-            pool.map(
-                lambda host: subprocess.run(
-                    ["ping", flag, "1", "-w", "300", f"{base}.{host}"],
-                    capture_output=True, timeout=5,
-                ),
-                range(1, 255),
-            )
-        try:
-            table = subprocess.run(["arp", "-a"], capture_output=True, text=True,
-                                   errors="replace", timeout=15).stdout or ""
-        except (OSError, subprocess.SubprocessError):
-            return ""
-        for line in table.splitlines():
-            if wanted in line.lower().replace(":", "-"):
-                for token in line.split():
-                    if token.count(".") == 3 and token.replace(".", "").isdigit():
-                        return token
-        return ""
-
-    def _sweep(self) -> str:
-        base = ".".join((self._cached_ip() or self.tv_ip_hint or "192.168.1.1").split(".")[:3])
-        candidates = [f"{base}.{h}" for h in range(1, 255)]
-        with ThreadPoolExecutor(max_workers=48) as pool:
-            for ip, hit in zip(candidates, pool.map(self._probe, candidates)):
-                if hit:
-                    return ip
-        return ""
-
-    def resolve_tv_ip(self, force: bool = False) -> str:
+    def resolve_tv_ip(self, force: bool = False, discover: bool = True) -> str:
         """
-        Cached hint -> ARP by MAC -> subnet probe. Verified by duid at every step.
+        Cached hint -> ARP by MAC -> TCP scan on :8001. Verified by duid at every step.
 
-        The happy path is one HTTP GET; discovery only runs on a miss, which is
+        The happy path is one probe. Discovery only runs on a miss, which is
         why a DHCP move self-heals instead of surfacing as "couldn't turn the
-        TV on".
+        TV on". Delegates to the shared DeviceFinder; see its docstring.
         """
-        if self._tv_ip and not force:
-            return self._tv_ip
-        for candidate in (self._cached_ip(), self.tv_ip_hint):
-            if candidate and self._probe(candidate):
-                self._tv_ip = candidate
-                return candidate
-        log.info("TV not at its cached address, rediscovering by MAC %s", self.tv_mac)
-        for finder in (self._arp_lookup, self._sweep):
-            found = finder()
-            if found and self._probe(found):
-                log.info("TV rediscovered at %s", found)
-                self._remember_ip(found)
-                self._tv_ip = found
-                return found
-        return ""
+        return self._finder.resolve(force=force, discover=discover)
 
     # ----------------------------------------------------------------- wake ---
 
     def _tv_is_up(self) -> bool:
         """
-        Probe the TV, and remember where it answered.
+        Probe the TV at its known addresses, and remember where it answered.
 
-        The assignment is load-bearing. `power_on_tv` returns early on this, so
-        without it `self._tv_ip` stays None on the happy path and `_remote()`
-        builds SamsungTVWS(host=None) -- "Can't build URL with port but without
-        host". That failure only hides while the cached IP is *stale*, because
-        the resulting rediscovery sets `_tv_ip` as a side effect.
+        Known addresses only, no scan: this runs BEFORE Wake-on-LAN, and a TV that
+        is off cannot be found by scanning -- spending ~2s on one just delays the
+        packet that turns it on. The scan happens in `power_on_tv`'s poll loop,
+        where the TV is booting and may well come up on a new lease.
+
+        The finder records the address as a side effect, which `_remote()` needs:
+        `power_on_tv` returns early on this, and without it SamsungTVWS was built
+        with host=None -- "Can't build URL with port but without host".
         """
-        ip = self._tv_ip or self._cached_ip() or self.tv_ip_hint
-        if not ip or not self._probe(ip):
-            return False
-        self._tv_ip = ip
-        return True
+        return bool(self.resolve_tv_ip(force=True, discover=False))
 
     def _send_wol(self) -> None:
         raw = bytes.fromhex(self.tv_mac.replace(":", "").replace("-", ""))
         packet = b"\xff" * 6 + raw * 16
-        base = ".".join((self._cached_ip() or self.tv_ip_hint or "192.168.1.1").split(".")[:3])
+        base = self._finder.subnet()
         for target in ("255.255.255.255", f"{base}.255"):
             for port in (9, 7):
                 try:
@@ -270,9 +256,12 @@ class CecWaker:
         for attempt in range(1, self.wol_attempts + 1):
             log.info("WoL to %s (attempt %d/%d)", self.tv_mac, attempt, self.wol_attempts)
             self._send_wol()
+            # Every miss rediscovers, then retries: the TV came back from deep
+            # standby on a new lease (.34 -> .59, 2026-09-11) and only a scan per
+            # poll finds that the moment it happens. Same rule as _wait_for_box.
             deadline = time.monotonic() + (self.tv_boot_timeout_s / self.wol_attempts)
             while time.monotonic() < deadline:
-                time.sleep(3)
+                time.sleep(self.poll_interval_s)
                 if self.resolve_tv_ip(force=True):
                     log.info("TV is up at %s", self._tv_ip)
                     return True

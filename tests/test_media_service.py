@@ -581,18 +581,41 @@ class BoxDiscoveryTests(unittest.TestCase):
                     svc.ensure_connected()
         self.assertEqual(resolve.call_count, 1)
 
-    def test_the_wait_loop_does_not_rediscover_on_every_poll(self):
+    def test_the_wait_loop_rediscovers_on_every_miss(self):
         """
-        A booting box is at a known address. Scanning each poll would be waste --
-        so discovery is suppressed during the wait and runs exactly once after it.
+        A box that just rebooted may be on a new lease, and on this network it
+        usually is (2026-09-11: .47 -> .60 after a CEC wake). The loop used to
+        poll the stale address for the whole settle window with discovery
+        suppressed, and found the box only in the single scan allowed after the
+        timeout. Now every miss rediscovers and retries, with the rescan cooldown
+        cleared each pass so the second poll is not silently a no-op.
         """
         svc = self._service()
-        with patch.object(svc, "ensure_connected", return_value=False):
-            with patch("services.media_service.time.sleep"):
-                with patch.object(svc._finder, "resolve", return_value="") as resolve:
+        stale = svc.ip
+
+        def adb(cmd, **_):
+            # connect succeeds anywhere the port probe let it through; the ping
+            # at the top of ensure_connected always misses, so each poll falls
+            # through to discovery.
+            return (True, "connected to x") if cmd.startswith("connect") else (False, "not found")
+
+        with patch.object(svc, "_adb", side_effect=adb):
+            with patch("services.media_service.port_open", side_effect=lambda ip, *a: ip == self.MOVED_TO):
+                with patch.object(svc._finder, "resolve", side_effect=["", self.MOVED_TO]) as resolve:
+                    with patch("services.media_service.time.sleep"):
+                        self.assertTrue(svc._wait_for_box())
+        self.assertEqual(resolve.call_count, 2, "the second poll must rescan, not sit in the cooldown")
+        self.assertNotEqual(svc.ip, stale)
+        self.assertEqual(svc.ip, self.MOVED_TO)
+
+    def test_the_wait_loop_ends_at_the_deadline_after_a_last_attempt(self):
+        svc = self._service()
+        clock = iter([0.0, 0.0, 100.0, 100.0, 100.0, 100.0])
+        with patch.object(svc, "ensure_connected", return_value=False) as ec:
+            with patch("services.media_service.time.monotonic", side_effect=lambda: next(clock)):
+                with patch("services.media_service.time.sleep"):
                     self.assertFalse(svc._wait_for_box())
-        self.assertEqual(resolve.call_count, 1)
-        self.assertFalse(svc._discovery_suppressed, "the flag must be cleared again")
+        self.assertGreaterEqual(ec.call_count, 1)
 
     def test_a_serial_mismatch_disconnects_the_stranger(self):
         """

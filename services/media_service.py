@@ -97,7 +97,6 @@ class MediaService:
         # touches the network, matching CecWaker's contract.
         self.ip = self._finder.cached_or_hint() if self.discovery_enabled else self.ip_hint
         self._last_discovery_t: float = 0
-        self._discovery_suppressed = False
         # Why the box is unreachable, for the dispatcher's spoken line. "off",
         # "moved" and "ADB disabled" need different answers from Master Miguel.
         self.unreachable_reason = ""
@@ -261,7 +260,7 @@ class MediaService:
         return self._rediscover_and_connect()
 
     def _rediscover_and_connect(self) -> bool:
-        if not self.discovery_enabled or self._discovery_suppressed:
+        if not self.discovery_enabled:
             return False
         now = time.monotonic()
         if self._last_discovery_t and now - self._last_discovery_t < self.rescan_cooldown_s:
@@ -767,29 +766,28 @@ class MediaService:
         return False
 
     def _wait_for_box(self) -> bool:
-        # The box is booting at an address we already know, so a subnet scan on
-        # every poll would be pure waste. Suppress discovery for the duration --
-        # as an instance flag, not a parameter, because the loop must keep calling
-        # the *public* ensure_connected() that tests patch by name.
-        self._discovery_suppressed = True
+        # Every miss rediscovers, then retries. The loop used to suppress
+        # discovery for the whole settle window on the theory that a booting box
+        # comes back at its known address and a scan per poll is waste. Measured
+        # 2026-09-11: the box came back on a NEW lease after a CEC wake, so the
+        # loop polled a dead address for 47s and only found it in the one scan
+        # allowed after the timeout. The scan costs ~1.7s against a 2s poll
+        # interval -- cheaper than a single wasted poll, and it ends the wait the
+        # moment the box is up anywhere on the LAN.
         deadline = time.monotonic() + self.wake_settle_s
-        try:
-            while time.monotonic() < deadline:
-                # ensure_connected() stamps _last_fail_time on every miss and then
-                # refuses to retry for _OFFLINE_COOLDOWN. That cooldown is correct
-                # for normal operation and wrong here, where we are deliberately
-                # waiting out a boot, so clear it on each pass.
-                self._last_fail_time = 0
-                if self.ensure_connected():
-                    return True
-                time.sleep(self.wake_poll_interval_s)
-        finally:
-            self._discovery_suppressed = False
-        # The wait timed out. A box that rebooted may have come back on a new
-        # lease, and this is the one moment that is likely -- so rediscover
-        # exactly once, after the wait, never during it.
-        self._last_fail_time = 0
-        return self._rediscover_and_connect()
+        while True:
+            # ensure_connected() stamps _last_fail_time on every miss and then
+            # refuses to retry for _OFFLINE_COOLDOWN, and _rediscover_and_connect
+            # refuses to rescan for rescan_cooldown_s. Both are correct for normal
+            # operation and wrong here, where we are deliberately waiting out a
+            # boot, so clear both before each pass.
+            self._last_fail_time = 0
+            self._last_discovery_t = 0
+            if self.ensure_connected():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self.wake_poll_interval_s)
 
     def is_active_source(self) -> bool | None:
         """
