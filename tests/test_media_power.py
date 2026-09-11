@@ -389,28 +389,59 @@ class _NoNetworkScanMixin:
     """
     Fail loudly instead of scanning the operator's LAN.
 
-    `CecWaker._arp_lookup` ping-floods all 254 hosts of the subnet and then
-    shells out to `arp -a`. That is correct in production and unacceptable in a
-    unit test, for the same reason StremioService may not reach a live adb: the
-    suite must not touch the network it happens to be run on. This is the
-    guard; individual tests still stub the discovery helpers they exercise.
+    The TV now rides the shared DeviceFinder ladder: `arp -a` via subprocess and
+    a TCP scan of the /24 on :8001 via socket. Both are correct in production and
+    unacceptable in a unit test, for the same reason StremioService may not reach
+    a live adb: the suite must not touch the network it happens to be run on.
+    Both boundaries are stubbed here -- patching subprocess alone cannot stop a
+    SYN scan. Individual tests still stub the probe they exercise.
     """
 
     def setUp(self):
         super().setUp()
-        patcher = patch("services.cec_wake.subprocess.run")
-        self.subprocess_run = patcher.start()
+        run = patch("services.device_finder.subprocess.run")
+        self.subprocess_run = run.start()
         self.subprocess_run.return_value = SimpleNamespace(returncode=1, stdout="", stderr="")
-        self.addCleanup(patcher.stop)
+        self.addCleanup(run.stop)
+        conn = patch("services.device_finder.socket.create_connection",
+                     side_effect=OSError("unit tests do not open sockets"))
+        self.create_connection = conn.start()
+        self.addCleanup(conn.stop)
+        # The finder persists a HINT hit too (the private ladder only wrote on a
+        # discovery hit), so a test that patches _probe to True would otherwise
+        # create tv_state_path in the CWD. Tests that assert on remember() patch
+        # it again on the instance, which wins over this class-level stub.
+        remember = patch("services.device_finder.DeviceFinder.remember")
+        remember.start()
+        self.addCleanup(remember.stop)
 
 
 class CecWakerTests(_NoNetworkScanMixin, unittest.TestCase):
-    def test_unit_tests_never_ping_sweep_the_real_subnet(self):
-        # The setUp stub is the guard. If someone removes it, this fails here
-        # rather than by firing 254 pings at whatever LAN the suite runs on.
+    def test_unit_tests_never_scan_the_real_subnet(self):
+        # The setUp stubs are the guard. If someone removes them, this fails here
+        # rather than by SYN-scanning 254 hosts of whatever LAN the suite runs on.
+        # Every rung is port-gated, so a refused socket is enough to walk the whole
+        # ladder without a single HTTP request.
         waker = CecWaker(_cec_config())
-        waker._arp_lookup()
+        with patch("services.cec_wake.urllib.request.urlopen") as urlopen:
+            self.assertEqual(waker.resolve_tv_ip(force=True), "")
         self.subprocess_run.assert_called()
+        self.create_connection.assert_called()
+        urlopen.assert_not_called()
+
+    def test_probe_never_opens_http_when_the_port_is_closed(self):
+        """
+        The TV-side 21-second rule. A TV that is off does not refuse :8001, it
+        stays silent, and the old probe waited out a 4s HTTP timeout to learn
+        that -- on the cached address, then the hint, then 254 more times in the
+        sweep. Measured 2026-09-11 at ~35s per miss. The port gate makes it 0.3s.
+        """
+        waker = CecWaker(_cec_config())
+        with patch("services.cec_wake.port_open", return_value=False) as gate:
+            with patch("services.cec_wake.urllib.request.urlopen") as urlopen:
+                self.assertFalse(waker._probe("192.168.1.34"))  # config-literal: any address; the gate is what is under test
+        gate.assert_called_once()
+        urlopen.assert_not_called()
 
     def test_self_disables_without_a_mac(self):
         waker = CecWaker(_cec_config(tv_mac=""))
@@ -454,21 +485,52 @@ class CecWakerTests(_NoNetworkScanMixin, unittest.TestCase):
         wol.assert_called()
 
     def test_wol_is_sent_and_retried_when_the_tv_is_down(self):
-        # _arp_lookup must be stubbed: an unreachable TV sends resolve_tv_ip
-        # into discovery, and the real _arp_lookup ping-floods all 254 hosts of
-        # the operator's subnet before shelling out to `arp -a`. A unit test
-        # must not scan the network any more than it may drive the TV.
+        # An unreachable TV sends every poll into discovery. The mixin stubs both
+        # network boundaries, so the real candidate sources run and find nothing.
         waker = CecWaker(_cec_config())
         with patch.object(CecWaker, "_probe", return_value=False):
-            with patch.object(CecWaker, "_arp_lookup", return_value=""):
-                with patch.object(CecWaker, "_send_wol") as wol:
-                    with patch("services.cec_wake.time.sleep"):
-                        result = waker.wake()
+            with patch.object(CecWaker, "_send_wol") as wol:
+                with patch("services.cec_wake.time.sleep"):
+                    result = waker.wake()
         self.assertFalse(result)
         self.assertIn("did not come up", result.detail)
         # One unconditional burst (see the shallow-standby note above) plus
         # wol_attempts retries while the TV stays unreachable.
         self.assertEqual(wol.call_count, 3)
+
+    def test_wol_wait_rediscovers_on_every_poll(self):
+        """
+        Miss -> rediscover -> retry, the same rule as MediaService._wait_for_box.
+
+        2026-09-11: the TV came back from deep standby on a new lease (.34 -> .59)
+        and the box did the same. A poll loop that only re-probed the known
+        address would wait out its whole boot timeout and then fail, so each poll
+        walks the full ladder and the wait ends the moment the TV is up anywhere.
+        The pre-WoL check is the one exception: known addresses only, because a
+        TV that is off cannot be found by scanning and the scan just delays the
+        packet that turns it on.
+        """
+        moved_to = "192.168.1.59"  # config-literal: the lease the TV came back on
+        waker = CecWaker(_cec_config())
+        scans = []
+        waker._finder.candidate_sources = [lambda base: scans.append(base) or [moved_to]]
+        with patch.object(CecWaker, "_probe", side_effect=lambda ip: ip == moved_to):
+            with patch.object(CecWaker, "_send_wol"):
+                with patch.object(waker._finder, "remember") as remember:
+                    with patch("services.cec_wake.time.sleep"):
+                        self.assertTrue(waker.power_on_tv())
+        self.assertEqual(waker._tv_ip, moved_to)
+        self.assertEqual(len(scans), 1, "the first poll must rediscover, not wait for a timeout")
+        remember.assert_called_once_with(moved_to)
+
+    def test_pre_wol_check_does_not_scan(self):
+        """A TV that is off cannot be found by a scan; the scan only delays the WoL."""
+        waker = CecWaker(_cec_config())
+        scans = []
+        waker._finder.candidate_sources = [lambda base: scans.append(base) or []]
+        with patch.object(CecWaker, "_probe", return_value=False):
+            self.assertFalse(waker._tv_is_up())
+        self.assertEqual(scans, [])
 
     def test_wake_resolves_the_host_when_the_tv_already_answers(self):
         """
@@ -516,39 +578,60 @@ class CecWakerTests(_NoNetworkScanMixin, unittest.TestCase):
 
 
 class TvDiscoveryTests(_NoNetworkScanMixin, unittest.TestCase):
-    """A DHCP move must self-heal, not surface as 'couldn't turn the TV on'."""
+    """
+    A DHCP move must self-heal, not surface as 'couldn't turn the TV on'.
+
+    The ladder itself is DeviceFinder's and is pinned in test_device_discovery;
+    these pin that the TV is wired to it the way the box is.
+    """
 
     def test_cached_ip_that_verifies_skips_discovery(self):
         cached_ip = real_config()["media"]["cec_wake"]["tv_ip"]
         waker = CecWaker(_cec_config())
+        scans = []
+        waker._finder.candidate_sources = [lambda base: scans.append(base) or []]
         with patch.object(CecWaker, "_probe", return_value=True):
-            with patch.object(CecWaker, "_arp_lookup") as arp:
-                self.assertEqual(waker.resolve_tv_ip(), cached_ip)
-        arp.assert_not_called()
+            self.assertEqual(waker.resolve_tv_ip(), cached_ip)
+        self.assertEqual(scans, [])
 
     def test_wrong_duid_at_the_cached_ip_is_rejected(self):
         """Another device taking the address must not be mistaken for the TV."""
+        moved_to = "192.168.1.77"  # config-literal: an address the TV moved to, found by ARP
         waker = CecWaker(_cec_config())
-        with patch.object(CecWaker, "_probe", side_effect=lambda ip: ip == "192.168.1.77"):  # config-literal: an address the TV moved to, found by ARP
-            with patch.object(CecWaker, "_arp_lookup", return_value="192.168.1.77"):  # config-literal: an address the TV moved to, found by ARP
-                with patch.object(CecWaker, "_remember_ip") as remember:
-                    self.assertEqual(waker.resolve_tv_ip(), "192.168.1.77")  # config-literal: an address the TV moved to, found by ARP
-        remember.assert_called_once_with("192.168.1.77")  # config-literal: an address the TV moved to, found by ARP
+        waker._finder.candidate_sources = [lambda base: [moved_to]]
+        with patch.object(CecWaker, "_probe", side_effect=lambda ip: ip == moved_to):
+            with patch.object(waker._finder, "remember") as remember:
+                self.assertEqual(waker.resolve_tv_ip(), moved_to)
+        remember.assert_called_once_with(moved_to)
 
-    def test_sweep_is_the_last_resort(self):
+    def test_the_tcp_scan_is_the_last_resort(self):
+        moved_to = "192.168.1.90"  # config-literal: an address only the subnet scan finds
         waker = CecWaker(_cec_config())
-        with patch.object(CecWaker, "_probe", side_effect=lambda ip: ip == "192.168.1.90"):  # config-literal: an address only the subnet sweep finds
-            with patch.object(CecWaker, "_arp_lookup", return_value=""):
-                with patch.object(CecWaker, "_sweep", return_value="192.168.1.90"):  # config-literal: an address only the subnet sweep finds
-                    with patch.object(CecWaker, "_remember_ip"):
-                        self.assertEqual(waker.resolve_tv_ip(), "192.168.1.90")  # config-literal: an address only the subnet sweep finds
+        order = []
+        waker._finder.candidate_sources = [
+            lambda base: order.append("arp") or [],
+            lambda base: order.append("scan") or [moved_to],
+        ]
+        with patch.object(CecWaker, "_probe", side_effect=lambda ip: ip == moved_to):
+            with patch.object(waker._finder, "remember"):
+                self.assertEqual(waker.resolve_tv_ip(), moved_to)
+        self.assertEqual(order, ["arp", "scan"])
+
+    def test_the_tv_is_wired_to_arp_then_a_port_scan(self):
+        """
+        What ships: warm ARP by MAC, then a TCP scan of the /24 on :8001. No ping
+        flood and no all-hosts HTTP sweep -- both were the private ladder's cost.
+        """
+        waker = CecWaker(_cec_config())
+        names = [getattr(src, "__qualname__", "").split(".")[0]
+                 for src in waker._finder.candidate_sources]
+        self.assertEqual(names, ["arp_table_candidates", "tcp_port_candidates"])
+        self.assertEqual(waker._finder.mac, real_config()["media"]["cec_wake"]["tv_mac"])
 
     def test_total_failure_returns_empty_not_an_exception(self):
         waker = CecWaker(_cec_config())
         with patch.object(CecWaker, "_probe", return_value=False):
-            with patch.object(CecWaker, "_arp_lookup", return_value=""):
-                with patch.object(CecWaker, "_sweep", return_value=""):
-                    self.assertEqual(waker.resolve_tv_ip(), "")
+            self.assertEqual(waker.resolve_tv_ip(), "")
 
 
 class HdmiInventoryTests(unittest.TestCase):

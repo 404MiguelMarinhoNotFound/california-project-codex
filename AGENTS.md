@@ -255,10 +255,12 @@ california/
 
 Important runtime note:
 
-- `watch_state.json`, `vpn_state.json`, `tv_state.json` and `device_state.json` are
-  generated cache files and should stay local; all are gitignored, so they will not
-  show up as pending changes. `device_state.json` is the one that makes a moved box
-  self-heal -- deleting it costs one rediscovery (~2s), never a failure
+- `watch_state.json`, `vpn_state.json` and `device_state.json` are generated cache
+  files and should stay local; all are gitignored, so they will not show up as pending
+  changes. `device_state.json` holds **both** the box and the TV, keyed by device, and
+  is what makes a moved device self-heal -- deleting it costs one rediscovery (~0.5-2s),
+  never a failure. `tv_state.json` is the TV's pre-2026-09-11 private cache; it is no
+  longer read or written and can be deleted
 - `sounds/bootup/`, `sounds/california_activations/`, `sounds/chime.wav`, and
   `sounds/error.wav` are generated audio and are **not** committed. This repo carries
   audio sources, not audio output. Run `generate_bootup_sounds.py` and
@@ -575,10 +577,10 @@ pairing token is a hard dependency. That is why a rejected token gets its own
 - The Mi Box is CEC physical address `0x2000` = **HDMI 2**. `KEY_HDMI` toggles
   HDMI2 <-> HDMI1 on this set, so **odd presses select the box**
 - `tv_ip` is a **cached hint, not configuration.** Identity keys off `tv_mac` and
-  `tv_duid`, both stable. On a miss `resolve_tv_ip()` goes cached -> ARP by MAC ->
-  subnet probe, verifying the duid at every step, and rewrites `tv_state.json`.
-  **The duid check is the point**: without it a stale IP that another device has
-  since taken would answer 200 and be trusted
+  `tv_duid`, both stable. On a miss `resolve_tv_ip()` goes cached -> hint -> ARP by
+  MAC -> TCP scan on :8001, verifying the duid at every step, and caches the answer
+  under `tv` in `device_state.json`. **The duid check is the point**: without it a
+  stale IP that another device has since taken would answer 200 and be trusted
 - **`mibox_ip` is now the same kind of hint**, for the same reason. See "Finding the
   box (and the TV) when the address moves" below
 - Re-pair with `uv run python tools/pair_samsung_tv.py`. It WoLs the TV first,
@@ -649,7 +651,24 @@ there is no `if device == "tv"` in the module:
 | | verify | candidate sources |
 |---|---|---|
 | Box | TCP 5555 open -> `adb connect` -> `ro.serialno` matches | warm ARP -> TCP scan on 5555 |
-| TV | HTTP `:8001/api/v2/` -> `duid` matches | warm ARP -> ping+ARP -> probe every host |
+| TV | TCP 8001 open -> HTTP `:8001/api/v2/` -> `duid` matches | warm ARP -> TCP scan on 8001 |
+
+**The TV was not actually on this ladder until 2026-09-11.** This table described it
+as shared while `cec_wake.py` still carried a private copy: an HTTP probe with a 4s
+timeout and no port gate, cached and hint tried in series, a 254-host ping flood, and
+then an HTTP GET to every host on the /24. Against a TV that is off none of those
+refuse -- they time out -- so one miss cost ~35s (measured in the 2026-09-11 log:
+16:46:17 -> 16:46:48 to find a TV that had moved `.34` -> `.59`). On the shared ladder
+the same rediscovery measures **0.47s**: hint rejected in 0.30s by the port gate, ARP
+hit verified in 0.06s. `CecWaker._probe` is the TV's `verify`, port-gated exactly like
+`_verify_box`, and `media.discovery.port_probe_timeout_ms` / `scan_workers` now govern
+both devices.
+
+`power_on_tv`'s poll loop follows the `_wait_for_box` rule: **every miss rediscovers,
+then retries**, polling on `cec_wake.poll_interval_ms`. The one deliberate exception is
+the check *before* Wake-on-LAN (`_tv_is_up`), which probes known addresses only
+(`resolve(discover=False)`): a TV that is off cannot be found by any scan, so a scan
+there only delays the packet that turns it on.
 
 #### The 21-second rule. This is the load-bearing constraint.
 
@@ -696,9 +715,11 @@ managing one or two, because every failed poll burned 21s.
  "devices": {"mibox": {"ip": "...", "mac": "...", "verified_at": "..."}}}
 ```
 
-**Do not make `_remember` a full overwrite.** The old `cec_wake._remember_ip` wrote
-`{"tv_ip": ip}` over the whole file; pointed at a shared cache, each rediscovery would
-erase the other device's entry. A cached entry whose stored MAC no longer matches
+Both devices live in this one file (`mibox` and `tv`). **Do not make `_remember` a
+full overwrite.** The old `cec_wake._remember_ip` wrote `{"tv_ip": ip}` over the whole
+file; pointed at a shared cache, each rediscovery would erase the other device's entry.
+`media.cec_wake.tv_state_path` still exists as an override to give the TV its own file
+(the tests use it) but is commented out in the shipped config. A cached entry whose stored MAC no longer matches
 config is discarded rather than probed — a new SSID invalidates the address for the
 same reason it changes the MAC.
 
@@ -1426,9 +1447,9 @@ exists.
 
 Only three categories are legitimate to override, and each should say why:
 
-- **paths** — `watch_state.json`, `vpn_state.json`, `tv_state.json`,
-  `device_state.json` and the Samsung token must go to a tmpdir or a nonexistent
-  file, never the real caches
+- **paths** — `watch_state.json`, `vpn_state.json`, `device_state.json` (via
+  `discovery.state_path` for the box and `cec_wake.tv_state_path` for the TV) and
+  the Samsung token must go to a tmpdir or a nonexistent file, never the real caches
 - **waits** — autoplay delays, Surfshark settle times and CEC boot timeouts are
   seconds each and buy nothing against a mocked ADB
 - **a flag the test exists to exercise** — `vpn_routing_enabled` is false in the
@@ -1472,8 +1493,12 @@ Current automated coverage exists for:
   already answers and retried when it does not, the input key sent exactly twice,
   and an auth failure flagged `needs_pairing` while other failures are not
 - TV discovery: a cached IP that verifies skips discovery entirely, a wrong duid
-  at that IP is rejected rather than trusted, ARP then sweep are tried in order,
-  and total failure returns `""` instead of raising
+  at that IP is rejected rather than trusted, warm ARP then the TCP scan are what
+  ships and are tried in that order, total failure returns `""` instead of raising,
+  the probe never opens HTTP when the port gate says :8001 is closed, the WoL wait
+  rediscovers on its first miss rather than at its timeout, and the pre-WoL check
+  never scans. The CEC test guard stubs **both** `subprocess` and `socket` in
+  `services.device_finder`, because the TV now SYN-scans like the box does
 - Box discovery (`tests/test_device_discovery.py`): the ladder's rung order and
   short-circuiting, that a hint hit is persisted (the old code only wrote on a
   discovery hit), that a cache entry for a different MAC is discarded, that

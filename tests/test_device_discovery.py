@@ -124,6 +124,19 @@ class LadderTests(_NoNetworkMixin, unittest.TestCase):
         finder.resolve(force=True)
         self.assertEqual(len(probes), 2, "force must re-probe")
 
+    def test_discover_false_stops_at_the_known_addresses(self):
+        """
+        CecWaker's pre-WoL check: a TV that is off cannot be found by a scan, so
+        the scan only delays the packet that turns it on. Known addresses are
+        still probed and a hit is still remembered.
+        """
+        scans = []
+        finder = _finder(self.cache, verify=lambda ip: False,
+                         sources=[lambda base: scans.append(base) or [MOVED_TO]])
+        self.assertEqual(finder.resolve(force=True, discover=False), "")
+        self.assertEqual(scans, [], "discover=False must not run a candidate source")
+        self.assertEqual(finder.last_verdict, "not-found")
+
     def test_trace_records_each_rung_in_order(self):
         finder = _finder(self.cache, verify=lambda ip: ip == MOVED_TO,
                          sources=[lambda base: [MOVED_TO]])
