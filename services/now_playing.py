@@ -8,10 +8,11 @@ beats memory outright, because it survives Master Miguel starting something
 with the remote.
 
 This still earns its place for everything that does not publish metadata.
-YouTube exposes only its package, so without this she can say YouTube is
-playing and nothing more. She fired the deep link herself, so she knows what
-she put on, and this remembers that one thing in the words she used -- handed
-back only when a live reading still agrees.
+YouTube publishes title and channel for most videos (measured 2026-09-14) but
+not all -- some sit at "null, null, null" with the position advancing -- and
+a playlist launch publishes nothing she could name. She fired the deep link
+herself, so she knows what she put on, and this remembers that one thing in
+the words she used -- handed back only when a live reading still agrees.
 
 Two rules make the difference between memory and a lie:
 

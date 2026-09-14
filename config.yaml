@@ -591,6 +591,17 @@ media:
   youtube_warm_launch_delay_ms: 1500     # On cross-app launches, open YouTube first and wait before the deep link
   youtube_profile_select_on_cold_start: true  # Press OK once to clear the YouTube profile picker after warm launch
   youtube_profile_select_delay_ms: 1200  # Wait after the profile OK before opening playlist/search URLs
+  # "Search YouTube for X and play it". The results deep link stops at the
+  # results page and never plays on its own (measured 2026-09-14: 20s on the
+  # page, session untouched), and pressing into it blind is a coin flip: the
+  # top result may be a video, a playlist page, a channel or a Mix. So the
+  # query is resolved to the first VIDEO result over the public web results
+  # page (services/youtube_search.py, no key, no account) and the box gets a
+  # watch?v= link, which plays directly and restarts even a video already on.
+  # Off: youtube_search just opens the results page, as before.
+  youtube_search_autoplay: true
+  youtube_search_resolve_timeout_ms: 5000  # HTTP budget for the results page. Measured ~1.6s from the laptop
+  youtube_search_verify_ms: 6000           # How long to watch media_session for the new playback. Success returns early
   ui_dump_retry_count: 2
   ui_dump_retry_delay_ms: 700
   ui_dump_timeout_ms: 6000               # Per-call cap for `uiautomator dump` so hung a11y trees fail fast

@@ -10,16 +10,18 @@ whole point: for the validator a 404 is the ANSWER — the playlist is gone — 
 an error to be swallowed into a generic "something went wrong" bucket.
 """
 
+import sys
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+# One UA for the tools and the runtime resolver alike; the assistant scrapes
+# the same results page at runtime now (services/youtube_search.py).
+from services.youtube_search import HEADERS, USER_AGENT  # noqa: E402,F401
 
 # Returned when the request never reached a server (DNS, timeout, TLS).
 NO_RESPONSE = 0

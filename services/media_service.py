@@ -36,6 +36,18 @@ _TV_POWER_RE = re.compile(
 # dumpsys media_session: "state=PlaybackState {state=3, position=240301, ..."
 _SESSION_STATE_RE = re.compile(r"state=PlaybackState\s*\{state=(\d+)")
 _SESSION_POSITION_RE = re.compile(r"state=PlaybackState\s*\{[^}]*?position=(-?\d+)")
+# "updated=" is the box's elapsed-realtime stamp of the last state publish. A
+# session an app has walked away from keeps its old line verbatim -- measured on
+# the real box 2026-09-14: YouTube sat on a results page for 20s still reporting
+# the previous video at state=3 with the same stamp -- so "is YouTube playing"
+# cannot tell a new playback from a stale one. A changed stamp can.
+_SESSION_UPDATED_RE = re.compile(r"state=PlaybackState\s*\{[^}]*?updated=(\d+)")
+
+# After a YouTube watch deep link the session shows a loading stub first (new
+# stamp, no description) and the title a second or two later -- when the video
+# publishes one at all. How long to keep polling for it once the stub has
+# already confirmed the launch.
+_YOUTUBE_TITLE_GRACE_S = 1.5
 
 # PlaybackState constants. 0, 2 and 3 observed on the real box; the rest are
 # the documented Android values and fall back to the plain wording if they
@@ -166,6 +178,7 @@ class MediaSession:
     state: int | None
     title: str | None
     position_ms: int | None = None
+    updated: int | None = None
 
 
 def _parse_media_sessions(dump: str) -> list[MediaSession]:
@@ -182,10 +195,11 @@ def _parse_media_sessions(dump: str) -> list[MediaSession]:
     state = None
     title = None
     position = None
+    updated = None
 
     def flush():
         if package is not None:
-            sessions.append(MediaSession(package, state, title, position))
+            sessions.append(MediaSession(package, state, title, position, updated))
 
     for line in (dump or "").splitlines():
         stripped = line.strip()
@@ -195,6 +209,7 @@ def _parse_media_sessions(dump: str) -> list[MediaSession]:
             state = None
             title = None
             position = None
+            updated = None
             continue
         if package is None:
             continue
@@ -206,6 +221,9 @@ def _parse_media_sessions(dump: str) -> list[MediaSession]:
             # the film and must not be read back as one.
             if spot and int(spot.group(1)) >= 0:
                 position = int(spot.group(1))
+            stamp = _SESSION_UPDATED_RE.search(stripped)
+            if stamp:
+                updated = int(stamp.group(1))
             continue
         match = _SESSION_METADATA_RE.search(stripped)
         if match:
@@ -261,6 +279,35 @@ def _session_for(sessions: list, package: str | None):
         if session.state == 3:
             return session
     return None
+
+
+def _is_new_playback(before: MediaSession | None, after: MediaSession | None) -> bool:
+    """
+    Did a playback start between these two readings of the same app's session?
+
+    `after` has to be playing, and it has to differ from `before` -- a new
+    stamp or a new title. Same stamp and same title is the stale line the app
+    left behind, which is exactly what a results page that never started
+    anything looks like.
+    """
+    if after is None or after.state != 3:
+        return False
+    if before is None:
+        return True
+    return after.updated != before.updated or after.title != before.title
+
+
+@dataclass(frozen=True)
+class YoutubePlayback:
+    """
+    What became of a YouTube watch deep link. `opened` is the launch itself;
+    `started` is whether the session then showed a NEW playback -- None when
+    the session could not be read. No __bool__ on purpose: see
+    GoveeCommandResult for what a falsy result object does to callers.
+    """
+    opened: bool
+    started: bool | None
+    title: str | None
 
 
 @dataclass(frozen=True)
@@ -358,6 +405,11 @@ class MediaService:
         self.youtube_warm_launch_delay_s = media_cfg.get("youtube_warm_launch_delay_ms", 1500) / 1000
         self.youtube_profile_select_on_cold_start = media_cfg.get("youtube_profile_select_on_cold_start", True)
         self.youtube_profile_select_delay_s = media_cfg.get("youtube_profile_select_delay_ms", 1200) / 1000
+        # A search deep link stops at the results page. See youtube_play_video
+        # and services/youtube_search.py.
+        self.youtube_search_autoplay = bool(media_cfg.get("youtube_search_autoplay", True))
+        self.youtube_search_resolve_timeout_s = max(1, int(media_cfg.get("youtube_search_resolve_timeout_ms", 5000))) / 1000
+        self.youtube_search_verify_s = max(0, int(media_cfg.get("youtube_search_verify_ms", 6000))) / 1000
         self.ui_dump_retry_count = max(1, int(media_cfg.get("ui_dump_retry_count", 2)))
         self.ui_dump_retry_delay_s = max(0, int(media_cfg.get("ui_dump_retry_delay_ms", 700)) / 1000)
         self.ui_dump_timeout_s = max(1, int(media_cfg.get("ui_dump_timeout_ms", 6000))) / 1000
@@ -1007,6 +1059,80 @@ class MediaService:
         encoded = quote_plus(query)
         url = f"https://www.youtube.com/results?search_query={encoded}"
         return self._open_youtube_url(url)
+
+    def youtube_watch(self, video_id: str) -> bool:
+        """Open one video in the player. Unlike the results page, this PLAYS."""
+        if not video_id:
+            return False
+        return self._open_youtube_url(f"https://www.youtube.com/watch?v={video_id}")
+
+    def _youtube_session(self) -> tuple[bool, MediaSession | None]:
+        """
+        YouTube's own media session, as (readable, session). Two Nones are not
+        the same None: an unreadable dump is "cannot tell", a readable dump with
+        no YouTube block is "YouTube has not played since boot", which is a
+        perfectly good baseline to confirm a launch against.
+        """
+        ok, output = self._adb("shell dumpsys media_session")
+        if not ok or not output:
+            return False, None
+        return True, _session_for(_parse_media_sessions(output), self._youtube_package())
+
+    def _wait_for_new_youtube_playback(self, before: MediaSession | None) -> tuple[bool | None, str | None]:
+        """
+        Poll the session until a playback newer than `before` shows up.
+
+        The first line after the launch is a loading stub (state=3,
+        position=0, no description, new stamp); the title lands a second or
+        two later. A new stamp is enough to believe the launch landed, but the
+        title is worth a short wait, so keep polling for it inside the grace.
+        """
+        deadline = time.monotonic() + self.youtube_search_verify_s
+        readable = False
+        started: MediaSession | None = None
+        while True:
+            ok, session = self._youtube_session()
+            readable = readable or ok
+            if ok and _is_new_playback(before, session):
+                if started is None:
+                    # Some results never publish a description at all (seen
+                    # live: playing, position advancing, description still
+                    # "null, null, null" 20s in). Give the title a short
+                    # grace, not the whole window -- he is waiting to hear back.
+                    deadline = min(deadline, time.monotonic() + _YOUTUBE_TITLE_GRACE_S)
+                started = session
+                if session.title:
+                    return True, session.title
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
+        if started is not None:
+            return True, started.title
+        return (False if readable else None), None
+
+    def youtube_play_video(self, video_id: str) -> YoutubePlayback:
+        """
+        Play one video by id and confirm it from the session.
+
+        Measured on the real box 2026-09-14: `watch?v=` plays directly, the
+        loading stub shows within ~0.5s and the title at ~2s, and firing it
+        for a video that is ALREADY playing restarts it from zero with a new
+        stamp -- so the before/after comparison in _is_new_playback holds in
+        every case. No key presses anywhere on this path: the DPAD approach it
+        replaced could not tell a video from a playlist from a channel at the
+        top of the results, and its retry press was play/pause in the player.
+
+        The baseline is read BEFORE the launch. Read after it, a fast launch
+        would already be in the baseline and then be compared against itself,
+        reading as "nothing changed". Before is the only honest baseline.
+        """
+        if not self.ensure_connected():
+            return YoutubePlayback(opened=False, started=False, title=None)
+        _, before = self._youtube_session()
+        if not self.youtube_watch(video_id):
+            return YoutubePlayback(opened=False, started=False, title=None)
+        started, title = self._wait_for_new_youtube_playback(before)
+        return YoutubePlayback(opened=True, started=started, title=title)
 
     # --- Power ---
     #

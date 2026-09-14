@@ -1,10 +1,12 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from core.orchestrator import _dispatch_tv
 from core.orchestrator import _route_target_for_action
+from services.media_service import YoutubePlayback
 from services.stremio_service import StremioPlayResult
 from services.surfshark_service import EnsureVpnResult
+from services.youtube_search import VideoResult
 
 
 class OrchestratorVpnRoutingTests(unittest.TestCase):
@@ -101,6 +103,9 @@ class OrchestratorVpnRoutingTests(unittest.TestCase):
         media_svc.ensure_connected.return_value = True
         media_svc.is_app_foreground.return_value = False
         media_svc.youtube_search.return_value = True
+        media_svc.youtube_search_autoplay = True
+        media_svc.youtube_search_resolve_timeout_s = 5.0
+        media_svc.youtube_play_video.return_value = YoutubePlayback(True, True, "Pagode na Praia, Grupo Menos e Mais")
         media_svc.force_stop_app.return_value = True
         surfshark_svc = Mock()
         surfshark_svc.enabled = True
@@ -113,17 +118,18 @@ class OrchestratorVpnRoutingTests(unittest.TestCase):
             message="I couldn't restart Surfshark.",
         )
 
-        response = _dispatch_tv(
-            {"action": "youtube_search", "query": "pagode praia"},
-            media_svc,
-            Mock(),
-            surfshark_svc,
-            {},
-        )
+        with patch("core.orchestrator.top_video", return_value=VideoResult("abc", "Pagode na Praia", "Menos e Mais")):
+            response = _dispatch_tv(
+                {"action": "youtube_search", "query": "pagode praia"},
+                media_svc,
+                Mock(),
+                surfshark_svc,
+                {},
+            )
 
         self.assertEqual(
             response,
-            "Searching YouTube for pagode praia but I couldn't complete Surfshark Albania auto-connect.",
+            "Playing Pagode na Praia on YouTube but I couldn't complete Surfshark Albania auto-connect.",
         )
 
     def test_dispatch_tv_appends_warning_when_stremio_route_fails_but_opening_continues(self):
