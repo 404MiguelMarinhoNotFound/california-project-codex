@@ -199,7 +199,8 @@ california/
 │   ├── stt.py                   # Speech-to-text
 │   ├── tts.py                   # Text-to-speech
 │   ├── tts_text_sanitizer.py    # Text cleanup for TTS timing
-│   └── youtube_playlist_resolver.py # Matches voice playlist names and picks one saved ID at random
+│   ├── youtube_playlist_resolver.py # Matches voice playlist names and picks one saved ID at random
+│   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
 ├── training/                    # Wake-word training, runs on Modal, see training/README.md
@@ -222,7 +223,7 @@ california/
 │   ├── search_youtube_playlists.py # Finds public YouTube playlist candidates by search query
 │   ├── search_youtube_videos.py    # Finds YouTube video candidates and derives radio playlist IDs
 │   ├── validate_youtube_playlists.py # Checks every saved playlist ID still exists (oembed); nonzero exit on failure
-│   └── youtube_http.py             # Shared spoofed-UA fetch for the three YouTube tools
+│   └── youtube_http.py             # Shared spoofed-UA fetch for the YouTube tools; the UA lives in services/youtube_search.py
 ├── tests/
 │   ├── config_fixture.py        # THE test fixture base: the real config.yaml, deep-merged
 │   ├── test_config_fixture.py   # Fixture behavior + guard against re-typed config values
@@ -244,6 +245,7 @@ california/
 │   ├── test_name_matcher.py     # Matcher tier order, despacing, "&" normalization
 │   ├── test_playlist_config.py  # Structural sweep of the real config.yaml playlist data
 │   ├── test_youtube_playlist_resolver.py # Matching, aliases, and random-selection coverage
+│   ├── test_youtube_search_autoplay.py # Query -> video id -> watch link, session-stamp verification, spoken lines
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -980,12 +982,60 @@ YouTube support is intentionally simple and predictable:
 - When a category has multiple IDs, the system picks one at random at runtime
 - The tool can launch a known playlist with a YouTube deep link
 - If the playlist name does not match confidently, the assistant should ask before doing a search
-- Search opens YouTube TV results using a search URL
+- **Search plays the first video result, it does not stop at the results page.** See below
 
 Cold-start behavior:
 
 - If YouTube is already foreground, California does not relaunch it before opening the requested playlist or search
 - If YouTube is not foreground, California warm-launches YouTube first, waits briefly, presses OK once for the profile picker, then opens the target URL
+
+### "Search for X and play it": the results page never plays
+
+Reported 2026-09-14: "search YouTube for the hottest hits of J. Cole and play
+the first thing" searched correctly and never played. The results deep link
+(`/results?search_query=`) stops at the results page, and measured on the real
+box it **never starts anything on its own** -- 20s on the page, media session
+untouched.
+
+Pressing into it blind was tried first and is the wrong primitive, for three
+measured reasons:
+
+- **The top result is not always a video.** For "anderson paak hottest hits"
+  it was a playlist: one OK opened the playlist *page* (screenshot confirmed),
+  a second OK would have been needed on its first item. Channels and Mixes are
+  different again. The YouTube TV app is a Cobalt web view, so `uiautomator`
+  returns one full-screen node and cannot say which
+- **A second OK inside the player is play/pause.** The retry paused the very
+  thing the first press had started
+- **The previous video keeps playing under the results page** (`dumpsys audio`
+  AudioTrack stays `started`), so no live reading separates "OK did nothing"
+  from "OK picked the video that was already on"
+
+`services/youtube_search.py` resolves the query instead: it fetches the
+public web results page and takes the first `videoRenderer` -- the same
+`ytInitialData` scrape `tools/search_youtube_videos.py` has used since day
+one, now shared. No API key, no account, no quota; ~1s from the laptop. The
+box then gets `watch?v=<id>`, which **plays directly**, publishes the title in
+the session ~2s later, and **restarts from zero with a fresh stamp even when
+that video is already on**. No key press anywhere on the path.
+
+`MediaService.youtube_play_video()` confirms it the only way the box allows:
+`dumpsys media_session` before the link and after, compared by the
+`updated=` stamp. This is load-bearing -- **a session an app walked away from
+is reported verbatim**, state=3, same stamp, same title, for as long as
+nothing new is published, so "is YouTube playing" was already true before the
+link and proves nothing. A changed stamp does. Some videos never publish a
+description (`null, null, null` with the position advancing), so the title
+gets a 1.5s grace after the stub, not the whole verify window; the spoken
+title comes from the scrape anyway, cut at the first `|` and stripped of
+`[tags]` by `speakable_title`.
+
+Fallbacks, each with its own line: a resolve that fails (no internet, consent
+wall, markup change) opens the results page and says "pick one with the
+remote"; a link that went but a session that never moved gets Stremio's
+"didn't start on its own, hit OK"; an unreadable session is "couldn't
+confirm", never "playing". `youtube_search_autoplay: false` restores the bare
+results page.
 
 ### Playlist Matching Rules
 
@@ -1227,8 +1277,11 @@ feature was designed around:
   `metadata: size=4, description=Fallout, The Strip, null` -- a MediaDescription
   printed as "title, subtitle, iconUri", with unset fields as the literal
   "null". So "what is playing" is readable after all, and unlike the launch
-  memory it survives him starting something with the remote. YouTube still
-  publishes nothing, which is why the memory below still earns its place.
+  memory it survives him starting something with the remote. **YouTube
+  publishes too** -- corrected 2026-09-14: `description=Port Antonio, J. Cole,
+  null` is title and channel -- but not for every video (some sit at
+  `null, null, null` with the position advancing), which is why the memory
+  below still earns its place.
 - **Sessions are plural.** Spotify held an active session at `state=0` the whole
   time Stremio was playing. A flat `"state=3" in dump` therefore answers a
   different question than the one asked and would hand Spotify's playback to
@@ -1540,6 +1593,13 @@ Current automated coverage exists for:
 - Now-playing memory: quoted only while the foreground app still matches,
   dropped when he switched apps, never claiming a search was played, and not
   recorded at all when the launch failed
+- YouTube search autoplay: the first `videoRenderer` wins and a playlist at
+  the top is skipped, a failed resolve is `None` rather than a traceback and
+  falls back to the results page, the `updated=` stamp is parsed and a
+  verbatim repeat of a playing session is not a new playback while the same
+  video restarted is, the baseline is read before the link, an undescribed
+  video stops waiting after the grace, no key is ever pressed, and each
+  outcome gets its own spoken line
 - Light shadow state: recorded only on success, brightness stored clamped,
   colour stored as the spoken word, brightness never implying power, and
   `light_status` never asking the service for state
@@ -1827,6 +1887,17 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 - If no resume progress exists for a series, opening the Stremio detail page is better than guessing an episode
 - Shared ADB helpers with explicit timeouts are more reliable than scattered raw shell calls for UI dumps and screenshot capture
 - Static YouTube playlist mapping is simpler and more reliable than OAuth-heavy integrations
+- **Pressing into a screen you cannot read is a coin flip, and "opened"
+  is not "playing".** The YouTube results page looked like one OK away from
+  playback and was one OK away from a playlist page, a channel page, or a
+  pause, depending on what happened to rank first. Resolving the query to a
+  video id off-box and deep-linking `watch?v=` turned a UI guess into a
+  deterministic launch that the session can confirm
+- **A published state is a record, not a reading.** `dumpsys media_session`
+  reports the last thing an app said, verbatim, for as long as it says
+  nothing new -- YouTube sat at state=3 on a results page for 20s. "Is it
+  playing" was true before the launch and proved nothing; only a change
+  (the `updated=` stamp) does. Same shape as the CEC power report
 - For YouTube curation, validation against the real fetched page title is more reliable than trusting search snippets or guessed IDs
 - Multi-ID playlist categories are a simple way to keep repeated requests fresh without changing the voice interface
 - The YouTube region path is best handled by restarting Surfshark and then opening YouTube, not by trying to select Albania manually inside the app

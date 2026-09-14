@@ -211,7 +211,8 @@ california/
 │   ├── stt.py
 │   ├── tts.py
 │   ├── tts_text_sanitizer.py
-│   └── youtube_playlist_resolver.py
+│   ├── youtube_playlist_resolver.py
+│   └── youtube_search.py
 ├── hardware/
 │   └── led_controller.py
 ├── tools/
@@ -240,6 +241,7 @@ YouTube support is intentionally simple:
 - exact and fuzzy category matching is handled in `services/youtube_playlist_resolver.py`
 - categories can hold one playlist ID or several IDs
 - when multiple IDs exist, one is chosen at random
+- a free-text search ("play the hottest hits of J. Cole") is resolved to the first video result in `services/youtube_search.py` and launched as a `watch?v=` link, then confirmed from the media session, because the results page never plays on its own
 
 ## Operational Notes
 

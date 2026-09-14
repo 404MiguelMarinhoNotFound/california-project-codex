@@ -27,6 +27,7 @@ from services.now_playing import NowPlaying
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
 from services.surfshark_service import SurfsharkService
 from services.youtube_playlist_resolver import resolve_playlist_choice
+from services.youtube_search import speakable_title, top_video
 
 logger = logging.getLogger(__name__)
 
@@ -517,12 +518,59 @@ def _dispatch_tv(
         query = (params.get("query") or "").strip()
         if not query:
             return "Tell me what to search for on YouTube."
-        ok = media_svc.youtube_search(query)
-        logger.info("[timing] youtube_search dispatch took %.3fs ok=%s", time.monotonic() - t_yt, ok)
-        if not ok:
-            return "I couldn't open YouTube search right now."
-        _remember_launch(now_playing, "youtube", query, "opened")
-        response = f"Searching YouTube for {query}."
+        # "Search for X" means "and play it". The results deep link stops at
+        # the results page (reported 2026-09-14: searched correctly, never
+        # played), so resolve the query to the first video and play THAT.
+        # The results page is only the fallback for a resolve that failed.
+        video = None
+        if getattr(media_svc, "youtube_search_autoplay", False):
+            t_resolve = time.monotonic()
+            video = top_video(query, timeout_s=media_svc.youtube_search_resolve_timeout_s)
+            logger.info(
+                "[timing] youtube_search resolve took %.3fs video=%s",
+                time.monotonic() - t_resolve, video.video_id if video else None,
+            )
+
+        if video is None:
+            ok = media_svc.youtube_search(query)
+            logger.info("[timing] youtube_search dispatch took %.3fs ok=%s", time.monotonic() - t_yt, ok)
+            if not ok:
+                return "I couldn't open YouTube search right now."
+            _remember_launch(now_playing, "youtube", query, "opened")
+            if getattr(media_svc, "youtube_search_autoplay", False):
+                # She meant to play it and could not pick. Say so, and hand
+                # over the one thing that finishes the job.
+                response = (
+                    f"I couldn't pick a result for {query}, so the YouTube search is up. "
+                    "Pick one with the remote."
+                )
+            else:
+                response = f"Searching YouTube for {query}."
+            return _append_route_warning(response, route_warning)
+
+        spoken = speakable_title(video.title) or query
+        t_play = time.monotonic()
+        playback = media_svc.youtube_play_video(video.video_id)
+        logger.info(
+            "[timing] youtube_search play took %.3fs opened=%s started=%s title=%r",
+            time.monotonic() - t_play, playback.opened, playback.started, playback.title,
+        )
+        if not playback.opened:
+            return "I couldn't open that on YouTube right now."
+        if playback.started is False:
+            # The link went and the session never moved. Same line Stremio
+            # uses, because the fix is the same: the remote.
+            _remember_launch(now_playing, "youtube", spoken, "opened")
+            response = f"YouTube's open on {spoken} but it didn't start on its own. Just hit OK on the remote."
+            return _append_route_warning(response, route_warning)
+        if playback.started is None:
+            # Launched, nothing readable back. Never claim a playback that
+            # was not confirmed.
+            _remember_launch(now_playing, "youtube", spoken, "opened")
+            response = f"I put {spoken} on YouTube, but I couldn't confirm it started."
+            return _append_route_warning(response, route_warning)
+        _remember_launch(now_playing, "youtube", spoken)
+        response = f"Playing {spoken} on YouTube."
         return _append_route_warning(response, route_warning)
 
     # Navigation
