@@ -17,11 +17,16 @@ holds a live session token):
 
 import json
 import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEVICE_ID_PATH = ROOT / ".deebot_device_id"
 CREDENTIALS_PATH = ROOT / ".deebot_credentials.json"
+
+_TOOLS_DIR = Path(__file__).resolve().parent
+if str(_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TOOLS_DIR))
 
 
 def stable_device_id() -> str:
@@ -90,9 +95,18 @@ async def build_authenticator(session, *, device_id: str, country: str, email: s
 async def authenticate(authenticator, *, verification_code_env: str = "ECOVACS_VERIFICATION_CODE") -> bool:
     """Authenticate, handling device verification if it's (still) required.
 
-    Returns True once authenticated. Returns False and prints instructions
-    if a fresh emailed code is needed and none was supplied via env.
+    Verification order when a code is needed:
+      1. verification_code_env, if already set (e.g. supplied by a human)
+      2. GMAIL_APP_PASSWORD auto-read (if ECOVACS_EMAIL/GMAIL_APP_PASSWORD are
+         set) -- requests a fresh code, then polls that inbox over IMAP and
+         extracts it, no human involved
+      3. otherwise, request a code and tell the caller to supply one
+
+    Returns True once authenticated, False if a code was needed and neither
+    (1) nor (2) could produce one.
     """
+    import asyncio
+
     from deebot_client.exceptions import DeviceVerificationRequiredError
 
     try:
@@ -106,6 +120,25 @@ async def authenticate(authenticator, *, verification_code_env: str = "ECOVACS_V
         print(f"Verifying with {verification_code_env}...")
         await authenticator.verify_device(code.strip())
         return True
+
+    gmail_address = os.getenv("ECOVACS_EMAIL")
+    app_password = os.getenv("GMAIL_APP_PASSWORD")
+    if gmail_address and app_password:
+        import gmail_verification_code as gmail
+
+        print("Device verification required. Reading the code from Gmail...")
+        since_uid = await asyncio.to_thread(gmail.latest_uid, gmail_address, app_password)
+        await authenticator.request_device_verification_code()
+        code = await asyncio.to_thread(
+            gmail.fetch_new_code, gmail_address, app_password, since_uid=since_uid
+        )
+        if code:
+            print(f"Found code {code} in Gmail, verifying...")
+            await authenticator.verify_device(code)
+            return True
+        print("No verification email arrived within the timeout. Try again, or")
+        print(f"check {gmail_address} manually and set {verification_code_env}.")
+        return False
 
     await authenticator.request_device_verification_code()
     print("Ecovacs wants this device verified again. Check email, then re-run with")
