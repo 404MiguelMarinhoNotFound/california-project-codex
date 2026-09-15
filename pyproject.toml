@@ -76,6 +76,9 @@ default = ["california[kokoro]", "california[govee]", "california[silero]", "cal
 cec = [
     "samsungtvws>=3.0.5",
 ]
+deebot = [
+    "deebot-client>=6.0.2",
+]
 
 [tool.uv]
 # Always use uv's own managed CPython. Building .venv on the Windows Store
