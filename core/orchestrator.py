@@ -18,6 +18,7 @@ import logging
 import threading
 import queue
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from services.activation_phrases import EchoGate, resolve_tier, strip_activation_echo
 from services.govee_service import GoveeService, clamp_percent, resolve_color
@@ -32,6 +33,40 @@ from services.youtube_search import speakable_title, top_video
 logger = logging.getLogger(__name__)
 
 _LIGHTS_UNREACHABLE = "I couldn't reach your lights just now."
+
+
+def _build_parallel(tasks: dict) -> dict:
+    """Run each zero-arg callable in `tasks` on its own thread and return
+    {name: result}. Every task runs to completion before this raises, so one
+    slow or failing component never hides how the others did. On failure,
+    raises RuntimeError naming every failed task, chained from the first
+    exception.
+
+    Boot-time component construction is dominated by model loads (Kokoro TTS,
+    Silero VAD, the wake-word ONNX model) and network calls (ADB connect and
+    device discovery, Stremio login + library sync) that don't depend on each
+    other's results — they were simply written one after another. Threads are
+    enough here even though CPython has a GIL: model loading is disk I/O and
+    the compute-heavy parts (torch, onnxruntime) release the GIL, and the
+    network calls are pure I/O wait.
+    """
+    results: dict = {}
+    errors: dict = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(tasks)), thread_name_prefix="boot") as pool:
+        future_to_name = {pool.submit(fn): name for name, fn in tasks.items()}
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:  # noqa: BLE001 - re-raised below with context
+                errors[name] = exc
+
+    if errors:
+        failed = ", ".join(errors)
+        first_exc = next(iter(errors.values()))
+        raise RuntimeError(f"Component init failed: {failed}") from first_exc
+
+    return results
 
 ROUTED_ACTIONS = {
     "youtube_playlist": ("youtube", "restart_autoconnect"),
@@ -792,21 +827,45 @@ class Orchestrator:
         from services.stt import STTService
         from services.tts import TTSService
 
-        # Initialize all components
-        logger.info("Initializing components...")
-        self.audio = AudioPipeline(config)
-        self.wake_word = WakeWordDetector(config)
-        self.vad = VAD(config)
-        self.stt = STTService(config)
-        self.llm = LLMService(config)
-        self.tts = TTSService(config)
-        self.leds = LEDController(config)
+        # Initialize all components. Phase 1 builds everything that only needs
+        # `config` — these don't depend on each other, so they run in parallel
+        # instead of one after another. See _build_parallel for why threads work
+        # here despite the GIL. This alone is most of the boot-time win: the
+        # slowest of these (Kokoro TTS, Silero VAD, the wake-word model) used to
+        # add up; now boot takes as long as the slowest one, not the sum.
+        logger.info("Initializing components (parallel boot)...")
+        boot_start = time.monotonic()
 
-        # Mi BOX S / Media control
-        if config.get("media", {}).get("enabled"):
-            self.media_service = MediaService(config)
-            connected = self.media_service.connect()
-            logger.info("Mi BOX S connected" if connected else "Mi BOX S not reachable at startup")
+        media_enabled = bool(config.get("media", {}).get("enabled"))
+
+        phase1 = {
+            "audio": lambda: AudioPipeline(config),
+            "wake_word": lambda: WakeWordDetector(config),
+            "vad": lambda: VAD(config),
+            "stt": lambda: STTService(config),
+            "llm": lambda: LLMService(config),
+            "tts": lambda: TTSService(config),
+            "leds": lambda: LEDController(config),
+            "govee": lambda: GoveeService(config),
+        }
+        if media_enabled:
+            # Construction only here — no network. MediaService.connect() is a
+            # network call and belongs in phase 2 with the other network work.
+            phase1["media"] = lambda: MediaService(config)
+
+        built = _build_parallel(phase1)
+
+        self.audio = built["audio"]
+        self.wake_word = built["wake_word"]
+        self.vad = built["vad"]
+        self.stt = built["stt"]
+        self.llm = built["llm"]
+        self.tts = built["tts"]
+        self.leds = built["leds"]
+        self.govee_service = built["govee"]
+
+        if media_enabled:
+            self.media_service = built["media"]
             self.surfshark_service = SurfsharkService(config, self.media_service)
         else:
             self.media_service = None
@@ -821,12 +880,23 @@ class Orchestrator:
         # write-only, so this is the only answer that exists for them.
         self.light_shadow = LightShadow()
 
-        # Govee lights. Constructed unconditionally — the service self-disables
-        # when config is off or GOVEE_API_KEY is missing, so there is no None branch.
-        self.govee_service = GoveeService(config)
+        # Phase 2: the network calls. MediaService.connect() (ADB connect +
+        # device discovery) and StremioService's startup login + library sync
+        # are both blocking I/O and don't depend on each other, so they also
+        # run side by side rather than back to back.
+        phase2 = {
+            "stremio": lambda: StremioService(config, media_service=self.media_service),
+        }
+        if self.media_service is not None:
+            phase2["media_connected"] = self.media_service.connect
 
-        # Stremio library/progress + deep-link control
-        self.stremio_service = StremioService(config, media_service=self.media_service)
+        done2 = _build_parallel(phase2)
+
+        self.stremio_service = done2["stremio"]
+        if self.media_service is not None:
+            connected = done2["media_connected"]
+            logger.info("Mi BOX S connected" if connected else "Mi BOX S not reachable at startup")
+
         self._background_stop = threading.Event()
         self._stremio_sync_thread: threading.Thread | None = None
 
@@ -886,7 +956,7 @@ class Orchestrator:
         self._active_tts_queue = None
         self._last_record_outcome = "ok"  # "ok" | "no_speech" | "short"
 
-        logger.info("All components initialized successfully")
+        logger.info("All components initialized in %.1fs", time.monotonic() - boot_start)
 
     def _play_bootup_sound(self):
         """Pick a random WAV from sounds/bootup/ and play it."""
