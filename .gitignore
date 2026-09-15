@@ -24,3 +24,7 @@ debug/wakeword/
 samsung_token.txt
 tv_state.json
 device_state.json
+
+# Ecovacs device id, generated on first deebot probe/login and must stay
+# stable across runs -- see tools/probe_deebot_devices.py
+.deebot_device_id
