@@ -238,6 +238,7 @@ llm:
       You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, and check the room with get_status, which reports the TV's power and input, the box, and what is up and playing. Say only what it gives you, never fill in a detail it left out, and trust it over anything you remember putting on earlier. Turning the TV on and off is yours too: turn_on and turn_off, and treat "put the TV on", "kill the TV", "turn everything off" as those. Two things to know about them. turn_on takes up to about a minute (measured at forty-seven seconds) because it wakes the television first and then the box, so say you're on it and then wait, never fire the tool twice or call it failed while it's still going. And turn_off puts the television into standby along with the box, which is intended, so mention both in one short line. You can switch the TV's inputs with switch_hdmi; the inputs are listed at the end of this prompt, do not guess at ones that are not. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
       Music and video both go through that TV, so treat "put on", "play", and "what can you play" as TV requests, not as questions about your own abilities. For music, YouTube is the path: use youtube_playlist for a saved category (they are listed at the end of this prompt) and youtube_search for anything else. For shows and films it is Stremio: stremio_play, stremio_continue, and stremio_get_progress for "what episode am I on". You have no music service of your own and no access to his YouTube account, so never claim to browse his subscriptions, liked songs, or account playlists.
       You can control Master Miguel's Govee lights using the control_lights tool: power, brightness from 1 to 100, and colour. The rooms you can reach are listed at the end of this prompt, do not invent others. Brightness and colour only show on a light that is already on, so turn it on first if it might be off. Use light_status for what a light is set to, and keep its wording that this is the last command you sent rather than a live reading, because the strip cannot be read back. Confirm in one short casual sentence, and say so plainly if a light is unreachable.
+      You can control Master Miguel's Deebot robot vacuum using the control_vacuum tool: vacuum_clean_all for the whole house, vacuum_clean_rooms with one or more room names for specific rooms (the rooms are listed at the end of this prompt, do not invent others), vacuum_stop, vacuum_dock to send it home to charge, and vacuum_status for battery and whether it is cleaning, docked, or in error. "Clean the house", "vacuum the flat", "hoover everything" mean vacuum_clean_all; "clean the kitchen and the bedroom" is one vacuum_clean_rooms call with both rooms. Each clean checks the vacuum first and refuses politely if it is already cleaning, so pass that on rather than retrying. Confirm in one short casual sentence, and say so plainly if the vacuum is unreachable.
 
   conversation_history_size: 6  # Number of exchanges to keep (1 exchange = user + assistant)
 
@@ -644,3 +645,40 @@ govee:
         - "upstairs"
         - "the lights"
         - "my lights"
+
+# --- Deebot vacuum (Ecovacs DEEBOT N8+) ---
+# Talks to Ecovacs' cloud over REST only, one connection per command, with the
+# login token cached in .deebot_credentials.json and the emailed device
+# verification code read from Gmail (GMAIL_APP_PASSWORD) when Ecovacs asks.
+# Needs: uv sync --extra default, plus ECOVACS_EMAIL / ECOVACS_PASSWORD in .env.
+#
+# rooms: keys mirror the names set in the ECOVACS HOME app (Map Management >
+# Edit Map > Area Type). `id` is a cache so "clean the kitchen" is one call;
+# ids shift after a remap, so a rejected id falls back to matching the key
+# against the robot's live room names. Rooms still called "Default" on the
+# robot are ignored. Regenerate this block from the robot with:
+#   uv run python tools/probe_deebot_rooms.py
+deebot:
+  enabled: true
+  country: null                   # null = ECOVACS_COUNTRY from .env (default PT)
+  command_timeout_ms: 30000
+  verification_email_timeout_ms: 90000
+  rooms:
+    living room:
+      id: 0
+      aliases: ["lounge", "sala", "the living room", "living"]
+    corridor:
+      id: 2
+      aliases: ["hallway", "hall", "the corridor", "corredor"]
+    study:
+      id: 3
+      aliases: ["office", "the study", "the office", "escritorio"]
+    bedroom:
+      id: 5
+      aliases: ["the bedroom", "quarto", "my room"]
+    kitchen:
+      id: 7
+      aliases: ["the kitchen", "cozinha"]
+    bathroom:
+      id: 8
+      aliases: ["toilet", "wc", "the bathroom", "casa de banho"]

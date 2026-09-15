@@ -6,6 +6,9 @@ from services.llm import (
     CONTROL_LIGHTS_TOOL_OPENAI,
     CONTROL_TV_TOOL,
     CONTROL_TV_TOOL_OPENAI,
+    CONTROL_VACUUM_TOOL,
+    CONTROL_VACUUM_TOOL_OPENAI,
+    LOCAL_TOOL_NAMES,
     LLMService,
 )
 from tests.config_fixture import config_for_tests
@@ -151,6 +154,51 @@ class ToolSchemaTests(unittest.TestCase):
         actions = CONTROL_TV_TOOL["input_schema"]["properties"]["action"]["enum"]
         self.assertIn("get_status", actions)
         self.assertEqual(len(actions), 23)
+
+    def test_control_vacuum_is_the_core_five_and_nothing_more(self):
+        # Every enum value is paid for on every turn. Pause/resume/locate were
+        # deliberately left out until someone actually asks for them by voice.
+        actions = CONTROL_VACUUM_TOOL["input_schema"]["properties"]["action"]["enum"]
+        self.assertEqual(
+            actions,
+            ["vacuum_clean_all", "vacuum_clean_rooms", "vacuum_stop", "vacuum_dock", "vacuum_status"],
+        )
+        self.assertIs(
+            CONTROL_VACUUM_TOOL_OPENAI["function"]["parameters"],
+            CONTROL_VACUUM_TOOL["input_schema"],
+        )
+        self.assertIn("control_vacuum", LOCAL_TOOL_NAMES)
+
+
+class VacuumInventoryPromptTests(unittest.TestCase):
+    """Same rule as the lights: room names are injected, never hardcoded."""
+
+    def _service(self, enabled=True, rooms=None):
+        rooms = {"kitchen": {"id": 7}, "bedroom": {"id": 5}} if rooms is None else rooms
+        config = _config()
+        config["deebot"] = {"enabled": enabled, "rooms": rooms}
+        with mock.patch.dict("os.environ", {"GROQ_API_KEY": "x"}), mock.patch("groq.Groq"):
+            return LLMService(config)
+
+    def test_configured_rooms_appear_in_the_system_prompt(self):
+        prompt = self._service()._build_system_prompt()
+        self.assertIn("Vacuum rooms you can clean by name: kitchen, bedroom.", prompt)
+
+    def test_orchestrator_can_override_with_what_actually_loaded(self):
+        service = self._service()
+        service.vacuum_room_names = ["kitchen"]
+        self.assertIn("by name: kitchen.", service._build_system_prompt())
+
+    def test_nothing_injected_when_disabled(self):
+        self.assertNotIn("Vacuum rooms", self._service(enabled=False)._build_system_prompt())
+
+    def test_nothing_injected_when_no_rooms(self):
+        self.assertNotIn("Vacuum rooms", self._service(rooms={})._build_system_prompt())
+
+    def test_the_tool_is_only_offered_when_enabled(self):
+        self.assertTrue(self._service().vacuum_enabled)
+        self.assertFalse(self._service(enabled=False).vacuum_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

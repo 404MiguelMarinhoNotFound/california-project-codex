@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**California** (C.A.L.I.F.O.R.N.I.A. - Cognitively Adaptive Language Intelligence For Operational Research, Navigation, and Intuitive Assistance) is a DIY voice assistant running on a Raspberry Pi or laptop in Carcavelos, Lisbon, Portugal. It is built around a streaming STT -> LLM -> TTS pipeline and now also controls a Mi Box / Android TV over ADB for Stremio, YouTube, and Surfshark routing, plus Govee smart lights over Bluetooth LE. The primary user is **Master Miguel**. Target operational cost: **under EUR5/month**.
+**California** (C.A.L.I.F.O.R.N.I.A. - Cognitively Adaptive Language Intelligence For Operational Research, Navigation, and Intuitive Assistance) is a DIY voice assistant running on a Raspberry Pi or laptop in Carcavelos, Lisbon, Portugal. It is built around a streaming STT -> LLM -> TTS pipeline and now also controls a Mi Box / Android TV over ADB for Stremio, YouTube, and Surfshark routing, plus Govee smart lights over Bluetooth LE and a Deebot N8+ robot vacuum through Ecovacs' cloud. The primary user is **Master Miguel**. Target operational cost: **under EUR5/month**.
 
 -----
 
@@ -46,10 +46,11 @@ No VPN preflight and no ADB on this path, and by default no network at all.
 | TTS | Kokoro, Edge TTS, Piper, ElevenLabs |
 | TV control | ADB over network to Mi Box / Android TV |
 | Light control | Govee over Bluetooth LE (`bleak`); Govee cloud v2 API optional |
+| Vacuum control | Ecovacs Deebot N8+ via `deebot-client` over REST only; verification codes read from Gmail over IMAP |
 | Stremio state | Stremio private API + local `watch_state.json` cache |
 | Title resolution | TMDB |
 | Audio I/O | `sounddevice`, `soundfile` |
-| Language | Python (pinned in `.python-version`, `requires-python = ">=3.11"`) |
+| Language | Python 3.14 (pinned in `.python-version`, `requires-python = ">=3.14"`; see the deebot note below for why it moved off 3.11) |
 | Packages / env | **uv only** — `pyproject.toml` + `uv.lock`, never pip |
 | Key libraries | `numpy`, `queue`, `requests`, `yaml` |
 
@@ -78,7 +79,18 @@ Optional, only for the Govee **cloud** transport:
   credentials at all. Without it the cloud transport disables itself and the rest of the
   assistant keeps working
 
+Required for the vacuum (`control_vacuum`):
+
+- `ECOVACS_EMAIL` / `ECOVACS_PASSWORD` - the ECOVACS HOME app login. `ECOVACS_COUNTRY`
+  defaults to `PT`. Without them `DeebotService` disables itself
+- `GMAIL_APP_PASSWORD` - a Gmail **App Password** for `ECOVACS_EMAIL`'s inbox (not the
+  account password; `myaccount.google.com/apppasswords`, needs 2-Step Verification on).
+  Ecovacs demands an emailed device-verification code roughly weekly; with this set the
+  service reads the code itself over IMAP. Without it, the vacuum tool stalls until
+  `ECOVACS_VERIFICATION_CODE` is set by hand once. See "DeebotService" below
+
 Keep secrets in `.env` or another local-only secret mechanism. Do not commit real credentials.
+`.deebot_credentials.json` holds a live Ecovacs session token and is gitignored for the same reason.
 
 > **Porcupine is retired in this project.** Picovoice sunset its Free Tier on
 > **2026-06-30** and disabled all Free Tier AccessKeys, so `PICOVOICE_ACCESS_KEY`
@@ -190,6 +202,9 @@ california/
 │   ├── cec_wake.py              # Wake the box via the TV over HDMI-CEC; ADB cannot turn it on
 │   ├── device_finder.py         # Shared find-by-MAC / verify-by-identity / cache-the-IP ladder
 │   ├── llm.py                   # Multi-provider LLM streaming + tool calling
+│   ├── deebot_service.py        # Deebot N8+ vacuum: REST-only, auth-first, cached-id-then-live rooms
+│   ├── deebot_session.py        # Ecovacs login: persisted token + device id, Gmail-read verification
+│   ├── gmail_verification_code.py # IMAP poller that pulls the Ecovacs verification code (stdlib only)
 │   ├── govee_service.py         # Govee cloud v2 light control
 │   ├── name_matcher.py          # Shared fuzzy hint -> key matching: exact, despaced, substring, token overlap
 │   ├── media_service.py         # Generic Mi Box / Android TV ADB controls
@@ -215,6 +230,8 @@ california/
 │   ├── run_stremio_e2e.py          # Live end-to-end Stremio routing and playback test
 │   ├── run_youtube_playlist_e2e.py # Live end-to-end YouTube playlist routing test
 │   ├── probe_govee_devices.py      # Lists Govee devices with sku, device id, and capabilities
+│   ├── probe_deebot_devices.py     # Lists the Ecovacs account's robots and whether deebot-client supports them
+│   ├── probe_deebot_rooms.py       # Live room id -> name; prints the deebot.rooms block; --check flags drift
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
@@ -229,12 +246,14 @@ california/
 │   ├── test_config_fixture.py   # Fixture behavior + guard against re-typed config values
 │   ├── test_activation_capture.py # Activation clip naming and pruning
 │   ├── test_activation_phrases.py # Wake tiers, echo stripping, recording trim, dropped turns
+│   ├── test_deebot_service.py   # Vacuum self-disable, room fallback, auth-first retry-once, no-network guard
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
 │   ├── test_device_discovery.py # DeviceFinder ladder, cache, ARP parsing; no-network guard
 │   ├── test_media_power.py      # turn_on/turn_off, BT wake fallback, no blind KEYCODE_POWER
 │   ├── test_media_service.py    # YouTube / ADB unit tests
 │   ├── test_mic_drain.py        # Stale mic-buffer draining after playback
 │   ├── test_orchestrator_lights.py # control_lights dispatch behavior
+│   ├── test_orchestrator_vacuum.py # control_vacuum dispatch: spoken lines, status-first guard
 │   ├── test_orchestrator_vpn_routing.py # VPN preflight routing behavior
 │   ├── test_stremio_service.py  # Stremio / TMDB / playback unit tests
 │   ├── test_stt_hallucination.py # Whisper non-speech filler and segment-probability gating
@@ -252,7 +271,9 @@ california/
 ├── deprecated/                  # Retired files kept for reference, see deprecated/README.md
 ├── device_state.json            # Generated locally, discovered device addresses
 ├── vpn_state.json               # Generated locally, Surfshark diagnostic cache
-└── watch_state.json             # Generated locally, cached Stremio progress
+├── watch_state.json             # Generated locally, cached Stremio progress
+├── .deebot_device_id            # Generated locally, the Ecovacs device id that got verified
+└── .deebot_credentials.json     # Generated locally, live Ecovacs session token (~7 day life)
 ```
 
 Important runtime note:
@@ -490,10 +511,12 @@ Use `queue.Queue(maxsize=2)` for synthesized audio buffering so synthesis and pl
 
 ### Tool-Driven Device Control
 
-- TV control is exposed to the LLM through the `control_tv` tool, lights through `control_lights`
-- `services/llm.py` defines both tool schemas and lists the locally dispatched ones in `LOCAL_TOOL_NAMES`
-- `core.orchestrator._handle_tool_call()` routes by tool name to `_dispatch_tv` or `_dispatch_lights`
-- Both dispatchers are **module-level functions taking services as parameters**, not methods. That is
+- TV control is exposed to the LLM through the `control_tv` tool, lights through `control_lights`,
+  the vacuum through `control_vacuum`
+- `services/llm.py` defines the tool schemas and lists the locally dispatched ones in `LOCAL_TOOL_NAMES`
+- `core.orchestrator._handle_tool_call()` routes by tool name to `_dispatch_tv`, `_dispatch_lights`
+  or `_dispatch_vacuum`
+- All three dispatchers are **module-level functions taking services as parameters**, not methods. That is
   what lets the tests exercise them without constructing an `Orchestrator`. Keep new ones that way
 - Handlers return a short natural-language string, never JSON, because the string goes straight back
   to the LLM to be spoken
@@ -888,6 +911,87 @@ order. Still do not remove either. `tests/test_name_matcher.py` pins the orderin
 Setup: `uv sync --extra govee`, then `uv run python tools/probe_govee_devices.py` to get the
 MAC, and put it in `config.yaml` under `govee.lights.<room>.mac`.
 
+### DeebotService
+
+`services/deebot_service.py` drives the Deebot N8+ through Ecovacs' cloud with
+`deebot-client`, behind the `control_vacuum` tool. Same contract as `GoveeService`:
+never raises at construction, self-disables when `deebot.enabled` is off, the
+dependency is missing, or `ECOVACS_EMAIL`/`ECOVACS_PASSWORD` are unset, returns
+`DeebotCommandResult` (falsy on failure, so `is not None` for existence checks),
+and resolves spoken room names through `services/name_matcher.py`. Five actions:
+`vacuum_clean_all`, `vacuum_clean_rooms` (one or more names), `vacuum_stop`,
+`vacuum_dock`, `vacuum_status`. Verified end to end on the real robot 2026-09-16.
+
+**REST only. No MQTT.** deebot-client sends every JSON command over
+`api/iot/devmanager.do` and the reply is in the same HTTP response; MQTT only
+carries push events. Battery, state, error and the room list all arrive through
+the event bus off those REST replies (`EventBus.subscribe` runs the event's
+refresh commands for its first subscriber, so `_await_event` subscribes and
+waits, it never sends a get-command itself). Measured: ~2s for a status, 0.4s
+for stop/dock, 3.1s for everything including the map. Skipping `MqttClient`
+also skips aiomqtt's Windows `add_reader`/`add_writer` `NotImplementedError`
+noise entirely -- the default Proactor loop cannot drive paho's sockets, and the
+one-shot scripts only worked *despite* it.
+
+**Connect-per-command on one worker thread**, the `BleTransport` pattern. The
+orchestrator is threaded and synchronous; every public method submits one
+coroutine to a single-worker executor and waits with `deebot.command_timeout_ms`.
+Never `asyncio.run` a deebot coroutine from orchestrator code. The `DeviceInfo`
+from `get_devices()` is cached in memory; the `Device` object is rebuilt per call
+because it holds the per-call `Authenticator`.
+
+**Auth first, every command, retry once.** `_with_auth` is the only path to the
+robot. It builds an `Authenticator` preloaded with the cached token
+(`services/deebot_session.py`), authenticates, runs the command, and if Ecovacs
+rejects the token mid-command (`DeviceVerificationRequiredError` /
+`InvalidAuthenticationError`) it drops the cache, re-authenticates and retries
+the command **exactly once**. Any `ApiError`/`ApiTimeoutError`/`OSError` maps to
+an unreachable result; the dispatcher never sees an exception.
+
+**The auth chain, and why re-verification is "forever" without being manual.**
+`services/deebot_session.py` persists the login token to
+`.deebot_credentials.json` and reuses it, so the gated password-login endpoint
+is only hit when the token has actually expired (~7 days). When Ecovacs then
+demands a fresh emailed device-verification code, `authenticate()` reads it
+itself: `services/gmail_verification_code.py` polls `ECOVACS_EMAIL`'s inbox over
+IMAP (stdlib only, `GMAIL_APP_PASSWORD`), records the newest existing code's UID
+*before* requesting a new one so a stale email can't be mistaken for the fresh
+one, extracts the 6 digits and verifies. No human step. Without
+`GMAIL_APP_PASSWORD` the service stalls until `ECOVACS_VERIFICATION_CODE` is set
+by hand once. The ~7-day token life is Ecovacs' server ceiling, not ours -- the
+official Home Assistant integration hits the same wall on every restart (it
+stores no token at all); confirmed against upstream
+`DeebotUniverse/client.py` #1777 and `home-assistant/core` #178405. The device
+id in `.deebot_device_id` must stay stable across runs or every login
+re-triggers verification.
+
+**Rooms: cached id first, live name as the fallback and the self-heal.**
+`deebot.rooms` in `config.yaml` maps each room key to a cached numeric `id`, so
+"clean the kitchen" is one REST call. Ecovacs' room ids shift after a remap, so
+`clean_rooms` falls back to matching the config key against the robot's live
+room names (`RoomsEvent`) for any key with no cached id, and — the load-bearing
+part — when `CleanArea` **rejects** a cached id, it refreshes the live rooms,
+re-resolves every key by name, and retries once. A stale id cleans the right
+room instead of the wrong one, and logs a warning to update config. Rooms still
+named `Default` on the robot are dropped (they can't be voiced anyway).
+`check_room_drift()` runs once at boot on a daemon thread and only *warns* when
+a cached id disagrees with the live name -- it never rewrites config. Name
+resolution is the shared `match_name` from `services/name_matcher.py`, same as
+the lights, so aliases and the despaced tier work identically.
+
+**Status is the pre-clean guard, and it lives in the dispatcher.** `_dispatch_vacuum`
+reads `status()` before any clean: an unreachable robot gets the unreachable
+line rather than a command fired into the void, and one already `cleaning` is
+left alone rather than restarted. `stop`/`dock` skip the guard (stopping a robot
+you can't see is harmless). `State` int → word via `deebot_client.models.State`;
+a nonzero `ErrorEvent` code overrides the state to `error` and carries the
+description. Position/duration are deliberately not read -- the N8+ reports
+elapsed but no total, same limit as the TV, so nothing implies a percentage.
+
+Setup: `uv sync --extra default`, put `ECOVACS_EMAIL`/`ECOVACS_PASSWORD`
+(+`GMAIL_APP_PASSWORD`) in `.env`, then `uv run python tools/probe_deebot_rooms.py`
+to print the `deebot.rooms` block after naming rooms in the ECOVACS HOME app.
+
 ### StremioService
 
 `services/stremio_service.py` handles:
@@ -1163,14 +1267,18 @@ The Claude path supports:
 - Anthropic web search via `web_search_20250305`
 - Custom `control_tv` tool for Mi Box and TV control (23 actions)
 - Custom `control_lights` tool for Govee light control (5 actions)
+- Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 
-With the committed `config.yaml` that is **3 tools** in every request: `web_search`,
-`control_tv`, `control_lights`. Each custom tool's full schema is sent on every turn, so
-adding actions and parameters costs input tokens on every single exchange. Keep descriptions
-tight — see Cost Discipline.
+With the committed `config.yaml` that is **4 tools** in every request: `web_search`,
+`control_tv`, `control_lights`, `control_vacuum`. Each custom tool's full schema is sent on
+every turn, so adding actions and parameters costs input tokens on every single exchange.
+Keep descriptions tight — see Cost Discipline. `control_vacuum` was deliberately held to a
+core five (`vacuum_clean_all`, `vacuum_clean_rooms`, `vacuum_stop`, `vacuum_dock`,
+`vacuum_status`); pause/resume/locate were left out until asked for by voice.
 
-Both custom tools are gated by config: `control_tv` on `media.enabled`, `control_lights` on
-`govee.enabled`. Web search runs server-side at Anthropic and is **not** dispatched locally, which
+The custom tools are gated by config: `control_tv` on `media.enabled`, `control_lights` on
+`govee.enabled`, `control_vacuum` on `deebot.enabled`. Web search runs server-side at
+Anthropic and is **not** dispatched locally, which
 is why the Claude tool loop checks `block.name in LOCAL_TOOL_NAMES` instead of `block.type` alone.
 Widening that check to any `tool_use` block would break web search.
 
@@ -1198,6 +1306,12 @@ The `control_tv` schema in `services/llm.py` currently supports these TV-related
 - `get_status`
 - `stremio_play`, `stremio_continue`, `stremio_get_progress`, `stremio_sync_library`
 - `youtube_playlist`, `youtube_search`
+
+`control_vacuum` supports these actions:
+
+- `vacuum_clean_all`, `vacuum_clean_rooms` (needs `rooms`, an array of names)
+- `vacuum_stop`, `vacuum_dock`
+- `vacuum_status` (battery + state; doubles as the pre-clean guard)
 
 When tools are active:
 
@@ -1607,6 +1721,14 @@ Current automated coverage exists for:
 - Surfshark route execution, route cache semantics, and debug route capture
 - Orchestrator VPN preflight routing and warning behavior
 - Govee transport selection, light resolution, BLE packet format, and cloud HTTP error mapping
+- Deebot vacuum: self-disable (flag off, missing dependency, missing credentials), `Default`
+  rooms dropped, room resolution by alias/despaced tier, the cached-id-then-live-name fallback
+  and the stale-id re-resolve-and-retry, that `_with_auth` re-authenticates exactly once on a
+  rejected token then retries, timeouts and API errors become unreachable results, and a guard
+  that this test file never opens a network session (no Ecovacs, no IMAP)
+- `control_vacuum` dispatch: every spoken line, the status-first guard refusing a clean when
+  the robot is unreachable or already cleaning, unknown room names refused before any status
+  read, stop/dock skipping the guard, and failed results surfacing their message
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection

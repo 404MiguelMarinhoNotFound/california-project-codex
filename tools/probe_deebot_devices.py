@@ -3,28 +3,21 @@ Logs into the EcoVacs account and lists Deebot devices with what deebot-client
 knows about them: the API-reported model name/class, and whether the library
 resolved a model-specific capability profile for that class.
 
-This is exploratory only, no vacuum control here. It exists to answer one
-question before anything gets wired into control_tv/control_lights-style
-dispatch: does deebot-client actually recognize the N8+ (or whatever is on
-the account)?
+Read-only. Answers: does deebot-client actually recognize the N8+ (or
+whatever is on the account)? For the room list and config snippet use
+tools/probe_deebot_rooms.py instead.
 
-Ecovacs now requires one-time device verification (an emailed code) before
-a device id logs in, and it does not reliably stay verified: this
-library's own internal token refresh re-runs a full password login, which
-re-checks verification, and Ecovacs doesn't always honor "already verified"
-on that recheck (see tools/deebot_session.py and the upstream issue linked
-there). The mitigation is to never do a cold password login when a
-still-valid cached token exists -- tools/deebot_session.py persists both
-the device id and the login token locally and reuses them, so this only
-needs a fresh emailed code roughly when the cached token actually expires
-(~7 days), not on every run.
+Auth goes through services/deebot_session.py: cached token first, then
+password login, then Ecovacs' emailed device-verification code read
+automatically from Gmail (GMAIL_APP_PASSWORD). See that module for why.
 
 Needs in .env:
   ECOVACS_EMAIL
   ECOVACS_PASSWORD
   ECOVACS_COUNTRY   two-letter code, e.g. PT, US, DE (default: PT)
+  GMAIL_APP_PASSWORD  optional, for hands-off verification
 
-  uv sync --extra default --extra deebot
+  uv sync --extra default
   uv run python tools/probe_deebot_devices.py
   uv run python tools/probe_deebot_devices.py --json
 """
@@ -32,6 +25,7 @@ Needs in .env:
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -42,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import deebot_session  # noqa: E402
+from services import deebot_session  # noqa: E402
 
 
 async def probe(email: str, password: str, country: str, as_json: bool) -> int:
@@ -57,8 +51,11 @@ async def probe(email: str, password: str, country: str, as_json: bool) -> int:
         )
 
         try:
-            if not await deebot_session.authenticate(authenticator):
+            ok, reason = await deebot_session.authenticate(authenticator)
+            if not ok:
+                print(f"Not authenticated ({reason}).")
                 return 1
+            print(f"auth: {reason}")
             api_client = ApiClient(authenticator)
             devices = await api_client.get_devices()
         except Exception as exc:  # noqa: BLE001 - report auth/API errors plainly
@@ -129,6 +126,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Print raw results as JSON")
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     load_dotenv()
     email = os.getenv("ECOVACS_EMAIL")
     password = os.getenv("ECOVACS_PASSWORD")

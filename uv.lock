@@ -254,6 +254,7 @@ deebot = [
 ]
 default = [
     { name = "bleak" },
+    { name = "deebot-client" },
     { name = "en-core-web-sm" },
     { name = "kokoro" },
     { name = "samsungtvws" },
@@ -292,6 +293,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.40.0" },
     { name = "bleak", marker = "extra == 'govee'", specifier = ">=0.22.0" },
     { name = "california", extras = ["cec"], marker = "extra == 'default'" },
+    { name = "california", extras = ["deebot"], marker = "extra == 'default'" },
     { name = "california", extras = ["govee"], marker = "extra == 'default'" },
     { name = "california", extras = ["kokoro"], marker = "extra == 'default'" },
     { name = "california", extras = ["silero"], marker = "extra == 'default'" },

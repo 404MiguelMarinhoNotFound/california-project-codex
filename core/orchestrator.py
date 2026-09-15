@@ -21,6 +21,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from services.activation_phrases import EchoGate, resolve_tier, strip_activation_echo
+from services.deebot_service import DeebotService
 from services.govee_service import GoveeService, clamp_percent, resolve_color
 from services.media_service import MediaService
 from services.light_shadow import LightShadow
@@ -33,6 +34,7 @@ from services.youtube_search import speakable_title, top_video
 logger = logging.getLogger(__name__)
 
 _LIGHTS_UNREACHABLE = "I couldn't reach your lights just now."
+_VACUUM_UNREACHABLE = "I couldn't reach the vacuum just now."
 
 
 def _build_parallel(tasks: dict) -> dict:
@@ -815,6 +817,95 @@ def _dispatch_lights(params: dict, govee_svc, light_shadow=None) -> str:
     return "unknown action"
 
 
+def _join_rooms(keys: list[str]) -> str:
+    names = [f"the {k}" for k in keys]
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + f" and {names[-1]}"
+
+
+def _vacuum_status_line(status) -> str:
+    battery = f"{status.battery} percent" if status.battery is not None else None
+    if status.state == "error":
+        detail = f": {status.error}" if status.error else ""
+        return f"The vacuum has an error{detail}."
+    if status.state == "docked":
+        return f"The vacuum is docked{' at ' + battery if battery else ''}."
+    if status.state in ("cleaning", "returning", "paused", "idle"):
+        word = {"returning": "heading home", "idle": "idle"}.get(status.state, status.state)
+        return f"The vacuum is {word}{', battery ' + battery if battery else ''}."
+    return f"The vacuum is reachable{', battery ' + battery if battery else ''}."
+
+
+def _dispatch_vacuum(params: dict, deebot_svc) -> str:
+    """
+    Deebot vacuum control. Module-level and service-injected like the other
+    two dispatchers, so tests drive it with a bare Mock service.
+
+    Every clean starts with a status read: a robot that is unreachable gets
+    the unreachable line rather than a command fired into the void, and one
+    that is already cleaning is left alone rather than restarted. The auth
+    check and its one retry live inside DeebotService, not here.
+    """
+    action = params.get("action")
+
+    if not deebot_svc or not getattr(deebot_svc, "enabled", False):
+        return "vacuum control isn't set up right now"
+
+    if action == "vacuum_status":
+        status = deebot_svc.status()
+        if not status.available:
+            return _VACUUM_UNREACHABLE
+        return _vacuum_status_line(status)
+
+    if action in ("vacuum_clean_all", "vacuum_clean_rooms"):
+        keys: list[str] = []
+        if action == "vacuum_clean_rooms":
+            hints = params.get("rooms") or []
+            if isinstance(hints, str):
+                hints = [hints]
+            hints = [str(h).strip() for h in hints if str(h).strip()]
+            if not hints:
+                return "Tell me which rooms to clean."
+            for hint in hints:
+                key, room = deebot_svc.resolve_room(hint)
+                if not room:
+                    return f"I don't have a room called {hint} on the vacuum's map."
+                if key not in keys:
+                    keys.append(key)
+
+        status = deebot_svc.status()
+        if not status.available:
+            return _VACUUM_UNREACHABLE
+        if status.state == "cleaning":
+            return "The vacuum's already cleaning."
+
+        if action == "vacuum_clean_all":
+            result = deebot_svc.clean_all()
+            if result:
+                return "Cleaning the whole house."
+            return result.message or _VACUUM_UNREACHABLE
+
+        result = deebot_svc.clean_rooms(keys)
+        if result:
+            return f"Cleaning {_join_rooms(keys)}."
+        return result.message or _VACUUM_UNREACHABLE
+
+    if action == "vacuum_stop":
+        result = deebot_svc.stop()
+        if result:
+            return "Vacuum stopped."
+        return result.message or _VACUUM_UNREACHABLE
+
+    if action == "vacuum_dock":
+        result = deebot_svc.dock()
+        if result:
+            return "Sending the vacuum home."
+        return result.message or _VACUUM_UNREACHABLE
+
+    return "unknown action"
+
+
 class Orchestrator:
     def __init__(self, config: dict):
         self.config = config
@@ -847,6 +938,9 @@ class Orchestrator:
             "tts": lambda: TTSService(config),
             "leds": lambda: LEDController(config),
             "govee": lambda: GoveeService(config),
+            # Construction only, no network: DeebotService authenticates lazily
+            # on the first command, and self-disables without credentials.
+            "deebot": lambda: DeebotService(config),
         }
         if media_enabled:
             # Construction only here — no network. MediaService.connect() is a
@@ -863,6 +957,7 @@ class Orchestrator:
         self.tts = built["tts"]
         self.leds = built["leds"]
         self.govee_service = built["govee"]
+        self.deebot_service = built["deebot"]
 
         if media_enabled:
             self.media_service = built["media"]
@@ -917,6 +1012,17 @@ class Orchestrator:
         # reality rather than raw config (lights missing a mac/sku are skipped).
         self.llm.light_names = list(self.govee_service.lights)
         self.llm.default_light = self.govee_service.default_light
+
+        # Same for the vacuum's rooms. Cached ids in config.yaml can go stale
+        # after a remap; the drift check is a best-effort background warning,
+        # never a blocker and never a config rewrite.
+        self.llm.vacuum_room_names = list(self.deebot_service.rooms)
+        if self.deebot_service.enabled and self.deebot_service.rooms:
+            threading.Thread(
+                target=self.deebot_service.check_room_drift,
+                name="deebot-room-drift",
+                daemon=True,
+            ).start()
 
         # Activation sound tiering + echo gating. The first wake of a run gets a
         # long personality line, every wake after gets a short one, and playback
@@ -1443,6 +1549,8 @@ class Orchestrator:
             )
         if tool_name == "control_lights":
             return _dispatch_lights(tool_input, self.govee_service, self.light_shadow)
+        if tool_name == "control_vacuum":
+            return _dispatch_vacuum(tool_input, self.deebot_service)
         return "unknown tool"
 
     def _stremio_sync_loop(self, interval_minutes: int):
