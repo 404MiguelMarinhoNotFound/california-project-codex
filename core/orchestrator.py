@@ -70,6 +70,7 @@ def _build_parallel(tasks: dict) -> dict:
 
     return results
 
+
 ROUTED_ACTIONS = {
     "youtube_playlist": ("youtube", "restart_autoconnect"),
     "youtube_search": ("youtube", "restart_autoconnect"),
