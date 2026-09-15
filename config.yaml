@@ -652,6 +652,9 @@ govee:
 # verification code read from Gmail (GMAIL_APP_PASSWORD) when Ecovacs asks.
 # Needs: uv sync --extra default, plus ECOVACS_EMAIL / ECOVACS_PASSWORD in .env.
 #
+# The vacuum's nickname is Sir Sucks-a-Lot. (The display name in the ECOVACS
+# HOME app is separate; rename it there too.)
+#
 # rooms: keys mirror the names set in the ECOVACS HOME app (Map Management >
 # Edit Map > Area Type). `id` is a cache so "clean the kitchen" is one call;
 # ids shift after a remap, so a rejected id falls back to matching the key

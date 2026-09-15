@@ -2030,6 +2030,28 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 
 -----
 
+## Development Session Log
+
+A trace of notable multi-turn Claude Code sessions, so a future session (or
+Master Miguel) can find the conversation that produced a feature instead of
+just the commits.
+
+- **"Deebot N8+ voice control" (2026-09-16, branch `feat/deebot-vacuum-exploration`).**
+  Went from "search online for a deebot-client library" to a shipped
+  `control_vacuum` tool. Covers, in order: evaluating `deebot-client`, hitting
+  and fixing the Python 3.11 -> 3.14 bump (blocked on an unrelated
+  `openwakeword`/`tflite-runtime` pin, fixed via a `tool.uv.dependency-metadata`
+  override rather than dropping wake-word support), discovering and working
+  around Ecovacs' mandatory device-verification requirement, building the
+  Gmail-over-IMAP auto-verification (`services/gmail_verification_code.py`)
+  after ruling out OAuth (7-day refresh-token expiry on unverified apps), live
+  map/room reads, renaming rooms in the ECOVACS HOME app, and finally the full
+  `DeebotService` + `control_vacuum` build documented under "DeebotService"
+  above. The vacuum's nickname, **Sir Sucks-a-Lot**, was decided in the same
+  session and lives as a comment in `config.yaml`'s `deebot:` block.
+
+-----
+
 ## Known Bugs / Audit
 
 A whole-codebase bug audit was run on **2026-07-12**. Full report:
