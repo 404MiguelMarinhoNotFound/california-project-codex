@@ -8,11 +8,16 @@ question before anything gets wired into control_tv/control_lights-style
 dispatch: does deebot-client actually recognize the N8+ (or whatever is on
 the account)?
 
-Ecovacs now requires one-time device verification (an emailed code) the
-first time a given device id logs in, and that device id must then stay
-STABLE across future logins -- a fresh random id every run re-triggers
-verification forever. This script persists its device id to
-.deebot_device_id (gitignored) for exactly that reason.
+Ecovacs now requires one-time device verification (an emailed code) before
+a device id logs in, and it does not reliably stay verified: this
+library's own internal token refresh re-runs a full password login, which
+re-checks verification, and Ecovacs doesn't always honor "already verified"
+on that recheck (see tools/deebot_session.py and the upstream issue linked
+there). The mitigation is to never do a cold password login when a
+still-valid cached token exists -- tools/deebot_session.py persists both
+the device id and the login token locally and reuses them, so this only
+needs a fresh emailed code roughly when the cached token actually expires
+(~7 days), not on every run.
 
 Needs in .env:
   ECOVACS_EMAIL
@@ -37,67 +42,23 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-DEVICE_ID_PATH = ROOT / ".deebot_device_id"
-
-
-def _stable_device_id() -> str:
-    from deebot_client.util import md5
-
-    if DEVICE_ID_PATH.exists():
-        return DEVICE_ID_PATH.read_text(encoding="utf-8").strip()
-
-    device_id = md5(os.urandom(16).hex())
-    DEVICE_ID_PATH.write_text(device_id, encoding="utf-8")
-    return device_id
-
-
-async def _authenticate(authenticator) -> None:
-    from deebot_client.exceptions import DeviceVerificationRequiredError
-
-    try:
-        await authenticator.authenticate()
-        return
-    except DeviceVerificationRequiredError:
-        pass
-
-    print("Ecovacs wants this device verified before it will log in.")
-    print(f"Device id {DEVICE_ID_PATH.read_text(encoding='utf-8').strip()!r} is now")
-    print("saved locally and will be reused on future runs, so this should only")
-    print("happen once per device id.\n")
-
-    code = os.getenv("ECOVACS_VERIFICATION_CODE")
-    if code:
-        # A code from a previous run's email is already in hand -- verify
-        # with it directly. Do NOT also request a new one here: Ecovacs only
-        # keeps the latest code valid, so requesting again would invalidate
-        # the one we were just handed.
-        print("Using ECOVACS_VERIFICATION_CODE from the environment.")
-        await authenticator.verify_device(code.strip())
-        return
-
-    await authenticator.request_device_verification_code()
-    print("Check your email for the code, then re-run with:")
-    print("  ECOVACS_VERIFICATION_CODE=123456 uv run python tools/probe_deebot_devices.py")
-    raise SystemExit(1)
+import deebot_session  # noqa: E402
 
 
 async def probe(email: str, password: str, country: str, as_json: bool) -> int:
     import aiohttp
     from deebot_client.api_client import ApiClient
-    from deebot_client.authentication import Authenticator, create_rest_config
-    from deebot_client.util import md5
 
-    device_id = _stable_device_id()
-    password_hash = md5(password)
+    device_id = deebot_session.stable_device_id()
 
     async with aiohttp.ClientSession() as session:
-        rest_config = create_rest_config(
-            session, device_id=device_id, alpha_2_country=country
+        authenticator = await deebot_session.build_authenticator(
+            session, device_id=device_id, country=country, email=email, password=password
         )
-        authenticator = Authenticator(rest_config, email, password_hash)
 
         try:
-            await _authenticate(authenticator)
+            if not await deebot_session.authenticate(authenticator):
+                return 1
             api_client = ApiClient(authenticator)
             devices = await api_client.get_devices()
         except Exception as exc:  # noqa: BLE001 - report auth/API errors plainly
