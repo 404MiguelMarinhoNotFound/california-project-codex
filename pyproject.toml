@@ -76,8 +76,19 @@ default = ["california[kokoro]", "california[govee]", "california[silero]", "cal
 cec = [
     "samsungtvws>=3.0.5",
 ]
+# Pinned to what's installable on our Python 3.11: deebot-client 18.5.0+
+# added the Ecovacs mandatory device-verification flow (email code, stable
+# device id) that login now requires, but also bumped requires-python to
+# >=3.14. Bumping *this whole project* to 3.14 was tried and reverted: our
+# core (non-optional) openwakeword>=0.6.0 depends on tflite-runtime on
+# Linux, which has no cp314 wheels (caps at cp311) -- that would break
+# wake-word on the actual Pi deployment target, not just this feature.
+# deebot-client stays on 6.0.2 until one of: an isolated 3.14 venv/subprocess
+# just for this integration, a hand backport of the verification flow onto
+# 6.0.2, or openwakeword/tflite-runtime unblocking 3.14 upstream.
+# See tools/probe_deebot_devices.py.
 deebot = [
-    "deebot-client>=6.0.2",
+    "deebot-client>=6.0.2,<7",
 ]
 
 [tool.uv]

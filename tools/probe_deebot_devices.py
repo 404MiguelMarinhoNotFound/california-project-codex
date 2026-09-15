@@ -36,6 +36,24 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def _patch_stale_app_version() -> None:
+    """Work around Ecovacs rejecting deebot-client's hardcoded appVersion.
+
+    deebot-client 6.0.2 (the newest release that still supports our pinned
+    Python 3.11 -- upstream bumped to requires-python >=3.14 in 18.x) sends
+    appVersion "1.6.3", which the Ecovacs API now rejects with
+    {"code": "1013", "msg": "Please update to the latest version to
+    continue."}. Upstream's real fix (closed issue #1702, PR #1703) is
+    exactly this: bump appVersion to match the current EcoVacs HOME Android
+    app (3.14.0, per Google Play / APKPure at the time of writing). It never
+    shipped in a Python-3.11-compatible release, so it's patched here instead
+    of vendoring a newer deebot-client.
+    """
+    from deebot_client import authentication
+
+    authentication._META["appVersion"] = "3.14.0"
+
+
 async def probe(email: str, password: str, country: str, as_json: bool) -> int:
     import aiohttp
     from deebot_client.api_client import ApiClient
@@ -43,6 +61,8 @@ async def probe(email: str, password: str, country: str, as_json: bool) -> int:
     from deebot_client.hardware import deebot as deebot_hardware
     from deebot_client.models import DeviceInfo
     from deebot_client.util import md5
+
+    _patch_stale_app_version()
 
     device_id = md5(str(time.time()))
     password_hash = md5(password)
