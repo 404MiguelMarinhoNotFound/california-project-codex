@@ -58,7 +58,7 @@ class ConfigFixtureTests(unittest.TestCase):
     def test_real_config_is_the_committed_file(self):
         self.assertTrue(CONFIG_PATH.exists(), "config.yaml is missing")
         config = real_config()
-        for key in ("media", "stremio", "govee", "llm", "vad", "audio"):
+        for key in ("media", "stremio", "govee", "deebot", "llm", "vad", "audio"):
             self.assertIn(key, config, f"config.yaml has no {key} block")
 
     def test_each_call_returns_an_independent_copy(self):

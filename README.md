@@ -39,6 +39,8 @@ This lets California do things like:
 - Multi-provider LLM support through `services/llm.py`
 - TTS support for Kokoro, Edge TTS, Piper, and ElevenLabs
 - ADB-based control of Mi Box / Android TV
+- Govee smart-light control over Bluetooth LE
+- Deebot N8+ robot vacuum control (clean the house or named rooms) over Ecovacs' cloud, REST only
 - Stremio integration with local watch-state caching in `watch_state.json`
 - TMDB-backed title resolution when a requested title is not already cached
 - Static YouTube playlist categories with fuzzy voice matching and optional multi-ID random selection
@@ -146,6 +148,13 @@ Stremio support:
 TMDB fallback title lookup:
 
 - `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN`
+
+Deebot vacuum (`control_vacuum`):
+
+- `ECOVACS_EMAIL` / `ECOVACS_PASSWORD` (the ECOVACS HOME app login), `ECOVACS_COUNTRY` (default `PT`)
+- `GMAIL_APP_PASSWORD` — a Gmail App Password for that inbox, so the assistant reads Ecovacs'
+  weekly device-verification code itself over IMAP. Without it, set `ECOVACS_VERIFICATION_CODE`
+  by hand when prompted. See the DeebotService section in `CLAUDE.md`
 
 Keep credentials in `.env` only. Do not commit real secrets.
 

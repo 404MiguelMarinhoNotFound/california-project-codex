@@ -186,10 +186,56 @@ CONTROL_LIGHTS_TOOL_OPENAI = {
     }
 }
 
+CONTROL_VACUUM_TOOL = {
+    "name": "control_vacuum",
+    "description": (
+        "Controls Master Miguel's Deebot robot vacuum. Use vacuum_clean_all for the "
+        "whole house, vacuum_clean_rooms with one or more room names for specific "
+        "rooms (only rooms listed in the prompt), vacuum_stop to stop, vacuum_dock "
+        "to send it back to charge, and vacuum_status for battery and whether it is "
+        "cleaning, docked, or in error. Not for the TV or the lights."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "vacuum_clean_all",
+                    "vacuum_clean_rooms",
+                    "vacuum_stop",
+                    "vacuum_dock",
+                    "vacuum_status",
+                ],
+                "description": "What to do with the vacuum."
+            },
+            "rooms": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Room names for vacuum_clean_rooms, for example [\"kitchen\", \"bedroom\"]."
+            }
+        },
+        "required": ["action"]
+    }
+}
+
+CONTROL_VACUUM_TOOL_OPENAI = {
+    "type": "function",
+    "function": {
+        "name": CONTROL_VACUUM_TOOL["name"],
+        "description": CONTROL_VACUUM_TOOL["description"],
+        "parameters": CONTROL_VACUUM_TOOL["input_schema"],
+    }
+}
+
 # Tools this project dispatches locally via tool_handler. Claude's built-in
 # web_search also arrives as a tool_use block but is executed server-side, so
 # the dispatch loop must check membership here rather than block.type alone.
-LOCAL_TOOL_NAMES = {CONTROL_TV_TOOL["name"], CONTROL_LIGHTS_TOOL["name"]}
+LOCAL_TOOL_NAMES = {
+    CONTROL_TV_TOOL["name"],
+    CONTROL_LIGHTS_TOOL["name"],
+    CONTROL_VACUUM_TOOL["name"],
+}
 
 
 class LLMService:
@@ -219,6 +265,12 @@ class LLMService:
         # any light skipped for a missing mac/sku.
         self.light_names: list[str] = list((govee_cfg.get("lights") or {}).keys())
         self.default_light: str = str(govee_cfg.get("default_light") or "").strip()
+
+        # Deebot vacuum: same injection rule as the lights. The orchestrator
+        # overwrites vacuum_room_names with what DeebotService actually loaded.
+        deebot_cfg = config.get("deebot", {}) or {}
+        self.vacuum_enabled = bool(deebot_cfg.get("enabled", False))
+        self.vacuum_room_names: list[str] = list((deebot_cfg.get("rooms") or {}).keys())
 
         # Saved YouTube playlist categories, injected for the same reason as the
         # lights: "what playlists do you know" is an inventory question, and the
@@ -306,7 +358,19 @@ class LLMService:
         now = datetime.now()
         time_info = f"\nCurrent date and time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}."
         return (self.system_prompt + time_info + self._light_inventory()
-                + self._playlist_inventory() + self._hdmi_inventory())
+                + self._playlist_inventory() + self._hdmi_inventory()
+                + self._vacuum_inventory())
+
+    def _vacuum_inventory(self) -> str:
+        """
+        Describe the vacuum's named rooms so "clean the kitchen" resolves and
+        "which rooms can you clean" is answered without a tool call. Same rule
+        as the lights: never hardcode these in system_prompt.
+        """
+        if not self.vacuum_enabled or not self.vacuum_room_names:
+            return ""
+        rooms = ", ".join(self.vacuum_room_names)
+        return f"\nVacuum rooms you can clean by name: {rooms}."
 
     def _light_inventory(self) -> str:
         """
@@ -423,6 +487,13 @@ class LLMService:
                 "description": CONTROL_LIGHTS_TOOL["description"],
                 "input_schema": CONTROL_LIGHTS_TOOL["input_schema"],
             })
+        if self.vacuum_enabled:
+            tools.append({
+                "type": "custom",
+                "name": CONTROL_VACUUM_TOOL["name"],
+                "description": CONTROL_VACUUM_TOOL["description"],
+                "input_schema": CONTROL_VACUUM_TOOL["input_schema"],
+            })
 
         messages = list(self.history)
 
@@ -496,6 +567,8 @@ class LLMService:
             tools_arg.append(CONTROL_TV_TOOL_OPENAI)
         if self.lights_enabled:
             tools_arg.append(CONTROL_LIGHTS_TOOL_OPENAI)
+        if self.vacuum_enabled:
+            tools_arg.append(CONTROL_VACUUM_TOOL_OPENAI)
 
         while True:
             create_kwargs = dict(

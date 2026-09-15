@@ -24,3 +24,9 @@ debug/wakeword/
 samsung_token.txt
 tv_state.json
 device_state.json
+
+# Ecovacs device id and cached login token, generated on first deebot
+# probe/login and must stay stable across runs -- see tools/deebot_session.py.
+# The credentials file holds a live session token, never commit it.
+.deebot_device_id
+.deebot_credentials.json

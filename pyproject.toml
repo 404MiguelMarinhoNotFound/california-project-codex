@@ -2,7 +2,7 @@
 name = "california"
 version = "0.1.0"
 description = "C.A.L.I.F.O.R.N.I.A. — DIY streaming voice assistant with Mi Box / Android TV control"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 
 # --- Core runtime dependencies (always installed) ---
 dependencies = [
@@ -69,12 +69,27 @@ govee = ["bleak>=0.22.0"]
 # lying about which VAD ran for the life of the project. `default` is defined as
 # exactly what the committed config.yaml selects, and config.yaml selects silero, so
 # it belongs here. This adds torchaudio only, not the full ~2GB — torch is already in.
-default = ["california[kokoro]", "california[govee]", "california[silero]", "california[cec]"]
+default = ["california[kokoro]", "california[govee]", "california[silero]", "california[cec]", "california[deebot]"]
 # cec belongs in default because the committed config.yaml sets
 # media.cec_wake.enabled: true, and turn_on cannot work without samsungtvws.
 # Same rule that put silero here: default == exactly what config.yaml selects.
+# deebot is there for the same reason: config.yaml sets deebot.enabled: true.
 cec = [
     "samsungtvws>=3.0.5",
+]
+# Pinned to what's installable on our Python 3.11: deebot-client 18.5.0+
+# added the Ecovacs mandatory device-verification flow (email code, stable
+# device id) that login now requires, but also bumped requires-python to
+# >=3.14. Bumping *this whole project* to 3.14 was tried and reverted: our
+# core (non-optional) openwakeword>=0.6.0 declares tflite-runtime on
+# Linux, which has no cp314 wheels (caps at cp311). We never need it though:
+# wake_word.inference_framework defaults to "onnx" (config.yaml), and
+# openwakeword's own model.py wraps the tflite import in try/except and
+# falls back to onnx if it's missing. The [[tool.uv.dependency-metadata]]
+# override below tells uv's resolver that directly instead of tripping over
+# a wheel we'd never import. See tools/probe_deebot_devices.py.
+deebot = [
+    "deebot-client>=18.5.0",
 ]
 
 [tool.uv]
@@ -83,3 +98,22 @@ cec = [
 # cannot re-query once its marker cache goes stale, which breaks every
 # `uv run` with "ModuleNotFoundError: No module named 'python'".
 python-preference = "only-managed"
+
+# openwakeword 0.6.0 unconditionally declares tflite-runtime on Linux, but
+# only imports it lazily inside an inference_framework == "tflite" branch
+# that already tolerates ImportError (see openwakeword/model.py). We ship
+# wake_word.inference_framework: "onnx" and never select tflite, so this
+# tells uv's resolver the real (used) dependency surface instead of the
+# declared one -- otherwise no cp314 tflite-runtime wheel exists on Linux
+# and the whole lock is unresolvable. If a future config or code path ever
+# sets inference_framework: "tflite" on Linux, this override must go first.
+[[tool.uv.dependency-metadata]]
+name = "openwakeword"
+version = "0.6.0"
+requires-dist = [
+    "onnxruntime>=1.10.0,<2",
+    "tqdm>=4.0,<5.0",
+    "scipy>=1.3,<2",
+    "scikit-learn>=1,<2",
+    "requests>=2.0,<3",
+]
