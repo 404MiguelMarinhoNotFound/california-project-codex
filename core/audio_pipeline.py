@@ -16,6 +16,7 @@ import math
 import os
 import random
 import logging
+import threading
 from typing import NamedTuple
 
 import numpy as np
@@ -54,6 +55,14 @@ class AudioPipeline:
         self._activation_pools = {tier: [] for tier in TIERS}
         self._activation_blocking = bool(sounds_cfg.get("activation_blocking", False))
         self._load_sounds(sounds_cfg)
+
+        # Per-turn speaker session. See open_speaker.
+        self._speaker = None
+        self._speaker_sr = 0
+        self._speaker_dead = False
+        self._speaker_tail_s = float(sounds_cfg.get("speaker_tail_ms", 500)) / 1000.0
+        self._abort = threading.Event()
+        self._speaker_lock = threading.Lock()
 
     def _load_sounds(self, sounds_cfg: dict):
         """Load or generate activation/error sounds."""
@@ -258,7 +267,13 @@ class AudioPipeline:
             return None
 
         blocking = self._activation_blocking if blocking is None else blocking
-        sd.play(data, sr, blocking=blocking)
+        if blocking:
+            # Through the turn's speaker session when one is open, so the
+            # clip's 20ms lead-in is not the first thing a freshly opened
+            # device hears.
+            self.play_audio(data, sr, blocking=True)
+        else:
+            sd.play(data, sr, blocking=False)
         # A blocking call has already finished by the time we return, so it
         # leaves no overlap for the caller to gate against.
         duration = 0.0 if blocking else len(data) / float(sr)
@@ -267,12 +282,183 @@ class AudioPipeline:
     def play_error_sound(self):
         """Play error indication sound."""
         if self._error_data is not None:
-            sd.play(self._error_data, self._error_sr, blocking=True)
+            self.play_audio(self._error_data, self._error_sr, blocking=True)
+
+    # ─── Speaker session ─────────────────────────────────────────────
+
+    # One write per this many milliseconds. It bounds how long a stop takes
+    # to land (one block, plus whatever PortAudio already holds).
+    SPEAKER_BLOCK_MS = 40
+
+    def open_speaker(self, sample_rate: int = 24000) -> None:
+        """
+        Open the speaker for a turn and hold it open.
+
+        `sd.play` opens and closes a fresh PortAudio stream per clip. On this
+        laptop (MME, `latency='high'`) that is ~180ms of primed silence plus
+        the device open before every sentence — a hole between chunks, and a
+        device opening right in front of an activation clip trimmed to a 20ms
+        lead-in, which is how the first syllable of "Sup." went missing. One
+        stream per turn, opened at the wake and closed after the last word,
+        removes both. It is deliberately not process-lifetime: the device is
+        released whenever she is idle.
+
+        Measured on the real device: the very first open of the process is
+        ~2s (driver init; `run()` pays it during the bootup sound), every open
+        after that ~200ms. That is the same cost `sd.play` paid in front of
+        the acknowledgement clip, so the ack is no later than before and the
+        reply no longer pays it per sentence.
+
+        Idempotent at the same rate. A different rate reopens (the 22050 Hz
+        chime/error fallbacks; every pre-rendered clip is 24 kHz mono), and so
+        does a stream a stop has aborted (see stop_playback). A failure to
+        open is logged and leaves `play_audio` on its `sd.play` fallback, so a
+        speaker problem never costs a turn.
+        """
+        with self._speaker_lock:
+            if (
+                self._speaker is not None
+                and self._speaker_sr == sample_rate
+                and not self._speaker_dead
+            ):
+                return
+            self._close_speaker_locked(tail_s=0.0)
+            try:
+                stream = sd.OutputStream(
+                    samplerate=sample_rate, channels=1, dtype="float32"
+                )
+                stream.start()
+            except Exception:
+                logger.exception("Could not open the speaker at %d Hz", sample_rate)
+                return
+            self._speaker = stream
+            self._speaker_sr = sample_rate
+            self._speaker_dead = False
+            logger.debug("Speaker open at %d Hz", sample_rate)
+
+    def close_speaker(self, tail_s: float | None = None) -> None:
+        """
+        Close the turn's speaker session.
+
+        Writes `tail_s` of silence first (default `sounds.speaker_tail_ms`) so
+        the last real samples are out of the device before it closes and the
+        amp has nothing to gate mid-word. No-op when nothing is open. Never
+        raises.
+        """
+        with self._speaker_lock:
+            self._close_speaker_locked(
+                self._speaker_tail_s if tail_s is None else tail_s
+            )
+
+    def _close_speaker_locked(self, tail_s: float) -> None:
+        stream = self._speaker
+        if stream is None:
+            return
+        self._speaker = None
+        sr = self._speaker_sr
+        self._speaker_sr = 0
+        dead = self._speaker_dead
+        self._speaker_dead = False
+        if not dead:
+            # An aborted stream cannot be written to or restarted on MME
+            # ("cannot perform this operation while media data is still
+            # playing"), and there is nothing left in it to flush anyway.
+            try:
+                if tail_s > 0:
+                    stream.write(np.zeros(int(sr * tail_s), dtype=np.float32))
+                stream.stop()
+            except Exception:
+                logger.debug("Speaker tail/stop failed on close", exc_info=True)
+        try:
+            stream.close()
+        except Exception:
+            logger.debug("Speaker close failed", exc_info=True)
+        logger.debug("Speaker closed")
+
+    @property
+    def speaker_open(self) -> bool:
+        return self._speaker is not None
 
     def play_audio(self, audio_data: np.ndarray, sample_rate: int, blocking: bool = True):
-        """Play arbitrary audio data through speakers."""
-        sd.play(audio_data, sample_rate, blocking=blocking)
+        """
+        Play arbitrary audio data through speakers.
+
+        With a speaker session open (and `blocking`), the clip is written into
+        it in `SPEAKER_BLOCK_MS` blocks, checking for `stop_playback` between
+        blocks. Otherwise it is one `sd.play`, as before — the manual test
+        modes in main.py never open a session.
+        """
+        if not blocking or self._speaker is None:
+            sd.play(audio_data, sample_rate, blocking=blocking)
+            return
+
+        # The abort flag is NOT cleared here. Once a stop lands it stays in
+        # force until the next turn calls reset_playback(), so a chunk the
+        # player thread had already dequeued when the stop came in is dropped
+        # rather than played in full. Clearing per clip lost that race.
+        if self._abort.is_set():
+            return
+
+        if sample_rate != self._speaker_sr or self._speaker_dead:
+            # A stop aborted the last stream; MME will not restart it. A fresh
+            # one is ~200ms, paid once per interrupt.
+            self.open_speaker(sample_rate)
+            if self._speaker is None:
+                sd.play(audio_data, sample_rate, blocking=True)
+                return
+
+        stream = self._speaker
+        data = self._as_mono_float32(audio_data)
+        if data.size == 0:
+            return
+
+        try:
+            block = max(1, sample_rate * self.SPEAKER_BLOCK_MS // 1000)
+            for start in range(0, data.size, block):
+                if self._abort.is_set():
+                    logger.debug("Playback stopped %.2fs in", start / sample_rate)
+                    return
+                stream.write(data[start : start + block])
+        except Exception:
+            if self._abort.is_set():
+                # The stop aborted the stream mid-write. Expected.
+                return
+            logger.exception("Speaker write failed; falling back to sd.play")
+            sd.play(audio_data, sample_rate, blocking=True)
+
+    @staticmethod
+    def _as_mono_float32(audio_data: np.ndarray) -> np.ndarray:
+        data = np.asarray(audio_data)
+        if data.dtype == np.int16:
+            data = data.astype(np.float32) / 32768.0
+        elif data.dtype != np.float32:
+            data = data.astype(np.float32)
+        if data.ndim > 1:
+            data = data.mean(axis=1, dtype=np.float32)
+        return np.ascontiguousarray(data)
+
+    def reset_playback(self):
+        """Arm the speaker for a new turn: clear any stop still in force."""
+        self._abort.clear()
 
     def stop_playback(self):
-        """Stop any currently playing audio (for barge-in)."""
+        """
+        Stop whatever is playing, now, and keep it stopped.
+
+        Sets the abort flag the `play_audio` write loop checks, and aborts the
+        open stream so the ~180ms PortAudio already holds is discarded rather
+        than played out. Safe from any thread. The aborted stream is marked
+        dead: on MME it can neither be written to nor restarted afterwards
+        (measured: `start()` fails with "media data is still playing"), so the
+        next play opens a fresh one. Playback stays refused until
+        `reset_playback` (the start of the next turn) — see `play_audio`.
+        """
+        self._abort.set()
+        stream = self._speaker
+        if stream is not None:
+            self._speaker_dead = True
+            try:
+                stream.abort()
+            except Exception:
+                logger.debug("Speaker abort failed", exc_info=True)
         sd.stop()

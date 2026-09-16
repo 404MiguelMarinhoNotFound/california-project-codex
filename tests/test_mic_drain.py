@@ -174,7 +174,9 @@ class IdleLoopDrainsAfterSpeakingTests(unittest.TestCase):
         orch.wake_word = Mock()
         orch.wake_word.process_audio = Mock(return_value=wake_fires)
         orch._capture_ring = None
-        orch._handle_activation = Mock()
+        # A bare Mock() is truthy, and a truthy return now means "he barged
+        # in, run another activation" — which loops forever on a Mock.
+        orch._handle_activation = Mock(return_value=False)
         return orch
 
     def test_drains_after_an_activation(self):

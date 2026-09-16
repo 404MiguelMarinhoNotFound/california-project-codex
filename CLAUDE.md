@@ -259,6 +259,8 @@ california/
 │   ├── test_bt_wake.py          # Self-disable contract for the two unverified alt wake candidates
 │   ├── test_media_service.py    # YouTube / ADB unit tests
 │   ├── test_mic_drain.py        # Stale mic-buffer draining after playback
+│   ├── test_speaker_session.py  # Per-turn OutputStream: block writes, stop-within-a-block, reopen after abort, tail on close
+│   ├── test_reply_barge_in.py   # Wake word over a reply: interrupt, queue drain, own-name guard, idle-loop chaining
 │   ├── test_orchestrator_lights.py # control_lights dispatch behavior
 │   ├── test_orchestrator_vacuum.py # control_vacuum dispatch: spoken lines, status-first guard
 │   ├── test_orchestrator_vpn_routing.py # VPN preflight routing behavior
@@ -534,6 +536,94 @@ tracks `saw_speech`, and the silence timer does not run until it is set.
 2. `_audio_player_worker` plays synthesized audio from a queue
 
 Use `queue.Queue(maxsize=2)` for synthesized audio buffering so synthesis and playback overlap without growing memory usage.
+
+### The Speaker Is Opened Once Per Turn
+
+`sd.play` opens and closes a fresh PortAudio stream for every clip. Measured on
+the dev laptop (MME host API, sounddevice `latency='high'`): ~180ms of primed
+silence plus ~30ms of device open in front of **every** sentence, and in front of
+an activation clip that `generate_activation_phrases.py` trims to a 20ms lead-in.
+That is the hole between chunks and the missing first syllable of "Sup.".
+`sd.play(blocking=True)` itself does *not* return early -- it returns clip length
+plus ~100-180ms -- so the tail was never the problem; the start was.
+
+`AudioPipeline.open_speaker()` now opens one `sd.OutputStream` when the wake word
+fires, `_idle_loop` holds it through the acknowledgement, recording, thinking,
+the whole reply and any turn chained onto it by a barge-in, and
+`close_speaker()` writes `sounds.speaker_tail_ms` of silence then closes it. It
+is per turn, not per process: the device is released while she is idle.
+`play_audio` writes clips into that stream in `SPEAKER_BLOCK_MS` (40ms) blocks
+and checks for a stop between blocks, which is what makes an interrupt land in
+tens of milliseconds instead of at the end of the sentence. With no session open
+(`_play_bootup_sound`, the manual test modes in `main.py`,
+`activation_blocking: false`) it falls back to `sd.play` exactly as before.
+
+**A stop stays in force until the next turn.** `stop_playback()` sets the abort
+flag and `abort()`s the stream so the ~180ms PortAudio already holds is dropped;
+`reset_playback()`, called at the top of `_handle_activation`, is the only thing
+that clears it. `play_audio` must not clear it per clip: the player thread may
+have already dequeued the next sentence when the stop lands, and clearing on
+entry played that sentence in full. `tests/test_speaker_session.py` pins it.
+
+### Interrupting Her Is the Wake Word, Not Loudness
+
+Until 2026-09-16 barge-in over a reply was dead code: `_interrupted` was
+assigned `False` in two places and `True` nowhere (BUG_AUDIT H1), and nothing
+read the microphone while she spoke -- the main thread sat inside the LLM
+stream, the mic buffer filled, and `_idle_loop` drained it afterwards. The 30s
+`join(timeout=30)` calls on the TTS threads made it worse: a reply with more
+than 30s of speech still queued when the LLM finished was abandoned, the
+orchestrator went back to idle *while she was still talking*, fed her own voice
+to the wake detector, and the next activation's `sd.play` cut her mid-word.
+
+Now `_stream_response(user_text, mic_stream)` starts `_reply_listener` on a
+thread for the length of the reply. It reads the mic and runs the same
+`WakeWordDetector.process_audio` the idle loop uses, at
+`wake_word.barge_in_threshold` (default: the idle threshold). A hit sets the
+`_interrupted` Event, calls `stop_playback()`, and the turn ends: the LLM
+generator is closed (`services/llm.py` catches `GeneratorExit` and stores the
+partial answer so history never ends on a user turn), both queues are drained,
+and `_handle_activation` returns `True`. `_idle_loop` then chains straight into
+another `_handle_activation` on the same open speaker session, so "California,
+no, the other one" is one motion. The joins have no timeout any more; a long
+reply is spoken to the end, and the only way to cut it short is the wake word
+or "stop".
+
+- **Why the wake word and not energy.** `EchoGate`'s RMS barge-in already had to
+  be switched off for the acknowledgement (`activation_blocking: true`) because
+  her own voice through the speaker clears any energy threshold. The detector is
+  trained on one word in his voice and scores hers near zero: **measured
+  2026-09-16, 45s of her own lines recorded through this mic at the current
+  volume (RMS ~480) peak at 0.053, zero fires at any threshold down to 0.2.**
+  `barge_in_threshold` is therefore 0.5, well under the idle 0.81, and can go
+  lower still without her waking herself
+- **The model cannot hear him over her, and that is a training gap, not a
+  runtime one.** Same session, same 40 real holdout takes (EN+PT): 10/40 fire
+  clean at 0.81, **1/40** mixed with her voice at 0.81, 5/40 at 0.5, 9/40 at
+  0.2. Even a clean mix at bleed RMS 300 — below his own voice at ~840 — takes
+  the median peak from 0.81 to 0.01. Ducking her volume once he starts was
+  simulated before being built: cutting her to 15% or even to zero 150-400ms
+  into the word recovers at best 7/40, because the model decides on the onset
+  and the onset is already contaminated. Do not build a ducker. The fix is
+  `augmentation.background_paths` in `training/california_v2.yaml`: her own
+  clips (every `sounds/**/google_en-US-Chirp3-HD-Aoede/*.wav`, plus a batch of
+  ordinary TTS sentences) as a background source, so the positives are heard
+  over her voice in training. Until that run, expect "California" over her to
+  land roughly one time in five, and read the `Reply listener: peak wake score`
+  line logged after every reply to see how close it got
+- **She cannot wake herself by saying her name.** `_audio_player_worker`
+  publishes the text of the chunk it is playing in `_speaking_text`, and the
+  listener ignores a hit while that text contains "California"
+- **The listener is the only mic reader for the length of the reply**, and it is
+  joined before `_idle_loop` reads again, so the stream never has two readers.
+  Its errors are logged and end the listener; they can never take the turn down
+- **A tool call cannot be interrupted, only silenced.** The LLM stream is
+  consumed on the main thread and a `_dispatch_*` runs inside it, so a wake word
+  during a 25s CEC wake stops her talking at once but the turn ends when the
+  tool returns. Same as before; it is called out so nobody adds a thread for it
+- `tests/test_reply_barge_in.py` covers the interrupt, the chaining, the
+  own-name guard, the threshold override, and that a reply with no mic (the
+  test modes) is a normal reply
 
 ### Tool-Driven Device Control
 
@@ -1943,6 +2033,17 @@ Current automated coverage exists for:
   gating on the worst segment, and failing open on an unexpected response shape
 - Dropped turns: `_record_speech` returning `None`, and `_handle_activation`
   aborting without touching STT, the LLM, or TTS
+- The per-turn speaker session: clips written in blocks and never through
+  `sd.play` while a session is open, a stop from another thread landing within
+  one block, a stop staying in force until `reset_playback`, an aborted stream
+  being closed and replaced rather than restarted, the silent tail on close, a
+  rate change reopening, and a failed open falling back to `sd.play`
+- Barge-in: the wake word mid-reply stops her, closes the LLM stream, drains
+  both queues and returns `True`; a hit while she is saying "California" is
+  ignored; the listener scores at `barge_in_threshold`; a listener error does
+  not end the turn; `_idle_loop` chains a barged-in turn into another activation
+  on one speaker session; and a closed LLM generator keeps the partial answer
+  in history
 
 Useful live-debug commands:
 
@@ -2236,6 +2337,19 @@ just the commits.
   `DeebotService` + `control_vacuum` build documented under "DeebotService"
   above. The vacuum's nickname, **Sir Sucks-a-Lot**, was decided in the same
   session and lives as a comment in `config.yaml`'s `deebot:` block.
+- **"Cut-off acknowledgements and interrupting her" (2026-09-16, branch
+  `feat/wake-word-barge-in`).** Two live complaints: the acknowledgement clip
+  losing its first syllable and long replies stopping mid-word, and no way to
+  talk over her. Measured the `sd.play`-per-clip cost on the real device (MME:
+  ~180ms primed silence plus the open in front of every clip; the tail was
+  never cut), found the dead `_interrupted` flag and the 30s TTS joins, and
+  shipped the per-turn speaker session plus the wake-word reply listener --
+  see "The Speaker Is Opened Once Per Turn" and "Interrupting Her Is the Wake
+  Word, Not Loudness". Live test: the ack and the long replies were fixed,
+  the interrupt was not, and the follow-up measured why: the model scores her
+  own voice at 0.053 (no self-wake risk) but drops from 10/40 to 1/40 on real
+  takes with her voice on top. Ducking was simulated and rejected. Next step
+  is a training run with her clips as `augmentation.background_paths`.
 
 -----
 
@@ -2296,9 +2410,11 @@ One more was found and fixed on **2026-09-03**, in the power path:
 
 Confirmed **High-severity** backlog:
 
-- **Barge-in / "stop" is non-functional** — still open. `_interrupted` is never set
-  `True`, so the interrupt guards are dead code and "stop" only skips the current
-  sentence (`core/orchestrator.py`).
+- ~~**Barge-in / "stop" is non-functional**~~ — **fixed 2026-09-16.** The wake word is
+  listened for through every reply and cuts it short; see "Interrupting Her Is the
+  Wake Word, Not Loudness". The same change opened the speaker once per turn, which
+  is what was clipping the first syllable of the acknowledgement, and removed the
+  30s TTS joins that abandoned long replies mid-word.
 - ~~**Claude provider does not stream**~~ — **fixed 2026-08-27.** `_stream_claude` now
   uses `client.messages.stream()` and yields real token deltas, so the default provider
   gets the sentence-chunker/TTS overlap the design assumes. The same change fixed **M2**

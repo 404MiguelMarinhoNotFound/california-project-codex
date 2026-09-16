@@ -70,6 +70,23 @@ wake_word:
   # fewer false fires at the cost of having to hold the word slightly longer.
   consecutive_frames: 2
   debounce_seconds: 1.2     # Ignore re-triggers for N seconds after activation
+  # Score needed to interrupt her WHILE SHE IS TALKING. The mic keeps running
+  # through every reply (core/orchestrator.py::_reply_listener), so "California"
+  # over her cuts her off and starts a new command. The name guard is separate:
+  # a hit is ignored while the sentence playing contains "California".
+  #
+  # Measured 2026-09-16 with 45s of her own voice recorded through this mic at
+  # the current speaker volume (RMS ~480): her peak score is 0.053, zero fires at
+  # any threshold down to 0.2. So this can sit far below `threshold` safely.
+  # What it cannot fix is recall: the same 40 real takes that fire 10/40 clean
+  # fire 1/40 mixed with her voice at 0.81 and 5/40 at 0.5. The model was never
+  # trained on the wake word spoken OVER speech, and no runtime trick recovers
+  # that (ducking her volume 150-400ms into the word was simulated: 7/40 at
+  # best). The fix is training-side - add her clips as a background source in
+  # training/california_v2.yaml `augmentation.background_paths`. Until then,
+  # expect to say it twice, and read the "Reply listener: peak wake score" log
+  # line to see how close it got.
+  barge_in_threshold: 0.5
 
   # Inaudible white-noise floor (int16 RMS) mixed into each frame before scoring.
   # THIS IS THE FALSE-POSITIVE FIX, and it is counter-intuitive: she was waking on
@@ -335,7 +352,20 @@ sounds:
   # read her own line straight back out of the buffer and sent it to Whisper.
   # Orchestrator._drain_mic() now flushes that buffer before recording. Do not
   # remove it; blocking playback is only half the fix.
+  #
+  # Interrupting her REPLY is a different mechanism and does not use the energy
+  # gate at all: the wake word is listened for through every reply (see
+  # wake_word.barge_in_threshold).
   activation_blocking: true
+
+  # The speaker is opened once per turn - at the wake, before the
+  # acknowledgement - and held through recording, thinking and the whole
+  # reply. sd.play used to open and close a fresh stream per clip: on this
+  # laptop (MME) that is ~180ms of primed silence plus the device open in front
+  # of every sentence, and in front of an activation clip trimmed to a 20ms
+  # lead-in, which is where the first syllable of "Sup." went. On close this
+  # much silence is written first so the last word is fully out of the device.
+  speaker_tail_ms: 500
 
   # RMS above which mic input during playback counts as you talking over her,
   # which cuts the line short. Well above vad.energy_threshold on purpose — it

@@ -709,6 +709,15 @@ def _dispatch_tv(
     return "unknown action"
 
 
+def _drain_queue(q: queue.Queue) -> None:
+    """Throw away everything queued, without blocking."""
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+
 def _chunk_rms(audio_chunk: np.ndarray) -> float:
     """RMS of an int16 chunk, on the same scale as vad.energy_threshold."""
     if len(audio_chunk) == 0:
@@ -1075,7 +1084,8 @@ class Orchestrator:
         # Optional capture of the audio around each activation, off by default.
         # Flip it on to collect real false positives, then score them with
         # tools/score_wakeword.py --negatives.
-        capture_cfg = config.get("wake_word", {}).get("capture", {}) or {}
+        ww_cfg = config.get("wake_word", {}) or {}
+        capture_cfg = ww_cfg.get("capture", {}) or {}
         self._capture_enabled = bool(capture_cfg.get("enabled", False))
         self._capture_dir = capture_cfg.get("dir", "debug/activations")
         self._capture_max_files = int(capture_cfg.get("max_files", 200))
@@ -1089,9 +1099,23 @@ class Orchestrator:
                 self._capture_dir, pre_seconds, self._capture_max_files,
             )
 
+        # Barge-in over a reply is by wake word, not by loudness: the mic hears
+        # her through the speaker at well over any energy threshold (that is
+        # why activation_blocking is on), but the detector is trained on one
+        # word in his voice and scores hers near zero. The score it needs
+        # while she is talking can sit above the idle threshold.
+        self._barge_in_threshold = float(
+            ww_cfg.get("barge_in_threshold", ww_cfg.get("threshold", 0.5))
+        )
+
         # State
         self._running = False
-        self._interrupted = False  # Barge-in flag
+        # Set by the reply listener (wake word heard mid-reply) or the "stop"
+        # command. Every stage of the speaking pipeline checks it.
+        self._interrupted = threading.Event()
+        # Text of the chunk being played right now, so the reply listener can
+        # ignore a wake-word hit while she is saying her own name.
+        self._speaking_text = ""
         # The current turn's TTS queue, set only while _generate_and_speak runs.
         # _say_now uses it to speak from inside a long tool call.
         self._active_tts_queue = None
@@ -1134,7 +1158,14 @@ class Orchestrator:
 
         mic_stream = self.audio.create_mic_stream()
         mic_stream.start()
-        self._play_bootup_sound()
+        # The process's first device open is ~2s on this laptop (driver init;
+        # every later open is ~200ms). Pay it here, under the greeting, rather
+        # than in front of the first acknowledgement clip.
+        self.audio.open_speaker()
+        try:
+            self._play_bootup_sound()
+        finally:
+            self.audio.close_speaker()
         # The bootup line went out of the speaker and straight into the mic
         # buffer. Do not hand it to the wake-word detector.
         self._drain_mic(mic_stream, "bootup sound")
@@ -1177,7 +1208,22 @@ class Orchestrator:
         if self.wake_word.process_audio(audio_chunk):
             # Wake word detected!
             pre_roll = list(self._capture_ring) if self._capture_ring is not None else []
-            self._handle_activation(mic_stream, pre_roll=pre_roll)
+
+            # The speaker is opened once here and held through the whole
+            # exchange — acknowledgement, recording, thinking, reply, and any
+            # turn chained onto it by a barge-in — then closed with a short
+            # silent tail. See AudioPipeline.open_speaker for why.
+            self.audio.open_speaker()
+            try:
+                barged_in = self._handle_activation(mic_stream, pre_roll=pre_roll)
+                while barged_in:
+                    # He said her name over the reply. The listener thread
+                    # was reading the mic, so the buffer is nearly fresh; the
+                    # drain covers the moments between it stopping and this.
+                    self._drain_mic(mic_stream, "barge-in")
+                    barged_in = self._handle_activation(mic_stream)
+            finally:
+                self.audio.close_speaker()
 
             # The whole turn — thinking, and every sentence she spoke — went
             # into the mic buffer while nobody was reading it. Feeding her own
@@ -1187,20 +1233,27 @@ class Orchestrator:
             if self._capture_ring is not None:
                 self._capture_ring.clear()
 
-    def _handle_activation(self, mic_stream, pre_roll=None):
+    def _handle_activation(self, mic_stream, pre_roll=None) -> bool:
         """
         Handle a wake word activation:
         1. Start the activation line (does not block the microphone)
         2. Record user speech, gating out the line's own bleed
         3. Transcribe
         4. Query LLM (streaming)
-        5. Speak response (streaming)
+        5. Speak response (streaming), listening for the wake word throughout
 
         If nothing was ever said (a false wake, or he changed his mind), step 2
         returns None and this goes quietly back to idle — no Whisper call, no
         LLM call, no spoken reply. Silence is not an input.
+
+        Returns True when the reply was cut off by the wake word, so the caller
+        goes straight into another activation instead of back to idle.
         """
         logger.info("--- Wake word activated ---")
+
+        # A stop from the previous turn (barge-in, "stop") stays in force
+        # until the next turn arms the speaker again. This is that.
+        self.audio.reset_playback()
 
         # First wake of the run gets a long line, the rest get short ones.
         tier = resolve_tier(self._wake_count)
@@ -1230,7 +1283,7 @@ class Orchestrator:
             # Do not let a false positive burn the one long cold-open line.
             self._wake_count = max(0, self._wake_count - 1)
             self.leds.set_state("idle")
-            return
+            return False
 
         self._capture_activation(pre_roll, audio_data, self._last_record_outcome)
 
@@ -1252,18 +1305,18 @@ class Orchestrator:
 
         if not transcript or transcript.strip() == "":
             logger.info("Empty transcription, returning to idle")
-            return
+            return False
 
         logger.info(f"User said: '{transcript}'")
         print(f"\n  👤 You: {transcript}")
 
         # Check for special commands
         if self._handle_command(transcript):
-            return
+            return False
 
         # --- STREAMING: LLM → Sentence Chunker → TTS ---
         self.leds.set_state("thinking")
-        self._stream_response(transcript)
+        return self._stream_response(transcript, mic_stream)
 
     def _drain_mic(self, mic_stream, why: str):
         """
@@ -1416,7 +1469,7 @@ class Orchestrator:
 
         return audio_data
 
-    def _stream_response(self, user_text: str):
+    def _stream_response(self, user_text: str, mic_stream=None) -> bool:
         """
         The streaming pipeline: LLM → Sentence Chunker → TTS → Speaker.
 
@@ -1429,16 +1482,41 @@ class Orchestrator:
 
         Architecture:
           [LLM stream] → [sentence_chunker] → [tts_queue] → [tts_worker thread]
+          [mic_stream] → [_reply_listener thread] → wake word → interrupt
+
+        The listener is what makes her interruptible: it keeps reading the mic
+        while she talks and runs the wake-word detector on it. A hit sets
+        `_interrupted`, which every stage checks, and stops the speaker.
+
+        Returns True when the reply was cut off that way. The caller then
+        treats it as a fresh activation — "California, no, the other one" is
+        one motion.
         """
         # Queue for sentences waiting to be spoken
         tts_queue: queue.Queue[str | None] = queue.Queue()
         full_response_parts = []
+        self._interrupted.clear()
 
         # A tool call runs synchronously on THIS thread inside the LLM stream,
         # while _tts_worker drains tts_queue on its own. So a long-running tool
         # can speak by pushing here: the audio plays while it is still blocked.
         # Nothing else can reach the queue, hence the handoff on self.
         self._active_tts_queue = tts_queue
+
+        # Listen for the wake word for as long as this turn is speaking. Only
+        # this thread reads the mic until it is stopped below, and it is
+        # stopped before _idle_loop reads again, so the stream never has two
+        # readers.
+        listener_stop = threading.Event()
+        listener = None
+        if mic_stream is not None:
+            listener = threading.Thread(
+                target=self._reply_listener,
+                args=(mic_stream, listener_stop),
+                name="reply-listener",
+                daemon=True,
+            )
+            listener.start()
 
         # Start TTS worker thread
         tts_thread = threading.Thread(
@@ -1456,8 +1534,12 @@ class Orchestrator:
             first_sentence = True
 
             for sentence in chunk_sentences(token_stream):
-                if self._interrupted:
-                    logger.info("Barge-in detected, stopping response")
+                if self._interrupted.is_set():
+                    # Close the LLM stream now rather than whenever the
+                    # generator is collected; stream_response records what was
+                    # generated so far in history on the way out.
+                    logger.info("Barge-in: abandoning the rest of the reply")
+                    token_stream.close()
                     break
 
                 full_response_parts.append(sentence)
@@ -1476,15 +1558,66 @@ class Orchestrator:
             # Drop the handoff before the queue is closed, so a stray say_now
             # from a later thread cannot push into a finished turn.
             self._active_tts_queue = None
-            # Signal TTS worker to stop
+            # Signal TTS worker to stop. No timeout: a long reply is spoken to
+            # the end, and the only way to cut it short is the wake word or
+            # "stop", both of which make the worker exit within a block.
             tts_queue.put(None)
-            tts_thread.join(timeout=30)
+            tts_thread.join()
+            listener_stop.set()
+            if listener is not None:
+                listener.join()
 
         full_response = " ".join(full_response_parts)
         if full_response:
             print(f"  🌴 California: {full_response}")
 
-        self._interrupted = False
+        return self._interrupted.is_set()
+
+    def _reply_listener(self, mic_stream, stop: threading.Event) -> None:
+        """
+        Read the mic while she is talking and watch for the wake word.
+
+        Runs on its own thread for the length of one reply. A hit means he is
+        talking over her: stop the speaker at once and flag the turn, and the
+        orchestrator chains straight into a new activation.
+
+        Two guards:
+        - `wake_word.barge_in_threshold` (default: the idle threshold), because
+          the mic is also hearing her through the speaker the whole time.
+        - Her own name. If the chunk playing right now contains "California",
+          a hit is ignored: she must not wake herself by introducing herself.
+
+        Anything that goes wrong in here is logged and ends the listener; it
+        can never take the turn down with it.
+        """
+        peak = 0.0
+        started = time.monotonic()
+        try:
+            while not stop.is_set():
+                audio_bytes, _ = mic_stream.read(self.audio.chunk_samples)
+                chunk = self.audio.bytes_to_numpy(audio_bytes)
+                hit = self.wake_word.process_audio(chunk, threshold=self._barge_in_threshold)
+                peak = max(peak, float(getattr(self.wake_word, "last_score", 0.0) or 0.0))
+                if not hit:
+                    continue
+                if "california" in (self._speaking_text or "").lower():
+                    logger.info("Wake word scored while she was saying her own name — ignored")
+                    continue
+                logger.info("Barge-in: wake word during reply")
+                self._interrupted.set()
+                self.audio.stop_playback()
+                return
+        except Exception:
+            logger.exception("Reply listener stopped early")
+        finally:
+            # The number to read when "California" over her did nothing: how
+            # close the detector got against barge_in_threshold. Measured
+            # 2026-09-16, her own voice through the mic peaks at 0.053, so
+            # anything well above that was him.
+            logger.info(
+                "Reply listener: peak wake score %.3f over %.1fs (barge_in_threshold %.2f)",
+                peak, time.monotonic() - started, self._barge_in_threshold,
+            )
 
     def _tts_worker(self, tts_queue: queue.Queue):
         """
@@ -1492,7 +1625,7 @@ class Orchestrator:
         A separate _audio_player_worker thread consumes audio_queue and plays it.
         This means synthesis of sentence N+1 overlaps with playback of sentence N.
         """
-        audio_queue: queue.Queue[tuple[np.ndarray, int] | None] = queue.Queue(maxsize=2)
+        audio_queue: queue.Queue[tuple[np.ndarray, int, str] | None] = queue.Queue(maxsize=2)
 
         # Start the audio playback thread
         player_thread = threading.Thread(
@@ -1509,31 +1642,33 @@ class Orchestrator:
                 if sentence is None:
                     break
 
-                if self._interrupted:
-                    while not tts_queue.empty():
-                        try:
-                            tts_queue.get_nowait()
-                        except queue.Empty:
-                            break
+                if self._interrupted.is_set():
+                    _drain_queue(tts_queue)
                     break
 
                 try:
                     audio_data, sample_rate = self.tts.synthesize(sentence)
-                    if len(audio_data) > 0:
-                        audio_queue.put((audio_data, sample_rate))
+                    # The stop may have landed during synthesis. The player
+                    # may already be gone, so do not hand it anything.
+                    if len(audio_data) > 0 and not self._interrupted.is_set():
+                        audio_queue.put((audio_data, sample_rate, sentence))
                 except Exception as e:
                     logger.error(f"TTS synthesis error: {e}")
 
         finally:
-            # Signal player to stop and wait for it to finish playing
+            # Signal player to stop and wait for it to finish playing. After an
+            # interrupt the player has exited, so clear its queue first or the
+            # bounded put below would block forever.
+            if self._interrupted.is_set():
+                _drain_queue(audio_queue)
             audio_queue.put(None)
-            player_thread.join(timeout=30)
+            player_thread.join()
 
     def _audio_player_worker(self, audio_queue: queue.Queue):
         """
         Pulls (audio_data, sample_rate) from audio_queue and plays them back-to-back.
         Blocks on each playback so order is preserved.
-        Runs until it receives None.
+        Runs until it receives None, or until the turn is interrupted.
         """
         while True:
             item = audio_queue.get()
@@ -1541,20 +1676,19 @@ class Orchestrator:
             if item is None:
                 break
 
-            if self._interrupted:
-                # Drain and exit
-                while not audio_queue.empty():
-                    try:
-                        audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
+            if self._interrupted.is_set():
+                _drain_queue(audio_queue)
                 break
 
-            audio_data, sample_rate = item
+            audio_data, sample_rate, text = item
+            # Published for the reply listener's own-name guard.
+            self._speaking_text = text
             try:
                 self.audio.play_audio(audio_data, sample_rate, blocking=True)
             except Exception as e:
                 logger.error(f"TTS playback error: {e}")
+            finally:
+                self._speaking_text = ""
 
 
     def _say_now(self, text: str) -> None:
@@ -1612,8 +1746,10 @@ class Orchestrator:
             self._speak_direct("Conversation history cleared. Fresh start!")
             return True
 
-        # Stop / shut up
+        # Stop / shut up. Reaching here at all means the wake word already cut
+        # the reply short; this makes sure nothing queued behind it plays.
         if lower in ("stop", "shut up", "be quiet", "cancel"):
+            self._interrupted.set()
             self.audio.stop_playback()
             return True
 

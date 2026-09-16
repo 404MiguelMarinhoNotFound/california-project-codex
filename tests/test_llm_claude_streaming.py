@@ -385,6 +385,34 @@ class ClaudeStreamingTests(unittest.TestCase):
         self.assertEqual(svc.history[0], {"role": "user", "content": "turn 6"})
         self.assertEqual(len(svc.history), 8)   # 2 exchanges x 4 messages
 
+    # --- interruption ------------------------------------------------------
+
+    def test_closing_the_stream_mid_reply_keeps_the_partial_answer(self):
+        """
+        A barge-in closes the generator before it finishes. History must still
+        end on an assistant message, or the next request opens with two user
+        turns in a row.
+        """
+        svc, _ = self._service([
+            (["The lights ", "are on. ", "Anything else ", "tonight?"], [], "end_turn"),
+        ])
+
+        gen = svc.stream_response("lights on")
+        self.assertEqual(next(gen), "The lights ")
+        self.assertEqual(next(gen), "are on. ")
+        gen.close()
+
+        self.assertEqual(svc.history[-1]["role"], "assistant")
+        self.assertEqual(svc.history[-1]["content"], "The lights are on.")
+        self.assertEqual(svc.history[-2], {"role": "user", "content": "lights on"})
+
+    def test_closing_before_any_text_stores_no_empty_assistant_turn(self):
+        svc, _ = self._service([(["", "hello"], [], "end_turn")])
+        gen = svc.stream_response("hi")
+        self.assertEqual(next(gen), "")
+        gen.close()
+        self.assertEqual(svc.history[-1], {"role": "user", "content": "hi"})
+
 
 if __name__ == "__main__":
     unittest.main()
