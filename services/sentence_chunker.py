@@ -54,6 +54,23 @@ FIRST_CHUNK_CHARS = 25
 FIRST_CHUNK_MAX_CHARS = 60
 
 
+class _ToolBoundary:
+    """Marker the LLM layer yields right before it blocks on a tool call."""
+
+    def __repr__(self) -> str:
+        return "TOOL_BOUNDARY"
+
+
+# Yielded by LLMService in place of a text token, right before a tool is
+# dispatched. The dispatch runs INSIDE the token generator, so anything still
+# buffered here stays unspoken until the tool returns. A CEC wake blocks for
+# ~47s, and "Okay, on it." is twelve characters, well under FIRST_CHUNK_CHARS,
+# so without this the promised "on it" plays after the TV is already on, and
+# a _say_now interim line jumps the queue in front of it. On this marker the
+# chunker ships whatever it holds, however short, then carries on as before.
+TOOL_BOUNDARY = _ToolBoundary()
+
+
 def chunk_sentences(
     token_stream: Generator[str, None, None],
     *,
@@ -105,6 +122,21 @@ def chunk_sentences(
         return chunk
 
     for token in token_stream:
+        if token is TOOL_BOUNDARY:
+            # Ship everything, however short. The sanitizer marks an unfinished
+            # fragment as a continuation, which is right: the tool's result is
+            # what comes next.
+            if buffer.strip():
+                clean = sanitize_for_tts(buffer.strip())
+                buffer = ""
+                if clean:
+                    _hold(clean)
+            chunk = _flush()
+            if chunk:
+                logger.debug(f"Tool-boundary chunk: '{chunk}'")
+                yield chunk
+            continue
+
         buffer += token
 
         # Try to extract complete sentences from buffer

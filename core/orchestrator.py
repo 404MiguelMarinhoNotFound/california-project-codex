@@ -37,6 +37,32 @@ _LIGHTS_UNREACHABLE = "I couldn't reach your lights just now."
 _VACUUM_UNREACHABLE = "I couldn't reach the vacuum just now."
 
 
+# Packages that more than one boot thread imports for the first time. Importing
+# them here, serially, before the pool starts is what keeps the pool safe.
+#
+# Python holds one lock per module while it imports. Two threads importing
+# overlapping graphs at the same instant can each end up waiting on a lock the
+# other holds, and 3.14 detects that cycle and raises _DeadlockError instead of
+# hanging. Seen live on Windows: the wake-word thread (openwakeword -> tqdm ->
+# colorama) and the TTS thread (Kokoro -> huggingface_hub -> tqdm -> colorama)
+# collided on colorama.win32, and boot failed with "Component init failed:
+# wake_word". It is timing-dependent, so it does not happen every run.
+#
+# Nothing is lost by doing this first: an import is serialised by that lock
+# anyway, so the second thread would only have waited on the first.
+_SHARED_BOOT_IMPORTS = ("tqdm", "torch", "huggingface_hub")
+
+
+def _warm_shared_imports() -> None:
+    import importlib
+    for name in _SHARED_BOOT_IMPORTS:
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            # Optional extras (torch only ships with the silero/kokoro extras).
+            pass
+
+
 def _build_parallel(tasks: dict) -> dict:
     """Run each zero-arg callable in `tasks` on its own thread and return
     {name: result}. Every task runs to completion before this raises, so one
@@ -626,6 +652,12 @@ def _dispatch_tv(
     elif action in ("turn_on", "wake"):
         if not media_svc:
             return "media service not available"
+        # Same interim line _ensure_playable uses, for the same ~47s of
+        # silence. The prompt promises "say you're on it and then wait", but
+        # the model's own preamble is not guaranteed and a direct turn_on
+        # never reached _ensure_playable, so nothing was said at all.
+        if say_now:
+            say_now("Hold on, waking everything up.")
         if media_svc.turn_on():
             return "TV is on"
         # A rejected pairing token and a dead TV need opposite fixes. Saying
@@ -927,6 +959,7 @@ class Orchestrator:
         # add up; now boot takes as long as the slowest one, not the sum.
         logger.info("Initializing components (parallel boot)...")
         boot_start = time.monotonic()
+        _warm_shared_imports()
 
         media_enabled = bool(config.get("media", {}).get("enabled"))
 

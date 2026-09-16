@@ -63,3 +63,19 @@ class SayNowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DirectTurnOnSpeaks(unittest.TestCase):
+    """
+    A direct turn_on blocks as long as the wake inside _ensure_playable, but
+    it never went through _ensure_playable, so nothing was said for ~47s.
+    """
+
+    def test_turn_on_speaks_an_interim_line_before_the_wake(self):
+        from core.orchestrator import _dispatch_tv
+        order = []
+        media = Mock()
+        media.turn_on.side_effect = lambda: order.append("wake") or True
+        _dispatch_tv({"action": "turn_on"}, media, None, None, {},
+                     say_now=lambda text: order.append("speak"))
+        self.assertEqual(order, ["speak", "wake"])
