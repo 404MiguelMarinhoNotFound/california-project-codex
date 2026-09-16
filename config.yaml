@@ -249,14 +249,29 @@ tts:
   # "edge"        = Microsoft Edge TTS, free, works everywhere (needs internet)
   # "elevenlabs"  = premium quality, paid (needs ELEVENLABS_API_KEY)
   # "kokoro"      = local, free, high quality (needs kokoro installed)
-  provider: "kokoro"
+  # "google"      = Google Cloud Chirp 3 HD, best quality, 1M chars/month free (needs GOOGLE_TTS_API_KEY)
+  provider: "google"
   piper:
     model: "C:\\Users\\Migue\\Downloads\\california-project\\california\\models\\en_GB-alan-medium.onnx"
     speaker: 0
     speed: 1.5
   edge:
-    voice: "en-US-AriaNeural"   # Good default. Others: en-US-GuyNeural, en-GB-SoniaNeural
-    rate: "+20%"                  # Speed adjustment: "-10%", "+10%", etc.
+    voice: "en-US-AvaMultilingualNeural"   # Female. Others: en-US-AriaNeural, en-US-EmmaMultilingualNeural, en-GB-SoniaNeural
+    rate: "+0%"                  # Speed adjustment: "-10%", "+10%", etc.
+  google:
+    # Chirp 3 HD voice: <locale>-Chirp3-HD-<Name>. Locales: en-US, en-GB, en-AU, en-IN.
+    # Listen to them all: https://cloud.google.com/text-to-speech/docs/chirp3-hd
+    voice: "en-US-Chirp3-HD-Aoede"       # the one. Warm, clear, natural.
+    # Standout female substitutes if Aoede ever needs a stand-in:
+    # voice: "en-GB-Chirp3-HD-Aoede"     # same voice, British accent
+    # voice: "en-US-Chirp3-HD-Kore"      # firmer, more assistant-like
+    # voice: "en-US-Chirp3-HD-Leda"      # younger, brighter
+    # voice: "en-US-Chirp3-HD-Zephyr"    # softer, breathier
+    # Other female names: Achernar, Autonoe, Callirrhoe, Despina, Erinome, Gacrux,
+    # Laomedeia, Pulcherrima, Sulafat, Vindemiatrix.
+    speed: 1.0            # 0.25 – 2.0
+    sample_rate: 24000
+    timeout_s: 15
   elevenlabs:
     voice_id: "21m00Tcm4TlvDq8ikWAM"  # "Rachel" — change to your preferred voice
     model: "eleven_turbo_v2_5"
@@ -284,7 +299,14 @@ sounds:
   activation: "sounds/chime.wav"
   error: "sounds/error.wav"
   generate_if_missing: true   # Auto-generate chime sounds if files don't exist
-  activation_dir: "sounds/california_activations"
+  # One folder per voice (generate_activation_phrases.py names them
+  # <provider>_<voice>). Keep this matching tts.provider / voice, or she will
+  # acknowledge in one voice and answer in another.
+  activation_dir: "sounds/california_activations/google_en-US-Chirp3-HD-Aoede"
+  # activation_dir: "sounds/california_activations/kokoro_af_bella"
+  # Same deal for the launch greeting, from generate_bootup_sounds.py.
+  bootup_dir: "sounds/bootup/google_en-US-Chirp3-HD-Aoede"
+  # bootup_dir: "sounds/bootup/kokoro_af_bella"
 
   # The wake acknowledgement is split into two pools by
   # generate_activation_phrases.py:
@@ -555,6 +577,29 @@ media:
     # 0x2000 (== HDMI 2), which the box reports itself in `dumpsys hdmi_control`.
     # Used to re-select the box when the TV has been parked on another source.
     mibox_hdmi_port: 2
+
+  # --- Alternate wake candidates, tried before the CEC chain above -----------
+  # Both OFF by default: neither has been verified against the real box yet.
+  # See services/bt_wake.py and services/esp32_bt_wake.py for what each does
+  # and why they're independent, self-disabling candidates rather than a
+  # single mechanism.
+  bt_wake:
+    enabled: false
+    # The box's OWN Bluetooth radio address (not the bonded remote's -- that's
+    # a separate, unrelated LE address). Confirmed live 2026-09-16 via
+    # `adb shell dumpsys bluetooth_manager` while the box was awake.
+    mac: "9C:12:21:1C:95:AF"
+    scan_duration_s: 10
+    signal_duration_s: 3
+    pair_interval_s: 1.0
+    spawn_timeout_s: 3.0
+    scan_stop_timeout_s: 1.0
+  esp32_wake:
+    enabled: false
+    # host: "192.168.1.XX"   # set once hardware/esp32_bt_wake is flashed and paired
+    button_id: "wake_mi_box"
+    timeout_s: 5
+
   vpn_routing_enabled: false
   vpn_state_path: "vpn_state.json"
   vpn_status_cache_max_age_minutes: 5
