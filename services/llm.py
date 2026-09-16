@@ -470,6 +470,19 @@ class LLMService:
                 yield from self._stream_openai_compatible(full_response_ref)
             full_response = full_response_ref["text"]
 
+        except GeneratorExit:
+            # The orchestrator closed the stream mid-reply: he said her name
+            # over her. Keep what she got to say, or the history ends on a
+            # user turn and the next request is malformed. It is what was
+            # *generated*, which may run a sentence past what was spoken.
+            partial = full_response_ref["last_text"].strip()
+            if partial:
+                self.history.append({"role": "assistant", "content": partial})
+            logger.info(
+                "LLM interrupted after %d chars", len(full_response_ref["text"])
+            )
+            raise
+
         except Exception as e:
             logger.error(f"LLM error: {e}")
             error_msg = "Sorry, I had trouble thinking about that. Could you try again?"

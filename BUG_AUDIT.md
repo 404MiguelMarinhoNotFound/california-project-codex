@@ -24,7 +24,7 @@ re-investigated later.
 
 | ID | Title | Location | Severity | Confidence |
 |----|-------|----------|----------|------------|
-| H1 | Barge-in / "stop" command is non-functional (`_interrupted` never set) | `core/orchestrator.py:363,540,565,590,622,672` | High | Confirmed |
+| H1 | Barge-in / "stop" command is non-functional (`_interrupted` never set) | `core/orchestrator.py:363,540,565,590,622,672` | High | **Fixed 2026-09-16** |
 | H2 | Claude provider does not actually stream tokens | `services/llm.py:270,279-282` | High | **Fixed 2026-08-27** |
 | H3 | Default TTS provider `kokoro` missing from `requirements.txt` | `config.yaml:133` + `requirements.txt` | High | Confirmed |
 | M1 | `_adb` uses `shell=True`; timeout may orphan hung `adb.exe` on Windows | `services/media_service.py:47-55` | Medium | Likely |
@@ -51,6 +51,7 @@ re-investigated later.
 **Trigger:** Say "stop" / "shut up" mid-response, or speak over California expecting barge-in.
 **Impact:** The advertised interrupt/barge-in behavior does not work; "stop" only skips one sentence.
 **Suggested fix:** Set `self._interrupted = True` in `_handle_command` for the stop phrases (and wherever barge-in should trigger) before calling `stop_playback()`; consider a `threading.Event` instead of a bare bool for clean cross-thread signaling, and drain both queues on interrupt.
+**Fixed 2026-09-16:** `_interrupted` is a `threading.Event`, set by a reply-listener thread that runs the wake-word detector over the mic for the length of every reply (and by the "stop" command). Both queues drain, the LLM stream is closed with the partial answer kept in history, and the idle loop chains into a new activation. See `tests/test_reply_barge_in.py` and "Interrupting Her Is the Wake Word, Not Loudness" in AGENTS.md.
 
 ### H2 — Claude provider does not actually stream tokens
 **Location:** `services/llm.py:270` (`self.client.messages.create(...)` with no `stream=True`), yield at `:279-282`.

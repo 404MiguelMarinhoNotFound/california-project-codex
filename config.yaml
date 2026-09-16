@@ -70,6 +70,13 @@ wake_word:
   # fewer false fires at the cost of having to hold the word slightly longer.
   consecutive_frames: 2
   debounce_seconds: 1.2     # Ignore re-triggers for N seconds after activation
+  # Score needed to interrupt her WHILE SHE IS TALKING. The mic keeps running
+  # through every reply (core/orchestrator.py::_reply_listener), so "California"
+  # over her cuts her off and starts a new command. Her own voice through the
+  # speaker is scored the whole time; it sits near zero on this model, but if
+  # she ever interrupts herself, raise this one, not `threshold`. The name guard
+  # is separate: a hit is ignored while the sentence playing contains "California".
+  barge_in_threshold: 0.81
 
   # Inaudible white-noise floor (int16 RMS) mixed into each frame before scoring.
   # THIS IS THE FALSE-POSITIVE FIX, and it is counter-intuitive: she was waking on
@@ -335,7 +342,20 @@ sounds:
   # read her own line straight back out of the buffer and sent it to Whisper.
   # Orchestrator._drain_mic() now flushes that buffer before recording. Do not
   # remove it; blocking playback is only half the fix.
+  #
+  # Interrupting her REPLY is a different mechanism and does not use the energy
+  # gate at all: the wake word is listened for through every reply (see
+  # wake_word.barge_in_threshold).
   activation_blocking: true
+
+  # The speaker is opened once per turn - at the wake, before the
+  # acknowledgement - and held through recording, thinking and the whole
+  # reply. sd.play used to open and close a fresh stream per clip: on this
+  # laptop (MME) that is ~180ms of primed silence plus the device open in front
+  # of every sentence, and in front of an activation clip trimmed to a 20ms
+  # lead-in, which is where the first syllable of "Sup." went. On close this
+  # much silence is written first so the last word is fully out of the device.
+  speaker_tail_ms: 500
 
   # RMS above which mic input during playback counts as you talking over her,
   # which cuts the line short. Well above vad.energy_threshold on purpose — it

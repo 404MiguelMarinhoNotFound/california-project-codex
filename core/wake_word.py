@@ -209,10 +209,16 @@ class WakeWordDetector:
 
     # ─── Audio processing ────────────────────────────────────────────
 
-    def process_audio(self, audio_chunk: np.ndarray) -> bool:
+    def process_audio(self, audio_chunk: np.ndarray, threshold: float | None = None) -> bool:
         """
         Feed an audio chunk (int16 numpy array) to the detector.
         Returns True if the wake word was detected (with debouncing).
+
+        `threshold` overrides the configured score threshold for this call.
+        The orchestrator's reply listener uses it: while California is talking
+        the mic also hears her through the speaker, and `wake_word.barge_in_threshold`
+        lets that path demand a higher score without touching idle detection.
+        Porcupine has no score, so it ignores the override.
         """
         if not self._enabled:
             return False
@@ -220,7 +226,7 @@ class WakeWordDetector:
         if self._backend == "porcupine":
             return self._process_porcupine(audio_chunk)
         else:
-            return self._process_oww(audio_chunk)
+            return self._process_oww(audio_chunk, threshold)
 
     def _process_porcupine(self, audio_chunk: np.ndarray) -> bool:
         """
@@ -242,7 +248,7 @@ class WakeWordDetector:
             return self._check_debounce(score=1.0)
         return False
 
-    def _process_oww(self, audio_chunk: np.ndarray) -> bool:
+    def _process_oww(self, audio_chunk: np.ndarray, threshold: float | None = None) -> bool:
         """
         openWakeWord scoring with consecutive-frame logic.
 
@@ -250,6 +256,7 @@ class WakeWordDetector:
         counted frame is a distinct inference. `consecutive_frames: 2` therefore
         means ~160ms of sustained detection, which is what it always claimed to mean.
         """
+        threshold = self.threshold if threshold is None else threshold
         self._oww_buffer = np.concatenate([self._oww_buffer, audio_chunk.astype(np.int16)])
 
         while len(self._oww_buffer) >= self._oww_frame_length:
@@ -261,7 +268,7 @@ class WakeWordDetector:
             prediction = self._oww_model.predict(self._apply_dither(frame))
             score = prediction.get(self.primary_key, 0.0)
 
-            if score >= self.threshold:
+            if score >= threshold:
                 self._consecutive_count += 1
             else:
                 self._consecutive_count = 0

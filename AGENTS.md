@@ -511,6 +511,77 @@ tracks `saw_speech`, and the silence timer does not run until it is set.
 
 Use `queue.Queue(maxsize=2)` for synthesized audio buffering so synthesis and playback overlap without growing memory usage.
 
+### The Speaker Is Opened Once Per Turn
+
+`sd.play` opens and closes a fresh PortAudio stream for every clip. Measured on
+the dev laptop (MME host API, sounddevice `latency='high'`): ~180ms of primed
+silence plus ~30ms of device open in front of **every** sentence, and in front of
+an activation clip that `generate_activation_phrases.py` trims to a 20ms lead-in.
+That is the hole between chunks and the missing first syllable of "Sup.".
+`sd.play(blocking=True)` itself does *not* return early -- it returns clip length
+plus ~100-180ms -- so the tail was never the problem; the start was.
+
+`AudioPipeline.open_speaker()` now opens one `sd.OutputStream` when the wake word
+fires, `_idle_loop` holds it through the acknowledgement, recording, thinking,
+the whole reply and any turn chained onto it by a barge-in, and
+`close_speaker()` writes `sounds.speaker_tail_ms` of silence then closes it. It
+is per turn, not per process: the device is released while she is idle.
+`play_audio` writes clips into that stream in `SPEAKER_BLOCK_MS` (40ms) blocks
+and checks for a stop between blocks, which is what makes an interrupt land in
+tens of milliseconds instead of at the end of the sentence. With no session open
+(`_play_bootup_sound`, the manual test modes in `main.py`,
+`activation_blocking: false`) it falls back to `sd.play` exactly as before.
+
+**A stop stays in force until the next turn.** `stop_playback()` sets the abort
+flag and `abort()`s the stream so the ~180ms PortAudio already holds is dropped;
+`reset_playback()`, called at the top of `_handle_activation`, is the only thing
+that clears it. `play_audio` must not clear it per clip: the player thread may
+have already dequeued the next sentence when the stop lands, and clearing on
+entry played that sentence in full. `tests/test_speaker_session.py` pins it.
+
+### Interrupting Her Is the Wake Word, Not Loudness
+
+Until 2026-09-16 barge-in over a reply was dead code: `_interrupted` was
+assigned `False` in two places and `True` nowhere (BUG_AUDIT H1), and nothing
+read the microphone while she spoke -- the main thread sat inside the LLM
+stream, the mic buffer filled, and `_idle_loop` drained it afterwards. The 30s
+`join(timeout=30)` calls on the TTS threads made it worse: a reply with more
+than 30s of speech still queued when the LLM finished was abandoned, the
+orchestrator went back to idle *while she was still talking*, fed her own voice
+to the wake detector, and the next activation's `sd.play` cut her mid-word.
+
+Now `_stream_response(user_text, mic_stream)` starts `_reply_listener` on a
+thread for the length of the reply. It reads the mic and runs the same
+`WakeWordDetector.process_audio` the idle loop uses, at
+`wake_word.barge_in_threshold` (default: the idle threshold). A hit sets the
+`_interrupted` Event, calls `stop_playback()`, and the turn ends: the LLM
+generator is closed (`services/llm.py` catches `GeneratorExit` and stores the
+partial answer so history never ends on a user turn), both queues are drained,
+and `_handle_activation` returns `True`. `_idle_loop` then chains straight into
+another `_handle_activation` on the same open speaker session, so "California,
+no, the other one" is one motion. The joins have no timeout any more; a long
+reply is spoken to the end, and the only way to cut it short is the wake word
+or "stop".
+
+- **Why the wake word and not energy.** `EchoGate`'s RMS barge-in already had to
+  be switched off for the acknowledgement (`activation_blocking: true`) because
+  her own voice through the speaker clears any energy threshold. The detector is
+  trained on one word in his voice and scores hers near zero. If she ever does
+  interrupt herself, raise `barge_in_threshold`, not `threshold`
+- **She cannot wake herself by saying her name.** `_audio_player_worker`
+  publishes the text of the chunk it is playing in `_speaking_text`, and the
+  listener ignores a hit while that text contains "California"
+- **The listener is the only mic reader for the length of the reply**, and it is
+  joined before `_idle_loop` reads again, so the stream never has two readers.
+  Its errors are logged and end the listener; they can never take the turn down
+- **A tool call cannot be interrupted, only silenced.** The LLM stream is
+  consumed on the main thread and a `_dispatch_*` runs inside it, so a wake word
+  during a 25s CEC wake stops her talking at once but the turn ends when the
+  tool returns. Same as before; it is called out so nobody adds a thread for it
+- `tests/test_reply_barge_in.py` covers the interrupt, the chaining, the
+  own-name guard, the threshold override, and that a reply with no mic (the
+  test modes) is a normal reply
+
 ### Tool-Driven Device Control
 
 - TV control is exposed to the LLM through the `control_tv` tool, lights through `control_lights`
@@ -2003,9 +2074,11 @@ One more was found and fixed on **2026-09-03**, in the power path:
 
 Confirmed **High-severity** backlog:
 
-- **Barge-in / "stop" is non-functional** — still open. `_interrupted` is never set
-  `True`, so the interrupt guards are dead code and "stop" only skips the current
-  sentence (`core/orchestrator.py`).
+- ~~**Barge-in / "stop" is non-functional**~~ — **fixed 2026-09-16.** The wake word is
+  listened for through every reply and cuts it short; see "Interrupting Her Is the
+  Wake Word, Not Loudness". The same change opened the speaker once per turn, which
+  is what was clipping the first syllable of the acknowledgement, and removed the
+  30s TTS joins that abandoned long replies mid-word.
 - ~~**Claude provider does not stream**~~ — **fixed 2026-08-27.** `_stream_claude` now
   uses `client.messages.stream()` and yields real token deltas, so the default provider
   gets the sentence-chunker/TTS overlap the design assumes. The same change fixed **M2**
