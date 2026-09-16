@@ -238,6 +238,8 @@ california/
 │   ├── test_media_power.py      # turn_on/turn_off, BT wake fallback, no blind KEYCODE_POWER
 │   ├── test_media_service.py    # YouTube / ADB unit tests
 │   ├── test_mic_drain.py        # Stale mic-buffer draining after playback
+│   ├── test_speaker_session.py  # Per-turn OutputStream: block writes, stop-within-a-block, reopen after abort, tail on close
+│   ├── test_reply_barge_in.py   # Wake word over a reply: interrupt, queue drain, own-name guard, idle-loop chaining
 │   ├── test_orchestrator_lights.py # control_lights dispatch behavior
 │   ├── test_orchestrator_vpn_routing.py # VPN preflight routing behavior
 │   ├── test_stremio_service.py  # Stremio / TMDB / playback unit tests
@@ -1760,6 +1762,17 @@ Current automated coverage exists for:
   gating on the worst segment, and failing open on an unexpected response shape
 - Dropped turns: `_record_speech` returning `None`, and `_handle_activation`
   aborting without touching STT, the LLM, or TTS
+- The per-turn speaker session: clips written in blocks and never through
+  `sd.play` while a session is open, a stop from another thread landing within
+  one block, a stop staying in force until `reset_playback`, an aborted stream
+  being closed and replaced rather than restarted, the silent tail on close, a
+  rate change reopening, and a failed open falling back to `sd.play`
+- Barge-in: the wake word mid-reply stops her, closes the LLM stream, drains
+  both queues and returns `True`; a hit while she is saying "California" is
+  ignored; the listener scores at `barge_in_threshold`; a listener error does
+  not end the turn; `_idle_loop` chains a barged-in turn into another activation
+  on one speaker session; and a closed LLM generator keeps the partial answer
+  in history
 
 Useful live-debug commands:
 

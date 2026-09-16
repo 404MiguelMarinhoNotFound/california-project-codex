@@ -259,6 +259,8 @@ california/
 │   ├── test_bt_wake.py          # Self-disable contract for the two unverified alt wake candidates
 │   ├── test_media_service.py    # YouTube / ADB unit tests
 │   ├── test_mic_drain.py        # Stale mic-buffer draining after playback
+│   ├── test_speaker_session.py  # Per-turn OutputStream: block writes, stop-within-a-block, reopen after abort, tail on close
+│   ├── test_reply_barge_in.py   # Wake word over a reply: interrupt, queue drain, own-name guard, idle-loop chaining
 │   ├── test_orchestrator_lights.py # control_lights dispatch behavior
 │   ├── test_orchestrator_vacuum.py # control_vacuum dispatch: spoken lines, status-first guard
 │   ├── test_orchestrator_vpn_routing.py # VPN preflight routing behavior
@@ -2031,6 +2033,17 @@ Current automated coverage exists for:
   gating on the worst segment, and failing open on an unexpected response shape
 - Dropped turns: `_record_speech` returning `None`, and `_handle_activation`
   aborting without touching STT, the LLM, or TTS
+- The per-turn speaker session: clips written in blocks and never through
+  `sd.play` while a session is open, a stop from another thread landing within
+  one block, a stop staying in force until `reset_playback`, an aborted stream
+  being closed and replaced rather than restarted, the silent tail on close, a
+  rate change reopening, and a failed open falling back to `sd.play`
+- Barge-in: the wake word mid-reply stops her, closes the LLM stream, drains
+  both queues and returns `True`; a hit while she is saying "California" is
+  ignored; the listener scores at `barge_in_threshold`; a listener error does
+  not end the turn; `_idle_loop` chains a barged-in turn into another activation
+  on one speaker session; and a closed LLM generator keeps the partial answer
+  in history
 
 Useful live-debug commands:
 
@@ -2324,6 +2337,19 @@ just the commits.
   `DeebotService` + `control_vacuum` build documented under "DeebotService"
   above. The vacuum's nickname, **Sir Sucks-a-Lot**, was decided in the same
   session and lives as a comment in `config.yaml`'s `deebot:` block.
+- **"Cut-off acknowledgements and interrupting her" (2026-09-16, branch
+  `feat/wake-word-barge-in`).** Two live complaints: the acknowledgement clip
+  losing its first syllable and long replies stopping mid-word, and no way to
+  talk over her. Measured the `sd.play`-per-clip cost on the real device (MME:
+  ~180ms primed silence plus the open in front of every clip; the tail was
+  never cut), found the dead `_interrupted` flag and the 30s TTS joins, and
+  shipped the per-turn speaker session plus the wake-word reply listener --
+  see "The Speaker Is Opened Once Per Turn" and "Interrupting Her Is the Wake
+  Word, Not Loudness". Live test: the ack and the long replies were fixed,
+  the interrupt was not, and the follow-up measured why: the model scores her
+  own voice at 0.053 (no self-wake risk) but drops from 10/40 to 1/40 on real
+  takes with her voice on top. Ducking was simulated and rejected. Next step
+  is a training run with her clips as `augmentation.background_paths`.
 
 -----
 
