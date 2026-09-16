@@ -8,6 +8,7 @@ test pins that.
 import asyncio
 import os
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -248,6 +249,19 @@ class StatusTests(unittest.TestCase):
         status = _drive(_service(), bot).status()
         self.assertEqual(status, VacuumStatus(available=True, state="docked", battery=70))
 
+    def test_an_auth_failure_keeps_its_own_line_instead_of_unreachable(self):
+        # The dispatcher gates every clean on status(), so a status that
+        # flattens this loses the only chance to say what actually broke.
+        service = _service()
+
+        async def _command(fn):
+            return DeebotCommandResult(False, "needs a code")
+
+        service._command = _command
+        status = service.status()
+        self.assertFalse(status.available)
+        self.assertEqual(status.message, "needs a code")
+
     def test_no_battery_means_unreachable(self):
         service = _service(command_timeout_ms=5000)
         with patch.object(DeebotService, "_await_event", new=AsyncMock(return_value=None)):
@@ -322,11 +336,30 @@ class AuthFirstTests(unittest.TestCase):
     def test_a_second_stale_token_is_not_retried_again(self):
         from deebot_client.exceptions import DeviceVerificationRequiredError
 
+        attempts = []
+
         async def fn(bot):
+            attempts.append(1)
             raise DeviceVerificationRequiredError("1013")
 
-        with self.assertRaises(DeviceVerificationRequiredError):
-            self._run_with_auth(_service(), fn, [(True, "cached"), (True, "cached")])
+        result, _, _ = self._run_with_auth(
+            _service(), fn, [(True, "cached"), (True, "cached")]
+        )
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(result)
+        self.assertIn("verification code", result.message)
+
+    def test_a_rejected_login_is_not_reported_as_unreachable(self):
+        # AuthenticationError is a sibling of ApiError, not a subclass, so it
+        # used to escape _with_auth entirely and surface as a generic outage.
+        from deebot_client.exceptions import InvalidAuthenticationError
+
+        async def fn(bot):
+            raise InvalidAuthenticationError("1005")
+
+        result, _, _ = self._run_with_auth(_service(), fn, [(True, "password"), (True, "password")])
+        self.assertFalse(result)
+        self.assertIn("email or password", result.message)
 
     def test_api_errors_become_unreachable_results(self):
         from deebot_client.exceptions import ApiError
@@ -339,11 +372,48 @@ class AuthFirstTests(unittest.TestCase):
         self.assertEqual(result.message, "I couldn't reach the vacuum just now.")
         self.assertTrue(bot.torn_down)
 
+    def test_an_empty_device_list_on_a_cached_token_re_auths_and_retries(self):
+        # A token Ecovacs revoked server-side is still unexpired locally, so
+        # authenticate() short-circuits and the portal answers with a body
+        # carrying no devices -- which reaches us as LookupError, not an auth
+        # error. Without the retry the dead token is never cleared and every
+        # later command repeats this until the local expiry, up to ~7 days.
+        attempts = []
+
+        async def fn(bot):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise LookupError("no supported Deebot on this account")
+            return DeebotCommandResult(True)
+
+        result, auth, _ = self._run_with_auth(
+            _service(), fn, [(True, "cached"), (True, "password")]
+        )
+        self.assertTrue(result)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(auth.await_count, 2)
+
+    def test_an_empty_device_list_on_a_fresh_token_is_not_retried(self):
+        # Nothing to re-auth away: the token was minted by this very call, so a
+        # retry would hit the gated login endpoint for an account that really
+        # has no supported robot.
+        attempts = []
+
+        async def fn(bot):
+            attempts.append(1)
+            raise LookupError("no supported Deebot on this account")
+
+        result, auth, _ = self._run_with_auth(_service(), fn, [(True, "password")])
+        self.assertFalse(result)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(auth.await_count, 1)
+        self.assertEqual(result.message, "I couldn't reach the vacuum just now.")
+
 
 class WorkerTests(unittest.TestCase):
     def test_a_hung_command_times_out_as_unreachable(self):
         service = _service(command_timeout_ms=5000)
-        service.command_timeout_s = 0.2
+        service._wait_timeout_s = 0.2
 
         async def hang():
             await asyncio.sleep(2)
@@ -357,6 +427,151 @@ class WorkerTests(unittest.TestCase):
             raise RuntimeError("x")
 
         self.assertFalse(_service()._run(boom))
+
+    def test_the_wait_covers_the_verification_budget(self):
+        # A command may have to complete a device verification on the way
+        # through. A wait shorter than that reports a verification that is
+        # succeeding as a failure.
+        service = _service(command_timeout_ms=30000, verification_email_timeout_ms=90000)
+        self.assertGreaterEqual(
+            service._wait_timeout_s,
+            service.command_timeout_s + service.verification_email_timeout_s,
+        )
+
+    def test_timeout_floors_are_applied_in_seconds(self):
+        # max(5, ms) / 1000 is a 5ms floor dressed as a 5s one.
+        service = _service(command_timeout_ms=3, verification_email_timeout_ms=500)
+        self.assertEqual(service.command_timeout_s, 5.0)
+        self.assertEqual(service.verification_email_timeout_s, 10)
+
+    def test_a_second_command_is_refused_while_one_is_still_running(self):
+        # The timed-out worker cannot be cancelled and keeps the robot busy;
+        # queueing behind it just burns the next command's budget in line.
+        service = _service()
+        service._wait_timeout_s = 0.2
+        released = threading.Event()
+
+        async def hang():
+            await asyncio.to_thread(released.wait, 5)
+
+        try:
+            self.assertFalse(service._run(hang))
+            second = service._run(hang)
+            self.assertFalse(second)
+            self.assertEqual(second.message, "I'm still working on the last vacuum command.")
+        finally:
+            released.set()
+
+    def test_close_stops_accepting_commands(self):
+        service = _service()
+        service.close()
+
+        async def never():
+            raise AssertionError("must not run")
+
+        self.assertFalse(service._run(never))
+
+    def test_the_worker_never_blocks_interpreter_exit(self):
+        # ThreadPoolExecutor workers are non-daemon and joined by an atexit
+        # hook, so a command still polling Gmail would hold Ctrl-C open.
+        service = _service()
+        service._wait_timeout_s = 0.2
+        seen = []
+
+        async def hang():
+            seen.append(threading.current_thread())
+            await asyncio.sleep(5)
+
+        service._run(hang)
+        self.assertTrue(seen[0].daemon)
+
+
+class SessionTests(unittest.TestCase):
+    """deebot_session: token cache recovery and the verification-code order."""
+
+    def test_unreadable_cached_credentials_fall_back_to_a_fresh_login(self):
+        # read_text raises UnicodeDecodeError on half-written bytes, which is a
+        # ValueError but not a JSONDecodeError. Escaping here wedged the vacuum
+        # for good, because nothing upstream ever deletes this file.
+        tmp = tempfile.mkdtemp()
+        (deebot_session._credentials_path(tmp)).write_bytes(b"\xff\xfe not json")
+        self.assertIsNone(deebot_session.load_cached_credentials(tmp))
+
+    def test_a_stale_env_code_falls_back_to_gmail_instead_of_stopping(self):
+        # Codes expire in 24h and ECOVACS_VERIFICATION_CODE outlives them, so a
+        # stale value must not shadow the automatic path forever.
+        from deebot_client.exceptions import (
+            DeviceVerificationRequiredError,
+            InvalidVerificationCodeError,
+        )
+
+        authenticator = Mock(_credentials=None)
+        authenticator.authenticate = AsyncMock(side_effect=DeviceVerificationRequiredError("1013"))
+        authenticator.verify_device = AsyncMock(
+            side_effect=[InvalidVerificationCodeError("1012"), None]
+        )
+        authenticator.request_device_verification_code = AsyncMock()
+
+        with patch.dict(os.environ, {"ECOVACS_VERIFICATION_CODE": "000000"}), \
+             patch("services.gmail_verification_code.latest_uid", return_value=4), \
+             patch("services.gmail_verification_code.fetch_new_code", return_value="123456"):
+            ok, reason = asyncio.run(
+                deebot_session.authenticate(
+                    authenticator,
+                    gmail_address="vacuum@example.com",
+                    gmail_app_password="app-pw",
+                )
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(reason, deebot_session.REASON_VERIFIED_GMAIL)
+        self.assertEqual(
+            [c.args[0] for c in authenticator.verify_device.await_args_list], ["000000", "123456"]
+        )
+
+
+class GmailVerificationTests(unittest.TestCase):
+    """No IMAP socket is opened anywhere in this class."""
+
+    def test_an_undecodable_text_part_does_not_crash_extraction(self):
+        import email as email_mod
+
+        from services import gmail_verification_code as gmail
+
+        msg = email_mod.message_from_string(
+            "MIME-Version: 1.0\n"
+            'Content-Type: multipart/alternative; boundary="b"\n\n'
+            "--b\nContent-Type: text/plain\n\n\n"
+            "--b\nContent-Type: text/plain\n\n"
+            "Your verification code is &nbsp;045689&nbsp;.\n"
+            "--b--\n"
+        )
+        imap = Mock()
+        imap.uid.return_value = ("OK", [(b"1", msg.as_bytes())])
+        self.assertEqual(gmail._extract_code(imap, 1), "045689")
+
+    def test_a_transient_imap_error_does_not_end_the_poll(self):
+        import imaplib
+
+        from services import gmail_verification_code as gmail
+
+        calls = []
+
+        def _connect(address, password):
+            calls.append(1)
+            if len(calls) == 1:
+                raise imaplib.IMAP4.error("rate limited")
+            return Mock()
+
+        with patch.object(gmail, "_connect", side_effect=_connect), \
+             patch.object(gmail, "_disconnect"), \
+             patch.object(gmail, "_sender_uids", return_value=[9]), \
+             patch.object(gmail, "_extract_code", return_value="045689"), \
+             patch.object(gmail.time, "sleep"):
+            code = gmail.fetch_new_code("a@b.c", "pw", since_uid=4, timeout_s=30)
+
+        self.assertEqual(code, "045689")
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

@@ -14,15 +14,22 @@ Three things about how it talks to the robot, all measured on the real N8+:
   arrive via the REST refresh (spike 2026-09-16: 3.1s for all five reads, ~2s
   for a status). Skipping MqttClient also skips aiomqtt's Windows
   `add_reader` NotImplementedError noise entirely.
-- **Connect-per-command on a dedicated worker thread**, like BleTransport.
-  The orchestrator is threaded and synchronous; every public method submits
-  one coroutine to a single-worker executor and waits with
-  `deebot.command_timeout_ms`. Never `asyncio.run` from orchestrator code.
+- **Connect-per-command on a daemon worker thread**, like BleTransport. The
+  orchestrator is threaded and synchronous; every public method runs one
+  coroutine on a fresh daemon thread and waits. Never `asyncio.run` from
+  orchestrator code. One command at a time: a timed-out future cannot be
+  cancelled, so a second command is refused rather than queued behind a worker
+  that is still talking to the robot. The wait is `command_timeout_ms` PLUS
+  `verification_email_timeout_ms`, because a single command may have to
+  complete a device verification on the way through.
 - **Auth first, every command, with one retry.** `_with_auth` reuses the
-  cached token (services/deebot_session), and when Ecovacs demands device
-  verification mid-command it drops the token, re-authenticates (reading the
-  emailed code from Gmail when GMAIL_APP_PASSWORD is set) and retries the
-  command exactly once. No human in the loop.
+  cached token (services/deebot_session), and when Ecovacs rejects it
+  mid-command it drops the token, re-authenticates (reading the emailed code
+  from Gmail when GMAIL_APP_PASSWORD is set) and retries the command exactly
+  once. No human in the loop. Rejection is not always an auth error: the
+  portal answers an unauthorised request with HTTP 200 and no `devices` key,
+  which arrives here as `LookupError`, so that counts as a stale token too --
+  but only when the token came from the cache.
 
 Room ids: `deebot.rooms` in config.yaml caches `name -> id` so a room command
 is one REST call. A room with no cached id, or a cached id the robot rejects
@@ -36,8 +43,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +60,8 @@ _MSG_UNREACHABLE = "I couldn't reach the vacuum just now."
 _MSG_NEEDS_CODE = (
     "The vacuum login needs a fresh verification code and I couldn't read one from email."
 )
+_MSG_BAD_LOGIN = "The vacuum login was rejected. The Ecovacs email or password looks wrong."
+_MSG_BUSY = "I'm still working on the last vacuum command."
 _MSG_UNKNOWN_ROOM = "I don't have that room on the vacuum's map."
 _MSG_REJECTED = "The vacuum didn't accept that command."
 
@@ -74,6 +84,11 @@ class VacuumStatus:
     state: str | None = None  # idle | cleaning | returning | docked | error | paused
     battery: int | None = None
     error: str | None = None
+    # Why it is unavailable, when we know something better than "unreachable".
+    # "needs a verification code" and "can't see it on the network" are opposite
+    # fixes, so the dispatcher has to be able to tell them apart -- the same
+    # reason MediaService carries unreachable_reason for the box.
+    message: str = ""
 
 
 def _as_int(value, default: int) -> int:
@@ -105,10 +120,22 @@ class DeebotService:
         ).strip()
 
         self.state_dir = Path(cfg.get("state_dir") or deebot_session.ROOT)
-        self.command_timeout_s = max(5, _as_int(cfg.get("command_timeout_ms"), 30000)) / 1000
-        self.verification_email_timeout_s = (
-            max(10, _as_int(cfg.get("verification_email_timeout_ms"), 90000)) // 1000
+        # Floor the SECONDS, not the milliseconds. max(5, ms) / 1000 reads like a
+        # 5s minimum and is a 5ms one, so command_timeout_ms: 3 used to expire
+        # every command instantly and verification_email_timeout_ms: 500 used to
+        # give fetch_new_code a 0s budget, whose poll loop never runs at all.
+        self.command_timeout_s = max(5.0, _as_int(cfg.get("command_timeout_ms"), 30000) / 1000)
+        self.verification_email_timeout_s = max(
+            10, _as_int(cfg.get("verification_email_timeout_ms"), 90000) // 1000
         )
+        # One command may have to complete a device verification on the way
+        # through (request a code, then poll Gmail for it), so the wait has to
+        # cover both budgets. At 30s vs 90s the old wait gave up while the
+        # verification was still succeeding, reported "unreachable", and left
+        # the worker running so the next command timed out too. This is a
+        # ceiling, not a cost: every step underneath has its own timeout, so an
+        # unreachable robot still answers in seconds.
+        self._wait_timeout_s = self.command_timeout_s + self.verification_email_timeout_s
 
         self.rooms = self._build_rooms(cfg.get("rooms") or {})
 
@@ -132,7 +159,9 @@ class DeebotService:
             )
         self.enabled = bool(configured and self.available and has_credentials)
 
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deebot")
+        self._lock = threading.Lock()
+        self._busy = False
+        self._closed = False
         self._device_info = None
         self._live_rooms: dict[str, int] = {}
         self._live_rooms_at = 0.0
@@ -186,13 +215,48 @@ class DeebotService:
 
     # --------------------------------------------------------------- plumbing
 
+    def close(self) -> None:
+        """Stop accepting commands. Safe to call more than once."""
+        with self._lock:
+            self._closed = True
+
     def _run(self, coro_factory):
-        """Run one command coroutine on the worker thread with a timeout."""
-        future = self._executor.submit(lambda: asyncio.run(coro_factory()))
+        """Run one command coroutine on a worker thread with a timeout.
+
+        One command at a time, and never more than one in flight. A timed-out
+        future cannot be cancelled, so the worker keeps going; queueing behind
+        it just means the next command burns its own budget waiting in line and
+        reports a failure that never reached the robot. Refusing outright says
+        something true instead.
+
+        The worker is a daemon thread on purpose. A ThreadPoolExecutor's workers
+        are not, and concurrent.futures joins them from an atexit hook, so a
+        command still polling Gmail would hold the whole process open on Ctrl-C.
+        """
+        with self._lock:
+            if self._closed:
+                return DeebotCommandResult(False, _MSG_NOT_CONFIGURED)
+            if self._busy:
+                logger.warning("Deebot: a command is still running, refusing a second")
+                return DeebotCommandResult(False, _MSG_BUSY)
+            self._busy = True
+
+        future: Future = Future()
+
+        def _work():
+            try:
+                future.set_result(asyncio.run(coro_factory()))
+            except BaseException as exc:  # noqa: BLE001 - handed to the caller below
+                future.set_exception(exc)
+            finally:
+                with self._lock:
+                    self._busy = False
+
+        threading.Thread(target=_work, name="deebot", daemon=True).start()
         try:
-            return future.result(timeout=self.command_timeout_s)
+            return future.result(timeout=self._wait_timeout_s)
         except FutureTimeoutError:
-            logger.warning("Deebot command timed out after %.0fs", self.command_timeout_s)
+            logger.warning("Deebot command timed out after %.0fs", self._wait_timeout_s)
             return DeebotCommandResult(False, _MSG_UNREACHABLE)
         except Exception:  # noqa: BLE001 - never let a device error reach the orchestrator
             logger.exception("Deebot command failed")
@@ -230,6 +294,7 @@ class DeebotService:
         from deebot_client.exceptions import (
             ApiError,
             ApiTimeoutError,
+            AuthenticationError,
             DeviceVerificationRequiredError,
             InvalidAuthenticationError,
         )
@@ -244,14 +309,33 @@ class DeebotService:
         )
         bot = None
         try:
-            ok, _ = await self._authenticate(authenticator)
+            ok, reason = await self._authenticate(authenticator)
             if not ok:
                 return DeebotCommandResult(False, _MSG_NEEDS_CODE)
+            # Authenticator.authenticate() short-circuits on an unexpired cached
+            # token without contacting Ecovacs at all, so this call may have
+            # proved nothing about whether the token is still good.
+            used_cached_token = reason == deebot_session.REASON_CACHED
             try:
                 bot = await self._device(authenticator)
                 return await fn(bot)
-            except (DeviceVerificationRequiredError, InvalidAuthenticationError):
-                logger.info("Deebot: token rejected mid-command, re-authenticating once")
+            except (
+                DeviceVerificationRequiredError,
+                InvalidAuthenticationError,
+                LookupError,
+            ) as exc:
+                # LookupError is here because a rejected token does not always
+                # arrive as an auth error. The portal answers an unauthorised
+                # request with HTTP 200 and a body carrying no "devices" key,
+                # which ApiClient turns into an empty device list and _device
+                # into LookupError. Retrying a cached token costs one login;
+                # retrying a token minted this call cannot help, and would hit
+                # the gated login endpoint for nothing.
+                if isinstance(exc, LookupError) and not used_cached_token:
+                    raise
+                logger.info(
+                    "Deebot: token rejected mid-command (%r), re-authenticating once", exc
+                )
                 if bot is not None:
                     await bot.teardown()
                     bot = None
@@ -263,6 +347,16 @@ class DeebotService:
                     return DeebotCommandResult(False, _MSG_NEEDS_CODE)
                 bot = await self._device(authenticator)
                 return await fn(bot)
+        except DeviceVerificationRequiredError as exc:
+            # Must precede AuthenticationError, which it subclasses.
+            logger.warning("Deebot still needs device verification: %r", exc)
+            return DeebotCommandResult(False, _MSG_NEEDS_CODE)
+        except AuthenticationError as exc:
+            # Not an ApiError -- they are siblings under DeebotError, so without
+            # this branch a wrong password escaped to _run's blanket handler and
+            # logged a traceback every turn under a generic "unreachable" line.
+            logger.warning("Deebot login rejected: %r", exc)
+            return DeebotCommandResult(False, _MSG_BAD_LOGIN)
         except (ApiTimeoutError, ApiError, LookupError, OSError, asyncio.TimeoutError) as exc:
             logger.warning("Deebot unreachable: %r", exc)
             return DeebotCommandResult(False, _MSG_UNREACHABLE)
@@ -334,7 +428,7 @@ class DeebotService:
 
     def status(self) -> VacuumStatus:
         if not self.enabled:
-            return VacuumStatus(available=False)
+            return VacuumStatus(available=False, message=_MSG_NOT_CONFIGURED)
 
         async def _status(bot) -> VacuumStatus:
             from deebot_client.events import BatteryEvent, ErrorEvent, StateEvent
@@ -358,7 +452,12 @@ class DeebotService:
         result = self._run(lambda: self._command(_status))
         if isinstance(result, VacuumStatus):
             return result
-        return VacuumStatus(available=False)
+        # Carry the failure's own line through. Flattening it here used to make
+        # _MSG_NEEDS_CODE unspeakable on every path: the dispatcher gates each
+        # clean on status(), so "needs a verification code" always came out as
+        # "I couldn't reach the vacuum" -- a network answer to a login problem.
+        message = result.message if isinstance(result, DeebotCommandResult) else ""
+        return VacuumStatus(available=False, message=message)
 
     def clean_all(self) -> DeebotCommandResult:
         return self._simple("clean_all")

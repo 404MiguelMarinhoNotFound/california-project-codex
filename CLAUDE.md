@@ -933,20 +933,66 @@ also skips aiomqtt's Windows `add_reader`/`add_writer` `NotImplementedError`
 noise entirely -- the default Proactor loop cannot drive paho's sockets, and the
 one-shot scripts only worked *despite* it.
 
-**Connect-per-command on one worker thread**, the `BleTransport` pattern. The
-orchestrator is threaded and synchronous; every public method submits one
-coroutine to a single-worker executor and waits with `deebot.command_timeout_ms`.
-Never `asyncio.run` a deebot coroutine from orchestrator code. The `DeviceInfo`
-from `get_devices()` is cached in memory; the `Device` object is rebuilt per call
-because it holds the per-call `Authenticator`.
+**Connect-per-command on one daemon worker thread**, the `BleTransport` pattern.
+The orchestrator is threaded and synchronous; every public method runs one
+coroutine on a worker thread and waits. Never `asyncio.run` a deebot coroutine
+from orchestrator code. The `DeviceInfo` from `get_devices()` is cached in
+memory; the `Device` object is rebuilt per call because it holds the per-call
+`Authenticator`.
+
+Three things about that wait, all of which were wrong until 2026-09-16:
+
+- **The wait is `command_timeout_ms` + `verification_email_timeout_ms`**, not
+  the former alone. One command may have to complete a device verification on
+  the way through (request the code, then poll Gmail up to 90s for it), and a
+  30s wait gave up while that was still *succeeding* -- speaking "I couldn't
+  reach the vacuum" on a weekly cadence. It is a ceiling, not a cost: every
+  step underneath has its own timeout, so an unreachable robot still answers in
+  seconds.
+- **One command at a time, refused rather than queued.** A timed-out future
+  cannot be cancelled, so the worker keeps running. On the old single-worker
+  executor the next command queued behind it and burned its own budget waiting
+  in line, turning one slow verification into three false failures --
+  `_dispatch_vacuum` calls `status()` before every clean, so a clean costs two.
+- **The worker is a daemon thread.** `ThreadPoolExecutor`'s workers are not, and
+  `concurrent.futures` joins them from an `atexit` hook, so a command still
+  polling Gmail held the whole process open on Ctrl-C. `DeebotService.close()`
+  stops accepting new ones and is called from the orchestrator's shutdown.
 
 **Auth first, every command, retry once.** `_with_auth` is the only path to the
 robot. It builds an `Authenticator` preloaded with the cached token
 (`services/deebot_session.py`), authenticates, runs the command, and if Ecovacs
-rejects the token mid-command (`DeviceVerificationRequiredError` /
-`InvalidAuthenticationError`) it drops the cache, re-authenticates and retries
-the command **exactly once**. Any `ApiError`/`ApiTimeoutError`/`OSError` maps to
-an unreachable result; the dispatcher never sees an exception.
+rejects the token mid-command it drops the cache, re-authenticates and retries
+the command **exactly once**.
+
+**A rejected token does not always arrive as an auth error, and assuming it did
+was a wedge.** `Authenticator.authenticate()` short-circuits on any token whose
+local `expires_at` is still in the future *without contacting Ecovacs*, so a
+token revoked server-side sails through. The portal then answers the
+unauthorised request with **HTTP 200 and a body carrying no `devices` key** --
+`_AuthClient.post` has no error-code mapping at all, unlike the login endpoint
+-- which `ApiClient` turns into an empty device list and `_device()` into
+`LookupError`. That used to land in the outer handler, so the cache was never
+cleared and *every* later command repeated it until the local expiry, up to ~7
+days. `LookupError` now triggers the retry too, but **only when the token came
+from the cache**: a token minted by this very call cannot be stale, and
+retrying it would hit the gated login endpoint for an account that genuinely
+has no supported robot.
+
+**`AuthenticationError` is a sibling of `ApiError`, not a subclass.** Catching
+`(ApiTimeoutError, ApiError, LookupError, OSError)` therefore missed every
+credential failure, and a wrong password escaped to `_run`'s blanket handler --
+a full traceback every turn under a generic "unreachable" line. It now has its
+own branch, and `DeviceVerificationRequiredError` a separate one before it
+(it subclasses `AuthenticationError`), because "check the email and password"
+and "I need a verification code" are different fixes.
+
+**`ECOVACS_VERIFICATION_CODE` must not end the attempt when it is rejected.**
+Setting it by hand is the documented way out of a stalled verification, it is
+checked before the Gmail path, and the codes expire in 24 hours -- so a value
+left in `.env` after one rescue used to shadow the automatic path permanently,
+failing every later verification with a stale code. A rejected env code now logs
+and **falls through** to Gmail instead of returning.
 
 **The auth chain, and why re-verification is "forever" without being manual.**
 `services/deebot_session.py` persists the login token to
@@ -983,7 +1029,15 @@ the lights, so aliases and the despaced tier work identically.
 reads `status()` before any clean: an unreachable robot gets the unreachable
 line rather than a command fired into the void, and one already `cleaning` is
 left alone rather than restarted. `stop`/`dock` skip the guard (stopping a robot
-you can't see is harmless). `State` int → word via `deebot_client.models.State`;
+you can't see is harmless).
+
+**`VacuumStatus.message` carries *why* it is unavailable, and that is what makes
+the guard safe to put in front of everything.** `status()` used to flatten every
+failure into a bare `available=False`, so `_MSG_NEEDS_CODE` was unreachable text
+on every path -- the guard runs before each clean, so "the login needs a fresh
+verification code" always came out as "I couldn't reach the vacuum just now". A
+network answer to a login problem, and the same mistake `needs_pairing` exists to
+avoid on the TV. The dispatcher now speaks `status.message or` the fallback. `State` int → word via `deebot_client.models.State`;
 a nonzero `ErrorEvent` code overrides the state to `error` and carries the
 description. Position/duration are deliberately not read -- the N8+ reports
 elapsed but no total, same limit as the TV, so nothing implies a percentage.
@@ -1726,6 +1780,20 @@ Current automated coverage exists for:
   and the stale-id re-resolve-and-retry, that `_with_auth` re-authenticates exactly once on a
   rejected token then retries, timeouts and API errors become unreachable results, and a guard
   that this test file never opens a network session (no Ecovacs, no IMAP)
+- Deebot auth taxonomy: that an empty device list (`LookupError`) on a **cached** token
+  re-authenticates and retries while the same on a freshly minted one does not, that a
+  rejected login is spoken as a credential problem rather than an outage, and that a second
+  verification demand returns the needs-a-code line instead of escaping the service
+- Deebot worker: that the wait covers the verification budget as well as the command one,
+  that the timeout floors are applied in seconds rather than milliseconds, that a second
+  command is refused while one is still running, that the worker thread is a daemon so it
+  cannot hold the process open, and that `close()` stops accepting commands
+- Deebot status: that an auth failure keeps its own line instead of collapsing into the
+  generic unreachable one
+- Deebot session and Gmail: that unreadable cached credentials fall back to a fresh login
+  rather than propagating, that a stale `ECOVACS_VERIFICATION_CODE` falls through to the
+  Gmail path instead of shadowing it, that an undecodable `text/plain` part does not crash
+  code extraction, and that a transient IMAP error does not end the poll
 - `control_vacuum` dispatch: every spoken line, the status-first guard refusing a clean when
   the robot is unreachable or already cleaning, unknown room names refused before any status
   read, stop/dock skipping the guard, and failed results surfacing their message

@@ -49,6 +49,19 @@ def _credentials_path(state_dir: Path | str) -> Path:
     return Path(state_dir) / CREDENTIALS_FILE
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a temp file and os.replace, like device_state.json does.
+
+    A truncated .deebot_device_id is not a cache miss, it is a *different*
+    device id, and that re-triggers Ecovacs device verification on the next
+    login. Neither of these files may ever be observed half-written.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def stable_device_id(state_dir: Path | str = ROOT) -> str:
     from deebot_client.util import md5
 
@@ -58,8 +71,7 @@ def stable_device_id(state_dir: Path | str = ROOT) -> str:
         if existing:
             return existing
     device_id = md5(os.urandom(16).hex())
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(device_id, encoding="utf-8")
+    _atomic_write(path, device_id)
     return device_id
 
 
@@ -76,7 +88,12 @@ def load_cached_credentials(state_dir: Path | str = ROOT):
             user_id=data["user_id"],
             expires_at=data["expires_at"],
         )
-    except (json.JSONDecodeError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, OSError):
+        # ValueError covers both JSONDecodeError and the UnicodeDecodeError a
+        # half-written file raises out of read_text. An unreadable cache has to
+        # fall through to a fresh login, never propagate -- nothing upstream
+        # deletes this file, so an escaping error wedges the vacuum for good.
+        logger.warning("Deebot: cached credentials unreadable, logging in fresh")
         return None
 
 
@@ -90,9 +107,8 @@ def clear_cached_credentials(state_dir: Path | str = ROOT) -> None:
 
 
 def _save_credentials(credentials, state_dir: Path | str) -> None:
-    path = _credentials_path(state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    _atomic_write(
+        _credentials_path(state_dir),
         json.dumps(
             {
                 "token": credentials.token,
@@ -100,7 +116,6 @@ def _save_credentials(credentials, state_dir: Path | str) -> None:
                 "expires_at": credentials.expires_at,
             }
         ),
-        encoding="utf-8",
     )
 
 
@@ -147,7 +162,8 @@ async def authenticate(
     """Authenticate, handling device verification if it's (still) required.
 
     Order when a code is needed:
-      1. `verification_code_env`, if set (a human supplied it)
+      1. `verification_code_env`, if set (a human supplied it), and if it is
+         *rejected* fall through rather than stopping -- see below
       2. Gmail auto-read, if `gmail_address` + `gmail_app_password` are given
          (default: ECOVACS_EMAIL + GMAIL_APP_PASSWORD from the environment):
          request a fresh code, poll that inbox over IMAP, extract it
@@ -157,7 +173,10 @@ async def authenticate(
     """
     import asyncio
 
-    from deebot_client.exceptions import DeviceVerificationRequiredError
+    from deebot_client.exceptions import (
+        DeviceVerificationRequiredError,
+        InvalidAuthenticationError,
+    )
 
     had_cached = authenticator._credentials is not None  # noqa: SLF001
     try:
@@ -169,8 +188,20 @@ async def authenticate(
     code = os.getenv(verification_code_env)
     if code:
         logger.info("Deebot: verifying device with %s", verification_code_env)
-        await authenticator.verify_device(code.strip())
-        return True, REASON_VERIFIED_ENV
+        try:
+            await authenticator.verify_device(code.strip())
+            return True, REASON_VERIFIED_ENV
+        except InvalidAuthenticationError as exc:
+            # Codes expire in 24h but the env var outlives them, and setting it
+            # by hand is the documented way out of a stalled verification. If a
+            # stale value ended the attempt here it would shadow Gmail forever,
+            # so a rejected code falls through to the automatic path instead.
+            # (InvalidVerificationCodeError subclasses this.)
+            logger.warning(
+                "Deebot: %s was rejected (%r), falling back to the Gmail path",
+                verification_code_env,
+                exc,
+            )
 
     gmail_address = gmail_address or os.getenv("ECOVACS_EMAIL")
     gmail_app_password = gmail_app_password or os.getenv("GMAIL_APP_PASSWORD")

@@ -856,7 +856,7 @@ def _dispatch_vacuum(params: dict, deebot_svc) -> str:
     if action == "vacuum_status":
         status = deebot_svc.status()
         if not status.available:
-            return _VACUUM_UNREACHABLE
+            return status.message or _VACUUM_UNREACHABLE
         return _vacuum_status_line(status)
 
     if action in ("vacuum_clean_all", "vacuum_clean_rooms"):
@@ -877,7 +877,7 @@ def _dispatch_vacuum(params: dict, deebot_svc) -> str:
 
         status = deebot_svc.status()
         if not status.available:
-            return _VACUUM_UNREACHABLE
+            return status.message or _VACUUM_UNREACHABLE
         if status.state == "cleaning":
             return "The vacuum's already cleaning."
 
@@ -1112,6 +1112,7 @@ class Orchestrator:
             self._background_stop.set()
             if self._stremio_sync_thread:
                 self._stremio_sync_thread.join(timeout=2)
+            self.deebot_service.close()
             mic_stream.stop()
             mic_stream.close()
             self.leds.off()
