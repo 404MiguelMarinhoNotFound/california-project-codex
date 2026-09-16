@@ -173,10 +173,12 @@ class ToolSchemaTests(unittest.TestCase):
 class VacuumInventoryPromptTests(unittest.TestCase):
     """Same rule as the lights: room names are injected, never hardcoded."""
 
-    def _service(self, enabled=True, rooms=None):
+    def _service(self, enabled=True, rooms=None, nickname=None):
         rooms = {"kitchen": {"id": 7}, "bedroom": {"id": 5}} if rooms is None else rooms
         config = _config()
         config["deebot"] = {"enabled": enabled, "rooms": rooms}
+        if nickname is not None:
+            config["deebot"]["nickname"] = nickname
         with mock.patch.dict("os.environ", {"GROQ_API_KEY": "x"}), mock.patch("groq.Groq"):
             return LLMService(config)
 
@@ -198,6 +200,42 @@ class VacuumInventoryPromptTests(unittest.TestCase):
     def test_the_tool_is_only_offered_when_enabled(self):
         self.assertTrue(self._service().vacuum_enabled)
         self.assertFalse(self._service(enabled=False).vacuum_enabled)
+
+    # --- nickname ----------------------------------------------------------
+    # "Where is SirSucksAlot?" was answered with "I don't have location
+    # tracking, is that a person or a pet?" because the name only existed as a
+    # YAML comment. It is a config field now and the prompt says what it is.
+
+    def test_the_nickname_reaches_the_prompt_as_the_vacuum(self):
+        prompt = self._service(nickname="Sir Sucks-a-Lot")._build_system_prompt()
+        self.assertIn("The vacuum is called Sir Sucks-a-Lot.", prompt)
+
+    def test_the_nickname_line_routes_where_is_he_to_vacuum_status(self):
+        # STT spelled it SirSoxalot, Sir Soxalot and "Sursocks a lot" in one
+        # session, so the line has to cover misspellings and say which action
+        # a location question is.
+        prompt = self._service(nickname="Sir Sucks-a-Lot")._build_system_prompt()
+        self.assertIn("misspells", prompt)
+        self.assertIn("vacuum_status", prompt)
+
+    def test_the_nickname_is_injected_even_with_no_rooms(self):
+        prompt = self._service(rooms={}, nickname="Sir Sucks-a-Lot")._build_system_prompt()
+        self.assertIn("The vacuum is called Sir Sucks-a-Lot.", prompt)
+        self.assertNotIn("Vacuum rooms", prompt)
+
+    def test_no_nickname_line_without_a_nickname(self):
+        self.assertNotIn("The vacuum is called", self._service()._build_system_prompt())
+        self.assertNotIn("The vacuum is called", self._service(nickname="  ")._build_system_prompt())
+
+    def test_nothing_about_the_vacuum_when_disabled(self):
+        prompt = self._service(enabled=False, nickname="Sir Sucks-a-Lot")._build_system_prompt()
+        self.assertNotIn("Sir Sucks-a-Lot", prompt)
+
+    def test_the_shipped_config_names_the_vacuum(self):
+        # The real config.yaml is the source of truth for the name; this fails
+        # if it ever goes back to being a comment.
+        prompt = _build()._build_system_prompt()
+        self.assertIn("The vacuum is called Sir Sucks-a-Lot.", prompt)
 
 
 if __name__ == "__main__":
