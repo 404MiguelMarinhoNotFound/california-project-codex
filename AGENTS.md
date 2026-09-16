@@ -566,8 +566,25 @@ or "stop".
 - **Why the wake word and not energy.** `EchoGate`'s RMS barge-in already had to
   be switched off for the acknowledgement (`activation_blocking: true`) because
   her own voice through the speaker clears any energy threshold. The detector is
-  trained on one word in his voice and scores hers near zero. If she ever does
-  interrupt herself, raise `barge_in_threshold`, not `threshold`
+  trained on one word in his voice and scores hers near zero: **measured
+  2026-09-16, 45s of her own lines recorded through this mic at the current
+  volume (RMS ~480) peak at 0.053, zero fires at any threshold down to 0.2.**
+  `barge_in_threshold` is therefore 0.5, well under the idle 0.81, and can go
+  lower still without her waking herself
+- **The model cannot hear him over her, and that is a training gap, not a
+  runtime one.** Same session, same 40 real holdout takes (EN+PT): 10/40 fire
+  clean at 0.81, **1/40** mixed with her voice at 0.81, 5/40 at 0.5, 9/40 at
+  0.2. Even a clean mix at bleed RMS 300 — below his own voice at ~840 — takes
+  the median peak from 0.81 to 0.01. Ducking her volume once he starts was
+  simulated before being built: cutting her to 15% or even to zero 150-400ms
+  into the word recovers at best 7/40, because the model decides on the onset
+  and the onset is already contaminated. Do not build a ducker. The fix is
+  `augmentation.background_paths` in `training/california_v2.yaml`: her own
+  clips (every `sounds/**/google_en-US-Chirp3-HD-Aoede/*.wav`, plus a batch of
+  ordinary TTS sentences) as a background source, so the positives are heard
+  over her voice in training. Until that run, expect "California" over her to
+  land roughly one time in five, and read the `Reply listener: peak wake score`
+  line logged after every reply to see how close it got
 - **She cannot wake herself by saying her name.** `_audio_player_worker`
   publishes the text of the chunk it is playing in `_speaking_text`, and the
   listener ignores a hit while that text contains "California"

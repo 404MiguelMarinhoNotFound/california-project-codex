@@ -1590,11 +1590,15 @@ class Orchestrator:
         Anything that goes wrong in here is logged and ends the listener; it
         can never take the turn down with it.
         """
+        peak = 0.0
+        started = time.monotonic()
         try:
             while not stop.is_set():
                 audio_bytes, _ = mic_stream.read(self.audio.chunk_samples)
                 chunk = self.audio.bytes_to_numpy(audio_bytes)
-                if not self.wake_word.process_audio(chunk, threshold=self._barge_in_threshold):
+                hit = self.wake_word.process_audio(chunk, threshold=self._barge_in_threshold)
+                peak = max(peak, float(getattr(self.wake_word, "last_score", 0.0) or 0.0))
+                if not hit:
                     continue
                 if "california" in (self._speaking_text or "").lower():
                     logger.info("Wake word scored while she was saying her own name — ignored")
@@ -1605,6 +1609,15 @@ class Orchestrator:
                 return
         except Exception:
             logger.exception("Reply listener stopped early")
+        finally:
+            # The number to read when "California" over her did nothing: how
+            # close the detector got against barge_in_threshold. Measured
+            # 2026-09-16, her own voice through the mic peaks at 0.053, so
+            # anything well above that was him.
+            logger.info(
+                "Reply listener: peak wake score %.3f over %.1fs (barge_in_threshold %.2f)",
+                peak, time.monotonic() - started, self._barge_in_threshold,
+            )
 
     def _tts_worker(self, tts_queue: queue.Queue):
         """

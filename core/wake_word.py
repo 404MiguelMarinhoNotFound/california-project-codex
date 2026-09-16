@@ -161,6 +161,9 @@ class WakeWordDetector:
         # defence was off. Buffer to the native frame so a "frame" is one inference.
         self._oww_frame_length = 1280
         self._oww_buffer = np.array([], dtype=np.int16)
+        # Score of the most recent native frame. Read by the orchestrator's
+        # reply listener to report how close a barge-in attempt came.
+        self.last_score = 0.0
 
         # Raise the noise floor before scoring. See _apply_dither: without this,
         # the quietest moments in the room are the ones that score highest.
@@ -267,6 +270,7 @@ class WakeWordDetector:
             # the remainder carried to the next call must stay byte-identical.
             prediction = self._oww_model.predict(self._apply_dither(frame))
             score = prediction.get(self.primary_key, 0.0)
+            self.last_score = float(score)
 
             if score >= threshold:
                 self._consecutive_count += 1

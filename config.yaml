@@ -72,11 +72,21 @@ wake_word:
   debounce_seconds: 1.2     # Ignore re-triggers for N seconds after activation
   # Score needed to interrupt her WHILE SHE IS TALKING. The mic keeps running
   # through every reply (core/orchestrator.py::_reply_listener), so "California"
-  # over her cuts her off and starts a new command. Her own voice through the
-  # speaker is scored the whole time; it sits near zero on this model, but if
-  # she ever interrupts herself, raise this one, not `threshold`. The name guard
-  # is separate: a hit is ignored while the sentence playing contains "California".
-  barge_in_threshold: 0.81
+  # over her cuts her off and starts a new command. The name guard is separate:
+  # a hit is ignored while the sentence playing contains "California".
+  #
+  # Measured 2026-09-16 with 45s of her own voice recorded through this mic at
+  # the current speaker volume (RMS ~480): her peak score is 0.053, zero fires at
+  # any threshold down to 0.2. So this can sit far below `threshold` safely.
+  # What it cannot fix is recall: the same 40 real takes that fire 10/40 clean
+  # fire 1/40 mixed with her voice at 0.81 and 5/40 at 0.5. The model was never
+  # trained on the wake word spoken OVER speech, and no runtime trick recovers
+  # that (ducking her volume 150-400ms into the word was simulated: 7/40 at
+  # best). The fix is training-side - add her clips as a background source in
+  # training/california_v2.yaml `augmentation.background_paths`. Until then,
+  # expect to say it twice, and read the "Reply listener: peak wake score" log
+  # line to see how close it got.
+  barge_in_threshold: 0.5
 
   # Inaudible white-noise floor (int16 RMS) mixed into each frame before scoring.
   # THIS IS THE FALSE-POSITIVE FIX, and it is counter-intuitive: she was waking on
