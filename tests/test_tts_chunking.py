@@ -27,7 +27,7 @@ import unittest
 
 import numpy as np
 
-from services.sentence_chunker import chunk_sentences
+from services.sentence_chunker import TOOL_BOUNDARY, chunk_sentences
 from services.tts import TTSService
 from services.tts_text_sanitizer import sanitize_for_tts
 from tests.config_fixture import real_config
@@ -267,3 +267,65 @@ class TrimStripsBothEnds(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ToolBoundaryFlushes(unittest.TestCase):
+    """
+    The LLM layer yields TOOL_BOUNDARY right before it blocks on a tool. The
+    dispatch runs inside the token generator, so anything the chunker is still
+    holding stays unspoken until the tool returns -- for a CEC wake that is
+    ~47s, and "Okay, on it." is well under FIRST_CHUNK_CHARS. Measured live as
+    "sometimes the on-it line plays after the TV is already on".
+    """
+
+    def _stream_with_boundary(self, before: str, after: str):
+        def gen():
+            for word in before.split(" "):
+                if word:
+                    yield word + " "
+            yield TOOL_BOUNDARY
+            for word in after.split(" "):
+                if word:
+                    yield word + " "
+        return gen()
+
+    def _chunks_before_boundary(self, before: str, after: str) -> list[str]:
+        """Consume the generator and record what was yielded before the tool ran."""
+        out: list[str] = []
+        seen: list[str] = []
+        src = self._stream_with_boundary(before, after)
+
+        def tapped():
+            after_boundary = False
+            for tok in src:
+                if after_boundary:
+                    # The chunker pulling the first token past the marker is
+                    # the tool returning: everything yielded by now is what
+                    # the speaker got while it ran.
+                    seen.extend(out)
+                    after_boundary = False
+                if tok is TOOL_BOUNDARY:
+                    after_boundary = True
+                yield tok
+
+        for chunk in chunk_sentences(tapped()):
+            out.append(chunk)
+        return seen
+
+    def test_a_short_finished_preamble_ships_before_the_tool_runs(self):
+        spoken = self._chunks_before_boundary("Okay, on it.", "TV is on now.")
+        self.assertEqual(spoken, ["Okay, on it."])
+
+    def test_an_unfinished_preamble_ships_as_a_continuation(self):
+        spoken = self._chunks_before_boundary("On it", "TV is on now.")
+        self.assertEqual(spoken, ["On it,"])
+
+    def test_nothing_held_means_nothing_yielded(self):
+        chunks = list(chunk_sentences(self._stream_with_boundary("", "Done.")))
+        self.assertEqual(chunks, ["Done."])
+
+    def test_the_rest_of_the_reply_is_unaffected(self):
+        chunks = list(chunk_sentences(
+            self._stream_with_boundary("Okay, on it.", "TV is on now. Enjoy the show.")
+        ))
+        self.assertEqual(chunks, ["Okay, on it.", "TV is on now. Enjoy the show."])

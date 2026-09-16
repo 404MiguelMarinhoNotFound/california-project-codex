@@ -13,6 +13,7 @@ import unittest
 import unittest.mock as mock
 
 from services.llm import LLMService
+from services.sentence_chunker import TOOL_BOUNDARY
 from tests.config_fixture import config_for_tests
 
 
@@ -154,6 +155,27 @@ class ClaudeStreamingTests(unittest.TestCase):
         self.assertIn("tool", order)
         self.assertLess(order.index("yield:On it. "), order.index("tool"))
 
+    def test_tool_boundary_is_yielded_between_the_preamble_and_the_dispatch(self):
+        """
+        The chunker holds a short preamble until it is worth synthesizing, and
+        the dispatch blocks inside this generator, so "On it." would play after
+        a 47s wake. The marker is what lets the chunker ship it first.
+        """
+        order = []
+        tool_block = _Block("tool_use", name="control_tv",
+                            input={"action": "turn_on"}, id="t1")
+        turns = [
+            (["On it. "], [_Block("text", text="On it. "), tool_block], "tool_use"),
+            (["TV's on."], [], "end_turn"),
+        ]
+        svc, _ = self._service(turns)
+        svc.tool_handler = lambda name, args: order.append("tool") or "TV is on"
+
+        for chunk in svc.stream_response("turn on the tv"):
+            order.append("boundary" if chunk is TOOL_BOUNDARY else f"yield:{chunk}")
+
+        self.assertEqual(order, ["yield:On it. ", "boundary", "tool", "yield:TV's on."])
+
     # --- tool loop ---------------------------------------------------------
 
     def test_two_tool_calls_in_one_turn_build_one_assistant_and_one_user_message(self):
@@ -194,7 +216,7 @@ class ClaudeStreamingTests(unittest.TestCase):
 
         chunks = list(svc.stream_response("pause"))
 
-        self.assertEqual(chunks, ["Paused."])
+        self.assertEqual(chunks, [TOOL_BOUNDARY, "Paused."])
         results = svc.client.messages.calls[1][2]["content"]
         self.assertEqual(results, [{"type": "tool_result",
                                     "tool_use_id": "t1",

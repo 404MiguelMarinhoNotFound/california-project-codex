@@ -25,6 +25,7 @@ import logging
 from datetime import datetime
 from typing import Generator
 
+from services.sentence_chunker import TOOL_BOUNDARY
 from services.youtube_playlist_resolver import playlist_ids
 
 logger = logging.getLogger(__name__)
@@ -429,7 +430,8 @@ class LLMService:
     def stream_response(self, user_text: str) -> Generator[str, None, None]:
         """
         Send user message and stream back response tokens.
-        Yields individual text chunks as they arrive.
+        Yields individual text chunks as they arrive, plus TOOL_BOUNDARY
+        right before each local tool dispatch (see sentence_chunker).
         Also accumulates the full response and adds it to history.
         """
         # Add user message to history
@@ -529,6 +531,9 @@ class LLMService:
                     continue
                 if block.name in LOCAL_TOOL_NAMES:
                     logger.info(f"Claude tool call: {block.name}({block.input})")
+                    # Flush the chunker before blocking: a short "On it." would
+                    # otherwise wait out the whole tool call unspoken.
+                    yield TOOL_BOUNDARY
                     result_text = "tool not available"
                     if self.tool_handler:
                         result_text = self.tool_handler(block.name, block.input)
@@ -639,6 +644,8 @@ class LLMService:
                         tool_input = {}
                     logger.info(f"Tool call: {tool_name}({tool_input})")
 
+                    # Same flush as the Claude path, for the same reason.
+                    yield TOOL_BOUNDARY
                     result_text = "tool not available"
                     if self.tool_handler:
                         result_text = self.tool_handler(tool_name, tool_input)
