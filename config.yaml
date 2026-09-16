@@ -350,6 +350,10 @@ stremio:
       - "torrentio"
   provider_scan_pages: 3
   provider_scan_delay_ms: 800
+  # Wall-clock cap on the whole preferred-source scan. Each hung uiautomator
+  # dump costs its full timeout (twice, with the retry), and there are up to
+  # providers x pages of them; without a cap one play request ran 2 minutes.
+  provider_scan_timeout_s: 45
   provider_fallback_policy: "ask"
 
 # --- TMDB ---
