@@ -1066,6 +1066,7 @@ class Orchestrator:
         self._barge_in_rms = float(sounds_cfg.get("barge_in_energy_threshold", 900))
         self._onset_guard_s = float(sounds_cfg.get("activation_onset_guard_ms", 150)) / 1000.0
         self._barge_in_guard_s = float(sounds_cfg.get("barge_in_guard_ms", 120)) / 1000.0
+        self._bootup_dir = sounds_cfg.get("bootup_dir", "sounds/bootup")
 
         # A recording shorter than this is not a command, whatever the VAD said.
         # _record_speech has always promised this in its docstring; now it keeps it.
@@ -1099,10 +1100,12 @@ class Orchestrator:
         logger.info("All components initialized in %.1fs", time.monotonic() - boot_start)
 
     def _play_bootup_sound(self):
-        """Pick a random WAV from sounds/bootup/ and play it."""
+        """Pick a random WAV from `sounds.bootup_dir` and play it."""
         import soundfile as sf
 
-        bootup_dir = os.path.join(os.path.dirname(__file__), "..", "sounds", "bootup")
+        bootup_dir = self._bootup_dir
+        if not os.path.isabs(bootup_dir):
+            bootup_dir = os.path.join(os.path.dirname(__file__), "..", bootup_dir)
         bootup_dir = os.path.normpath(bootup_dir)
         files = glob.glob(os.path.join(bootup_dir, "*.wav"))
         if not files:

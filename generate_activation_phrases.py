@@ -1,10 +1,15 @@
 """
 Generate the post-wake acknowledgements California plays when the wake word fires.
 
-The set is split into two tiers, written to two subdirectories:
+The set is split into two tiers, written under one directory PER VOICE so that
+switching `tts.provider` / voice in config.yaml never overwrites another voice's
+clips:
 
-    sounds/california_activations/cold/   long, personality-heavy lines
-    sounds/california_activations/warm/   one or two words
+    sounds/california_activations/<provider>_<voice>/cold/   long, personality-heavy lines
+    sounds/california_activations/<provider>_<voice>/warm/   one or two words
+
+e.g. kokoro_af_bella/ or google_en-US-Chirp3-HD-Aoede/. Point
+`sounds.activation_dir` in config.yaml at the folder you want played.
 
 `Orchestrator._handle_activation` plays a cold line on the first wake of a run
 and a warm line on every wake after that. The long ones only land on first
@@ -18,11 +23,14 @@ uses it to strip the line back out of the transcript on the rare occasion that
 speaker bleed survives into Whisper — playback no longer blocks the microphone,
 so recording overlaps the line by design.
 
-Run it after editing the tables, and once on a fresh clone: the generated WAVs
-are deliberately not committed, matching sounds/bootup/ and sounds/chime.wav.
-This repo carries audio *sources*, not audio output.
+Run it after editing the tables, after changing the TTS voice, and once on a
+fresh clone: the generated WAVs are deliberately not committed, matching
+sounds/bootup/ and sounds/chime.wav. This repo carries audio *sources*, not
+audio output.
 
-    uv sync --extra default          # or: uv sync --extra kokoro
+The voice is whatever config.yaml's `tts` block selects (same TTSService the
+assistant speaks with), so the acknowledgement always matches the replies.
+
     uv run python generate_activation_phrases.py
 
 Sibling script: generate_bootup_sounds.py, for the launch greeting.
@@ -33,12 +41,12 @@ import os
 
 import numpy as np
 import soundfile as sf
-from kokoro import KPipeline
+import yaml
+from dotenv import load_dotenv
 
-pipeline = KPipeline(lang_code="a")
+from services.tts import TTSService
 
-OUTPUT_DIR = "sounds/california_activations"
-SAMPLE_RATE = 24000
+OUTPUT_ROOT = "sounds/california_activations"
 
 # ─────────────────────────────────────────────
 # COLD — first wake of a run. Take your time here.
@@ -112,17 +120,18 @@ WARM_RESPONSES = {
 TIERS = {"cold": COLD_RESPONSES, "warm": WARM_RESPONSES}
 
 # Kokoro pads roughly 0.4s of silence onto the front of every clip and 0.5s onto
-# the back. On a 0.42s line like "Sup." that is more padding than speech, and the
-# leading half is the damaging one: it delays the onset, which is the whole point
-# of the acknowledgement. Master Miguel knows the wake fired the moment he hears
-# her, so every millisecond before that is pure lag.
+# the back; Google's Chirp voices pad far less but still some. On a 0.42s line
+# like "Sup." that is more padding than speech, and the leading half is the
+# damaging one: it delays the onset, which is the whole point of the
+# acknowledgement. Master Miguel knows the wake fired the moment he hears her,
+# so every millisecond before that is pure lag.
 SILENCE_FLOOR = 0.02   # fraction of peak amplitude that still counts as silence
 LEAD_IN_MS = 20        # keep a sliver before the first sound
 TAIL_MS = 60           # and a little decay after the last
 FADE_MS = 5            # avoid a click from cutting mid-waveform
 
 
-def trim_silence(audio: np.ndarray) -> np.ndarray:
+def trim_silence(audio: np.ndarray, sample_rate: int) -> np.ndarray:
     """Strip the synthesiser's leading and trailing padding."""
     amplitude = np.abs(audio)
     peak = amplitude.max() if len(amplitude) else 0.0
@@ -133,20 +142,20 @@ def trim_silence(audio: np.ndarray) -> np.ndarray:
     if loud.size == 0:
         return audio
 
-    start = max(0, int(loud[0]) - SAMPLE_RATE * LEAD_IN_MS // 1000)
-    end = min(len(audio), int(loud[-1]) + SAMPLE_RATE * TAIL_MS // 1000)
+    start = max(0, int(loud[0]) - sample_rate * LEAD_IN_MS // 1000)
+    end = min(len(audio), int(loud[-1]) + sample_rate * TAIL_MS // 1000)
     trimmed = audio[start:end].copy()
 
-    fade = min(SAMPLE_RATE * FADE_MS // 1000, len(trimmed) // 2)
+    fade = min(sample_rate * FADE_MS // 1000, len(trimmed) // 2)
     if fade > 0:
         trimmed[:fade] *= np.linspace(0.0, 1.0, fade, dtype=trimmed.dtype)
         trimmed[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=trimmed.dtype)
     return trimmed
 
 
-def synthesize(tier: str, responses: dict) -> tuple[dict, list]:
-    """Render every line in `responses` into sounds/.../<tier>/."""
-    tier_dir = os.path.join(OUTPUT_DIR, tier)
+def synthesize(tts: TTSService, output_dir: str, tier: str, responses: dict) -> tuple[dict, list]:
+    """Render every line in `responses` into <output_dir>/<tier>/."""
+    tier_dir = os.path.join(output_dir, tier)
     os.makedirs(tier_dir, exist_ok=True)
 
     written, durations = {}, []
@@ -154,16 +163,15 @@ def synthesize(tier: str, responses: dict) -> tuple[dict, list]:
 
     for name, text in responses.items():
         try:
-            chunks = [chunk for _, _, chunk in pipeline(text, voice="af_bella", speed=1.0)]
-            raw = np.concatenate(chunks)
-            audio = trim_silence(raw)
-            sf.write(os.path.join(tier_dir, f"{name}.wav"), audio, SAMPLE_RATE)
+            raw, sample_rate = tts.synthesize(text)
+            audio = trim_silence(raw, sample_rate)
+            sf.write(os.path.join(tier_dir, f"{name}.wav"), audio, sample_rate)
         except Exception as exc:
             print(f"  ✗  {name} failed: {exc}")
             continue
 
-        seconds = len(audio) / SAMPLE_RATE
-        saved = (len(raw) - len(audio)) / SAMPLE_RATE
+        seconds = len(audio) / sample_rate
+        saved = (len(raw) - len(audio)) / sample_rate
         written[name] = text
         durations.append(seconds)
         print(f"  ✓  {seconds:4.2f}s  (-{saved:4.2f}s)  {name}.wav  —  \"{text}\"")
@@ -172,11 +180,18 @@ def synthesize(tier: str, responses: dict) -> tuple[dict, list]:
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    load_dotenv()
+    with open("config.yaml", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    tts = TTSService(config)
+
+    output_dir = os.path.join(OUTPUT_ROOT, tts.voice_slug())
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Voice: {tts.voice_slug()}")
     manifest = {}
 
     for tier, responses in TIERS.items():
-        written, durations = synthesize(tier, responses)
+        written, durations = synthesize(tts, output_dir, tier, responses)
         manifest[tier] = written
         if durations:
             print(
@@ -184,12 +199,13 @@ def main():
                 f"{sum(durations) / len(durations):.2f}s mean"
             )
 
-    manifest_path = os.path.join(OUTPUT_DIR, "manifest.json")
+    manifest_path = os.path.join(output_dir, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, ensure_ascii=False)
 
     total = sum(len(lines) for lines in manifest.values())
-    print(f"\nDone. {total} files and manifest.json saved to /{OUTPUT_DIR}/")
+    print(f"\nDone. {total} files and manifest.json saved to /{output_dir}/")
+    print(f'Point config.yaml at it:  sounds.activation_dir: "{output_dir.replace(os.sep, "/")}"')
     print("A wide max in the warm tier is worth trimming — that spread is the lag you feel.")
 
 

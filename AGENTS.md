@@ -43,7 +43,7 @@ No VPN preflight and no ADB on this path, and by default no network at all.
 | Wake word | openWakeWord runtime + custom model trained with livekit-wakeword (Porcupine retired, see note below) |
 | STT | Groq Whisper API |
 | LLM | Anthropic Claude, Groq, Fireworks, or OpenAI-compatible |
-| TTS | Kokoro, Edge TTS, Piper, ElevenLabs |
+| TTS | Kokoro, Edge TTS, Piper, ElevenLabs, Google Cloud TTS |
 | TV control | ADB over network to Mi Box / Android TV |
 | Light control | Govee over Bluetooth LE (`bleak`); Govee cloud v2 API optional |
 | Stremio state | Stremio private API + local `watch_state.json` cache |
@@ -59,6 +59,10 @@ Required for the default setup:
 
 - `GROQ_API_KEY` - Whisper STT
 - `ANTHROPIC_API_KEY` - Claude LLM
+- `GOOGLE_TTS_API_KEY` - Google Cloud Text-to-Speech, the current `tts.provider`.
+  Without it `TTSService` logs a warning and falls back to Edge, so she still
+  speaks, just not as Aoede, and the pre-rendered greeting/acknowledgement clips
+  will no longer match the live voice
 - ~~`PICOVOICE_ACCESS_KEY`~~ - **dead.** Picovoice disabled all Free Tier AccessKeys
   on 2026-06-30. The Porcupine backend is no longer usable in this project
 
@@ -266,12 +270,26 @@ Important runtime note:
 - `sounds/bootup/`, `sounds/california_activations/`, `sounds/chime.wav`, and
   `sounds/error.wav` are generated audio and are **not** committed. This repo carries
   audio sources, not audio output. Run `generate_bootup_sounds.py` and
-  `generate_activation_phrases.py` on a fresh clone, both of which need
-  `uv sync --extra default` for Kokoro. Missing files are handled gracefully:
-  the orchestrator skips the greeting and `sounds.generate_if_missing` recreates the chime
-- `sounds/california_activations/` holds `cold/` and `warm/` subdirectories plus a
-  `manifest.json` of line text. A flat directory of WAVs is the pre-tier layout and still
-  loads, into both pools; re-run `generate_activation_phrases.py` to get the split
+  `generate_activation_phrases.py` on a fresh clone. Both synthesize with whatever
+  `config.yaml`'s `tts` block selects (the same `TTSService` the assistant speaks
+  with), so the clips always match the live voice. Missing files are handled
+  gracefully: the orchestrator skips the greeting and `sounds.generate_if_missing`
+  recreates the chime
+- **Pre-rendered clips live in one folder per voice**, named by
+  `TTSService.voice_slug()` as `<provider>_<voice>`:
+  `sounds/bootup/google_en-US-Chirp3-HD-Aoede/`,
+  `sounds/california_activations/kokoro_af_bella/`, and so on. `config.yaml` picks
+  which folder plays via `sounds.bootup_dir` and `sounds.activation_dir`. Switching
+  voice is therefore three lines: `tts.provider` (+ its voice) and those two paths.
+  The generators never overwrite another voice's set, so Bella's clips survive a
+  move to Aoede and back. When you change voice, regenerate both sets **and** repoint
+  both paths, or she acknowledges in one voice and answers in another
+- Inside each voice folder, `california_activations/` holds `cold/` and `warm/`
+  subdirectories plus a `manifest.json` of line text. A flat directory of WAVs is the
+  pre-tier layout and still loads, into both pools; re-run
+  `generate_activation_phrases.py` to get the split. The flat `.wav` files sitting
+  directly in `sounds/california_activations/` are pre-tier Bella leftovers that
+  nothing reads
 - `deprecated/` holds files retired from the live tree. Nothing there is imported or
   executed. Do not add references to it; see `deprecated/README.md` for what was moved and why
 - `core/orchestrator.py` is the main coordinator, not a top-level `orchestrator.py`
@@ -344,8 +362,13 @@ truth. `requirements.txt` has been deleted and must not be reintroduced.
 
 ### Note on the config default TTS provider
 
-`config.yaml` defaults to `tts.provider: kokoro`, and `kokoro` is an **extra**, not a core
-dependency. A plain `uv sync` therefore does not install it. Use:
+`config.yaml` now selects `tts.provider: google` (Chirp 3 HD, voice
+`en-US-Chirp3-HD-Aoede`). That provider is plain REST over the core `requests`
+dependency and needs no extra -- only `GOOGLE_TTS_API_KEY` in `.env`. Without the
+key it falls back to Edge at init.
+
+If you switch back to `tts.provider: kokoro`, remember `kokoro` is an **extra**, not
+a core dependency, so a plain `uv sync` does not install it. Use:
 
 ```bash
 uv sync --extra kokoro
@@ -1386,9 +1409,24 @@ would auto-stub **truthy** and the tests would pass while reading nothing.
 
 ### Current Defaults
 
-- Current config default is Kokoro
-- Current preferred voice is `af_bella`
-- Kokoro uses `lang_code="a"` in this project
+- Current config default is **Google Cloud TTS, Chirp 3 HD**, voice
+  `en-US-Chirp3-HD-Aoede` (switched 2026-09-16; Kokoro's baked-in pauses were
+  the reason). Standout female substitutes are hashtagged under `tts.google` in
+  `config.yaml`: `en-GB-Chirp3-HD-Aoede`, `Kore`, `Leda`, `Zephyr`
+- The previous default was Kokoro `af_bella`, `lang_code="a"`. Its config block and
+  pre-rendered clips (`sounds/*/kokoro_af_bella/`) are kept so switching back is a
+  config change, not a regeneration
+- Google is called over REST with an API key (`GOOGLE_TTS_API_KEY`), see
+  `TTSService._synthesize_google`. Request body is the documented minimum:
+  `input.text`, `voice.{languageCode,name}`, `audioConfig.{LINEAR16, sampleRateHertz,
+  speakingRate}`. Chirp 3 HD has **no style/emotion prompt** -- its only delivery
+  knobs are `speakingRate` (0.25-2.0), `[pause short|pause|pause long]` markup, and
+  custom pronunciations. Natural-language style prompting is a Gemini-TTS feature,
+  and Gemini-TTS has no free tier
+- Cost: Chirp 3 HD includes 1M characters/month free (roughly 15-20 hours of
+  speech), then $30/1M. Billing must be enabled on the Google Cloud project even
+  inside the free allowance. A home assistant does not get near the limit; the
+  47 activation lines + 19 bootup lines together are ~1,200 characters
 
 ### Text Sanitization
 

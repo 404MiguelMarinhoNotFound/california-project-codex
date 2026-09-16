@@ -37,7 +37,7 @@ This lets California do things like:
 - Streaming STT -> LLM -> TTS pipeline with sentence-level overlap for lower perceived latency
 - Wake-word support via openWakeWord (Porcupine retired, see note under Environment Variables)
 - Multi-provider LLM support through `services/llm.py`
-- TTS support for Kokoro, Edge TTS, Piper, and ElevenLabs
+- TTS support for Kokoro, Edge TTS, Piper, ElevenLabs, and Google Cloud (Chirp 3 HD)
 - ADB-based control of Mi Box / Android TV
 - Govee smart-light control over Bluetooth LE
 - Deebot N8+ robot vacuum control (clean the house or named rooms) over Ecovacs' cloud, REST only

@@ -1,10 +1,12 @@
 """
 Generate the boot-up one-liners California plays at startup.
 
-Synthesizes every line in BOOTUP_LINES with Kokoro af_bella and writes one WAV
-per line into sounds/bootup/. `Orchestrator._play_bootup_sound` picks one of
-them at random on each launch, so the assistant does not greet Master Miguel
-the same way twice.
+Synthesizes every line in BOOTUP_LINES with the voice config.yaml's `tts`
+block selects and writes one WAV per line into sounds/bootup/<provider>_<voice>/
+(e.g. kokoro_af_bella/ or google_en-US-Chirp3-HD-Aoede/), so switching voices
+never overwrites another voice's set. `Orchestrator._play_bootup_sound` picks
+one at random from the folder `sounds.bootup_dir` names on each launch, so the
+assistant does not greet Master Miguel the same way twice.
 
 Run it after editing BOOTUP_LINES, and once on a fresh clone: the generated
 WAVs are deliberately not committed, matching sounds/chime.wav and
@@ -12,14 +14,10 @@ sounds/error.wav. This repo carries audio *sources*, not audio output. Without
 them the orchestrator logs "No bootup sounds found" and starts silently, which
 is harmless but loses the greeting.
 
-Kokoro is an optional extra, so this needs it installed:
+The voice is whatever config.yaml selects (same TTSService the assistant speaks
+with), so the greeting always matches the replies. Run it after changing voice:
 
-    uv sync --extra default          # or: uv sync --extra kokoro
     uv run python generate_bootup_sounds.py
-
-TTS settings are forced to kokoro / af_bella / speed 1.0 regardless of what
-config.yaml selects, so the sound set stays consistent even when the live TTS
-provider is switched to edge or elevenlabs.
 
 Sibling script: generate_activation_phrases.py, which does the same job for the
 post-wake-word acknowledgements.
@@ -29,7 +27,7 @@ import os
 import sys
 import yaml
 import soundfile as sf
-import numpy as np
+from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -71,19 +69,14 @@ def load_config(path="config.yaml"):
 
 
 def main():
+    load_dotenv()
     config = load_config()
-
-    # Force kokoro af_bella regardless of current config
-    config["tts"]["provider"] = "kokoro"
-    config["tts"]["kokoro"]["voice"] = "af_bella"
-    config["tts"]["kokoro"]["speed"] = 1.0
-    config["tts"]["kokoro"]["lang_code"] = "a"
-
     tts = TTSService(config)
 
-    out_dir = os.path.join("sounds", "bootup")
+    out_dir = os.path.join("sounds", "bootup", tts.voice_slug())
     os.makedirs(out_dir, exist_ok=True)
 
+    print(f"Voice: {tts.voice_slug()}")
     print(f"Generating {len(BOOTUP_LINES)} boot-up sound bites -> {out_dir}/\n")
 
     for filename, text in BOOTUP_LINES.items():
@@ -98,6 +91,7 @@ def main():
         print(f"    -> {out_path}  ({duration_ms}ms)")
 
     print(f"\nDone. {len(BOOTUP_LINES)} files written to {out_dir}/")
+    print(f'Point config.yaml at it:  sounds.bootup_dir: "{out_dir.replace(os.sep, "/")}"')
 
 
 if __name__ == "__main__":

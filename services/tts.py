@@ -6,6 +6,7 @@ Providers:
 - "piper":      Piper TTS (free, local, fast on Linux/Pi)
 - "elevenlabs": ElevenLabs (premium quality, paid)
 - "kokoro":     Kokoro TTS (free, local, high quality)
+- "google":     Google Cloud TTS, Chirp 3 HD voices (1M chars/month free, needs GOOGLE_TTS_API_KEY)
 
 All providers implement the same interface:
 synthesize(text) -> (audio_data: np.ndarray, sample_rate: int)
@@ -60,10 +61,36 @@ class TTSService:
             self._init_kokoro()
             logger.info(f"TTS initialized: Kokoro ({self.kokoro_voice})")
 
+        elif self.provider == "google":
+            google_cfg = tts_cfg["google"]
+            self.google_voice = google_cfg.get("voice", "en-US-Chirp3-HD-Aoede")
+            self.google_speed = float(google_cfg.get("speed", 1.0))
+            self.google_sample_rate = int(google_cfg.get("sample_rate", 24000))
+            self.google_timeout = float(google_cfg.get("timeout_s", 15))
+            self._init_google()
+            if self.provider == "google":
+                logger.info(f"TTS initialized: Google ({self.google_voice})")
+
         else:
             raise ValueError(f"Unknown TTS provider: {self.provider}")
 
         logger.debug("TTSService.__init__ done")
+
+    def voice_slug(self) -> str:
+        """
+        `<provider>_<voice>`, e.g. kokoro_af_bella or google_en-US-Chirp3-HD-Aoede.
+
+        The generate_*.py scripts name their output folders with this so that
+        switching voices never overwrites another voice's pre-rendered clips.
+        """
+        voice = {
+            "kokoro": lambda: self.kokoro_voice,
+            "google": lambda: self.google_voice,
+            "edge": lambda: self.voice,
+            "elevenlabs": lambda: self.voice_id,
+            "piper": lambda: os.path.splitext(os.path.basename(self.piper_model))[0],
+        }[self.provider]()
+        return f"{self.provider}_{voice}"
 
     def synthesize(self, text: str) -> tuple[np.ndarray, int]:
         """
@@ -94,6 +121,10 @@ class TTSService:
             elif self.provider == "kokoro":
                 logger.debug("synthesize dispatch -> _synthesize_kokoro")
                 audio, sr = self._synthesize_kokoro(text)
+
+            elif self.provider == "google":
+                logger.debug("synthesize dispatch -> _synthesize_google")
+                audio, sr = self._synthesize_google(text)
 
             else:
                 raise ValueError(f"Unknown TTS provider: {self.provider}")
@@ -359,4 +390,83 @@ class TTSService:
 
         audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
         logger.debug(f"_synthesize_elevenlabs decoded sr={sr} audio_shape={audio.shape}")
+        return audio, sr
+
+    # ─── Google Cloud TTS ───────────────────────────────────────────
+
+    GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
+
+    def _init_google(self):
+        """
+        Check for the Google Cloud TTS API key.
+
+        Plain REST with an API key rather than the google-cloud-texttospeech
+        client: it is one HTTPS POST, `requests` is already a core dependency,
+        and an API key is far less setup than a service account for a project
+        that runs on one box. Same fallback-to-Edge behaviour as ElevenLabs so
+        a missing key never stops the assistant from speaking.
+        """
+        logger.debug("_init_google start")
+        self.google_api_key = os.environ.get("GOOGLE_TTS_API_KEY")
+        if not self.google_api_key:
+            logger.warning("GOOGLE_TTS_API_KEY not set — falling back to edge TTS")
+            self.provider = "edge"
+            self.voice = "en-US-AvaMultilingualNeural"
+            self.rate = "+0%"
+            return
+
+        # "en-US-Chirp3-HD-Aoede" -> "en-US". The API wants both even though
+        # the locale is right there in the voice name.
+        self.google_language_code = "-".join(self.google_voice.split("-")[:2])
+        logger.debug("_init_google done")
+
+    def _synthesize_google(self, text: str) -> tuple[np.ndarray, int]:
+        """Synthesize using Google Cloud TTS (Chirp 3 HD by default)."""
+        import base64
+        import requests
+
+        logger.debug(
+            f"_synthesize_google text_len={len(text)} voice={self.google_voice} speed={self.google_speed}"
+        )
+
+        body = {
+            "input": {"text": text},
+            "voice": {
+                "languageCode": self.google_language_code,
+                "name": self.google_voice,
+            },
+            "audioConfig": {
+                # LINEAR16 comes back as a complete WAV (header included), so
+                # soundfile decodes it straight from memory like the other providers.
+                "audioEncoding": "LINEAR16",
+                "sampleRateHertz": self.google_sample_rate,
+                "speakingRate": self.google_speed,
+            },
+        }
+
+        resp = requests.post(
+            self.GOOGLE_TTS_URL,
+            params={"key": self.google_api_key},
+            json=body,
+            timeout=self.google_timeout,
+        )
+        if resp.status_code != 200:
+            # Google puts the useful message in error.message; surface it
+            # instead of a bare HTTP code.
+            detail = resp.text
+            try:
+                detail = resp.json().get("error", {}).get("message", detail)
+            except Exception:
+                pass
+            raise RuntimeError(f"Google TTS HTTP {resp.status_code}: {detail}")
+
+        audio_b64 = resp.json().get("audioContent")
+        if not audio_b64:
+            logger.warning("_synthesize_google response had no audioContent")
+            return np.array([], dtype=np.float32), self.google_sample_rate
+
+        audio, sr = sf.read(io.BytesIO(base64.b64decode(audio_b64)), dtype="float32")
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        logger.debug(f"_synthesize_google decoded sr={sr} audio_shape={audio.shape}")
         return audio, sr
