@@ -45,6 +45,17 @@ UI_DUMP_REMOTE_PATH = "/sdcard/window_dump.xml"
 IMDB_ID_RE = re.compile(r"(tt\d+)")
 
 
+class _PlaybackStartedDuringScan(Exception):
+    """
+    Raised from inside the provider scan when `dumpsys media_session` turns
+    up state=3 -- the OK presses worked after all and a torrent stream simply
+    took longer to buffer than the autoplay wait. Seen live 2026-09-16: Fallout
+    was playing for ninety seconds while the scan timed out on uiautomator dumps
+    (which never go idle over a rendering video) and then reported the show as
+    missing from every preferred source.
+    """
+
+
 @dataclass
 class SourceCandidate:
     label: str
@@ -79,6 +90,10 @@ class StremioService:
         )
         self.provider_scan_pages = max(1, int(stremio_cfg.get("provider_scan_pages", 3)))
         self.provider_scan_delay_ms = int(stremio_cfg.get("provider_scan_delay_ms", 800))
+        self.provider_scan_timeout_s = max(
+            0.0, float(stremio_cfg.get("provider_scan_timeout_s", 45))
+        )
+        self._scan_deadline: float | None = None
         self.provider_fallback_policy = str(
             stremio_cfg.get("provider_fallback_policy", "ask")
         ).strip().lower()
@@ -581,33 +596,54 @@ class StremioService:
                 target_mode=target_mode,
             )
 
-        for source_key in source_order:
-            selection = self._attempt_provider(source_key)
-            if not selection:
-                continue
+        # Every UI dump below re-reads media_session first: the OK presses may
+        # have started a stream that was still buffering when the autoplay wait
+        # ran out, and a scan that ignores that reports a playing show as
+        # missing. The deadline caps the scan as a whole, since each hung
+        # uiautomator dump costs its full timeout and there are up to
+        # providers x pages x retries of them.
+        started_late = StremioPlayResult(
+            success=True, played_source=None, target_mode=target_mode
+        )
+        self._scan_deadline = time.monotonic() + self.provider_scan_timeout_s
+        try:
+            for source_key in source_order:
+                selection = self._attempt_provider(source_key)
+                if not selection:
+                    continue
 
-            selection.target_mode = target_mode
-            found_preferred_source = True
-            if selection.success:
-                self._remember_successful_source(
-                    title_key=title_key,
-                    title_label=title_label,
-                    imdb_id=imdb_id,
-                    media_type=media_type,
-                    source_label=selection.played_source,
+                selection.target_mode = target_mode
+                found_preferred_source = True
+                if selection.success:
+                    self._remember_successful_source(
+                        title_key=title_key,
+                        title_label=title_label,
+                        imdb_id=imdb_id,
+                        media_type=media_type,
+                        source_label=selection.played_source,
+                    )
+                    return selection
+
+            # The last dump may have hung over a stream that started meanwhile.
+            if self._is_playing():
+                log.info("Playback started during the source scan; not asking about sources")
+                return started_late
+
+            if self.provider_fallback_policy == "ask" and not allow_unknown_source:
+                title_for_message = title_label or title_key or "that title"
+                return StremioPlayResult(
+                    success=False,
+                    message=UNKNOWN_SOURCE_CONFIRMATION_TEMPLATE.format(title=title_for_message),
+                    requires_confirmation=True,
+                    target_mode=target_mode,
                 )
-                return selection
 
-        if self.provider_fallback_policy == "ask" and not allow_unknown_source:
-            title_for_message = title_label or title_key or "that title"
-            return StremioPlayResult(
-                success=False,
-                message=UNKNOWN_SOURCE_CONFIRMATION_TEMPLATE.format(title=title_for_message),
-                requires_confirmation=True,
-                target_mode=target_mode,
-            )
-
-        fallback_attempt = self._attempt_unknown_source()
+            fallback_attempt = self._attempt_unknown_source()
+        except _PlaybackStartedDuringScan:
+            log.info("Playback started during the source scan; stopping the scan")
+            return started_late
+        finally:
+            self._scan_deadline = None
         fallback_attempt.target_mode = target_mode
         if fallback_attempt.success:
             self._remember_successful_source(
@@ -732,6 +768,8 @@ class StremioService:
 
     def _find_provider_candidate(self, provider_key: str) -> SourceCandidate | None:
         for page_index in range(self.provider_scan_pages):
+            if self._scan_budget_spent(provider_key):
+                return None
             candidates = self._get_visible_source_candidates()
             for candidate in candidates:
                 if self._provider_matches(provider_key, candidate):
@@ -748,6 +786,8 @@ class StremioService:
         }
 
         for page_index in range(self.provider_scan_pages):
+            if self._scan_budget_spent("first available"):
+                return None
             candidates = self._get_visible_source_candidates()
             for candidate in candidates:
                 if self._normalize_provider_key(candidate.provider_key) not in excluded:
@@ -757,7 +797,23 @@ class StremioService:
                 time.sleep(self.provider_scan_delay_ms / 1000)
         return None
 
+    def _scan_budget_spent(self, what: str) -> bool:
+        """Deadline check for one scan page. Only armed inside _play_deep_link."""
+        if self._scan_deadline is None or time.monotonic() < self._scan_deadline:
+            return False
+        log.warning(
+            "Source scan for %s abandoned: %.0fs budget spent",
+            what,
+            self.provider_scan_timeout_s,
+        )
+        return True
+
     def _get_visible_source_candidates(self) -> list[SourceCandidate]:
+        # Cheap (one dumpsys) next to the dump it guards, which can hang for its
+        # full timeout twice over while a stream is rendering. Outside a scan
+        # (no deadline armed) this is a plain dump, as the diagnostics expect.
+        if self._scan_deadline is not None and self._is_playing():
+            raise _PlaybackStartedDuringScan()
         xml_text = self._dump_ui_hierarchy()
         return self._extract_candidates_from_ui_xml(xml_text)
 

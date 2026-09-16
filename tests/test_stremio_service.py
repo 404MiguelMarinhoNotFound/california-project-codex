@@ -516,6 +516,101 @@ class StremioServiceTests(unittest.TestCase):
             cached = json.loads(watch_state.read_text(encoding="utf-8"))
             self.assertEqual(cached["shrinking"]["last_successful_source"], "Comet")
 
+    def test_stream_that_starts_while_scanning_is_reported_as_playing(self):
+        """
+        Live 2026-09-16: both OK presses worked but the torrent buffered past
+        the autoplay wait, so the scan spent two minutes timing out on UI dumps
+        (which never idle over a rendering video) and then asked Master Miguel
+        about sources while Fallout was already on. A scan page must re-read
+        media_session before it dumps, and stop the moment state=3 shows up.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            watch_state = Path(tmp) / "watch_state.json"
+            media_service = Mock()
+            media_service.is_app_foreground.return_value = True
+            media_service.dump_ui_hierarchy.return_value = "<hierarchy />"
+            svc = StremioService(self._config(watch_state), media_service=media_service)
+
+            # Autoplay gives up; the first scan page dumps (that is the one that
+            # hung live), and the check before the second page sees PLAYING.
+            playing = iter([False] + [True] * 10)
+            with patch.object(svc, "_is_playing", side_effect=lambda: next(playing)):
+                with patch.object(svc, "_wait_for_playback", return_value=False):
+                    result = svc._play_deep_link(
+                        imdb_id="tt12637874",
+                        media_type="series",
+                        title_key="fallout",
+                        title_label="Fallout",
+                        allow_unknown_source=False,
+                    )
+
+            self.assertTrue(result.success)
+            self.assertFalse(result.requires_confirmation)
+            self.assertIsNone(result.played_source)
+            self.assertEqual(result.target_mode, "series_detail")
+            media_service.dump_ui_hierarchy.assert_called_once_with()
+            media_service.tap.assert_not_called()
+            self.assertIsNone(svc._scan_deadline)
+
+    def test_stream_that_starts_during_the_last_dump_is_not_asked_about(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            watch_state = Path(tmp) / "watch_state.json"
+            svc = StremioService(self._config(watch_state))
+
+            # Every provider scan comes back empty, then media_session flips to
+            # playing right before the "ask" branch would have fired.
+            with patch.object(svc, "_attempt_provider", return_value=None) as attempt_provider,                     patch.object(svc, "_try_stremio_autoplay", return_value=False),                     patch.object(svc, "_is_playing", return_value=True):
+                with patch.object(svc, "_attempt_unknown_source") as unknown_attempt:
+                        result = svc._play_deep_link(
+                            imdb_id="tt12637874",
+                            media_type="series",
+                            title_key="fallout",
+                            title_label="Fallout",
+                            allow_unknown_source=False,
+                        )
+
+            self.assertTrue(result.success)
+            self.assertFalse(result.requires_confirmation)
+            self.assertEqual(attempt_provider.call_count, 3)
+            unknown_attempt.assert_not_called()
+
+    def test_source_scan_stops_dumping_once_its_time_budget_is_spent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            watch_state = Path(tmp) / "watch_state.json"
+            media_service = Mock()
+            media_service.is_app_foreground.return_value = True
+            media_service.dump_ui_hierarchy.return_value = "<hierarchy />"
+            config = self._config(watch_state)
+            config["stremio"]["provider_scan_timeout_s"] = 0
+            svc = StremioService(config, media_service=media_service)
+
+            with patch.object(svc, "_is_playing", return_value=False):
+                with patch.object(svc, "_wait_for_playback", return_value=False):
+                    result = svc._play_deep_link(
+                        imdb_id="tt12637874",
+                        media_type="series",
+                        title_key="fallout",
+                        title_label="Fallout",
+                        allow_unknown_source=False,
+                    )
+
+            self.assertFalse(result.success)
+            self.assertTrue(result.requires_confirmation)
+            # Zero budget: not one uiautomator dump, straight to the question.
+            media_service.dump_ui_hierarchy.assert_not_called()
+
+    def test_ui_dump_outside_a_scan_does_not_consult_media_session(self):
+        """Diagnostics call _dump_ui_hierarchy directly; no deadline is armed then."""
+        media_service = Mock()
+        media_service.dump_ui_hierarchy.return_value = "<hierarchy />"
+        svc = StremioService(self._config(Path("watch_state.json")), media_service=media_service)
+
+        with patch.object(svc, "_is_playing") as is_playing:
+            svc._get_visible_source_candidates()
+
+        is_playing.assert_not_called()
+        media_service.dump_ui_hierarchy.assert_called_once_with()
+
     def test_shared_media_service_helpers_are_used_for_ui_actions(self):
         media_service = Mock()
         media_service.dump_ui_hierarchy.return_value = "<hierarchy />"

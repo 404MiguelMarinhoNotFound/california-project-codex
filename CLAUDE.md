@@ -1080,6 +1080,8 @@ When asked to play or continue a title:
 9. Press OK once
 10. Check `dumpsys media_session`
 11. Retry OK one time if playback still is not active
+12. Scan the visible stream list for the preferred providers, page by page. Before every `uiautomator dump`, and once more before giving up, re-read `dumpsys media_session`: a torrent stream picked by step 9 or 11 can take longer to buffer than the autoplay wait, and a rendering video keeps `uiautomator dump` from ever going idle, so the scan would otherwise time out for minutes over a show that is already on (seen live 2026-09-16 with Fallout). `state=3` at any of those checks ends the request as a success.
+13. The whole scan is capped by `stremio.provider_scan_timeout_s` (45s); past it, no further dumps are attempted and the request falls through to the fallback policy.
 
 If playback still does not start, use this exact fallback line:
 
