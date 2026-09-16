@@ -276,6 +276,115 @@ class ClaudeStreamingTests(unittest.TestCase):
         svc.tool_handler.assert_not_called()
         self.assertEqual(len(svc.client.messages.calls), 1)
 
+    # --- history -----------------------------------------------------------
+    #
+    # History used to keep only the spoken text. After two turns whose
+    # tool_use/tool_result blocks had been stripped, the model's own context
+    # showed device actions apparently done by announcing them, and it began
+    # doing exactly that: "Sending him back to dock now. Done." with no
+    # vacuum_dock in the log, "Your attic lights are off now" with no
+    # control_lights call. The round has to survive into the next turn.
+
+    def test_a_tool_round_is_kept_in_history_not_just_its_spoken_text(self):
+        tool_block = _Block("tool_use", name="control_vacuum",
+                            input={"action": "vacuum_dock"}, id="t1")
+        first_content = [_Block("text", text="On it. "), tool_block]
+        turns = [
+            (["On it. "], first_content, "tool_use"),
+            (["He's heading home."], [_Block("text", text="He's heading home.")], "end_turn"),
+        ]
+        svc, _ = self._service(turns)
+        svc.tool_handler = lambda name, args: "Sending the vacuum home."
+
+        list(svc.stream_response("dock him"))
+
+        self.assertEqual(
+            svc.history,
+            [
+                {"role": "user", "content": "dock him"},
+                {"role": "assistant", "content": first_content},
+                {"role": "user", "content": [{"type": "tool_result",
+                                              "tool_use_id": "t1",
+                                              "content": "Sending the vacuum home."}]},
+                {"role": "assistant", "content": "He's heading home."},
+            ],
+        )
+
+    def test_the_final_message_is_only_the_last_generation_not_the_whole_turn(self):
+        """The preamble already sits in the tool_use message's text block."""
+        tool_block = _Block("tool_use", name="control_lights",
+                            input={"action": "light_off"}, id="t1")
+        turns = [
+            (["Okay, on it. "], [_Block("text", text="Okay, on it. "), tool_block], "tool_use"),
+            (["Attic's off."], [], "end_turn"),
+        ]
+        svc, _ = self._service(turns)
+        svc.tool_handler = lambda name, args: "off"
+
+        list(svc.stream_response("lights off"))
+
+        self.assertEqual(svc.history[-1], {"role": "assistant", "content": "Attic's off."})
+        self.assertNotIn("Okay, on it. Attic's off.", str(svc.history[-1]))
+
+    def test_the_next_turn_sends_the_previous_round_to_the_model(self):
+        tool_block = _Block("tool_use", name="control_vacuum",
+                            input={"action": "vacuum_status"}, id="t1")
+        turns = [
+            ([], [tool_block], "tool_use"),
+            (["Docked."], [], "end_turn"),
+            (["Sure."], [], "end_turn"),
+        ]
+        svc, _ = self._service(turns)
+        svc.tool_handler = lambda name, args: "docked, 100%"
+
+        list(svc.stream_response("where is he"))
+        list(svc.stream_response("ok dock him"))
+
+        roles = [(m["role"], type(m["content"]).__name__) for m in svc.client.messages.calls[2]]
+        self.assertEqual(roles, [("user", "str"), ("assistant", "list"), ("user", "list"),
+                                 ("assistant", "str"), ("user", "str")])
+
+    def test_an_empty_final_generation_is_not_stored_as_an_empty_message(self):
+        """An empty text block is an invalid message on the next request."""
+        tool_block = _Block("tool_use", name="control_tv",
+                            input={"action": "play_pause"}, id="t1")
+        turns = [([], [tool_block], "tool_use"), ([], [], "end_turn")]
+        svc, _ = self._service(turns)
+        svc.tool_handler = lambda name, args: "paused"
+
+        list(svc.stream_response("pause"))
+
+        self.assertEqual(svc.history[-1]["role"], "user")
+        self.assertEqual(svc.history[-1]["content"][0]["type"], "tool_result")
+
+    def test_trimming_drops_whole_exchanges_and_never_orphans_a_tool_result(self):
+        """
+        With tool rounds in history an exchange is no longer two messages.
+        A count-based trim would cut a round in half and put a tool_result
+        first, which the API rejects. The test drives more turns than the
+        configured window and checks the front of history is always a spoken
+        user message.
+        """
+        def tool_turn():
+            block = _Block("tool_use", name="control_lights",
+                           input={"action": "light_on"}, id="t")
+            return [([], [block], "tool_use"), (["ok"], [], "end_turn")]
+
+        turns = []
+        for _ in range(8):
+            turns += tool_turn()
+        svc, _ = self._service(turns)
+        svc.max_history = 2
+        svc.tool_handler = lambda name, args: "on"
+
+        for i in range(8):
+            list(svc.stream_response(f"turn {i}"))
+
+        starts = [m for m in svc.history if m["role"] == "user" and isinstance(m["content"], str)]
+        self.assertEqual([m["content"] for m in starts], ["turn 6", "turn 7"])
+        self.assertEqual(svc.history[0], {"role": "user", "content": "turn 6"})
+        self.assertEqual(len(svc.history), 8)   # 2 exchanges x 4 messages
+
 
 if __name__ == "__main__":
     unittest.main()

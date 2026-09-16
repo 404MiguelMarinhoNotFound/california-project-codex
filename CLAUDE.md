@@ -1376,6 +1376,47 @@ When tools are active:
 - Keep tool confirmations short and natural
 - Treat plain show requests for `stremio_play` as "sync the library, then resume the latest tracked episode"
 
+### History keeps the tool rounds, and that is what stops the model faking them
+
+`LLMService.history` used to store one plain-text assistant message per turn: the
+spoken words only. The `tool_use` / `tool_result` blocks lived in the local `messages`
+list of the provider loop and were dropped when the turn ended. That was a slow-acting
+bug. From the model's side, every earlier device action then looked like it had been
+carried out by *announcing* it, and after two such turns in a session Haiku did exactly
+that: "Sending him back to dock now. Done." with no `vacuum_dock` in the log, and "Your
+attic lights are off now" with no `control_lights` call at all (2026-09-16). The tell in
+the log is the timing, about one second for a single generation instead of the five to
+six a real tool round takes.
+
+Both provider loops now append each round, the assistant message with its tool blocks
+and the user/tool message with the results, to `self.history` as well as to the request.
+The final assistant message holds only the text of the *last* generation, because the
+preamble ("On it.") already sits in the tool_use message. An empty final generation is
+not stored at all: an empty text block is an invalid message, and the API merges
+consecutive user turns.
+
+`_trim_history` therefore trims by **exchange**, not by message count. An exchange runs
+from one spoken user message (`role: user` with a string `content`) to the next; a
+count-based trim would cut a round in half and leave a `tool_result` at the front with
+no `tool_use` before it, which the API rejects outright. The cost is a few dozen tokens
+per remembered round, inside the six-exchange window.
+
+The system prompt backs this with one rule: a device only changes when its tool is
+called and the result comes back, so never describe an outcome without a tool result in
+this very turn, and "where is it / what is it doing" is a status call. The "Done. That
+worked out well." signature pattern is now explicitly "after a tool result".
+
+### The vacuum's name is config, not a comment
+
+"Where is SirSucksAlot?" was answered with "is that a person or a pet?" because the
+nickname existed only as a comment in `config.yaml`, which the model never sees. It is
+`deebot.nickname` now, injected by `_vacuum_inventory()` next to the room list, with a
+note that speech recognition misspells it (one session produced SirSoxalot, Sir Soxalot
+and "Sursocks a lot") and that a question about where it is or what it is doing means
+`vacuum_status`. The nickname line is independent of the room list, so it still appears
+before rooms are configured. Same rule as every other inventory: never hardcode it in
+`system_prompt`.
+
 -----
 
 ## Reading State Back

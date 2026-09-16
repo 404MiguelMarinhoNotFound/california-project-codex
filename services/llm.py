@@ -272,6 +272,10 @@ class LLMService:
         deebot_cfg = config.get("deebot", {}) or {}
         self.vacuum_enabled = bool(deebot_cfg.get("enabled", False))
         self.vacuum_room_names: list[str] = list((deebot_cfg.get("rooms") or {}).keys())
+        # The robot's spoken name. It used to be a comment in config.yaml, which
+        # the model never saw, so "where is Sir Sucks-a-Lot" got "I don't do
+        # location tracking" instead of a vacuum_status call.
+        self.vacuum_nickname: str = str(deebot_cfg.get("nickname") or "").strip()
 
         # Saved YouTube playlist categories, injected for the same reason as the
         # lights: "what playlists do you know" is an inventory question, and the
@@ -364,14 +368,29 @@ class LLMService:
 
     def _vacuum_inventory(self) -> str:
         """
-        Describe the vacuum's named rooms so "clean the kitchen" resolves and
-        "which rooms can you clean" is answered without a tool call. Same rule
-        as the lights: never hardcode these in system_prompt.
+        Describe the vacuum's name and its named rooms so "clean the kitchen"
+        resolves and "which rooms can you clean" is answered without a tool
+        call. Same rule as the lights: never hardcode these in system_prompt.
+
+        The nickname line also warns that speech recognition mangles the name.
+        "Sir Sucks-a-Lot" came through as SirSoxalot, Sir Soxalot and "Sursocks
+        a lot" in one session, and without the hint the model treated the
+        first of those as an unknown person.
         """
-        if not self.vacuum_enabled or not self.vacuum_room_names:
+        if not self.vacuum_enabled:
             return ""
-        rooms = ", ".join(self.vacuum_room_names)
-        return f"\nVacuum rooms you can clean by name: {rooms}."
+        parts = []
+        if self.vacuum_nickname:
+            parts.append(
+                f"\nThe vacuum is called {self.vacuum_nickname}. Speech recognition"
+                " often misspells that name, so any similar-sounding name means the"
+                " vacuum, and asking where it is, what it is doing, or how its"
+                " battery is means vacuum_status."
+            )
+        if self.vacuum_room_names:
+            rooms = ", ".join(self.vacuum_room_names)
+            parts.append(f"\nVacuum rooms you can clean by name: {rooms}.")
+        return "".join(parts)
 
     def _light_inventory(self) -> str:
         """
@@ -440,17 +459,16 @@ class LLMService:
 
         start = time.time()
         full_response = ""
+        # "text" accumulates everything spoken this turn, across tool rounds;
+        # "last_text" is only what the final generation said.
+        full_response_ref = {"text": "", "last_text": ""}
 
         try:
             if self.provider == "claude":
-                yield from self._stream_claude(full_response_ref := {"text": ""})
-                full_response = full_response_ref["text"]
-            elif self.provider == "groq":
-                yield from self._stream_openai_compatible(full_response_ref := {"text": ""})
-                full_response = full_response_ref["text"]
-            elif self.provider in ("fireworks", "openai"):
-                yield from self._stream_openai_compatible(full_response_ref := {"text": ""})
-                full_response = full_response_ref["text"]
+                yield from self._stream_claude(full_response_ref)
+            elif self.provider in ("groq", "fireworks", "openai"):
+                yield from self._stream_openai_compatible(full_response_ref)
+            full_response = full_response_ref["text"]
 
         except Exception as e:
             logger.error(f"LLM error: {e}")
@@ -458,8 +476,17 @@ class LLMService:
             full_response = error_msg
             yield error_msg
 
-        # Add assistant response to history
-        self.history.append({"role": "assistant", "content": full_response})
+        # The final assistant message holds only the text of the *last*
+        # generation. Any tool round before it was already appended by the
+        # provider loop as its own assistant/tool_use and user/tool_result
+        # pair, and that pair carries the preamble text, so storing the full
+        # spoken string here would duplicate it. An empty final generation is
+        # skipped rather than stored: an empty text block is an invalid
+        # message, and consecutive user turns are merged by the API.
+        final_text = full_response_ref["last_text"] if full_response else ""
+        final_text = final_text or full_response
+        if final_text:
+            self.history.append({"role": "assistant", "content": final_text})
 
         elapsed = time.time() - start
         logger.info(f"LLM completed in {elapsed:.2f}s ({len(full_response)} chars)")
@@ -504,6 +531,7 @@ class LLMService:
             # returned only after the whole generation finished, so the first
             # sentence could not reach TTS until the last token was written —
             # which defeated the sentence-chunker overlap on the default provider.
+            response_ref["last_text"] = ""
             with self.client.messages.stream(
                 model=self.model,
                 max_tokens=self.max_tokens,
@@ -513,6 +541,7 @@ class LLMService:
             ) as stream:
                 for text in stream.text_stream:
                     response_ref["text"] += text
+                    response_ref["last_text"] += text
                     yield text
                 response = stream.get_final_message()
 
@@ -554,8 +583,19 @@ class LLMService:
             if not tool_results:
                 break
 
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
+            # The round goes into history as well as this request. History
+            # used to keep only the spoken text, so every earlier device
+            # action looked, from the model's side, like it had been done by
+            # announcing it -- and after two such turns it started announcing
+            # instead of calling ("Sending him to dock now. Done." with no
+            # vacuum_dock in the log). Both messages are appended together so
+            # a handler that raises leaves no half-round behind.
+            round_messages = [
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": tool_results},
+            ]
+            messages.extend(round_messages)
+            self.history.extend(round_messages)
 
     def _stream_openai_compatible(self, response_ref: dict) -> Generator[str, None, None]:
         """
@@ -590,12 +630,14 @@ class LLMService:
             # Accumulate streamed tool calls and text
             tool_calls_acc = {}  # index -> {id, name, arguments_str}
             had_tool_call = False
+            response_ref["last_text"] = ""
 
             for chunk in stream:
                 delta = chunk.choices[0].delta
 
                 if delta.content:
                     response_ref["text"] += delta.content
+                    response_ref["last_text"] += delta.content
                     yield delta.content
 
                 if delta.tool_calls:
@@ -629,13 +671,17 @@ class LLMService:
                             "arguments": tc["arguments"],
                         }
                     })
-                messages.append({
+                # Same persistence rule as the Claude loop: the round is kept
+                # in history, and the preamble spoken alongside the call stays
+                # attached to it rather than being dropped.
+                assistant_msg = {
                     "role": "assistant",
-                    "content": None,
+                    "content": response_ref["last_text"] or None,
                     "tool_calls": assistant_tool_calls,
-                })
+                }
+                tool_messages = []
 
-                # Execute each tool and append results
+                # Execute each tool and collect results
                 for tc_msg in assistant_tool_calls:
                     tool_name = tc_msg["function"]["name"]
                     try:
@@ -650,21 +696,40 @@ class LLMService:
                     if self.tool_handler:
                         result_text = self.tool_handler(tool_name, tool_input)
 
-                    messages.append({
+                    tool_messages.append({
                         "role": "tool",
                         "tool_call_id": tc_msg["id"],
                         "content": result_text,
                     })
 
+                round_messages = [assistant_msg, *tool_messages]
+                messages.extend(round_messages)
+                self.history.extend(round_messages)
+
             # If no tool call happened, we're done
             if not had_tool_call:
                 break
 
+    @staticmethod
+    def _starts_exchange(message: dict) -> bool:
+        """A plain spoken user message. Tool results are user-role too on the
+        Claude path, but their content is a list of blocks, not a string."""
+        return message.get("role") == "user" and isinstance(message.get("content"), str)
+
     def _trim_history(self):
-        """Keep only the last N exchanges."""
-        max_messages = self.max_history * 2  # Each exchange = 2 messages
-        while len(self.history) > max_messages:
-            self.history.pop(0)
+        """
+        Keep only the last N exchanges, where an exchange is everything from
+        one spoken user message up to the next.
+
+        History now carries the tool rounds, so one exchange can be four or
+        more messages, not two. Trimming by message count would cut a round
+        in half and leave a tool_result at the front with no tool_use before
+        it, which the API rejects outright. Whole exchanges only.
+        """
+        starts = [i for i, m in enumerate(self.history) if self._starts_exchange(m)]
+        if len(starts) <= self.max_history:
+            return
+        del self.history[:starts[len(starts) - self.max_history]]
 
     def clear_history(self):
         """Clear conversation history."""
