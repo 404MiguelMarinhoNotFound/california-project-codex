@@ -131,9 +131,16 @@ class ToolSchemaTests(unittest.TestCase):
         actions = CONTROL_LIGHTS_TOOL["input_schema"]["properties"]["action"]["enum"]
         self.assertIn("light_status", actions)
 
-    def test_the_description_says_it_is_not_a_live_reading(self):
-        # The model must not offer a reading the hardware cannot give.
-        self.assertIn("not a live reading", CONTROL_LIGHTS_TOOL["description"])
+    def test_the_description_does_not_promise_which_kind_of_answer_comes_back(self):
+        # This used to assert "not a live reading", which was true while every
+        # transport was write-only. A Tapo bulb answers, so a blanket "not a
+        # reading" in the schema would now be the model under-claiming what it
+        # just read. Which kind of answer it is depends on the transport, so the
+        # schema says the RESULT will tell it -- and the result does, because
+        # _light_memory_line carries the hedge in the string it returns.
+        description = CONTROL_LIGHTS_TOOL["description"]
+        self.assertIn("light_status", description)
+        self.assertIn("memory rather than a live reading", description)
 
     def test_the_openai_mirror_shares_the_same_schema_object(self):
         # It is built FROM the same dict, so schema edits flow automatically.

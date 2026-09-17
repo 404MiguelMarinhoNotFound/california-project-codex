@@ -441,7 +441,28 @@ class CloudTransport:
         return payload.get("data") or []
 
 
-_TRANSPORTS = {"ble": BleTransport, "cloud": CloudTransport}
+_TRANSPORT_NAMES = ("ble", "cloud", "tapo")
+
+
+def _transport_class(name: str):
+    """
+    Look up a transport class by config name, importing Tapo's only on demand.
+
+    The lazy import is not an optimisation, it breaks a cycle: `tapo_transport`
+    imports `GoveeCommandResult` and `clamp_percent` from this module, so a
+    top-level import here would be circular. It also keeps python-kasa (and its
+    Python 3.14 import shim) out of the process entirely for the two transports
+    that have nothing to do with TP-Link.
+    """
+    if name == "ble":
+        return BleTransport
+    if name == "cloud":
+        return CloudTransport
+    if name == "tapo":
+        from services.tapo_transport import TapoTransport
+
+        return TapoTransport
+    return None
 
 
 class GoveeService:
@@ -451,12 +472,12 @@ class GoveeService:
         self.transport_name = str(govee_cfg.get("transport") or "ble").strip().lower()
         self.default_light = str(govee_cfg.get("default_light") or "").strip()
 
-        transport_cls = _TRANSPORTS.get(self.transport_name)
+        transport_cls = _transport_class(self.transport_name)
         if transport_cls is None:
             logger.error(
                 "Unknown govee.transport '%s'. Choose from: %s",
                 self.transport_name,
-                ", ".join(sorted(_TRANSPORTS)),
+                ", ".join(sorted(_TRANSPORT_NAMES)),
             )
             self.transport = None
             self.lights = {}
@@ -470,6 +491,17 @@ class GoveeService:
 
         configured = bool(govee_cfg.get("enabled", False))
         self.enabled = bool(configured and self.transport and self.transport.available)
+
+        # Whether this transport can tell us what the light is ACTUALLY doing,
+        # rather than what we last sent it. True only for Tapo today; BLE has no
+        # notify characteristic and the cloud API cannot see the attic strip.
+        # A plain bool, and `_dispatch_lights` compares it with `is True` -- the
+        # light tests build the service as a bare Mock, which auto-stubs every
+        # attribute as truthy, so a loose check there would read "yes I can read
+        # the bulb" off a Mock that reads nothing.
+        self.can_read_state = bool(
+            self.enabled and hasattr(self.transport, "get_state")
+        )
 
         if self.enabled:
             logger.info(
@@ -561,3 +593,20 @@ class GoveeService:
         if error is not None:
             return error
         return self.transport.set_color(light, rgb)
+
+    def get_state(self, light_key: str):
+        """
+        A live reading off the light, or None when there is none to be had.
+
+        `None` covers every "I could not tell": the transport cannot read at all,
+        the light is unknown, the service is disabled, or the bulb did not answer.
+        The caller falls back to `light_shadow`'s memory, which is what the BLE
+        strip has always used, so a failed read degrades to the old behaviour
+        rather than to silence.
+        """
+        if not self.can_read_state:
+            return None
+        light, error = self._light_for(light_key)
+        if error is not None:
+            return None
+        return self.transport.get_state(light)

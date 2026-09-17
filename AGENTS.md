@@ -31,7 +31,8 @@ Voice request -> LLM tool call (control_tv) -> Orchestrator VPN preflight -> Med
 ### Light Control Pipeline
 
 ```text
-Voice request -> LLM tool call (control_lights) -> GoveeService -> BleTransport -> Bluetooth LE -> light strip
+Voice request -> LLM tool call (control_lights) -> GoveeService -> BleTransport  -> Bluetooth LE      -> Govee strip (write only)
+                                                                -> TapoTransport -> LAN, python-kasa -> Tapo bulb (reads back)
 ```
 
 No VPN preflight and no ADB on this path, and by default no network at all.
@@ -45,7 +46,7 @@ No VPN preflight and no ADB on this path, and by default no network at all.
 | LLM | Anthropic Claude, Groq, Fireworks, or OpenAI-compatible |
 | TTS | Kokoro, Edge TTS, Piper, ElevenLabs, Google Cloud TTS |
 | TV control | ADB over network to Mi Box / Android TV |
-| Light control | Govee over Bluetooth LE (`bleak`); Govee cloud v2 API optional |
+| Light control | Govee over Bluetooth LE (`bleak`) or TP-Link Tapo over the LAN (`python-kasa`); Govee cloud v2 API optional |
 | Stremio state | Stremio private API + local `watch_state.json` cache |
 | Title resolution | TMDB |
 | Audio I/O | `sounddevice`, `soundfile` |
@@ -74,6 +75,13 @@ Required for Stremio features:
 Required for TMDB fallback title resolution:
 
 - `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN`
+
+Optional, only for the Tapo transport (`govee.transport: "tapo"`):
+
+- `TAPO_USERNAME` / `TAPO_PASSWORD` - the TP-Link account the bulbs were onboarded
+  with. Control traffic never leaves the LAN, but the KLAP handshake still
+  authenticates against that account, so these are not optional for local control.
+  Without them `TapoTransport` disables itself and `control_lights` is not offered
 
 Optional, only for the Govee **cloud** transport:
 
@@ -195,6 +203,7 @@ california/
 │   ├── device_finder.py         # Shared find-by-MAC / verify-by-identity / cache-the-IP ladder
 │   ├── llm.py                   # Multi-provider LLM streaming + tool calling
 │   ├── govee_service.py         # Govee cloud v2 light control
+│   ├── tapo_transport.py        # TP-Link Tapo over the LAN; the one transport that reads state back
 │   ├── name_matcher.py          # Shared fuzzy hint -> key matching: exact, despaced, substring, token overlap
 │   ├── media_service.py         # Generic Mi Box / Android TV ADB controls
 │   ├── sentence_chunker.py      # Splits streamed LLM output into sentences
@@ -219,6 +228,7 @@ california/
 │   ├── run_stremio_e2e.py          # Live end-to-end Stremio routing and playback test
 │   ├── run_youtube_playlist_e2e.py # Live end-to-end YouTube playlist routing test
 │   ├── probe_govee_devices.py      # Lists Govee devices with sku, device id, and capabilities
+│   ├── probe_tapo_devices.py       # Finds Tapo bulbs and prints their host; python-kasa's own CLI cannot run here
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
@@ -234,6 +244,7 @@ california/
 │   ├── test_activation_capture.py # Activation clip naming and pruning
 │   ├── test_activation_phrases.py # Wake tiers, echo stripping, recording trim, dropped turns
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
+│   ├── test_tapo_transport.py   # RGB->HSV, credential self-disable, live reads, no-network guard
 │   ├── test_device_discovery.py # DeviceFinder ladder, cache, ARP parsing; no-network guard
 │   ├── test_media_power.py      # turn_on/turn_off, BT wake fallback, no blind KEYCODE_POWER
 │   ├── test_media_service.py    # YouTube / ADB unit tests
@@ -338,7 +349,7 @@ truth. `requirements.txt` has been deleted and must not be reintroduced.
 - **Optional/heavy providers go in `[project.optional-dependencies]`,** not in the core
   `dependencies` list. Current extras: `kokoro`, `piper`, `elevenlabs`, `openai`,
   `cec`,
-  `porcupine`, `silero`, `pi`, `govee`, and the aggregate `default`.
+  `porcupine`, `silero`, `pi`, `govee`, `tapo`, and the aggregate `default`.
 - **`uv sync --extra <name>` syncs ONLY that extra and uninstalls everything else.**
   It is not additive. Running `uv sync --extra govee` on this project removes kokoro,
   torch and spacy, which silently breaks TTS on the next launch because `config.yaml`
@@ -905,6 +916,7 @@ selected by `govee.transport` in `config.yaml`:
 |-----------|-------|-------------|------------|
 | `ble` (default) | Any Govee BLE device in Bluetooth range | none | `uv sync --extra govee` |
 | `cloud` | Only Wi-Fi models on Govee's published whitelist, owned by the key's account | `GOVEE_API_KEY` | core `requests` |
+| `tapo` | TP-Link Tapo bulbs on the LAN. **The only transport that can be read back** | `TAPO_USERNAME` / `TAPO_PASSWORD` | `uv sync --extra default` |
 
 **Why BLE is the default here.** Master Miguel's attic strip is an **H617E**, which is
 BLE-only. It is absent from Govee's supported-model list, so `GET /user/devices` returns
@@ -1290,7 +1302,7 @@ Widening that check to any `tool_use` block would break web search.
 `control_lights` supports these actions:
 
 - `light_on`, `light_off`
-- `light_status` (answers from shadow state, never a reading -- see Reading State Back)
+- `light_status` (a live reading on `tapo`, shadow memory on `ble`/`cloud` -- see Reading State Back)
 - `light_brightness` (needs `brightness_percent`, 1-100, clamped not rejected)
 - `light_color` (needs `color`)
 
@@ -1460,6 +1472,29 @@ label only exists there: `StremioService` holds an IMDb id and a deep link, and
 not remembered at all rather than read out loud later.
 
 ### The lights cannot be read, and saying so is the feature
+
+**Corrected 2026-09-17: that is true of the Govee strip, not of every light.**
+A TP-Link Tapo bulb answers, so `govee.transport: "tapo"` makes `light_status`
+a real reading and `_light_reading_line` states it with none of the hedge below.
+Everything in this section still holds for `ble` and `cloud`, which is what the
+shipped config selects, and the fallback is deliberate: a Tapo read that fails
+drops through to the same shadow memory rather than to silence.
+
+Two rules carried over into the readable path:
+
+- **The hedge lives in the returned string, never in the system prompt**, which is
+  why one transport can hedge and another not without the prompt knowing anything.
+- **A field the bulb did not answer is not narrated.** `LightReading.power is None`
+  means "it did not tell me", and the dispatcher falls back to memory rather than
+  speaking a blank -- the same `None` contract `MediaService`'s readers use, and the
+  same trap that made a television in standby report as "on" for the life of that
+  feature.
+- **`GoveeService.can_read_state` is compared with `is True`, not truthiness.**
+  `_svc()` in `tests/test_orchestrator_lights.py` is a bare `Mock`, so every
+  attribute of it is truthy; a loose check would claim a live reading off a service
+  that reads nothing. `test_a_bare_mock_service_never_produces_a_reading_line`
+  pins it.
+
 
 The Govee characteristic `00010203-...-2b11` is **Write Without Response**, with
 no notify characteristic beside it, and the attic H617E is absent from Govee's
@@ -1735,6 +1770,16 @@ Current automated coverage exists for:
 - Surfshark route execution, route cache semantics, and debug route capture
 - Orchestrator VPN preflight routing and warning behavior
 - Govee transport selection, light resolution, BLE packet format, and cloud HTTP error mapping
+- Tapo transport: RGB->HSV conversion with the value component discarded so a dark
+  colour is not a dimmer, colour never touching brightness (`set_hsv(..., None)`),
+  brightness clamped rather than rejected, self-disable without credentials, a live
+  reading carrying power and brightness, an unreadable bulb reading `None` rather
+  than a blank, that a `LightReading` has no `__bool__` to re-create the falsy-result
+  trap, that work runs off the calling thread, and a guard that the file never opens
+  a socket
+- `light_status` on a readable transport: a live reading stated without the memory
+  hedge, brightness not quoted on a light that is off, a failed read falling back to
+  memory, and a bare `Mock` service never producing a reading line
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
@@ -1791,6 +1836,8 @@ uv run python tools\check_stremio_adb.py --sync --json      # refresh library, m
 uv run python tools\check_stremio_adb.py --title Fallout --launch   # actually plays
 uv run python tools\probe_govee_devices.py
 uv run python tools\probe_govee_devices.py --transport cloud
+uv run python tools\probe_tapo_devices.py
+uv run python tools\probe_tapo_devices.py --host 192.168.1.42
 
 # Playlist rot. Exits nonzero when an ID is gone, so it can gate a curation pass.
 uv run python toolsalidate_youtube_playlists.py

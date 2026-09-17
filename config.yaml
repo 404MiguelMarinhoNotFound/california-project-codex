@@ -716,9 +716,30 @@ govee:
   api_key: null                 # null = read GOVEE_API_KEY from .env
   base_url: "https://openapi.api.govee.com"
   request_timeout_ms: 10000
+  # Tapo-only settings, ignored unless transport is "tapo".
+  #
+  # This block is under `govee:` because GoveeService reads that key; the service
+  # is really a generic light service with pluggable transports and the block is
+  # due a rename, which is its own change.
+  #
+  # Set transport: "tapo" and give each light a `host` (its LAN address) instead
+  # of a `mac`. Credentials come from TAPO_USERNAME / TAPO_PASSWORD in .env --
+  # control traffic never leaves the LAN, but the handshake still authenticates
+  # against the TP-Link account, so the bulb must be onboarded in the Tapo app
+  # first. Find the address with: uv run python tools/probe_tapo_devices.py
+  # (python-kasa's own `kasa` CLI does NOT run here -- see that tool's docstring)
+  #
+  # Unlike the Govee strip these bulbs can be READ, so light_status answers with
+  # a fact instead of the shadow-memory hedge. That is the reason to switch.
+  tapo:
+    request_timeout_ms: 5000
+    retries: 2
+    username: null              # null = read TAPO_USERNAME from .env
+    password: null              # null = read TAPO_PASSWORD from .env
   lights:
     attic:
       mac: "EE:2E:01:06:53:0E"  # Govee_H617E_530E, verified over BLE
+      # host: "192.168.1.xx"    # for transport "tapo" -- the L530E's address
       aliases:
         - "attic"
         - "loft"

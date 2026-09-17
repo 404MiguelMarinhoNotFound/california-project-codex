@@ -69,7 +69,13 @@ govee = ["bleak>=0.22.0"]
 # lying about which VAD ran for the life of the project. `default` is defined as
 # exactly what the committed config.yaml selects, and config.yaml selects silero, so
 # it belongs here. This adds torchaudio only, not the full ~2GB — torch is already in.
-default = ["california[kokoro]", "california[govee]", "california[silero]", "california[cec]", "california[deebot]"]
+#
+# tapo is the one entry here that config.yaml does NOT currently select: the shipped
+# `govee.transport` is still "ble" for the attic strip. The rule is that default must
+# be a superset of what the config selects, not an exact match, and pre-staging this
+# one keeps flipping to the Tapo bulbs a single config edit instead of a config edit
+# plus a dependency change nobody remembers to make.
+default = ["california[kokoro]", "california[govee]", "california[silero]", "california[cec]", "california[deebot]", "california[tapo]"]
 # cec belongs in default because the committed config.yaml sets
 # media.cec_wake.enabled: true, and turn_on cannot work without samsungtvws.
 # Same rule that put silero here: default == exactly what config.yaml selects.
@@ -90,6 +96,14 @@ cec = [
 # a wheel we'd never import. See tools/probe_deebot_devices.py.
 deebot = [
     "deebot-client>=18.5.0",
+]
+# Light control: TP-Link Tapo over the LAN (config.yaml `govee.transport: "tapo"`).
+# Unlike the Govee strip these bulbs can be READ back, which is the whole reason
+# they are here -- see services/tapo_transport.py. Local control still
+# authenticates with TP-Link cloud credentials (TAPO_USERNAME / TAPO_PASSWORD),
+# so this needs .env even though no traffic leaves the LAN.
+tapo = [
+    "python-kasa>=0.10.0",
 ]
 
 [tool.uv]

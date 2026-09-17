@@ -753,6 +753,26 @@ def _prune_clips(directory: str, max_files: int) -> list[str]:
     return doomed
 
 
+def _light_reading_line(key: str, reading) -> str:
+    """
+    Say what the bulb IS doing, with none of the memory hedge.
+
+    The counterpart to `_light_memory_line`, and the difference between them is
+    the whole point: that one has to say "that's memory, not a reading" because
+    the Govee strip cannot be read. This one must NOT, because a hedge on a fact
+    is just as misleading as a fact on a guess.
+
+    Brightness is only mentioned on a light that is on. The bulb keeps reporting
+    its last level while switched off, and "off at 60 percent" invites the reply
+    "no it isn't".
+    """
+    if not reading.power:
+        return f"The {key} light is off."
+    if reading.percent is None:
+        return f"The {key} light is on."
+    return f"The {key} light is on at {reading.percent} percent."
+
+
 def _light_memory_line(key: str, memory) -> str:
     """
     Say what she last sent the light, and say that it is what she SENT.
@@ -812,7 +832,16 @@ def _dispatch_lights(params: dict, govee_svc, light_shadow=None) -> str:
         return "I don't have any lights saved yet."
 
     if action == "light_status":
-        # Nothing to ask the service: the characteristic is write-only.
+        # A Tapo bulb answers; the Govee strip's characteristic is write-only.
+        # `is True` rather than a truthiness check: the tests build govee_svc as
+        # a bare Mock, and every attribute of a Mock is truthy, so a loose check
+        # would claim a live reading off a service that cannot read at all.
+        if getattr(govee_svc, "can_read_state", False) is True:
+            reading = govee_svc.get_state(key)
+            # power is None means the bulb did not answer, so there is no
+            # reading -- fall through to memory rather than narrate a blank.
+            if reading is not None and reading.power is not None:
+                return _light_reading_line(key, reading)
         remembered = light_shadow.remembered(key) if light_shadow else None
         return _light_memory_line(key, remembered)
 
