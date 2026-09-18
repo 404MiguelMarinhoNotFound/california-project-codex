@@ -727,6 +727,23 @@ Both are tried, in that order, ahead of the CEC chain in
 `MediaService._wake_and_wait`, and both cost nothing while disabled — see
 that method's docstring.
 
+**Hardware-tested 2026-09-18 — read `research/xiaomi-wake-windows-2026-09-18.md`
+before touching any of this again.** Neither `services/bt_wake.py` nor
+`services/esp32_bt_wake.py` exists on `master` (the `config.yaml` keys are
+orphans; `_wake_and_wait` goes straight to CEC). The Win32
+`BluetoothAuthenticateDeviceEx` page *does* reach the box, so "never
+discoverable" above overstates it — but the box's firmware drops the incoming
+pairing before Android's consent dialog, and standby wake is gated anyway by
+the `persist.vendor.wake_up_rc` address whitelist (only the Xiaomi RC is on it;
+only Xiaomi's `BLE_Service` writes it; shell cannot). Editing it needs root,
+root needs a bootloader unlock, the unlock forces a factory reset, and Master
+Miguel declined that. The verified root procedure over USB A-to-A is in
+`research/jaws-root-prep/README.md`. Benchmarked the same night: forced CEC
+wake **52s** to `mWakefulness=Awake`; ADB `KEYCODE_WAKEUP` **1.3s** when the
+box is still on the LAN — which it stayed, for 3 minutes after `KEYCODE_SLEEP`,
+while the USB cable to the laptop was connected. Soak-test that before relying
+on it.
+
 #### What works
 
 `services/cec_wake.py`, two steps:
