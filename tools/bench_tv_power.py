@@ -14,6 +14,7 @@ behaviour she will get.
     uv run python tools/bench_tv_power.py wake --runs 3 --via-turn-on
     uv run python tools/bench_tv_power.py keys      # the proven KEY_HDMI pair, TV-on from shallow standby
     uv run python tools/bench_tv_power.py wol-only  # WoL alone, box awake
+    uv run python tools/bench_tv_power.py tv-standby --key KEY_POWER   # one press, outcome read off the bus
 
 Never sends KEYCODE_POWER -- it is a toggle, see CLAUDE.md. `soak` and `wake`
 put the room to sleep on purpose; run them when nobody is watching.
@@ -188,6 +189,42 @@ def cmd_wol_only(svc: MediaService, args) -> int:
     return 0
 
 
+def cmd_tv_standby(svc: MediaService, args) -> int:
+    """
+    Send ONE key to the television over its websocket and read what the CEC
+    bus says happened: <Standby> broadcast = it went off; enumeration traffic
+    = it just came ON (so a toggle found it off); nothing = unconfirmed. The
+    box must stay awake throughout, which is the whole point of the mode.
+    """
+    print("Room:", _room(svc))
+    if svc.is_awake() is not True:
+        print("Precondition: the box must be awake and reachable.")
+        return 2
+    before = svc.hdmi_state()
+    if before.tv_power != "on" and not args.force:
+        print(f"The bus does not say the TV is on (tv_power={before.tv_power}); "
+              f"a toggle now could turn it ON. Re-run with --force if you can see it is on.")
+        return 2
+    t0 = time.monotonic()
+    result = svc.cec_waker._send_keys([args.key])
+    print(f"  {_stamp(t0)} {args.key} -> ok={bool(result)} detail={result.detail!r}", flush=True)
+    verdict = None
+    while time.monotonic() - t0 < args.watch:
+        time.sleep(1.5)
+        h = svc.hdmi_state(since=before.newest_stamp)
+        awake = svc.is_awake()
+        print(f"  {_stamp(t0)} tv_power={h.tv_power} active_source={h.active_source} box_awake={awake}", flush=True)
+        if h.tv_power == "standby":
+            verdict = "TV went to STANDBY (Standby broadcast seen)"
+            break
+        if h.tv_power == "on":
+            verdict = "TV came ON (enumeration traffic) -- it was off before the press"
+            break
+    print("Verdict:", verdict or f"no TV evidence on the bus within {args.watch}s (unconfirmed)")
+    print("Box awake at the end:", svc.is_awake())
+    return 0
+
+
 def _time_primitives(svc: MediaService, watch: float) -> dict:
     """Box half and TV half in parallel, timing every first."""
     t0 = time.monotonic()
@@ -273,6 +310,11 @@ def main() -> int:
     p = sub.add_parser("wol-only", help="send Wake-on-LAN only and watch")
     p.add_argument("--watch", type=float, default=40)
 
+    p = sub.add_parser("tv-standby", help="send one power key to the TV and read the CEC bus for the outcome")
+    p.add_argument("--key", default="KEY_POWER", help="KEY_POWER (toggle, verified on the bus) or KEY_POWEROFF")
+    p.add_argument("--watch", type=float, default=12)
+    p.add_argument("--force", action="store_true", help="send even if the bus cannot confirm the TV is on")
+
     p = sub.add_parser("wake", help="time the wake, primitives in parallel or the real turn_on()")
     p.add_argument("--runs", type=int, default=1)
     p.add_argument("--between-minutes", type=float, default=1)
@@ -290,7 +332,7 @@ def main() -> int:
         return 1
     return {
         "soak": cmd_soak, "otp": cmd_otp, "keys": cmd_keys,
-        "wol-only": cmd_wol_only, "wake": cmd_wake,
+        "wol-only": cmd_wol_only, "wake": cmd_wake, "tv-standby": cmd_tv_standby,
     }[args.cmd](svc, args)
 
 
