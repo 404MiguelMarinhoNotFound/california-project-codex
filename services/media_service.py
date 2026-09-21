@@ -469,6 +469,12 @@ class MediaService:
         self.fast_wake_timeout_s = max(1, int(wake_cfg.get("fast_wake_timeout_ms", 20000))) / 1000
         self.tv_confirm_timeout_s = max(0, int(wake_cfg.get("tv_confirm_timeout_ms", 12000))) / 1000
         self.tv_confirm_poll_s = max(0.1, int(wake_cfg.get("tv_confirm_poll_ms", 1500)) / 1000)
+        # A box that just woke re-asserts itself as active source through its
+        # own One Touch Play about a second later. Selecting the input before
+        # that lands costs ~18s of key traffic (measured 2026-09-21: 20.7s vs
+        # 2.2s for the same wake), so a parked input gets this long to fix
+        # itself before ensure_active_source() is called.
+        self.otp_grace_s = max(0, int(wake_cfg.get("otp_grace_ms", 4000))) / 1000
         self.cec_waker = cec_waker if cec_waker is not None else CecWaker(config)
 
         # media.power.tv_only_standby: turn_off puts only the television into
@@ -1276,10 +1282,14 @@ class MediaService:
         Put the television into standby and leave the box awake.
 
         KEY_POWEROFF over the websocket is discrete, so it is safe regardless of
-        what the CEC tail last said. KEYCODE_TV_POWER from the box is Android's
-        own query-then-act and would also work, but it is a toggle at the TV end
-        on some sets, so it stays out until measured. Never KEYCODE_SLEEP here:
-        that is the whole point of the mode.
+        what the CEC tail last said -- and **this UE49M5505 ignores it**
+        (measured 2026-09-21: two presses, no <Standby> on the bus, TV stayed
+        on). The next candidate is KEYCODE_TV_POWER from the box, which is
+        Android's own query-then-act (<Give Device Power Status> first, then
+        <Standby> or One Touch Play), still unmeasured. Until one of them is
+        proven the mode cannot deliver a dark television, which is why
+        tv_only_standby ships off. Never KEYCODE_SLEEP here: that is the whole
+        point of the mode.
         """
         result = self.cec_waker.standby_tv()
         self.last_wake_result = result
@@ -1405,9 +1415,11 @@ class MediaService:
 
         `since` hides evidence older than the wake, see _parse_tv_power.
         `nudge_first` sends the pair before the first read, for a television
-        the caller already knows is dark.
+        the caller already knows is dark. A parked input is left alone for
+        otp_grace_s first: the box's own One Touch Play usually fixes it.
         """
-        deadline = time.monotonic() + timeout_s
+        started = time.monotonic()
+        deadline = started + timeout_s
         last = HdmiState(None, None)
         nudged = False
         if nudge_first and self.cec_waker.available:
@@ -1421,7 +1433,7 @@ class MediaService:
             if last.tv_power == "on":
                 if last.active_source is True:
                     return True
-                if last.active_source is False:
+                if last.active_source is False and time.monotonic() - started >= self.otp_grace_s:
                     return self.ensure_active_source() is True
             elif last.tv_power == "standby" and not nudged and self.cec_waker.available:
                 # WoL cannot lift a shallow-standby TV; the proven pair can. The

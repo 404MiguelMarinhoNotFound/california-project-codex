@@ -48,6 +48,7 @@ def _config(**media_overrides) -> dict:
                 "fast_wake_timeout_ms": 1000,
                 "tv_confirm_timeout_ms": 100,
                 "tv_confirm_poll_ms": 100,
+                "otp_grace_ms": 0,
             },
             "discovery": {"enabled": False},
             **media_overrides,
@@ -403,6 +404,21 @@ class ConfirmTvShowingBoxTests(unittest.TestCase):
 
     def test_a_parked_input_is_selected_once_the_tv_is_on(self):
         svc = self._svc(_on(False, "on"))
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc._confirm_tv_showing_box(1.0), True)
+        svc.ensure_active_source.assert_called_once()
+
+    def test_a_parked_input_gets_the_box_its_own_one_touch_play_grace_first(self):
+        """Measured 2026-09-21: selecting at once cost 20.7s; waiting a second cost 2.2s."""
+        svc = self._svc(_on(False, "on"), _on(False, "on"), _on(True, "on"))
+        svc.otp_grace_s = 60
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc._confirm_tv_showing_box(5.0), True)
+        svc.ensure_active_source.assert_not_called()
+
+    def test_a_parked_input_is_selected_once_the_grace_has_passed(self):
+        svc = self._svc(_on(False, "on"))
+        svc.otp_grace_s = 0
         with patch("services.media_service.time.sleep"):
             self.assertIs(svc._confirm_tv_showing_box(1.0), True)
         svc.ensure_active_source.assert_called_once()

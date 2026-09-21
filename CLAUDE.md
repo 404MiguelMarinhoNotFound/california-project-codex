@@ -797,6 +797,19 @@ exactly that, three times, during this work. `MediaService` is now state-aware:
 `None` and `False` take different branches. **Do not collapse them into a
 boolean** — that is the whole wake path.
 
+#### Measured 2026-09-21, nobody in the room
+
+| path | measured |
+|---|---|
+| already on (box awake, TV showing it) | 0.6s, nothing sent |
+| fast path, box asleep-but-reachable | **2.2s** (box awake 1.7s, active source at 1.9s) once the OTP grace was in; **20.7s** before it, because the first CEC read landed before the box's own One Touch Play re-asserted it and the loop went straight to `KEY_HDMI2` + cycle |
+| deep standby (CEC chain) | **45.3s** (TV had moved to `.86`, rediscovered on the way) |
+| box reachable after `KEYCODE_SLEEP` | **< 5s** — `adb shell` fails before the 15s force-suspend; the shallow window is ~3s |
+| `KEY_POWEROFF` to the TV | **ignored** by the UE49M5505: two presses, no `<Standby>` on the bus, TV stayed on |
+
+So today the fast path is the exception and the 45s chain the rule, because the
+box is gone within seconds of `turn_off`. The lever is below.
+
 #### Standby depth: what keeps the fast path available
 
 The box never sleeps on its own (`stay_on_while_plugged_in=3`, `sleep_timeout=-1`,
@@ -807,10 +820,13 @@ either way it force-suspends ~15s later and the next wake costs ~30s of resume.
 standby (`KEY_POWEROFF`, a discrete key, never a toggle), stop playback and park
 on Home, so the box stays awake and the next `turn_on` is the fast path. It
 needs `adb shell settings put global hdmi_control_auto_device_off_enabled 0` on
-the box first. **Off by default until `tools/bench_tv_power.py soak` has shown
-it holds** — the soak on 2026-09-21 was cut short because someone was watching.
-Measure with `bench otp` (does the box's own wake bring the TV on?), `bench
-soak` (how long does it stay reachable?) and `bench wake --via-turn-on`.
+the box first (set on 2026-09-21; the box then stays awake when the TV goes to
+standby by any route). **Off by default because the TV half is unproven**:
+`KEY_POWEROFF` is ignored by this set (measured), and `KEYCODE_TV_POWER` from
+the box — Android's query-then-act, `<Give Device Power Status>` then
+`<Standby>` or One Touch Play — is the next thing to measure. When a standby
+key works, the box stays awake (measured: still awake a minute after
+`turn_off` under the mode) and every `turn_on` is the ~2s path.
 
 **The power actions are deliberately absent from `_dispatch_tv`'s `requires_tv`
 set.** That gate returns `"TV is off or unreachable right now"` when
