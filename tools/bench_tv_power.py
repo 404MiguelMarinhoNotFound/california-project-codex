@@ -205,9 +205,15 @@ def cmd_tv_standby(svc: MediaService, args) -> int:
         print(f"The bus does not say the TV is on (tv_power={before.tv_power}); "
               f"a toggle now could turn it ON. Re-run with --force if you can see it is on.")
         return 2
+    if not svc.cec_waker.resolve_tv_ip():
+        print("TV not reachable over REST; the key needs an address.")
+        return 2
+    print(f"TV at {svc.cec_waker._tv_ip}")
     t0 = time.monotonic()
     result = svc.cec_waker._send_keys([args.key])
     print(f"  {_stamp(t0)} {args.key} -> ok={bool(result)} detail={result.detail!r}", flush=True)
+    if not result:
+        return 1
     verdict = None
     while time.monotonic() - t0 < args.watch:
         time.sleep(1.5)
