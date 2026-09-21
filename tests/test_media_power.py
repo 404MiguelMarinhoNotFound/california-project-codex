@@ -1,11 +1,16 @@
 """
-Power path: turning the Mi Box off is ADB, turning it on is the television.
+Power path: turning the Mi Box off is ADB, turning it on depends on how deep
+it went.
 
-The box leaves Wi-Fi entirely in standby, so every "turn it on" route through
-ADB is unreachable by construction. These tests pin the two things that made
-the old implementation wrong: KEYCODE_POWER was sent blind (a toggle, so it
-turned the TV *off* when asked to turn it on), and `wake` sat behind a
-reachability gate that answered first.
+In DEEP standby the box leaves Wi-Fi entirely, so every "turn it on" route
+through ADB is unreachable by construction and only the television can reach
+it over CEC. While it is still on the LAN (shallow standby, or awake under a
+dark television) KEYCODE_WAKEUP and the television's own power-on run side by
+side and the CEC bus confirms the result. These tests pin the things that made
+earlier implementations wrong: KEYCODE_POWER was sent blind (a toggle, so it
+turned the TV *off* when asked to turn it on), `wake` sat behind a
+reachability gate that answered first, and "reachable" was taken to mean "the
+television is on".
 """
 
 from types import SimpleNamespace
@@ -14,7 +19,9 @@ from unittest.mock import Mock, patch
 
 from core.orchestrator import _dispatch_tv, _ensure_playable
 from services.cec_wake import CecWaker, WakeResult
-from services.media_service import MediaService, RoomStatus
+from services.media_service import (
+    HdmiState, MediaService, RoomStatus, _newest_cec_stamp, _parse_tv_power,
+)
 from services.now_playing import NowPlaying
 from tests.config_fixture import config_for_tests, real_config
 
@@ -38,6 +45,9 @@ def _config(**media_overrides) -> dict:
                 "settle_ms": 100,
                 "poll_interval_ms": 100,
                 "wake_attempts": 1,
+                "fast_wake_timeout_ms": 1000,
+                "tv_confirm_timeout_ms": 100,
+                "tv_confirm_poll_ms": 100,
             },
             "discovery": {"enabled": False},
             **media_overrides,
@@ -46,28 +56,220 @@ def _config(**media_overrides) -> dict:
 
 
 def _service(waker=None) -> MediaService:
-    return MediaService(_config(), cec_waker=waker or Mock(spec=CecWaker))
+    return MediaService(_config(), cec_waker=waker or _waker())
+
+
+def _waker(*, tv_answers=True) -> Mock:
+    """A CecWaker that answers like a paired, reachable television."""
+    waker = Mock(spec=CecWaker)
+    waker.available = True
+    waker.unavailable_reason = ""
+    waker.power_on_tv.return_value = tv_answers
+    waker.press_input_pair.return_value = WakeResult(True, "sent KEY_HDMI, KEY_HDMI")
+    waker.standby_tv.return_value = WakeResult(True, "sent KEY_POWEROFF")
+    waker.wake.return_value = WakeResult(True, "sent")
+    return waker
+
+
+def _on(active=True, power="on", stamp="2026-09-21 21:00:00") -> HdmiState:
+    return HdmiState(active, power, stamp)
 
 
 class TurnOnTests(unittest.TestCase):
-    def test_already_awake_sends_no_keyevent(self):
+    def test_already_awake_with_the_tv_on_sends_nothing(self):
         """The one-way door: a blind KEYCODE_POWER here turns the TV off."""
         svc = _service()
         with patch.object(svc, "is_awake", return_value=True):
-            with patch.object(svc, "_adb") as adb:
-                self.assertTrue(svc.turn_on())
+            with patch.object(svc, "hdmi_state", return_value=_on()):
+                with patch.object(svc, "_adb") as adb:
+                    self.assertTrue(svc.turn_on())
         adb.assert_not_called()
         svc.cec_waker.wake.assert_not_called()
+        svc.cec_waker.power_on_tv.assert_not_called()
+        svc.cec_waker.press_input_pair.assert_not_called()
+        self.assertIs(svc.last_wake_result.tv_confirmed, True)
+
+    def test_already_awake_but_the_tv_in_standby_powers_the_tv_without_touching_the_box(self):
+        """tv_only_standby leaves exactly this room: box up, television dark."""
+        svc = _service()
+        # Pre-check reads standby; the confirm loop reads standby once more (and
+        # sends the proven pair), then sees the set come on.
+        states = iter([_on(True, "standby"), _on(True, "standby"), _on(True, "on")])
+        with patch.object(svc, "is_awake", return_value=True):
+            with patch.object(svc, "hdmi_state", side_effect=lambda since=None: next(states)):
+                with patch.object(svc, "_adb", return_value=(True, "")) as adb:
+                    self.assertTrue(svc.turn_on())
+        adb.assert_not_called()
+        svc.cec_waker.power_on_tv.assert_called_once()
+        svc.cec_waker.press_input_pair.assert_called_once()
+        self.assertIs(svc.last_wake_result.tv_confirmed, True)
+
+    def test_already_awake_with_the_tv_on_another_input_selects_it_without_a_wake(self):
+        svc = _service()
+        with patch.object(svc, "is_awake", return_value=True):
+            with patch.object(svc, "hdmi_state", return_value=_on(False, "on")):
+                with patch.object(svc, "ensure_active_source", return_value=True) as select:
+                    self.assertTrue(svc.turn_on())
+        select.assert_called_once()
+        svc.cec_waker.power_on_tv.assert_not_called()
+        svc.cec_waker.press_input_pair.assert_not_called()
+        self.assertIs(svc.last_wake_result.tv_confirmed, True)
+
+    def test_already_awake_with_the_tv_on_and_the_input_unknown_guesses_nothing(self):
+        svc = _service()
+        with patch.object(svc, "is_awake", return_value=True):
+            with patch.object(svc, "hdmi_state", return_value=_on(None, "on")):
+                with patch.object(svc, "ensure_active_source") as select:
+                    self.assertTrue(svc.turn_on())
+        select.assert_not_called()
+        svc.cec_waker.press_input_pair.assert_not_called()
+        self.assertIsNone(svc.last_wake_result.tv_confirmed)
+
+    def test_a_dark_tv_under_an_awake_box_gets_the_pair_before_the_first_read(self):
+        """Nothing re-asks a TV's power once the box is awake; do not wait 12s to find that out."""
+        svc = _service()
+        reads = []
+        states = iter([_on(True, "standby"), _on(True, "on")])
+
+        def hdmi(since=None):
+            reads.append(len(svc.cec_waker.press_input_pair.call_args_list))
+            return next(states)
+
+        with patch.object(svc, "is_awake", return_value=True):
+            with patch.object(svc, "hdmi_state", side_effect=hdmi):
+                self.assertTrue(svc.turn_on())
+        # Pre-check read happened with no pair sent; the confirm read after one.
+        self.assertEqual(reads, [0, 1])
 
     def test_asleep_but_reachable_uses_wakeup_not_power(self):
         svc = _service()
-        with patch.object(svc, "is_awake", return_value=False):
-            with patch.object(svc, "_adb", return_value=(True, "")) as adb:
-                self.assertTrue(svc.turn_on())
-        command = adb.call_args[0][0]
-        self.assertIn("KEYCODE_WAKEUP", command)
-        self.assertNotIn("KEYCODE_POWER", command)
+        with patch.object(svc, "is_awake", side_effect=[False, True]):
+            with patch.object(svc, "hdmi_state", return_value=_on()):
+                with patch.object(svc, "_adb", return_value=(True, "")) as adb:
+                    self.assertTrue(svc.turn_on())
+        commands = [c[0][0] for c in adb.call_args_list]
+        self.assertEqual(len(commands), 1)
+        self.assertIn("KEYCODE_WAKEUP", commands[0])
+        self.assertNotIn("KEYCODE_POWER", commands[0])
         svc.cec_waker.wake.assert_not_called()
+        svc.cec_waker.power_on_tv.assert_called_once()
+        self.assertIs(svc.last_wake_result.tv_confirmed, True)
+
+    def test_the_box_and_tv_halves_run_concurrently(self):
+        """Serial execution would make the second arrival at the barrier wait forever."""
+        import threading
+        barrier = threading.Barrier(2, timeout=2)
+        svc = _service()
+
+        def box_half(*_):
+            barrier.wait()
+            return True
+
+        def tv_half(*_, **__):
+            barrier.wait()
+            return True
+
+        svc.cec_waker.power_on_tv.side_effect = tv_half
+        with patch.object(svc, "is_awake", return_value=False):
+            with patch.object(svc, "_send_wakeup", side_effect=box_half):
+                with patch.object(svc, "_wait_for_awake", return_value=True):
+                    with patch.object(svc, "hdmi_state", return_value=_on()):
+                        self.assertTrue(svc.turn_on())
+        self.assertFalse(barrier.broken)
+
+    def test_the_fast_path_fires_wakeup_and_wol_exactly_once(self):
+        svc = _service()
+        with patch.object(svc, "is_awake", side_effect=[False, True]):
+            with patch.object(svc, "_send_wakeup", return_value=True) as wakeup:
+                with patch.object(svc, "hdmi_state", return_value=_on()):
+                    self.assertTrue(svc.turn_on())
+        wakeup.assert_called_once()
+        svc.cec_waker.power_on_tv.assert_called_once()
+        svc.cec_waker.wake.assert_not_called()
+
+    def test_the_fast_path_never_sends_the_input_pair_unless_the_tv_reports_standby(self):
+        """The pair is not idempotent; a television that is on and showing us gets nothing."""
+        svc = _service()
+        with patch.object(svc, "is_awake", side_effect=[False, True]):
+            with patch.object(svc, "_send_wakeup", return_value=True):
+                with patch.object(svc, "hdmi_state", return_value=_on()):
+                    self.assertTrue(svc.turn_on())
+        svc.cec_waker.press_input_pair.assert_not_called()
+        svc.cec_waker.cycle_input.assert_not_called()
+
+    def test_a_tv_half_failure_does_not_fail_a_box_that_is_awake(self):
+        svc = _service(_waker(tv_answers=False))
+        with patch.object(svc, "is_awake", side_effect=[False, True]):
+            with patch.object(svc, "_send_wakeup", return_value=True):
+                with patch.object(svc, "hdmi_state", return_value=HdmiState(None, None)):
+                    self.assertTrue(svc.turn_on())
+        self.assertIs(svc.last_wake_result.ok, True)
+        self.assertIsNone(svc.last_wake_result.tv_confirmed)
+        self.assertIn("did not answer", svc.last_wake_result.detail)
+
+    def test_a_tv_half_exception_is_a_result_not_a_traceback(self):
+        svc = _service()
+        svc.cec_waker.power_on_tv.side_effect = OSError("no route to host")
+        with patch.object(svc, "is_awake", side_effect=[False, True]):
+            with patch.object(svc, "_send_wakeup", return_value=True):
+                with patch.object(svc, "hdmi_state", return_value=HdmiState(None, None)):
+                    self.assertTrue(svc.turn_on())
+        self.assertIn("no route to host", svc.last_wake_result.detail)
+
+    def test_a_box_that_will_not_wake_over_adb_falls_back_to_cec(self):
+        """adbd can suspend between the check and the key; the CEC chain is the answer then."""
+        svc = _service()
+        with patch.object(svc, "is_awake", return_value=False):
+            with patch.object(svc, "_send_wakeup", return_value=False):
+                with patch.object(svc, "_wake_and_wait", return_value=True) as chain:
+                    self.assertTrue(svc.turn_on())
+        chain.assert_called_once()
+
+    def test_a_rejected_token_during_input_selection_surfaces_needs_pairing(self):
+        svc = _service()
+        svc.cec_waker.press_input_pair.return_value = WakeResult(
+            False, "TV pairing token rejected", needs_pairing=True)
+        with patch.object(svc, "is_awake", side_effect=[False, True]):
+            with patch.object(svc, "_send_wakeup", return_value=True):
+                with patch.object(svc, "hdmi_state", return_value=_on(True, "standby")):
+                    self.assertTrue(svc.turn_on())
+        self.assertIs(svc.last_wake_result.needs_pairing, True)
+        self.assertIsNot(svc.last_wake_result.tv_confirmed, True)
+
+    def test_the_fast_path_never_shells_out_to_a_real_adb(self):
+        svc = _service()
+        with patch("services.media_service.subprocess.run", side_effect=AssertionError("real adb")):
+            with patch.object(svc, "is_awake", side_effect=[False, True]):
+                with patch.object(svc, "_send_wakeup", return_value=True):
+                    with patch.object(svc, "hdmi_state", return_value=_on()):
+                        self.assertTrue(svc.turn_on())
+
+    def test_the_fast_path_is_bounded_by_the_configured_timeouts(self):
+        svc = _service()
+        with patch.object(svc, "is_awake", side_effect=[False, True]):
+            with patch.object(svc, "_send_wakeup", return_value=True):
+                with patch.object(svc, "hdmi_state", return_value=_on()):
+                    svc.turn_on()
+        svc.cec_waker.power_on_tv.assert_called_once_with(timeout_s=svc.fast_wake_timeout_s)
+
+    def test_the_fast_path_ignores_tv_power_evidence_older_than_the_wake(self):
+        """
+        Measured 2026-09-21: the tail read "standby" long after the set was
+        switched back on by hand, because nothing re-asked. The awake path reads
+        the tail once, then hands its newest stamp to every later read.
+        """
+        svc = _service()
+        stamps = []
+
+        def hdmi(since=None):
+            stamps.append(since)
+            return _on(True, "on" if since else "standby", stamp="2026-09-21 21:00:05")
+
+        with patch.object(svc, "is_awake", return_value=True):
+            with patch.object(svc, "hdmi_state", side_effect=hdmi):
+                self.assertTrue(svc.turn_on())
+        self.assertEqual(stamps[0], None)
+        self.assertEqual(stamps[1], "2026-09-21 21:00:05")
 
     def test_unreachable_falls_back_to_cec(self):
         waker = Mock(spec=CecWaker)
@@ -128,6 +330,137 @@ class TurnOnTests(unittest.TestCase):
         self.assertEqual(seen, [0, 0], "cooldown was not cleared before each retry")
 
 
+class TvPowerEvidenceTests(unittest.TestCase):
+    """
+    Nothing asks the television for a power report once the box is awake, so
+    the parser must also read what an ON television volunteers: the
+    enumeration burst on its way up. Both fixtures are real dumps.
+    """
+
+    def _fixture(self, name):
+        with open(f"tests/fixtures/{name}", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_a_television_enumerating_the_bus_is_on(self):
+        dump = self._fixture("hdmi_control_tv_poweron_dump.txt")
+        # Last power report says standby (21:42:28); the TV then asks for
+        # physical addresses, OSD names and the CEC version -- it is on.
+        self.assertEqual(_parse_tv_power(dump), "on")
+
+    def test_evidence_at_or_before_since_is_ignored(self):
+        dump = self._fixture("hdmi_control_tv_poweron_dump.txt")
+        self.assertEqual(_parse_tv_power(dump, since="2026-09-21 21:42:28"), "on")
+        self.assertIsNone(_parse_tv_power(dump, since=_newest_cec_stamp(dump)))
+
+    def test_a_standby_broadcast_still_wins_when_it_is_last(self):
+        dump = self._fixture("hdmi_control_standby_dump.txt")
+        self.assertEqual(_parse_tv_power(dump), "standby")
+
+    def test_give_device_power_status_alone_is_not_evidence_of_on(self):
+        """A television in standby still polls power status (2026-09-21 21:42:25)."""
+        dump = (
+            "    [R] time=2026-09-21 21:42:24 message=<Standby> 0F:36\n"
+            "    [R] time=2026-09-21 21:42:25 message=<Give Device Power Status> 04:8F\n"
+        )
+        self.assertEqual(_parse_tv_power(dump), "standby")
+
+
+class ConfirmTvShowingBoxTests(unittest.TestCase):
+    """The CEC bus is the only honest witness of the television; read it, never assume it."""
+
+    def _svc(self, *states):
+        """hdmi_state answers the given states in order, then repeats the last one."""
+        svc = _service()
+        remaining = list(states)
+
+        def read(since=None):
+            if len(remaining) > 1:
+                return remaining.pop(0)
+            return remaining[0]
+
+        svc.hdmi_state = Mock(side_effect=read)
+        svc.ensure_active_source = Mock(return_value=True)
+        return svc
+
+    def test_tv_on_and_box_on_screen_confirms_on_the_first_read(self):
+        svc = self._svc(_on())
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc._confirm_tv_showing_box(1.0), True)
+        svc.ensure_active_source.assert_not_called()
+
+    def test_it_keeps_polling_until_the_tv_reports_on(self):
+        svc = self._svc(HdmiState(None, None), HdmiState(None, None), _on())
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc._confirm_tv_showing_box(5.0), True)
+        self.assertEqual(svc.hdmi_state.call_count, 3)
+
+    def test_an_unknown_active_source_never_switches_inputs(self):
+        svc = self._svc(*([HdmiState(None, "on")] * 10))
+        with patch("services.media_service.time.sleep"):
+            self.assertIsNone(svc._confirm_tv_showing_box(0.2))
+        svc.ensure_active_source.assert_not_called()
+        svc.cec_waker.press_input_pair.assert_not_called()
+
+    def test_a_parked_input_is_selected_once_the_tv_is_on(self):
+        svc = self._svc(_on(False, "on"))
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc._confirm_tv_showing_box(1.0), True)
+        svc.ensure_active_source.assert_called_once()
+
+    def test_a_parked_input_is_selected_once_at_the_deadline_when_tv_power_is_unknown(self):
+        svc = self._svc(*([HdmiState(False, None)] * 10))
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc._confirm_tv_showing_box(0.2), True)
+        svc.ensure_active_source.assert_called_once()
+
+    def test_a_tv_still_in_standby_at_the_deadline_is_false_not_none(self):
+        svc = self._svc(*([_on(True, "standby")] * 10))
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc._confirm_tv_showing_box(0.2), False)
+        # The proven pair is the one nudge that lifts a shallow-standby TV; once.
+        svc.cec_waker.press_input_pair.assert_called_once()
+
+    def test_an_input_that_cannot_be_selected_is_false(self):
+        svc = self._svc(_on(False, "on"))
+        svc.ensure_active_source.return_value = False
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc._confirm_tv_showing_box(1.0), False)
+
+    def test_the_confirm_loop_never_shells_out_to_a_real_adb(self):
+        svc = self._svc(_on())
+        with patch("services.media_service.subprocess.run", side_effect=AssertionError("real adb")):
+            with patch("services.media_service.time.sleep"):
+                self.assertIs(svc._confirm_tv_showing_box(1.0), True)
+
+
+class WaitForAwakeTests(unittest.TestCase):
+    def test_it_returns_the_moment_the_box_is_awake(self):
+        svc = _service()
+        with patch.object(svc, "is_awake", side_effect=[False, False, True]) as awake:
+            with patch("services.media_service.time.sleep"):
+                self.assertTrue(svc._wait_for_awake(5.0))
+        self.assertEqual(awake.call_count, 3)
+
+    def test_it_never_rediscovers_or_clears_cooldowns(self):
+        """Unlike _wait_for_box: the TV thread may be scanning, this one must not."""
+        svc = _service()
+        svc._last_discovery_t = 42.0
+        svc._last_fail_time = 7.0
+        svc._finder.resolve = Mock()
+        with patch.object(svc, "is_awake", return_value=False):
+            with patch("services.media_service.time.sleep"):
+                self.assertFalse(svc._wait_for_awake(0.05))
+        svc._finder.resolve.assert_not_called()
+        self.assertEqual(svc._last_discovery_t, 42.0)
+        self.assertEqual(svc._last_fail_time, 7.0)
+
+    def test_it_times_out_false(self):
+        svc = _service()
+        with patch.object(svc, "is_awake", return_value=False):
+            with patch("services.media_service.time.sleep"):
+                self.assertFalse(svc._wait_for_awake(0.05))
+
+
 class TurnOffTests(unittest.TestCase):
     def test_sends_sleep(self):
         svc = _service()
@@ -142,6 +475,45 @@ class TurnOffTests(unittest.TestCase):
             with patch.object(svc, "_adb") as adb:
                 self.assertTrue(svc.turn_off())
         adb.assert_not_called()
+
+    def _tv_only(self):
+        svc = MediaService(_config(power={"tv_only_standby": True}), cec_waker=_waker())
+        return svc
+
+    def test_tv_only_standby_never_sleeps_the_box(self):
+        svc = self._tv_only()
+        with patch.object(svc, "is_awake", return_value=True):
+            with patch.object(svc, "_adb", return_value=(True, "")) as adb:
+                self.assertTrue(svc.turn_off())
+        sent = " ".join(str(c[0][0]) for c in adb.call_args_list)
+        self.assertNotIn("KEYCODE_SLEEP", sent)
+        self.assertNotIn("KEYCODE_POWER", sent)
+        self.assertIn("KEYCODE_MEDIA_STOP", sent)
+        svc.cec_waker.standby_tv.assert_called_once()
+
+    def test_tv_only_standby_uses_the_discrete_key_never_a_toggle(self):
+        svc = self._tv_only()
+        with patch.object(svc, "is_awake", return_value=True):
+            with patch.object(svc, "_adb", return_value=(True, "")):
+                svc.turn_off()
+        svc.cec_waker.standby_tv.assert_called_once()
+        svc.cec_waker._send_keys.assert_not_called()
+
+    def test_tv_only_standby_reports_a_failed_tv_command(self):
+        svc = self._tv_only()
+        svc.cec_waker.standby_tv.return_value = WakeResult(False, "TV not reachable")
+        with patch.object(svc, "is_awake", return_value=True):
+            with patch.object(svc, "_adb", return_value=(True, "")):
+                self.assertFalse(svc.turn_off())
+
+    def test_the_default_turn_off_still_sleeps_the_box(self):
+        svc = _service()
+        self.assertFalse(svc.tv_only_standby)
+        with patch.object(svc, "is_awake", return_value=True):
+            with patch.object(svc, "_adb", return_value=(True, "")) as adb:
+                svc.turn_off()
+        self.assertIn("KEYCODE_SLEEP", adb.call_args[0][0])
+        svc.cec_waker.standby_tv.assert_not_called()
 
 
 class PowerToggleTests(unittest.TestCase):
@@ -166,15 +538,26 @@ class PowerToggleTests(unittest.TestCase):
         """Guard the regression directly, across every state."""
         for state in (True, False, None):
             with self.subTest(state=state):
-                waker = Mock(spec=CecWaker)
-                waker.wake.return_value = WakeResult(True, "sent")
-                svc = _service(waker)
+                svc = _service()
                 with patch.object(svc, "is_awake", return_value=state):
                     with patch.object(svc, "ensure_connected", return_value=True):
-                        with patch.object(svc, "_adb", return_value=(True, "")) as adb:
-                            svc.power_toggle()
+                        with patch.object(svc, "hdmi_state", return_value=_on(True, "standby")):
+                            with patch.object(svc, "_adb", return_value=(True, "")) as adb:
+                                svc.power_toggle()
                 sent = " ".join(str(c[0][0]) for c in adb.call_args_list)
                 self.assertNotIn("KEYCODE_POWER", sent)
+
+    def test_keycode_sleep_is_never_sent_by_turn_on(self):
+        for state in (True, False, None):
+            with self.subTest(state=state):
+                svc = _service()
+                with patch.object(svc, "is_awake", return_value=state):
+                    with patch.object(svc, "ensure_connected", return_value=True):
+                        with patch.object(svc, "hdmi_state", return_value=_on(True, "standby")):
+                            with patch.object(svc, "_adb", return_value=(True, "")) as adb:
+                                svc.turn_on()
+                sent = " ".join(str(c[0][0]) for c in adb.call_args_list)
+                self.assertNotIn("KEYCODE_SLEEP", sent)
 
 
 class IsAwakeTests(unittest.TestCase):
@@ -236,6 +619,41 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("approved on screen", reply)
         self.assertNotIn("remote", reply)
 
+    def test_a_box_up_with_the_tv_unconfirmed_is_said_plainly(self):
+        media = Mock()
+        media.turn_on.return_value = True
+        media.last_wake_result = WakeResult(True, "box awake; TV unconfirmed", tv_confirmed=None)
+        reply = self._dispatch("turn_on", media)
+        self.assertIn("box is on", reply)
+        self.assertNotIn("remote", reply)
+
+    def test_a_box_up_but_the_tv_on_another_input_sends_him_to_the_remote(self):
+        media = Mock()
+        media.turn_on.return_value = True
+        media.last_wake_result = WakeResult(True, "TV not showing it", tv_confirmed=False)
+        reply = self._dispatch("turn_on", media)
+        self.assertIn("remote", reply)
+
+    def test_a_box_up_but_pairing_rejected_says_approve_me_on_screen(self):
+        media = Mock()
+        media.turn_on.return_value = True
+        media.last_wake_result = WakeResult(True, "token rejected", needs_pairing=True, tv_confirmed=None)
+        reply = self._dispatch("turn_on", media)
+        self.assertIn("approved on screen", reply)
+        self.assertNotIn("remote", reply)
+
+    def test_a_bare_mock_result_still_reads_as_tv_is_on(self):
+        """Identity comparisons: a Mock attribute is truthy but is neither False nor None."""
+        media = Mock()
+        media.turn_on.return_value = True
+        self.assertEqual(self._dispatch("turn_on", media), "TV is on")
+
+    def test_tv_only_standby_is_said_as_such(self):
+        media = Mock()
+        media.turn_off.return_value = True
+        media.tv_only_standby = True
+        self.assertIn("box stays up", self._dispatch("turn_off", media))
+
     def test_switch_hdmi_routes_with_the_port(self):
         media = Mock()
         media.switch_hdmi.return_value = WakeResult(True, "ok")
@@ -270,9 +688,14 @@ class EnsurePlayableTests(unittest.TestCase):
     to call turn_on and re-issue the action. One tool call, one outcome.
     """
 
-    def _media(self, *, reachable=True, active_source=True):
+    def _media(self, *, reachable=True, active_source=True, awake=None, tv_power="on"):
         media = Mock()
         media.ensure_connected.return_value = reachable
+        # Explicit, because a bare Mock's is_awake() is neither True nor None
+        # and the gate compares by identity: a forgotten value here would send
+        # every test down the wake path and still pass.
+        media.is_awake.return_value = awake if awake is not None else (True if reachable else None)
+        media.hdmi_state.return_value = HdmiState(active_source, tv_power)
         # The verified selector; MediaService owns the retry/cycle loop, and
         # EnsureActiveSourceTests covers it. Here we only care what the
         # dispatcher does with each answer.
@@ -281,6 +704,44 @@ class EnsurePlayableTests(unittest.TestCase):
         media.unreachable_reason = ""
         media.last_wake_result = None
         return media
+
+    def test_a_reachable_but_sleeping_box_is_woken_not_played_into(self):
+        """Shallow standby is reachable; a deep link now lands on a black screen."""
+        media = self._media(reachable=True, awake=False)
+        media.turn_on.return_value = True
+        media.last_wake_result = WakeResult(True, "fast", tv_confirmed=True)
+        self.assertEqual(_ensure_playable(media), "")
+        media.turn_on.assert_called_once()
+
+    def test_a_reachable_box_with_the_tv_in_standby_powers_the_tv(self):
+        media = self._media(awake=True, tv_power="standby")
+        media.turn_on.return_value = True
+        media.last_wake_result = WakeResult(True, "fast", tv_confirmed=True)
+        self.assertEqual(_ensure_playable(media), "")
+        media.turn_on.assert_called_once()
+
+    def test_an_unknown_tv_power_still_proceeds(self):
+        media = self._media(awake=True, tv_power=None)
+        self.assertEqual(_ensure_playable(media), "")
+        media.turn_on.assert_not_called()
+
+    def test_a_wake_with_the_tv_unconfirmed_still_plays(self):
+        media = self._media(reachable=True, awake=False)
+        media.turn_on.return_value = True
+        media.last_wake_result = WakeResult(True, "unconfirmed", tv_confirmed=None)
+        self.assertEqual(_ensure_playable(media), "")
+
+    def test_a_wake_whose_tv_refused_its_input_says_so(self):
+        media = self._media(reachable=True, awake=False)
+        media.turn_on.return_value = True
+        media.last_wake_result = WakeResult(True, "TV on HDMI 1", tv_confirmed=False)
+        self.assertIn("remote", _ensure_playable(media))
+
+    def test_a_wake_whose_tv_rejected_the_token_says_approve_me(self):
+        media = self._media(reachable=True, awake=False)
+        media.turn_on.return_value = True
+        media.last_wake_result = WakeResult(True, "rejected", needs_pairing=True)
+        self.assertIn("Approve me on screen", _ensure_playable(media))
 
     def test_a_ready_room_is_left_alone(self):
         media = self._media()
@@ -314,7 +775,7 @@ class EnsurePlayableTests(unittest.TestCase):
 
     def test_a_sleeping_room_is_woken_and_then_used(self):
         media = self._media(reachable=False)
-        media.ensure_connected.side_effect = [False, True]
+        media.ensure_connected.return_value = True  # back on the LAN after the wake
         media.turn_on.return_value = True
         self.assertEqual(_ensure_playable(media), "")
         media.turn_on.assert_called_once()
@@ -322,7 +783,7 @@ class EnsurePlayableTests(unittest.TestCase):
     def test_the_wake_is_announced_before_it_blocks(self):
         """A ~25s tool call that says nothing reads as a hang."""
         media = self._media(reachable=False)
-        media.ensure_connected.side_effect = [False, True]
+        media.ensure_connected.return_value = True
         media.turn_on.return_value = True
         spoken = []
         _ensure_playable(media, say_now=spoken.append)
@@ -575,6 +1036,43 @@ class CecWakerTests(_NoNetworkScanMixin, unittest.TestCase):
                 result = waker.wake()
         self.assertFalse(result)
         self.assertFalse(result.needs_pairing)
+
+
+class CecWakerFastPathTests(_NoNetworkScanMixin, unittest.TestCase):
+    def test_power_on_tv_honours_a_caller_timeout(self):
+        """The fast path passes its own budget; the default stays tv_boot_timeout."""
+        waker = CecWaker(_cec_config(wol_attempts=2, tv_boot_timeout_ms=100000))
+        waker._probe = Mock(return_value=False)
+        waker._send_wol = Mock()
+        clock = iter(range(0, 10000))
+        with patch("services.cec_wake.time.monotonic", side_effect=lambda: next(clock)):
+            with patch("services.cec_wake.time.sleep"):
+                self.assertFalse(waker.power_on_tv(timeout_s=4))
+        # 2 attempts x (4s / 2) = a handful of polls, not 100 seconds' worth.
+        self.assertLess(waker._probe.call_count, 20)
+
+    def test_press_input_pair_sends_the_proven_pair_and_nothing_else(self):
+        waker = CecWaker(_cec_config())
+        waker._probe = Mock(return_value=True)
+        waker._send_keys = Mock(return_value=WakeResult(True, "sent"))
+        self.assertTrue(waker.press_input_pair())
+        waker._send_keys.assert_called_once_with(["KEY_HDMI", "KEY_HDMI"])
+
+    def test_standby_tv_uses_a_discrete_key_never_a_toggle(self):
+        waker = CecWaker(_cec_config())
+        waker._probe = Mock(return_value=True)
+        waker._send_keys = Mock(return_value=WakeResult(True, "sent"))
+        self.assertTrue(waker.standby_tv())
+        keys = waker._send_keys.call_args[0][0]
+        self.assertEqual(keys, ["KEY_POWEROFF"])
+        self.assertNotIn("KEY_POWER", keys)
+
+    def test_a_disabled_waker_answers_the_new_calls_without_touching_the_network(self):
+        waker = CecWaker(_cec_config(enabled=False))
+        waker._send_keys = Mock()
+        self.assertFalse(waker.press_input_pair())
+        self.assertFalse(waker.standby_tv())
+        waker._send_keys.assert_not_called()
 
 
 class TvDiscoveryTests(_NoNetworkScanMixin, unittest.TestCase):

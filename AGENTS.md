@@ -1238,7 +1238,7 @@ Recommended behavior:
 
 ### Operational Recommendation
 
-For the Mi Box itself, **Wakelock Revamp** is a good deployment-side addition to reduce suspend and sleep issues that can break ADB reliability over time. That is an environment recommendation, not a code dependency.
+A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby` plus `hdmi_control_auto_device_off_enabled=0` on the box — see CLAUDE.md "Standby depth".
 
 ### Final VPN Routing Rules
 

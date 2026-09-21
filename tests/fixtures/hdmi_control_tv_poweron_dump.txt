@@ -1,0 +1,112 @@
+mProhibitMode: false
+mPowerStatus: 0
+System_settings:
+  mHdmiControlEnabled: true
+  mMhlInputChangeEnabled: true
+  mSystemAudioActivated: false
+  mHdmiCecVolumeControlEnabled true
+mMhlController: 
+mPortInfo:
+  port_id: 0, type: HDMI_OUT, address: 0x2000, cec: true, arc: true, mhl: false
+mCecController: 
+  HdmiCecLocalDevice #4:
+    mDeviceType: 4
+    mAddress: 4
+    mPreferredAddress: 4
+    mDeviceInfo: CEC: logical_address: 0x04 device_type: 4 vendor_id: 0x00EC0A display_name: Xiaomi TV Box power_status: 0 physical_address: 0x2000 port_id: 0
+    mActiveSource: (0x04, 0x2000)
+    mActiveRoutingPath: 0x0000
+    mRoutingControlFeatureEnabled: true
+    mIsActiveSource: true
+    mAutoTvOff:true
+    mOneTouchPlayEnabed:true
+    mAutoLanguageChange:false
+  CEC message history:
+    [S] time=2024-08-13 02:47:26 message=<Give Device Power Status> 40:8F
+    [S] time=2024-08-13 02:47:26 message=<Report Physical Address> 4F:84:20:00:04
+    [S] time=2024-08-13 02:47:26 message=<Device Vendor Id> 4F:87:00:EC:0A
+    [S] time=2024-08-13 02:47:26 message=<Give Device Vendor Id> 40:8C
+    [S] time=2024-08-13 02:47:26 message=<Set Osd Name> 40:47 <Redacted len=13>
+    [S] time=2024-08-13 02:47:26 message=<Give System Audio Mode Status> 45:7D
+    [S] time=2024-08-13 02:47:26 message=<Text View On> 40:0D
+    [S] time=2024-08-13 02:47:26 message=<Active Source> 4F:82:20:00
+    [S] time=2024-08-13 02:47:26 message=<Menu Status> 40:8E:00
+    [S] time=2024-08-13 02:47:26 message=<Give Device Power Status> 40:8F
+    [S] time=2024-08-13 02:47:26 message=<Text View On> 40:0D
+    [S] time=2024-08-13 02:47:26 message=<Active Source> 4F:82:20:00
+    [S] time=2024-08-13 02:47:26 message=<Menu Status> 40:8E:00
+    [S] time=2024-08-13 02:47:26 message=<Give Device Power Status> 40:8F
+    [R] time=2024-08-13 02:47:27 message=<Report Power Status> 04:90:00
+    [R] time=2024-08-13 02:47:27 message=<Device Vendor Id> 0F:87:00:00:F0
+    [R] time=2024-08-13 02:47:28 message=<Report Power Status> 04:90:00
+    [S] time=2024-08-13 02:47:28 message=<Feature Abort> 40:00:90:00
+    [R] time=2024-08-13 02:47:28 message=<Report Power Status> 04:90:00
+    [S] time=2024-08-13 02:47:28 message=<Feature Abort> 40:00:90:00
+    [R] time=2026-09-21 21:38:28 message=<Give Device Power Status> 04:8F
+    [S] time=2026-09-21 21:38:28 message=<Report Power Status> 40:90:00
+    [S] time=2026-09-21 21:38:28 message=<InActive Source> 40:9D:20:00
+    [S] time=2026-09-21 21:38:28 message=<Standby> 40:36
+    [R] time=2026-09-21 21:38:55 message=<Report Physical Address> 3F:84:10:00:03
+    [S] time=2026-09-21 21:38:55 message=<Give Device Power Status> 40:8F
+    [S] time=2026-09-21 21:38:55 message=<Report Physical Address> 4F:84:20:00:04
+    [S] time=2026-09-21 21:38:55 message=<Device Vendor Id> 4F:87:00:EC:0A
+    [S] time=2026-09-21 21:38:55 message=<Give Device Vendor Id> 40:8C
+    [S] time=2026-09-21 21:38:55 message=<Set Osd Name> 40:47 <Redacted len=13>
+    [S] time=2026-09-21 21:38:55 message=<Give System Audio Mode Status> 45:7D
+    [S] time=2026-09-21 21:38:55 message=<Text View On> 40:0D
+    [S] time=2026-09-21 21:38:55 message=<Active Source> 4F:82:20:00
+    [S] time=2026-09-21 21:38:55 message=<Menu Status> 40:8E:00
+    [S] time=2026-09-21 21:38:55 message=<Give Device Power Status> 40:8F
+    [R] time=2026-09-21 21:38:56 message=<Report Power Status> 04:90:00
+    [R] time=2026-09-21 21:38:57 message=<Device Vendor Id> 0F:87:00:00:F0
+    [R] time=2026-09-21 21:38:58 message=<Give Deck Status> 04:1A:01
+    [S] time=2026-09-21 21:38:58 message=<Feature Abort> 40:00:1A:00
+    [R] time=2026-09-21 21:38:58 message=<Report Power Status> 04:90:00
+    [S] time=2026-09-21 21:38:58 message=<Feature Abort> 40:00:90:00
+    [R] time=2026-09-21 21:39:11 message=<Report Physical Address> 3F:84:10:00:03
+    [R] time=2026-09-21 21:39:21 message=<Give Device Vendor Id> 04:8C
+    [S] time=2026-09-21 21:39:21 message=<Device Vendor Id> 4F:87:00:EC:0A
+    [R] time=2026-09-21 21:39:22 message=<Give Device Power Status> 04:8F
+    [S] time=2026-09-21 21:39:22 message=<Report Power Status> 40:90:00
+    [R] time=2026-09-21 21:39:22 message=<Give Physical Address> 04:83
+    [S] time=2026-09-21 21:39:22 message=<Report Physical Address> 4F:84:20:00:04
+    [R] time=2026-09-21 21:39:22 message=<Vendor Command With Id> 04:A0 <Redacted len=4>
+    [S] time=2026-09-21 21:39:22 message=<Feature Abort> 40:00:A0:00
+    [R] time=2026-09-21 21:39:27 message=<Get Cec Version> 04:9F
+    [S] time=2026-09-21 21:39:27 message=<Cec Version> 40:9E:05
+    [S] time=2026-09-21 21:42:24 message=<InActive Source> 40:9D:20:00
+    [S] time=2026-09-21 21:42:24 message=<Standby> 40:36
+    [R] time=2026-09-21 21:42:25 message=<Give Device Power Status> 04:8F
+    [S] time=2026-09-21 21:42:25 message=<Report Power Status> 40:90:01
+    [S] time=2026-09-21 21:42:26 message=<Give Device Power Status> 40:8F
+    [S] time=2026-09-21 21:42:26 message=<Report Physical Address> 4F:84:20:00:04
+    [S] time=2026-09-21 21:42:26 message=<Device Vendor Id> 4F:87:00:EC:0A
+    [S] time=2026-09-21 21:42:26 message=<Give Device Vendor Id> 40:8C
+    [S] time=2026-09-21 21:42:26 message=<Set Osd Name> 40:47 <Redacted len=13>
+    [S] time=2026-09-21 21:42:26 message=<Give System Audio Mode Status> 45:7D
+    [S] time=2026-09-21 21:42:26 message=<Text View On> 40:0D
+    [S] time=2026-09-21 21:42:26 message=<Active Source> 4F:82:20:00
+    [S] time=2026-09-21 21:42:26 message=<Menu Status> 40:8E:00
+    [S] time=2026-09-21 21:42:26 message=<Give Device Power Status> 40:8F
+    [R] time=2026-09-21 21:42:27 message=<Report Power Status> 04:90:01
+    [R] time=2026-09-21 21:42:27 message=<Device Vendor Id> 0F:87:00:00:F0
+    [R] time=2026-09-21 21:42:28 message=<Report Power Status> 04:90:01
+    [R] time=2026-09-21 21:42:29 message=<Give Deck Status> 04:1A:01
+    [S] time=2026-09-21 21:42:29 message=<Feature Abort> 40:00:1A:00
+    [R] time=2026-09-21 21:42:29 message=<Give Device Vendor Id> 04:8C
+    [S] time=2026-09-21 21:42:29 message=<Device Vendor Id> 4F:87:00:EC:0A
+    [R] time=2026-09-21 21:42:29 message=<Give Device Power Status> 04:8F
+    [S] time=2026-09-21 21:42:29 message=<Report Power Status> 40:90:00
+    [R] time=2026-09-21 21:42:29 message=<Give Physical Address> 04:83
+    [S] time=2026-09-21 21:42:29 message=<Report Physical Address> 4F:84:20:00:04
+    [R] time=2026-09-21 21:42:30 message=<Give Physical Address> 04:83
+    [S] time=2026-09-21 21:42:30 message=<Report Physical Address> 4F:84:20:00:04
+    [R] time=2026-09-21 21:42:30 message=<Give Osd Name> 04:46
+    [S] time=2026-09-21 21:42:30 message=<Set Osd Name> 40:47 <Redacted len=13>
+    [R] time=2026-09-21 21:42:31 message=<Give Osd Name> 04:46
+    [S] time=2026-09-21 21:42:31 message=<Set Osd Name> 40:47 <Redacted len=13>
+    [R] time=2026-09-21 21:42:31 message=<Vendor Command With Id> 04:A0 <Redacted len=4>
+    [S] time=2026-09-21 21:42:31 message=<Feature Abort> 40:00:A0:00
+    [R] time=2026-09-21 21:42:36 message=<Get Cec Version> 04:9F
+    [S] time=2026-09-21 21:42:36 message=<Cec Version> 40:9E:05
+    [R] time=2026-09-21 21:42:46 message=<Report Physical Address> 3F:84:10:00:03

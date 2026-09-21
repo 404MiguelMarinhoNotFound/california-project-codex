@@ -204,8 +204,6 @@ california/
 ├── services/
 │   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
 │   ├── cec_wake.py              # Wake the box via the TV over HDMI-CEC; ADB cannot turn it on
-│   ├── bt_wake.py               # UNVERIFIED alt wake candidate: pages the box's own BT radio via bluetoothctl, Linux only
-│   ├── esp32_bt_wake.py         # UNVERIFIED alt wake candidate: HTTP-triggers an ESP32 emulating a bonded remote
 │   ├── device_finder.py         # Shared find-by-MAC / verify-by-identity / cache-the-IP ladder
 │   ├── llm.py                   # Multi-provider LLM streaming + tool calling
 │   ├── deebot_service.py        # Deebot N8+ vacuum: REST-only, auth-first, cached-id-then-live rooms
@@ -239,6 +237,7 @@ california/
 │   ├── probe_deebot_devices.py     # Lists the Ecovacs account's robots and whether deebot-client supports them
 │   ├── probe_deebot_rooms.py       # Live room id -> name; prints the deebot.rooms block; --check flags drift
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
+│   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
 │   ├── probe_stremio_sync.py       # Refreshes and inspects Stremio watch-state cache
@@ -255,8 +254,7 @@ california/
 │   ├── test_deebot_service.py   # Vacuum self-disable, room fallback, auth-first retry-once, no-network guard
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
 │   ├── test_device_discovery.py # DeviceFinder ladder, cache, ARP parsing; no-network guard
-│   ├── test_media_power.py      # turn_on/turn_off, no blind KEYCODE_POWER (this file's "BT wake fallback" description was stale -- see test_bt_wake.py, 2026-09-16)
-│   ├── test_bt_wake.py          # Self-disable contract for the two unverified alt wake candidates
+│   ├── test_media_power.py      # turn_on/turn_off: fast path, CEC-bus confirm, deep-standby fallback, no blind KEYCODE_POWER
 │   ├── test_media_service.py    # YouTube / ADB unit tests
 │   ├── test_mic_drain.py        # Stale mic-buffer draining after playback
 │   ├── test_speaker_session.py  # Per-turn OutputStream: block writes, stop-within-a-block, reopen after abort, tail on close
@@ -660,11 +658,18 @@ or "stop".
 - YouTube playlist and search deep links
 - YouTube warm launch plus one OK press to clear the profile picker on cold starts
 
-### Power: Off Is ADB, On Is The Television
+### Power: Off Is ADB, On Depends On How Deep The Box Went
 
 **Turning the box off and turning it on are not symmetric.** Off is one ADB
-keyevent. On goes through the TV, because the Mi Box suspends in standby and
-`adbd` suspends with it. Measured on the real box 2026-09-03:
+keyevent. On depends on standby depth: while the box is still on the LAN
+(shallow standby, or awake under a dark television) `KEYCODE_WAKEUP` and the
+television's own power-on run side by side and the CEC bus confirms the
+result, ~10-15s; once it has suspended, only the TV can reach it, over CEC.
+The Mi Box goes to sleep on `KEYCODE_SLEEP` and its firmware **force-suspends
+~15s later regardless of any wakelock** (`PowerManagerService: force-suspend
+now`, listing the wakelocks it ignores — measured 2026-09-21, which is why every
+"keep it awake" setting and the wakelock-app idea fail). Once suspended,
+`adbd` goes with it. Measured on the real box 2026-09-03:
 
 ```text
 adb shell input keyevent KEYCODE_SLEEP   -> ok, mWakefulness=Asleep
@@ -701,36 +706,10 @@ code, not whatever test result (if any) led to dropping it. The commit
 message says CEC was "proven end-to-end on real hardware"; it does not say
 Bluetooth was tried and failed. Read no more into the removal than that.
 
-**Rebuilt from scratch 2026-09-16, both still unverified, both off by
-default:**
-
-- `services/bt_wake.py` ports [MiPower](https://github.com/DenizOner/MiPower)
-  (MIT) almost verbatim: spawn `bluetoothctl`, `scan on` until the box's own
-  radio address appears, `scan off`, then `pair <mac>` on a loop — the page
-  itself is the wake signal, whether or not pairing completes. Needs BlueZ +
-  a real Bluetooth adapter, so Linux only (the Pi's onboard radio, or a
-  genuine USB BT dongle — **not** a proprietary 2.4GHz mouse/keyboard
-  receiver like a Logitech Unifying dongle; confirmed on this laptop
-  2026-09-16, `VID_046D&PID_C534` never appears as a Bluetooth adapter at
-  all). `media.bt_wake.enabled: false`.
-- `services/esp32_bt_wake.py` + `hardware/esp32_bt_wake/` is a different
-  mechanism: an ESP32 running
-  [shammysha/esphome-ble-mi-remote](https://github.com/shammysha/esphome-ble-mi-remote)
-  bonds as a second remote through Android's own Bluetooth settings, then
-  its `ble_mi_remote.connect_wake` action sends the same class of directed
-  BLE advertising a real remote sends on reconnect. Triggered over plain
-  HTTP (`web_server:` → `POST /button/wake_mi_box/press`), no new Python
-  dependency. `media.esp32_wake.enabled: false`. See
-  `hardware/esp32_bt_wake/README.md` for the comparison and setup.
-
-Both are tried, in that order, ahead of the CEC chain in
-`MediaService._wake_and_wait`, and both cost nothing while disabled — see
-that method's docstring.
-
 **Hardware-tested 2026-09-18 — read `research/xiaomi-wake-windows-2026-09-18.md`
 before touching any of this again.** Neither `services/bt_wake.py` nor
-`services/esp32_bt_wake.py` exists on `master` (the `config.yaml` keys are
-orphans; `_wake_and_wait` goes straight to CEC). The Win32
+`services/esp32_bt_wake.py` ever existed on `master`; their orphan `config.yaml`
+keys were removed 2026-09-21 and `_wake_and_wait` goes straight to CEC. The Win32
 `BluetoothAuthenticateDeviceEx` page *does* reach the box, so "never
 discoverable" above overstates it — but the box's firmware drops the incoming
 pairing before Android's consent dialog, and standby wake is gated anyway by
@@ -746,7 +725,32 @@ on it.
 
 #### What works
 
-`services/cec_wake.py`, two steps:
+**The fast path** (`MediaService._turn_on_fast`, 2026-09-21), for a box that
+is still on the LAN. Two halves on a two-thread pool, then a confirm loop:
+
+1. **Box half:** `KEYCODE_WAKEUP`, then `_wait_for_awake` polls `is_awake()`
+   until `True`. It never rediscovers and never clears the cooldowns — a miss
+   means the box went deep between the check and the key, and that is the CEC
+   chain's job, so `_turn_on_fast` falls through to `_wake_and_wait`.
+2. **TV half:** `cec_waker.power_on_tv(timeout_s=…)` — Wake-on-LAN and wait
+   for REST. Touches only the waker, never `_adb` or `self.ip`, so the two
+   halves need no lock. Every exception becomes a `WakeResult`.
+3. **Confirm on the CEC bus:** `_confirm_tv_showing_box` polls `hdmi_state()`
+   until `tv_power == "on"` and the box is the active source. The input is
+   selected only on a definitive `active_source is False`, never on `None`. If
+   the bus says the TV is still in **standby**, the proven `KEY_HDMI` pair is
+   sent once (`CecWaker.press_input_pair`) — **WoL does not lift a television
+   out of shallow standby**; the box's own `<Text View On>` + `<Active Source>`
+   or that pair does. Only evidence stamped **after the wake started** counts
+   (`_parse_tv_power(..., since=)`), because the tail read "standby" for good
+   after the set was switched back on by hand (2026-09-21).
+
+`turn_on()` returns "the box is awake". The television is a separate claim in
+`last_wake_result.tv_confirmed`: `True`, `False` (still dark, or on another
+input), `None` (could not tell). `_dispatch_tv` and `_ensure_playable` read it
+by identity and say different things for each; they never truthiness-test it.
+
+**The deep-standby fallback** — `services/cec_wake.py`, two steps:
 
 1. **Wake-on-LAN the Samsung TV.** Needs no IP and no token — it is a MAC
    broadcast — which is what makes the whole chain recoverable. Took 2 attempts
@@ -786,12 +790,27 @@ exactly that, three times, during this work. `MediaService` is now state-aware:
 
 | `is_awake()` | meaning | `turn_on()` does |
 |---|---|---|
-| `True` | awake | nothing — returns success |
-| `False` | asleep, radio up | `KEYCODE_WAKEUP` |
-| `None` | unreachable | CEC wake through the TV, then wait |
+| `True` | awake | one `hdmi_state()`; nothing if the TV is on and showing the box, else the TV half + confirm |
+| `False` | asleep, radio up | fast path: `KEYCODE_WAKEUP` ∥ WoL, then confirm on the CEC bus |
+| `None` | unreachable | CEC wake through the TV, then wait (~52s) |
 
 `None` and `False` take different branches. **Do not collapse them into a
 boolean** — that is the whole wake path.
+
+#### Standby depth: what keeps the fast path available
+
+The box never sleeps on its own (`stay_on_while_plugged_in=3`, `sleep_timeout=-1`,
+screensaver after 10 min). It sleeps on `KEYCODE_SLEEP` (our `turn_off`) or when
+the television enters standby with `hdmi_control_auto_device_off_enabled=1`;
+either way it force-suspends ~15s later and the next wake costs ~30s of resume.
+`media.power.tv_only_standby` makes `turn_off` put only the television into
+standby (`KEY_POWEROFF`, a discrete key, never a toggle), stop playback and park
+on Home, so the box stays awake and the next `turn_on` is the fast path. It
+needs `adb shell settings put global hdmi_control_auto_device_off_enabled 0` on
+the box first. **Off by default until `tools/bench_tv_power.py soak` has shown
+it holds** — the soak on 2026-09-21 was cut short because someone was watching.
+Measure with `bench otp` (does the box's own wake bring the TV on?), `bench
+soak` (how long does it stay reachable?) and `bench wake --via-turn-on`.
 
 **The power actions are deliberately absent from `_dispatch_tv`'s `requires_tv`
 set.** That gate returns `"TV is off or unreachable right now"` when
@@ -1453,7 +1472,7 @@ Recommended behavior:
 
 ### Operational Recommendation
 
-For the Mi Box itself, **Wakelock Revamp** is a good deployment-side addition to reduce suspend and sleep issues that can break ADB reliability over time. That is an environment recommendation, not a code dependency.
+A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby` plus `hdmi_control_auto_device_off_enabled=0` on the box — see "Standby depth" above.
 
 ### Final VPN Routing Rules
 
@@ -1601,8 +1620,8 @@ said not to: "The set exposes no PowerState field at all... What we must NOT do
 is treat the answer as 'powered on'." `_tv_is_up` verifies an *address*. It is
 not, and can never be made into, a power check.
 
-`MediaService.tv_power_status()` is the real oracle, and it reads **two kinds of
-evidence, whichever came last**:
+`MediaService.tv_power_status()` is the real oracle, and it reads **three kinds
+of evidence, whichever came last**:
 
 - `<Report Power Status>` is an **answer**. The only thing that asks is the
   box's own wake sequence -- in `tests/fixtures/hdmi_control_dump.txt` every one
@@ -1615,6 +1634,20 @@ evidence, whichever came last**:
   (`tests/fixtures/hdmi_control_standby_dump.txt`). This is the only thing that
   makes "he turned it off himself" observable, and without it that capture reads
   as `on` from four hours earlier with three `<Standby>` broadcasts after it.
+
+- Enumeration and routing traffic from the TV (`<Give Physical Address>`,
+  `<Give Osd Name>`, `<Get Cec Version>`, `<Give Deck Status>`, `<Set Stream
+  Path>`, `<Routing Change>`, `<Request Active Source>`) is **volunteered by a
+  set that is on**. In standby this set sends only `<Give Device Power Status>`
+  and `<Standby>`, so those two stay out of the list. Added 2026-09-21 because
+  after the television was switched back on by hand the tail read "standby"
+  for good -- nothing re-asks once the box is awake -- and the fast wake needs
+  to see the set come up under an awake box
+  (`tests/fixtures/hdmi_control_tv_poweron_dump.txt`).
+
+`_parse_tv_power(dump, since=)` ignores evidence stamped at or before `since`;
+the fast path passes the stamp it read before acting so nothing older can pose
+as the answer to this wake.
 
 `[S]` is the box talking, never the television -- counting our own `<Standby>`
 or `<Report Power Status>` reports the box's state as the TV's.
@@ -1931,11 +1964,18 @@ Current automated coverage exists for:
   still booting and accepts an unreadable flag, that the check short-circuits
   while the box is unreachable, and that the loop never shells out to a real
   adb
-- Power: that `KEYCODE_POWER` is never sent in any state, that `turn_on`
-  is a no-op when already awake, that unreachable falls back to Bluetooth,
-  that `is_awake()` keeps `None` distinct from `False`, that the wait loop
-  clears the offline cooldown, and that `turn_on` survives the
-  `requires_tv` gate while the TV is unreachable
+- Power: that `KEYCODE_POWER` is never sent in any state and `KEYCODE_SLEEP`
+  never by `turn_on`, that an awake box under an on television gets nothing,
+  that the fast path fires `KEYCODE_WAKEUP` and WoL once each and concurrently
+  (a barrier test), that a TV-half failure or exception never fails a box that
+  is awake, that a box that will not wake over ADB falls back to CEC, that the
+  confirm loop never switches inputs on an unknown active source and sends the
+  `KEY_HDMI` pair only when the bus says standby, that evidence older than the
+  wake is ignored, that `_wait_for_awake` never rediscovers, that
+  `tv_only_standby` never sleeps the box and never sends a toggle, that
+  `is_awake()` keeps `None` distinct from `False`, that the wait loop clears
+  the offline cooldown, and that `turn_on` survives the `requires_tv` gate
+  while the TV is unreachable
 - CEC wake: self-disabling without `tv_mac`/`tv_duid`, WoL skipped when the TV
   already answers and retried when it does not, the input key sent exactly twice,
   and an auth failure flagged `needs_pairing` while other failures are not
@@ -2063,6 +2103,12 @@ Current automated coverage exists for:
   in history
 
 Useful live-debug commands:
+
+```bash
+uv run python tools/bench_tv_power.py otp                 # box asleep-but-reachable: does its own wake bring the TV on?
+uv run python tools/bench_tv_power.py soak --minutes 60   # how long after turn_off does the box stay on the LAN?
+uv run python tools/bench_tv_power.py wake --runs 3 --via-turn-on
+```
 
 ```bash
 uv run python tools\debug_surfshark_sequence.py restart_autoconnect --capture --debug
@@ -2340,6 +2386,17 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 A trace of notable multi-turn Claude Code sessions, so a future session (or
 Master Miguel) can find the conversation that produced a feature instead of
 just the commits.
+
+- **"1 minute really is unacceptable" (2026-09-21, branch `feat/fast-tv-wake`).**
+  After the Bluetooth route was ruled out (PR #33), rebuilt `turn_on` around
+  the fact that a box still on the LAN wakes in 1.3s: box half and TV half on
+  a thread pool, then a CEC-bus confirm with `tv_confirmed` carried on
+  `WakeResult`; `_ensure_playable` stopped treating "reachable" as "the TV is
+  on". Found on hardware that the firmware force-suspends ~15s after sleep
+  ignoring wakelocks, and that the CEC tail keeps saying "standby" after the
+  set is turned on by hand (hence `_parse_tv_power(since=)`). Added
+  `tools/bench_tv_power.py`; the `tv_only_standby` mode is in but off until
+  its soak test runs at a quiet hour.
 
 - **"Deebot N8+ voice control" (2026-09-16, branch `feat/deebot-vacuum-exploration`).**
   Went from "search online for a deebot-client library" to a shipped
