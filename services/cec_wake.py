@@ -76,6 +76,11 @@ class WakeResult:
     ok: bool
     detail: str
     needs_pairing: bool = False
+    # Set by MediaService.turn_on on the fast path: True when the CEC bus
+    # confirmed the TV is on and showing the box, False when it definitely is
+    # not, None when the box came up but the television could not be confirmed
+    # either way. `ok` alone is "the box is awake", which is a weaker claim.
+    tv_confirmed: bool | None = None
 
     def __bool__(self) -> bool:
         return self.ok
@@ -224,9 +229,14 @@ class CecWaker:
                 except OSError as exc:
                     log.debug("WoL to %s:%s failed: %s", target, port, exc)
 
-    def power_on_tv(self) -> bool:
+    def power_on_tv(self, timeout_s: float | None = None) -> bool:
         """
         Wake-on-LAN the TV and wait for it to answer. Needs no token.
+
+        `timeout_s` caps the whole wait; the default is the configured
+        tv_boot_timeout. The fast path in MediaService passes its own budget so
+        a television that is unplugged cannot hold a wake hostage for 40s while
+        the box itself came up in one.
 
         **"Answers REST" is NOT "powered on", and this used to assume it was.**
         This set has two standby depths, measured 2026-09-05:
@@ -253,13 +263,14 @@ class CecWaker:
         self._send_wol()
         if reachable:
             return True
+        budget_s = self.tv_boot_timeout_s if timeout_s is None else max(0.0, float(timeout_s))
         for attempt in range(1, self.wol_attempts + 1):
             log.info("WoL to %s (attempt %d/%d)", self.tv_mac, attempt, self.wol_attempts)
             self._send_wol()
             # Every miss rediscovers, then retries: the TV came back from deep
             # standby on a new lease (.34 -> .59, 2026-09-11) and only a scan per
             # poll finds that the moment it happens. Same rule as _wait_for_box.
-            deadline = time.monotonic() + (self.tv_boot_timeout_s / self.wol_attempts)
+            deadline = time.monotonic() + (budget_s / self.wol_attempts)
             while time.monotonic() < deadline:
                 time.sleep(self.poll_interval_s)
                 if self.resolve_tv_ip(force=True):
@@ -290,6 +301,46 @@ class CecWaker:
             log.error("TV remote failed: %s", exc)
             return WakeResult(False, f"TV remote failed: {exc}")
         return WakeResult(True, f"sent {', '.join(keys)}")
+
+    def press_input_pair(self) -> WakeResult:
+        """
+        The proven "TV on and showing the box" nudge: away, then back.
+
+        Wake-on-LAN does nothing to a television in SHALLOW standby (it answers
+        REST and stays dark, see power_on_tv), and KEY_HDMI<n> direct addressing
+        has no observable effect on this set. The pair of KEY_HDMI presses is the
+        one thing measured to bring the screen up on the box's input. It is not
+        idempotent -- an odd number of presses lands on the other input -- so the
+        caller must only send it when the box says the TV is NOT showing it.
+        """
+        if not self.available:
+            return WakeResult(False, self.unavailable_reason)
+        if not self.resolve_tv_ip():
+            return WakeResult(False, "TV not reachable")
+        return self._send_keys([self.input_key, self.input_key])
+
+    def standby_tv(self, tv_confirmed_on: bool) -> WakeResult:
+        """
+        Put the television into standby WITHOUT sleeping the box.
+
+        `tv_confirmed_on` must be a FRESH reading of the CEC bus saying the set
+        is on, and it is required rather than advisory. KEY_POWEROFF, Samsung's
+        discrete off key, would need no such proof -- but this UE49M5505
+        ignores it outright (measured 2026-09-21: two presses, nothing on the
+        bus, TV stayed on). What works is KEY_POWER, and that is a toggle, so
+        sending it against an unknown state is the same class of bug as
+        KEYCODE_POWER on the box: it would turn a dark television back on.
+
+        MediaService.tv_power_status() is the only honest source for that flag.
+        Never pass a REST probe: this set answers :8001 in standby.
+        """
+        if not self.available:
+            return WakeResult(False, self.unavailable_reason)
+        if not tv_confirmed_on:
+            return WakeResult(False, "TV power unconfirmed; KEY_POWER is a toggle")
+        if not self.resolve_tv_ip():
+            return WakeResult(False, "TV not reachable")
+        return self._send_keys(["KEY_POWER"])
 
     def wake(self) -> WakeResult:
         """Power the TV, then toggle its input so CEC wakes the box."""

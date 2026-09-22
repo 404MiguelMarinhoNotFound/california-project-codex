@@ -253,7 +253,7 @@ llm:
       I am european portuguese based in Carcavelos, Lisbon Portugal. use celcius 
       Every time I ask you something about something you probably don't know or need up to date info like weather etc -> use web search.
       Every device action goes through its tool. The TV, the lights and the vacuum only change when control_tv, control_lights or control_vacuum is actually called and its result comes back, so never say a device did something, is doing something, or is in some state unless a tool result in this very turn told you so. If you are about to describe an outcome and have not called the tool yet, call it instead. Questions about a device, where it is, what it is doing, whether it is on, are status calls, not things to guess at.
-      You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, and check the room with get_status, which reports the TV's power and input, the box, and what is up and playing. Say only what it gives you, never fill in a detail it left out, and trust it over anything you remember putting on earlier. Turning the TV on and off is yours too: turn_on and turn_off, and treat "put the TV on", "kill the TV", "turn everything off" as those. Two things to know about them. turn_on takes up to about a minute (measured at forty-seven seconds) because it wakes the television first and then the box, so say you're on it and then wait, never fire the tool twice or call it failed while it's still going. And turn_off puts the television into standby along with the box, which is intended, so mention both in one short line. You can switch the TV's inputs with switch_hdmi; the inputs are listed at the end of this prompt, do not guess at ones that are not. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
+      You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, and check the room with get_status, which reports the TV's power and input, the box, and what is up and playing. Say only what it gives you, never fill in a detail it left out, and trust it over anything you remember putting on earlier. Turning the TV on and off is yours too: turn_on and turn_off, and treat "put the TV on", "kill the TV", "turn everything off" as those. Two things to know about them. turn_on takes a few seconds while the box is still up and about forty-five seconds once it has gone fully cold, because then the television has to wake it, so say you're on it and then wait, never fire the tool twice or call it failed while it's still going. And turn_off puts the television into standby along with the box, which is intended, so mention both in one short line. You can switch the TV's inputs with switch_hdmi; the inputs are listed at the end of this prompt, do not guess at ones that are not. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
       Music and video both go through that TV, so treat "put on", "play", and "what can you play" as TV requests, not as questions about your own abilities. For music, YouTube is the path: use youtube_playlist for a saved category (they are listed at the end of this prompt) and youtube_search for anything else. For shows and films it is Stremio: stremio_play, stremio_continue, and stremio_get_progress for "what episode am I on". You have no music service of your own and no access to his YouTube account, so never claim to browse his subscriptions, liked songs, or account playlists.
       You can control Master Miguel's Govee lights using the control_lights tool: power, brightness from 1 to 100, and colour. The rooms you can reach are listed at the end of this prompt, do not invent others. Brightness and colour only show on a light that is already on, so turn it on first if it might be off. Use light_status for what a light is set to, and keep its wording that this is the last command you sent rather than a live reading, because the strip cannot be read back. Confirm in one short casual sentence, and say so plainly if a light is unreachable.
       You can control Master Miguel's Deebot robot vacuum using the control_vacuum tool: vacuum_clean_all for the whole house, vacuum_clean_rooms with one or more room names for specific rooms (the rooms are listed at the end of this prompt, do not invent others), vacuum_stop, vacuum_dock to send it home to charge, and vacuum_status for battery and whether it is cleaning, docked, or in error. "Clean the house", "vacuum the flat", "hoover everything" mean vacuum_clean_all; "clean the kitchen and the bedroom" is one vacuum_clean_rooms call with both rooms. Each clean checks the vacuum first and refuses politely if it is already cleaning, so pass that on rather than retrying. Confirm in one short casual sentence, and say so plainly if the vacuum is unreachable.
@@ -518,7 +518,7 @@ media:
   # rewrites this line; it only matters on a first run with an empty cache.
   # It drifted .35 -> .40 on a renewal (no reboot, 9.6 days uptime) and broke every
   # TV tool call, which is why discovery exists.
-  mibox_ip: "192.168.1.40"
+  mibox_ip: "192.168.1.200"   # static, set on the box 2026-09-22 (DHCP pool is .2-.199)
   adb_port: 5555
   volume_max_steps: 15            # Mi Box S hardware max — used by volume_set()
 
@@ -531,7 +531,7 @@ media:
     # changes on a new SSID or a factory reset, not on a DHCP renewal, which is the
     # only case this exists for. Nothing DEPENDS on it -- if it changes, the ARP
     # rung goes dead and the port scan still finds the box by serial.
-    mibox_mac: "16:da:99:37:d0:89"
+    mibox_mac: "9c:12:21:1c:95:ae"   # device MAC; randomized-per-SSID MAC switched off 2026-09-22
     # ro.serialno. Permanent, and the duid-equivalent. Without it a stale address
     # that another device with wireless debugging on has taken would accept
     # `adb connect` and then accept keyevents.
@@ -548,10 +548,12 @@ media:
     rescan_cooldown_ms: 120000
 
   # --- Power / wake ---
-  # ADB can turn the box OFF but never ON. The Mi Box suspends in standby and
-  # adbd suspends with it:
+  # ADB can turn the box OFF, and can turn it ON only while it is still on the
+  # LAN. The Mi Box goes to sleep on KEYCODE_SLEEP and its firmware then
+  # force-suspends ~15s later regardless of any wakelock (measured 2026-09-21);
+  # once suspended adbd goes with it:
   #   input keyevent KEYCODE_SLEEP  -> ok, mWakefulness=Asleep
-  #   input keyevent KEYCODE_WAKEUP -> error: closed
+  #   input keyevent KEYCODE_WAKEUP -> error: closed   (deep standby)
   #   adb connect                   -> WSA 10060, every time
   # Ping is NOT a reachability test here: the box answers ICMP intermittently
   # (windows every 6-15s) because the Wi-Fi firmware's offload replies while
@@ -559,9 +561,17 @@ media:
   # is already 2 ("never sleep") and stay_on_while_plugged_in=3 does not prevent
   # the suspend either -- both measured 2026-09-03.
   #
-  # The wake goes through the TELEVISION instead: Wake-on-LAN the Samsung, then
-  # toggle its HDMI input, which makes it emit <Routing Change> + <Set Stream
-  # Path> on the CEC bus, which wakes the box. Proven end to end 2026-09-03.
+  # Two wake paths, chosen by what is_awake() says:
+  #   False (asleep, on the LAN) / True with the TV dark: FAST PATH. KEYCODE_WAKEUP
+  #     to the box and Wake-on-LAN to the Samsung run side by side, then the CEC
+  #     bus is read until the TV reports on and the box is the active source.
+  #     2.2s measured 2026-09-21 (box awake at 1.7s).
+  #   None (deep standby): the TELEVISION wakes it. Wake-on-LAN the Samsung, then
+  #     toggle its HDMI input, which makes it emit <Routing Change> + <Set Stream
+  #     Path> on the CEC bus, which wakes the box. Proven end to end 2026-09-03;
+  #     52s measured 2026-09-18 and 45.3s on 2026-09-21, most of it the box
+  #     resuming. The box is unreachable within ~5s of KEYCODE_SLEEP, so this
+  #     is the common path until tv_only_standby works.
   cec_wake:
     enabled: true
     # Identity keys off things that do not move. tv_ip is only a cached hint --
@@ -572,7 +582,7 @@ media:
     # so only the websocket step is affected by a DHCP move.
     tv_mac: "54:BD:79:24:45:32"   # Samsung UE49M5505, Tizen
     tv_duid: "uuid:ce6399e0-8c5a-46f9-86b8-a05754f7a9ea"
-    tv_ip: "192.168.1.34"         # hint only, self-heals
+    tv_ip: "192.168.1.201"        # static, set on the TV 2026-09-22 (DHCP pool is .2-.199)
     # tv_state_path: "tv_state.json"   # override to keep the TV in its own file; default is discovery.state_path
     tv_port: 8002
     # Written on first pairing; needs on-screen approval WITH THE TV ON.
@@ -583,7 +593,8 @@ media:
     wol_attempts: 5               # the TV took 2 in testing
     tv_boot_timeout_ms: 40000
     wake_attempts: 3
-    # How long to wait for the box to rejoin the network after the CEC wake.
+    # Deep-standby fallback only. How long to wait for the box to rejoin the
+    # network after the CEC wake.
     # MEASURED 2026-09-05 over three clean cold wakes: 32.4s, 32.4s, 31.1s from
     # wake() returning to port 5555 accepting. At the old 25000 the first attempt
     # ALWAYS timed out and the second one did the work, which is why a cold "put
@@ -608,27 +619,39 @@ media:
     # Used to re-select the box when the TV has been parked on another source.
     mibox_hdmi_port: 2
 
-  # --- Alternate wake candidates, tried before the CEC chain above -----------
-  # Both OFF by default: neither has been verified against the real box yet.
-  # See services/bt_wake.py and services/esp32_bt_wake.py for what each does
-  # and why they're independent, self-disabling candidates rather than a
-  # single mechanism.
-  bt_wake:
-    enabled: false
-    # The box's OWN Bluetooth radio address (not the bonded remote's -- that's
-    # a separate, unrelated LE address). Confirmed live 2026-09-16 via
-    # `adb shell dumpsys bluetooth_manager` while the box was awake.
-    mac: "9C:12:21:1C:95:AF"
-    scan_duration_s: 10
-    signal_duration_s: 3
-    pair_interval_s: 1.0
-    spawn_timeout_s: 3.0
-    scan_stop_timeout_s: 1.0
-  esp32_wake:
-    enabled: false
-    # host: "192.168.1.XX"   # set once hardware/esp32_bt_wake is flashed and paired
-    button_id: "wake_mi_box"
-    timeout_s: 5
+    # --- Fast path (box still on the LAN) ---
+    # Each half -- KEYCODE_WAKEUP + waiting for mWakefulness=Awake, and
+    # Wake-on-LAN + waiting for the TV to answer REST -- gets this long before
+    # the box falls back to the CEC chain above.
+    fast_wake_timeout_ms: 20000
+    # Then the CEC bus gets this long to say the TV is on AND showing the box,
+    # one `dumpsys hdmi_control` per poll. WoL does not lift a television out of
+    # SHALLOW standby (it answers REST and stays dark); the box's own wake
+    # (<Text View On> + <Active Source>) does, and if the bus still says
+    # "standby" the proven KEY_HDMI pair is sent once. Only evidence newer than
+    # the wake counts, so a stale "standby" from hours ago cannot fail it.
+    tv_confirm_timeout_ms: 12000
+    tv_confirm_poll_ms: 1500
+    # A box that just woke re-asserts itself as active source through its own
+    # One Touch Play ~1s later. Selecting the input before that lands cost 20.7s
+    # instead of 2.2s (measured 2026-09-21), so a parked input gets this grace.
+    otp_grace_ms: 4000
+
+  # --- Standby depth ---
+  # tv_only_standby: turn_off puts ONLY the television into standby and keeps
+  # the box awake, so the next turn_on is the ~2s path instead of the ~45s one.
+  # What it costs, measured 2026-09-22: the set broadcasts <Standby> and the
+  # framework sleeps the box on it (persist.sys.hdmi.keep_awake is not writable
+  # from shell), so the box is caught and woken again inside the ~3-5s window,
+  # with One Touch Play suppressed for exactly that long and then restored.
+  # KEY_POWEROFF is ignored by this set; KEY_POWER works and is a toggle, so it
+  # is only ever sent behind a fresh "the TV is on" reading of the CEC bus.
+  # Needs no box setting: the stock hdmi_control_auto_device_off_enabled=1 and
+  # hdmi_control_one_touch_play_enabled=1 are what it expects. Off until
+  # `tools/bench_tv_power.py standby-mode` has shown the box holds awake.
+  power:
+    tv_only_standby: false
+    tv_standby_settle_ms: 10000
 
   vpn_routing_enabled: false
   vpn_state_path: "vpn_state.json"

@@ -1,6 +1,7 @@
 import logging
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import time
 import yaml
 from dataclasses import dataclass
@@ -8,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from services.cec_wake import CecWaker
+from services.cec_wake import CecWaker, WakeResult
 from services.device_finder import (
     DeviceFinder,
     arp_table_candidates,
@@ -78,6 +79,17 @@ _SESSION_METADATA_RE = re.compile(r"metadata:.*?\bdescription=(.*)$")
 # tests/fixtures/hdmi_control_standby_dump.txt.
 _TV_STANDBY_RE = re.compile(r"\[R\][^\n]*<Standby>\s*0[0-9A-Fa-f]:36")
 
+# Traffic only a television that is ON sends: enumerating the bus on its way
+# up, or routing between inputs. In standby this set sends nothing but
+# <Give Device Power Status> and <Standby> (fixtures hdmi_control_standby_dump
+# and hdmi_control_tv_poweron_dump, 2026-09-06 / 2026-09-21), so those two stay
+# out of this list. Lets the fast path see the TV come on even though nothing
+# asks it for a power report once the box is already awake.
+_TV_ON_TRAFFIC_RE = re.compile(
+    r"\[R\][^\n]*<(?:Set Stream Path|Routing Change|Request Active Source|"
+    r"Give Physical Address|Give Osd Name|Get Cec Version|Give Deck Status)>\s*0[0-9A-Fa-f]:"
+)
+
 # Every CEC line carries the BOX's own clock: "time=2026-09-05 14:18:51".
 _CEC_TIME_RE = re.compile(r"time=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
@@ -117,11 +129,29 @@ def _stamp_age_s(stamp: str, newest: str) -> float:
         return 0.0
 
 
-def _parse_tv_power(dump: str) -> str | None:
+def _newest_cec_stamp(dump: str) -> str | None:
+    """The latest CEC log timestamp in a dumpsys hdmi_control dump, or None."""
+    newest = None
+    for match in _CEC_TIME_RE.finditer(dump or ""):
+        stamp = match.group(1)
+        if newest is None or stamp > newest:
+            newest = stamp
+    return newest
+
+
+def _parse_tv_power(dump: str, since: str | None = None) -> str | None:
     """
     The TV's power state as the box last heard it: "on" | "standby" | None.
 
-    TWO kinds of evidence, and whichever came LAST wins:
+    `since` is a CEC log timestamp (the box's own clock, see _newest_cec_stamp);
+    evidence stamped at or before it is ignored. The fast wake passes the stamp
+    it read before acting, so a <Report Power Status> 01 the TV answered while
+    still dark, or a stale "standby" from an hour ago, cannot masquerade as the
+    answer to THIS wake. Measured 2026-09-21: after Master Miguel turned the set
+    back on with its own remote the tail still read "standby" indefinitely,
+    because nothing re-asked.
+
+    THREE kinds of evidence, and whichever came LAST wins:
 
     - `<Report Power Status>` is an ANSWER. The only thing that asks is the
       box's own wake sequence, so on its own it goes stale the moment Master
@@ -129,6 +159,9 @@ def _parse_tv_power(dump: str) -> str | None:
     - `<Standby>` is VOLUNTEERED. The TV broadcasts it on its way off, and the
       box logs it even though it was not addressed to us. That is what makes
       "he turned it off himself" observable at all.
+    - Enumeration and routing traffic (_TV_ON_TRAFFIC_RE) only comes from a
+      set that is on. It is what makes "he turned it back on himself", and the
+      fast path's "the TV just came up under an awake box", observable.
 
     Without the second, a dump whose last report says "on" from four hours ago
     and carries three <Standby> broadcasts since reads as either a confident
@@ -152,12 +185,17 @@ def _parse_tv_power(dump: str) -> str | None:
         # Lexical compare is chronological for this fixed-width format.
         if stamp and (newest_stamp is None or stamp > newest_stamp):
             newest_stamp = stamp
+        if since and stamp and stamp <= since:
+            continue
         report = _TV_POWER_RE.search(line)
         if report:
             last_value = {"00": "on", "01": "standby"}.get(report.group(1))
             last_stamp = stamp
         elif _TV_STANDBY_RE.search(line):
             last_value = "standby"
+            last_stamp = stamp
+        elif _TV_ON_TRAFFIC_RE.search(line):
+            last_value = "on"
             last_stamp = stamp
 
     if last_value is None:
@@ -363,6 +401,9 @@ class HdmiState:
     """Both facts `dumpsys hdmi_control` carries, from one round trip."""
     active_source: bool | None
     tv_power: str | None
+    # The box-clock stamp of the newest CEC line in the dump, so a caller can
+    # ask the next read to ignore everything up to here. None when unreadable.
+    newest_stamp: str | None = None
 
 
 @dataclass(frozen=True)
@@ -414,18 +455,44 @@ class MediaService:
         self.ui_dump_retry_delay_s = max(0, int(media_cfg.get("ui_dump_retry_delay_ms", 700)) / 1000)
         self.ui_dump_timeout_s = max(1, int(media_cfg.get("ui_dump_timeout_ms", 6000))) / 1000
 
-        # Wake. ADB can put the box to sleep but can never bring it back, so
-        # turn_on goes through the television over CEC. See services/cec_wake.py.
+        # Wake. ADB can put the box to sleep, and can bring it back only while
+        # it is still on the LAN (shallow standby). From deep standby turn_on
+        # goes through the television over CEC. See services/cec_wake.py.
         wake_cfg = media_cfg.get("cec_wake", {}) or {}
         self.wake_settle_s = max(0, int(wake_cfg.get("settle_ms", 25000))) / 1000
         self.wake_poll_interval_s = max(0.1, int(wake_cfg.get("poll_interval_ms", 2000)) / 1000)
         self.wake_attempts = max(1, int(wake_cfg.get("wake_attempts", 3)))
         self.mibox_hdmi_port = int(wake_cfg.get("mibox_hdmi_port", 2))
+        # Fast path budgets: the box half and the TV half each get
+        # fast_wake_timeout, then the CEC bus gets tv_confirm_timeout to say the
+        # television is on and showing the box.
+        self.fast_wake_timeout_s = max(1, int(wake_cfg.get("fast_wake_timeout_ms", 20000))) / 1000
+        self.tv_confirm_timeout_s = max(0, int(wake_cfg.get("tv_confirm_timeout_ms", 12000))) / 1000
+        self.tv_confirm_poll_s = max(0.1, int(wake_cfg.get("tv_confirm_poll_ms", 1500)) / 1000)
+        # A box that just woke re-asserts itself as active source through its
+        # own One Touch Play about a second later. Selecting the input before
+        # that lands costs ~18s of key traffic (measured 2026-09-21: 20.7s vs
+        # 2.2s for the same wake), so a parked input gets this long to fix
+        # itself before ensure_active_source() is called.
+        self.otp_grace_s = max(0, int(wake_cfg.get("otp_grace_ms", 4000))) / 1000
         self.cec_waker = cec_waker if cec_waker is not None else CecWaker(config)
 
-        # Set by _wake_and_wait so the dispatcher can tell a rejected pairing
-        # token (needs a human at the screen) from any other wake failure.
+        # media.power.tv_only_standby: turn_off puts only the television into
+        # standby and leaves the box awake, so the next turn_on never pays for a
+        # resume from deep standby. Needs hdmi_control_auto_device_off_enabled=0
+        # on the box or the TV's own standby drags the box down with it.
+        power_cfg = media_cfg.get("power", {}) or {}
+        self.tv_only_standby = bool(power_cfg.get("tv_only_standby", False))
+        # How long to watch for the television's <Standby> to put the box down
+        # so it can be picked straight back up. The window before adbd suspends
+        # with it is ~3-5s (measured 2026-09-21).
+        self.tv_standby_settle_s = max(1, int(power_cfg.get("tv_standby_settle_ms", 10000))) / 1000
+
+        # Set by turn_on so the dispatcher can tell a rejected pairing token
+        # (needs a human at the screen) and an unconfirmed television from any
+        # other wake outcome. last_input_result is the same for input selection.
         self.last_wake_result = None
+        self.last_input_result = None
 
         # Discovery. Identity keys off the MAC and ro.serialno, both stable; the
         # address is cached, never written back to config.yaml.
@@ -1137,18 +1204,21 @@ class MediaService:
     # --- Power ---
     #
     # Turning the box on and turning it off are NOT symmetric, and nothing here
-    # should pretend they are. Off is one ADB keyevent. On is a Bluetooth pair
-    # request, because the box leaves Wi-Fi entirely in standby and ADB cannot
-    # reach it at all. That asymmetry is why KEYCODE_POWER is never sent blind:
-    # it is a toggle, so firing it at an already-awake box turns the TV off and
-    # ends every other form of control until someone picks up the remote.
+    # should pretend they are. Off is one ADB keyevent. On depends on how deep
+    # the box went: while it is still on the LAN (shallow standby, or awake with
+    # the television dark) one KEYCODE_WAKEUP and the television's own power-on
+    # are all it takes, run side by side; once it has suspended its radio only
+    # the television can reach it, over HDMI-CEC. That asymmetry is why
+    # KEYCODE_POWER is never sent blind: it is a toggle, so firing it at an
+    # already-awake box turns the TV off and ends every other form of control
+    # until someone picks up the remote.
 
     def is_awake(self) -> bool | None:
         """
         True if awake, False if asleep but reachable, None if unreachable.
 
-        None is the interesting one: it means the box is in standby with its
-        Wi-Fi radio down, which is the only state that needs the Bluetooth path.
+        None is the interesting one: it means the box is in deep standby with
+        its Wi-Fi radio down, which is the only state that needs the CEC path.
         """
         if not self.ensure_connected():
             return None
@@ -1158,23 +1228,308 @@ class MediaService:
         return _parse_wakefulness(output)
 
     def turn_on(self) -> bool:
+        """
+        Get the box awake and the television on and showing it.
+
+        Returns True when the box is awake and reachable. The television's side
+        of the story is in last_wake_result.tv_confirmed: True (seen on the CEC
+        bus), False (definitely still dark or on another input), None (could
+        not tell). Callers must read that field, never truthiness-test the
+        result for it -- see WakeResult.
+        """
+        self.last_wake_result = None
         state = self.is_awake()
+        if state is None:
+            return self._wake_and_wait()  # Deep standby: only the TV can reach it.
         if state is True:
-            return True  # Already on. Sending anything here risks turning it off.
-        if state is False:
-            # Reachable but asleep: the screen is off, the radio is not.
-            # KEYCODE_WAKEUP is a no-op when already awake, so it is the safe
-            # choice over KEYCODE_POWER even though we checked the state first.
-            return self._adb("shell input keyevent KEYCODE_WAKEUP")[0]
-        return self._wake_and_wait()
+            hdmi = self.hdmi_state()
+            if hdmi.tv_power == "on":
+                if hdmi.active_source is True:
+                    # Already on. Sending anything here risks turning it off.
+                    self.last_wake_result = WakeResult(True, "already on", tv_confirmed=True)
+                    return True
+                if hdmi.active_source is False:
+                    # TV on, parked elsewhere: select the input, no wake needed.
+                    selected = self.ensure_active_source() is True
+                    pairing = getattr(self.last_input_result, "needs_pairing", False) is True
+                    self.last_wake_result = WakeResult(
+                        True, "TV on; box selected" if selected else "TV on another input",
+                        needs_pairing=pairing, tv_confirmed=selected)
+                    return True
+                # TV on, input unknown: nothing to do that would not be a guess.
+                self.last_wake_result = WakeResult(True, "TV on, input unknown", tv_confirmed=None)
+                return True
+            # TV in standby, or unknown: power the television. Evidence older
+            # than this read is hidden from the confirm loop.
+            return self._turn_on_fast(box_asleep=False, since=hdmi.newest_stamp,
+                                      tv_dark=hdmi.tv_power == "standby")
+        return self._turn_on_fast(box_asleep=True)
 
     def turn_off(self) -> bool:
         if self.is_awake() is None:
             return True  # Unreachable already means off.
-        return self._adb("shell input keyevent KEYCODE_SLEEP")[0]
+        if not self.tv_only_standby:
+            # The box sleeps and, with mAutoTvOff, tells the television to
+            # follow. The firmware force-suspends ~15s later regardless of any
+            # wakelock (measured 2026-09-21), so the next turn_on pays for a
+            # resume from deep standby unless something wakes it first.
+            return self._adb("shell input keyevent KEYCODE_SLEEP")[0]
+        # Television-only standby: stop whatever is playing so a stream does not
+        # keep running into a dark screen, park on Home, then put only the TV
+        # into standby. The box stays awake and reachable.
+        self._adb("shell input keyevent KEYCODE_MEDIA_STOP")
+        self.go_home()
+        return self._standby_tv_only()
+
+    def _standby_tv_only(self) -> bool:
+        """
+        Put the television into standby and leave the box awake.
+
+        Three measured facts make this harder than one key press, all
+        2026-09-21/22 on the real pair:
+
+        1. This UE49M5505 **ignores KEY_POWEROFF** (two presses, nothing on the
+           bus, TV stayed on). KEY_POWER works and is a toggle, so CecWaker
+           only sends it behind a fresh "on" reading of the CEC bus -- see
+           standby_tv().
+        2. When the set goes off it **broadcasts <Standby>**, and the framework
+           puts the box to sleep on it ("Going to sleep due to hdmi"). That is
+           the TV->box direction and it is NOT the "Device auto power off"
+           toggle (that one is box->TV, `hdmi_control_auto_device_off_enabled`,
+           already off here). It is gated by `persist.sys.hdmi.keep_awake`,
+           which is `exported2_system_prop` -- the shell cannot write it and
+           the box is unrooted, so the sleep cannot be prevented.
+        3. So the box is picked straight back up instead, inside the ~3-5s
+           window before adbd suspends with it. A plain wake would announce
+           <Text View On> + <Active Source> (One Touch Play) and turn the set
+           **straight back on**, so OTP is suppressed across the window and
+           restored afterwards. Measured: with
+           `hdmi_control_one_touch_play_enabled=0` the wake emits neither.
+
+        The suppression is transient on purpose. Leaving it off would mean the
+        physical remote no longer wakes the television either, which is Master
+        Miguel's living room, not ours. It is restored in a finally, and OTP
+        only ever fires on a wake, so restoring it while the box is already
+        awake cannot turn the set back on.
+
+        Never KEYCODE_SLEEP here: an awake box is the whole point of the mode.
+        """
+        # A fresh bus reading, because KEY_POWER is a toggle. "Could not tell"
+        # is not "on": a None here must never reach the key.
+        confirmed_on = self.hdmi_state().tv_power == "on"
+        result = self.cec_waker.standby_tv(confirmed_on)
+        self.last_wake_result = result
+        if not result:
+            log.warning("Television standby did not go out: %s", result.detail)
+            return False
+
+        previous_otp = self._one_touch_play_setting()
+        self._set_one_touch_play(False)
+        try:
+            self._catch_the_box_before_it_suspends()
+        finally:
+            # Restore whatever the box shipped with, defaulting to enabled: a
+            # box left unable to wake its own television is worse than a slow
+            # wake.
+            self._set_one_touch_play(previous_otp is not False)
+        return True
+
+    def _one_touch_play_setting(self) -> bool | None:
+        """True/False as the box has it, None when it could not be read."""
+        ok, out = self._adb("shell settings get global hdmi_control_one_touch_play_enabled")
+        if not ok:
+            return None
+        answer = (out or "").strip()
+        return {"1": True, "0": False}.get(answer)
+
+    def _set_one_touch_play(self, enabled: bool) -> bool:
+        value = "1" if enabled else "0"
+        return self._adb(f"shell settings put global hdmi_control_one_touch_play_enabled {value}")[0]
+
+    def _catch_the_box_before_it_suspends(self) -> bool:
+        """
+        Wait for the television's <Standby> to put the box to sleep, then wake
+        it again while it is still on the LAN. True when the box ends awake.
+        """
+        deadline = time.monotonic() + self.tv_standby_settle_s
+        while time.monotonic() < deadline:
+            state = self.is_awake()
+            if state is False:
+                self._send_wakeup()
+                if self._wait_for_awake(min(self.fast_wake_timeout_s, 5.0)):
+                    log.info("Box caught and kept awake with the television off")
+                    return True
+                break
+            if state is None:
+                break
+            time.sleep(0.5)
+        if self.is_awake() is True:
+            # It never followed the set down -- fine, that is the goal state.
+            return True
+        log.warning("Box followed the television into standby; the next wake pays the CEC chain")
+        return False
+
+    def _send_wakeup(self) -> bool:
+        """KEYCODE_WAKEUP: a no-op when already awake, never KEYCODE_POWER."""
+        return self._adb("shell input keyevent KEYCODE_WAKEUP")[0]
+
+    def _wait_for_awake(self, timeout_s: float) -> bool:
+        """
+        Poll is_awake() until True, for a box that was reachable a moment ago.
+
+        Unlike _wait_for_box this NEVER rediscovers and never clears the
+        cooldowns: the precondition is a box on the LAN, and a miss here means
+        it went deep between the check and the key, which is _wake_and_wait's
+        job. It also keeps this thread from running a /24 scan while the TV
+        thread is running its own.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if self.is_awake() is True:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(self.tv_confirm_poll_s, 1.0))
+
+    def _tv_half(self, timeout_s: float) -> WakeResult:
+        """
+        The television's half of a fast wake, on its own thread.
+
+        Touches ONLY self.cec_waker -- never _adb, never self.ip, never the
+        cooldowns -- so it can run beside the box half without a lock. Wake-on-LAN
+        is what brings a television out of DEEP standby; it does nothing to one
+        in shallow standby, and the box's own wake (<Text View On> + <Active
+        Source>) or the KEY_HDMI pair does that part, so this only has to get
+        the set answering. Every exception becomes a result: a traceback on a
+        worker thread must never take the turn down.
+        """
+        try:
+            if not self.cec_waker.available:
+                return WakeResult(False, self.cec_waker.unavailable_reason)
+            if self.cec_waker.power_on_tv(timeout_s=timeout_s):
+                return WakeResult(True, "TV answering")
+            return WakeResult(False, "TV did not answer after Wake-on-LAN")
+        except Exception as exc:  # noqa: BLE001 - reported, never raised across the join
+            log.error("TV half of the wake failed: %s", exc)
+            return WakeResult(False, f"TV half failed: {exc}")
+
+    def _turn_on_fast(self, box_asleep: bool, since: str | None = None,
+                      tv_dark: bool = False) -> bool:
+        """
+        Box half and TV half side by side, then confirm on the CEC bus.
+
+        Thread invariant: during the parallel window the box thread is the only
+        _adb caller and the TV thread never touches MediaService state, so _adb
+        needs no lock and hdmi_state() is read only after both futures joined.
+        If the box half fails (adbd suspended between the check and the key, or
+        it never reported awake) this falls through to the CEC chain; the second
+        Wake-on-LAN in there is a documented no-op.
+
+        `tv_dark` is the pre-check's verdict that the television is in standby
+        under an awake box. Nothing will re-ask its power then -- the box's own
+        wake sequence is what asks, and the box is not waking -- so the proven
+        KEY_HDMI pair goes out as soon as the set answers REST, and the confirm
+        loop reads the enumeration traffic the TV emits as it comes up.
+        """
+        started = time.monotonic()
+        budget = self.fast_wake_timeout_s
+
+        def box_half() -> bool:
+            if not box_asleep:
+                return True
+            return self._send_wakeup() and self._wait_for_awake(budget)
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wake") as pool:
+            box_future = pool.submit(box_half)
+            tv_future = pool.submit(self._tv_half, budget)
+            box_ok = box_future.result()
+            tv_result = tv_future.result()
+        box_at = time.monotonic() - started
+
+        if not box_ok:
+            log.warning("Box did not wake over ADB in %.1fs, falling back to the CEC chain", box_at)
+            return self._wake_and_wait()
+
+        if not tv_result:
+            log.warning("TV half did not complete: %s", tv_result.detail)
+
+        self.last_input_result = None
+        confirmed = self._confirm_tv_showing_box(self.tv_confirm_timeout_s, since=since,
+                                                 nudge_first=tv_dark and bool(tv_result))
+        elapsed = time.monotonic() - started
+        needs_pairing = getattr(self.last_input_result, "needs_pairing", False) is True
+        if confirmed is True:
+            detail = f"box awake in {box_at:.1f}s, TV showing it at {elapsed:.1f}s"
+        elif confirmed is False:
+            detail = f"box awake in {box_at:.1f}s; TV not showing it after {elapsed:.1f}s"
+        else:
+            detail = f"box awake in {box_at:.1f}s; TV unconfirmed after {elapsed:.1f}s"
+        if not tv_result:
+            detail += f" ({tv_result.detail})"
+        if needs_pairing:
+            detail = f"{self.last_input_result.detail}; {detail}"
+        self.last_wake_result = WakeResult(True, detail, needs_pairing=needs_pairing,
+                                           tv_confirmed=confirmed)
+        log.info("Fast wake: %s", detail)
+        return True
+
+    def _confirm_tv_showing_box(self, timeout_s: float, since: str | None = None,
+                                nudge_first: bool = False) -> bool | None:
+        """
+        Watch the CEC bus until the television is on and showing the box.
+
+        One `dumpsys hdmi_control` per pass. True when tv_power is "on" and the
+        box is the active source. The input is selected ONLY on a definitive
+        active_source False -- once the TV reports on, or once at the deadline if
+        its power never became known -- never on None, because cycling from an
+        unknown input is not idempotent. A television still reporting "standby"
+        at the deadline is False; nothing heard either way is None.
+
+        `since` hides evidence older than the wake, see _parse_tv_power.
+        `nudge_first` sends the pair before the first read, for a television
+        the caller already knows is dark. A parked input is left alone for
+        otp_grace_s first: the box's own One Touch Play usually fixes it.
+        """
+        started = time.monotonic()
+        deadline = started + timeout_s
+        last = HdmiState(None, None)
+        nudged = False
+        if nudge_first and self.cec_waker.available:
+            nudged = True
+            result = self.cec_waker.press_input_pair()
+            self.last_input_result = result
+            if getattr(result, "needs_pairing", False) is True:
+                return None
+        while True:
+            last = self.hdmi_state(since=since)
+            if last.tv_power == "on":
+                if last.active_source is True:
+                    return True
+                if last.active_source is False and time.monotonic() - started >= self.otp_grace_s:
+                    return self.ensure_active_source() is True
+            elif last.tv_power == "standby" and not nudged and self.cec_waker.available:
+                # WoL cannot lift a shallow-standby TV; the proven pair can. The
+                # box says the TV is dark, so an odd landing is not a risk here.
+                nudged = True
+                result = self.cec_waker.press_input_pair()
+                self.last_input_result = result
+                if getattr(result, "needs_pairing", False) is True:
+                    return None
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self.tv_confirm_poll_s)
+        if last.tv_power == "standby":
+            return False
+        if last.active_source is False:
+            return self.ensure_active_source() is True
+        return None
 
     def _wake_and_wait(self) -> bool:
-        """Wake via the TV over CEC, then wait for the box to rejoin the network."""
+        """
+        The deep-standby fallback: wake via the TV over CEC, then wait for the
+        box to rejoin the network. ~52s measured 2026-09-18, most of it the box
+        resuming.
+        """
         self.last_wake_result = None
         for attempt in range(1, self.wake_attempts + 1):
             result = self.cec_waker.wake()
@@ -1284,9 +1639,12 @@ class MediaService:
         """
         return self.hdmi_state().tv_power
 
-    def hdmi_state(self) -> HdmiState:
+    def hdmi_state(self, since: str | None = None) -> HdmiState:
         """
         Both hdmi_control facts from ONE round trip.
+
+        `since` (a CEC stamp from an earlier HdmiState.newest_stamp) makes the
+        TV-power reading ignore older evidence; see _parse_tv_power.
 
         is_active_source() and tv_power_status() each ran their own `dumpsys
         hdmi_control` over identical output, so asking for both cost two of them.
@@ -1299,7 +1657,11 @@ class MediaService:
         ok, output = self._adb("shell dumpsys hdmi_control")
         if not ok or not output:
             return HdmiState(None, None)
-        return HdmiState(_parse_active_source(output), _parse_tv_power(output))
+        return HdmiState(
+            _parse_active_source(output),
+            _parse_tv_power(output, since=since),
+            _newest_cec_stamp(output),
+        )
 
     def ensure_active_source(self, attempts: int = 3, settle_s: float = 2.0) -> bool | None:
         """
@@ -1330,9 +1692,16 @@ class MediaService:
             # on this set. Do not "simplify" to direct-only -- the TV accepts
             # KEY_HDMI2 and ignores it, so that loop never converges.
             if attempt == 1:
-                self.switch_hdmi(self.mibox_hdmi_port)
+                result = self.switch_hdmi(self.mibox_hdmi_port)
             else:
-                self.cec_waker.cycle_input()
+                result = self.cec_waker.cycle_input()
+            self.last_input_result = result
+            # Identity, not truthiness: a bare Mock's attribute is truthy.
+            if getattr(result, "needs_pairing", False) is True:
+                # Cycling will not fix a rejected token; stop and let the
+                # dispatcher send Master Miguel to the screen.
+                log.error("Input selection needs the TV re-paired: %s", result.detail)
+                return False
             time.sleep(settle_s)
             state = self.is_active_source()
             if state is True:
