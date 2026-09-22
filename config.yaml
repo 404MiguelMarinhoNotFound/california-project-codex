@@ -518,7 +518,7 @@ media:
   # rewrites this line; it only matters on a first run with an empty cache.
   # It drifted .35 -> .40 on a renewal (no reboot, 9.6 days uptime) and broke every
   # TV tool call, which is why discovery exists.
-  mibox_ip: "192.168.1.90"
+  mibox_ip: "192.168.1.200"   # static, set on the box 2026-09-22 (DHCP pool is .2-.199)
   adb_port: 5555
   volume_max_steps: 15            # Mi Box S hardware max — used by volume_set()
 
@@ -531,7 +531,7 @@ media:
     # changes on a new SSID or a factory reset, not on a DHCP renewal, which is the
     # only case this exists for. Nothing DEPENDS on it -- if it changes, the ARP
     # rung goes dead and the port scan still finds the box by serial.
-    mibox_mac: "16:da:99:37:d0:89"
+    mibox_mac: "9c:12:21:1c:95:ae"   # device MAC; randomized-per-SSID MAC switched off 2026-09-22
     # ro.serialno. Permanent, and the duid-equivalent. Without it a stale address
     # that another device with wireless debugging on has taken would accept
     # `adb connect` and then accept keyevents.
@@ -582,7 +582,7 @@ media:
     # so only the websocket step is affected by a DHCP move.
     tv_mac: "54:BD:79:24:45:32"   # Samsung UE49M5505, Tizen
     tv_duid: "uuid:ce6399e0-8c5a-46f9-86b8-a05754f7a9ea"
-    tv_ip: "192.168.1.89"         # hint only, self-heals
+    tv_ip: "192.168.1.201"        # static, set on the TV 2026-09-22 (DHCP pool is .2-.199)
     # tv_state_path: "tv_state.json"   # override to keep the TV in its own file; default is discovery.state_path
     tv_port: 8002
     # Written on first pairing; needs on-screen approval WITH THE TV ON.

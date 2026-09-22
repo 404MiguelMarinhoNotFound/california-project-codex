@@ -991,8 +991,28 @@ a full rediscovery is ~1.7s against a 2s poll interval, cheaper than one wasted 
 The loop clears **both** cooldowns (`_last_fail_time` and `_last_discovery_t`) before
 each pass, for the same reason it always cleared the first, and keeps calling the
 *public* `ensure_connected()` that tests patch by name. On this router a lease change
-after sleep is the common case, not the edge case -- a DHCP reservation for the box's
-MAC is the real fix, and it costs no code.
+after sleep is the common case, not the edge case -- see "Static addresses" below for
+what fixed it.
+
+#### Static addresses (2026-09-22)
+
+Both devices drifted constantly on this network (the box `.84 -> .87 -> .90 -> .94 ->
+.97` and the TV `.82 -> .86 -> .89 -> .93` in two days) because the NOS gateway hands
+out **60-minute leases** and the box goes off the LAN in deep standby. The router is a
+NOS Askey TCG310J: its local page at `192.168.1.1` is read-only, and the NOS portal
+(aminhanet.nos.pt) offers **no per-device DHCP reservation**, only the pool range. So:
+
+- The DHCP pool was shrunk to `192.168.1.2 - 192.168.1.199` in the NOS portal
+- The box has a static `192.168.1.200` (gateway and DNS `192.168.1.1`), set in its own
+  Network settings, and its **Privacy** is set to *Use device MAC*. Its MAC is now the
+  hardware one, `9c:12:21:1c:95:ae`, and `16:da:99:37:d0:89` above is historical
+- The TV has a static `192.168.1.201`, set in its own Network Status -> IP Settings
+
+Both are outside the pool, so nothing can be handed their address. `mibox_ip` and
+`tv_ip` still stay *hints* in the code, and discovery still backs them: if either
+device is ever reset to DHCP it comes back somewhere in `.2-.199` and the ladder finds
+it as before. This is a robustness fix, not a speed one -- a full rediscovery measures
+~1.7s against a ~49s wake.
 
 -----
 
