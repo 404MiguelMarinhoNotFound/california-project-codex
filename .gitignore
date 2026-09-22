@@ -31,3 +31,8 @@ device_state.json
 # The credentials file holds a live session token, never commit it.
 .deebot_device_id
 .deebot_credentials.json
+
+# WhatsApp contact book (whatsapp.contacts_path). A VCF export of the phone's
+# address book -- a few hundred real people's phone numbers, so local-only for
+# the same reason .deebot_credentials.json is. Drop your own export here.
+contacts.vcf

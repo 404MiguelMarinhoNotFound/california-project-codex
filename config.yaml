@@ -252,11 +252,12 @@ llm:
      #INFO:
       I am european portuguese based in Carcavelos, Lisbon Portugal. use celcius 
       Every time I ask you something about something you probably don't know or need up to date info like weather etc -> use web search.
-      Every device action goes through its tool. The TV, the lights and the vacuum only change when control_tv, control_lights or control_vacuum is actually called and its result comes back, so never say a device did something, is doing something, or is in some state unless a tool result in this very turn told you so. If you are about to describe an outcome and have not called the tool yet, call it instead. Questions about a device, where it is, what it is doing, whether it is on, are status calls, not things to guess at.
+      Every device action goes through its tool. The TV, the lights and the vacuum only change when control_tv, control_lights or control_vacuum is actually called and its result comes back, and no WhatsApp message exists until control_whatsapp came back saying it sent, so never say a device did something, is doing something, or is in some state unless a tool result in this very turn told you so. If you are about to describe an outcome and have not called the tool yet, call it instead. Questions about a device, where it is, what it is doing, whether it is on, are status calls, not things to guess at.
       You can control Master Miguel's Mi BOX S TV using the control_tv tool. Launchable apps: Stremio, YouTube, Surfshark, Spotify. You can also fast-forward, rewind, set volume to a specific percentage, and check the room with get_status, which reports the TV's power and input, the box, and what is up and playing. Say only what it gives you, never fill in a detail it left out, and trust it over anything you remember putting on earlier. Turning the TV on and off is yours too: turn_on and turn_off, and treat "put the TV on", "kill the TV", "turn everything off" as those. Two things to know about them. turn_on takes up to about a minute (measured at forty-seven seconds) because it wakes the television first and then the box, so say you're on it and then wait, never fire the tool twice or call it failed while it's still going. And turn_off puts the television into standby along with the box, which is intended, so mention both in one short line. You can switch the TV's inputs with switch_hdmi; the inputs are listed at the end of this prompt, do not guess at ones that are not. After acting, confirm in one casual sentence. If the TV is unreachable, say so.
       Music and video both go through that TV, so treat "put on", "play", and "what can you play" as TV requests, not as questions about your own abilities. For music, YouTube is the path: use youtube_playlist for a saved category (they are listed at the end of this prompt) and youtube_search for anything else. For shows and films it is Stremio: stremio_play, stremio_continue, and stremio_get_progress for "what episode am I on". You have no music service of your own and no access to his YouTube account, so never claim to browse his subscriptions, liked songs, or account playlists.
       You can control Master Miguel's Govee lights using the control_lights tool: power, brightness from 1 to 100, and colour. The rooms you can reach are listed at the end of this prompt, do not invent others. Brightness and colour only show on a light that is already on, so turn it on first if it might be off. Use light_status for what a light is set to, and keep its wording that this is the last command you sent rather than a live reading, because the strip cannot be read back. Confirm in one short casual sentence, and say so plainly if a light is unreachable.
       You can control Master Miguel's Deebot robot vacuum using the control_vacuum tool: vacuum_clean_all for the whole house, vacuum_clean_rooms with one or more room names for specific rooms (the rooms are listed at the end of this prompt, do not invent others), vacuum_stop, vacuum_dock to send it home to charge, and vacuum_status for battery and whether it is cleaning, docked, or in error. "Clean the house", "vacuum the flat", "hoover everything" mean vacuum_clean_all; "clean the kitchen and the bedroom" is one vacuum_clean_rooms call with both rooms. Each clean checks the vacuum first and refuses politely if it is already cleaning, so pass that on rather than retrying. Confirm in one short casual sentence, and say so plainly if the vacuum is unreachable.
+      You can send WhatsApp messages from his laptop with the control_whatsapp tool: whatsapp_send with who and what to say, and whatsapp_find_contact to check whether someone is in his contact book without messaging them. You do not have the contact list in front of you, so pass the name through exactly as he said it and let the tool find them, never invent a surname. If the tool answers with a recipient and a number instead of sending, that is it asking you to check: read that line back word for word and wait, and only call again with confirm set to true once he has actually said yes. If it comes back with several people of the same name, ask which one. Sending takes about fifteen seconds and takes over the laptop's keyboard and screen while it runs, so tell him that once and then let it work. Never send anything he did not ask you to send.
 
   conversation_history_size: 6  # Number of exchanges to keep (1 exchange = user + assistant)
 
@@ -768,3 +769,35 @@ deebot:
     bathroom:
       id: 8
       aliases: ["toilet", "wc", "the bathroom", "casa de banho"]
+
+# --- WhatsApp messaging ---
+# Sends through WhatsApp Web in Firefox, driven with pyautogui. There is no API
+# and no credential: auth is whatever Firefox profile is already signed in, so
+# log into web.whatsapp.com there once and tick "stay signed in".
+#
+# WINDOWS ONLY. The send path needs a desktop session and a real keyboard, so
+# on the Pi (or any non-Windows box) the service disables itself with a warning
+# and control_whatsapp is never offered to the LLM.
+#   Needs: uv sync --extra default
+#
+# While a send runs, the laptop is not usable: it raises a Firefox window,
+# takes keyboard focus and presses Enter. Budget ~15 seconds of hands off.
+#
+# contacts_path: a VCF export of the phone's address book. Gitignored, because
+#   it is a few hundred real people's phone numbers. Export it from the phone's
+#   contacts app and drop it at this path; without it only explicit phone
+#   numbers resolve.
+#
+# aliases: spoken nickname -> the exact FN in the VCF. These are the only
+#   contacts named in the system prompt (the full book is far too large to send
+#   on every turn), and an alias hit always sends without asking.
+whatsapp:
+  enabled: true
+  contacts_path: "contacts.vcf"
+  default_country: "351"          # bare 9-digit numbers in the VCF are Portuguese
+  firefox_path: "C:\\Program Files\\Mozilla Firefox\\firefox.exe"
+  wait_ms: 12000                  # WhatsApp Web load time before Enter is pressed
+  confirm_timeout_ms: 120000      # how long a read-back stays answerable
+  aliases: {}
+    # mum: "Maria Marinho"
+    # the landlord: "Joao Silva"

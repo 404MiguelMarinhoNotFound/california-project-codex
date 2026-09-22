@@ -69,7 +69,7 @@ govee = ["bleak>=0.22.0"]
 # lying about which VAD ran for the life of the project. `default` is defined as
 # exactly what the committed config.yaml selects, and config.yaml selects silero, so
 # it belongs here. This adds torchaudio only, not the full ~2GB — torch is already in.
-default = ["california[kokoro]", "california[govee]", "california[silero]", "california[cec]", "california[deebot]"]
+default = ["california[kokoro]", "california[govee]", "california[silero]", "california[cec]", "california[deebot]", "california[whatsapp]"]
 # cec belongs in default because the committed config.yaml sets
 # media.cec_wake.enabled: true, and turn_on cannot work without samsungtvws.
 # Same rule that put silero here: default == exactly what config.yaml selects.
@@ -90,6 +90,17 @@ cec = [
 # a wheel we'd never import. See tools/probe_deebot_devices.py.
 deebot = [
     "deebot-client>=18.5.0",
+]
+
+# WhatsApp messaging (config.yaml `whatsapp.enabled: true`). Drives WhatsApp
+# Web in Firefox with synthetic keystrokes, so it is Windows-only and both
+# entries carry the marker -- a Pi or a Linux CI box syncs this extra and
+# installs nothing, and services/whatsapp_service.py self-disables there.
+# In `default` for the usual reason: default is defined as exactly what the
+# committed config.yaml selects, and config.yaml selects this.
+whatsapp = [
+    "pyautogui>=0.9.54; sys_platform == 'win32'",
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [tool.uv]

@@ -47,6 +47,7 @@ No VPN preflight and no ADB on this path, and by default no network at all.
 | TV control | ADB over network to Mi Box / Android TV |
 | Light control | Govee over Bluetooth LE (`bleak`); Govee cloud v2 API optional |
 | Vacuum control | Ecovacs Deebot N8+ via `deebot-client` over REST only; verification codes read from Gmail over IMAP |
+| WhatsApp | WhatsApp Web in Firefox, driven with `pyautogui`; contacts from a local VCF. **Windows only** |
 | Stremio state | Stremio private API + local `watch_state.json` cache |
 | Title resolution | TMDB |
 | Audio I/O | `sounddevice`, `soundfile` |
@@ -92,6 +93,11 @@ Required for the vacuum (`control_vacuum`):
   Ecovacs demands an emailed device-verification code roughly weekly; with this set the
   service reads the code itself over IMAP. Without it, the vacuum tool stalls until
   `ECOVACS_VERIFICATION_CODE` is set by hand once. See "DeebotService" below
+
+WhatsApp (`control_whatsapp`) needs **no credential at all**, and that is deliberate: the send
+path drives WhatsApp Web in an already-signed-in Firefox profile, so the session *is* the auth.
+What it does need is `contacts.vcf` at `whatsapp.contacts_path` -- a VCF export of the phone's
+address book, gitignored because it is several hundred real people's phone numbers.
 
 Keep secrets in `.env` or another local-only secret mechanism. Do not commit real credentials.
 `.deebot_credentials.json` holds a live Ecovacs session token and is gitignored for the same reason.
@@ -221,6 +227,7 @@ california/
 │   ├── tts.py                   # Text-to-speech
 │   ├── tts_text_sanitizer.py    # Text cleanup for TTS timing
 │   ├── youtube_playlist_resolver.py # Matches voice playlist names and picks one saved ID at random
+│   ├── whatsapp_service.py      # WhatsApp Web over Firefox + pyautogui; VCF contacts, confirm-before-send. Windows only
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
@@ -274,6 +281,8 @@ california/
 │   ├── test_playlist_config.py  # Structural sweep of the real config.yaml playlist data
 │   ├── test_youtube_playlist_resolver.py # Matching, aliases, and random-selection coverage
 │   ├── test_youtube_search_autoplay.py # Query -> video id -> watch link, session-stamp verification, spoken lines
+│   ├── test_whatsapp_service.py # WhatsApp self-disable, VCF parsing, match certainty, the confirm token, no-keyboard guard
+│   ├── test_orchestrator_whatsapp.py # control_whatsapp dispatch: spoken lines, the read-back guard, the interim line
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -1214,6 +1223,98 @@ Setup: `uv sync --extra default`, put `ECOVACS_EMAIL`/`ECOVACS_PASSWORD`
 (+`GMAIL_APP_PASSWORD`) in `.env`, then `uv run python tools/probe_deebot_rooms.py`
 to print the `deebot.rooms` block after naming rooms in the ECOVACS HOME app.
 
+### WhatsAppService
+
+`services/whatsapp_service.py` sends WhatsApp messages behind the `control_whatsapp`
+tool. Same contract as `GoveeService` and `DeebotService`: never raises at construction,
+self-disables, returns `WhatsAppCommandResult` (falsy on failure, so `is not None` for
+existence checks), and runs the blocking work on a daemon worker thread with one command
+in flight. Ported from Master Miguel's standalone `wa_send.py`.
+
+**There is no API and no credential.** The send path opens
+`web.whatsapp.com/send?phone=...&text=...` in a new Firefox tab, waits for the page to
+drop the text into the compose box, and presses Enter. Auth is whatever Firefox profile
+is already signed in to WhatsApp Web -- log in there once, tick "stay signed in", done.
+That is also why there is no `.env` entry: the session *is* the credential.
+
+**Windows only, and this is not a portability gap to close later.** It needs a desktop
+session, a real keyboard and `win32gui` to raise the window. `_probe_platform` checks
+four things -- `sys.platform == "win32"`, `pyautogui` imports, the configured Firefox
+binary exists, and each failure logs its own line naming its own fix, because "wrong OS",
+"missing package" and "Firefox lives somewhere else" are three different problems. On the
+Pi the service disables itself and `control_whatsapp` is never offered to the LLM, the
+same shape as `services/bt_wake.py` being Linux only.
+
+**Three import-time hazards from the CLI had to move, and all three would have taken the
+assistant down at boot on the Pi.** `wa_send.py` does `raise SystemExit` when Firefox is
+missing (now a warning that sets `available = False` -- a service must never kill the
+boot), registers a `webbrowser` handler at import (dropped entirely; `_open_chat` uses
+`subprocess.Popen` directly anyway), and imports `pyautogui` at module scope. That last
+one matters most: `pyautogui` **raises on a headless box**, not merely fails to import,
+so a top-level import would break every `unittest discover` run on the Pi. It is imported
+inside `_press_send`, and `FAILSAFE`/`PAUSE` are set there too rather than at module
+scope, where `FAILSAFE = False` would disarm a corner-of-screen abort for the whole
+assistant.
+
+**A loosely matched name is read back before anything sends, and the check is
+server-side.** The TV, the lights and the vacuum are all recoverable; a message to a
+person is not. Whisper mangles names here (the vacuum's nickname has come back as
+"SirSoxalot") and the book is full of shared first names. So:
+
+| What he said | Score | Sends? |
+|---|---|---|
+| a phone number, or an alias hit | -- | yes |
+| the full name, or a prefix of it | 100 / 90 | yes |
+| an exact name token ("marta" in "Marta Zuka") | 80-85 | yes |
+| a bare substring ("oaquim") | 60 | **reads back first** |
+| a fuzzy `difflib` hit ("Martah") | < 55 ratio | **reads back first** |
+| two contacts within 5 points of each other | -- | asks which, sends nothing |
+
+`confirm=True` on its own does **not** send. `send()` stores
+`(contact_key, message, deadline)` in `self._pending` and `_confirmed()` requires a
+later call to match **both** the recipient and the exact message text, inside
+`confirm_timeout_ms`. A model that sets the flag on a first attempt therefore still gets
+the read-back, and agreeing to "tell Marta I'm late" does not carry over to a different
+body. The record is one-shot: a second message to the same person is read back again.
+
+**The contact roster is deliberately NOT injected into the system prompt**, and it is the
+only inventory in this project that is not. The lights, the playlists, the HDMI ports and
+the vacuum rooms all list themselves because they are small; the contact book is several
+hundred cards and the full prompt is re-sent on every turn, so listing it would cost more
+per exchange than everything else in the prompt put together. `_contact_inventory()`
+emits one line telling the model to pass the spoken name through unchanged, plus the
+handful of configured `whatsapp.aliases`. `test_llm_prompt.py` has a guard that the
+roster never appears -- if someone later "fixes" the missing inventory, it fails.
+
+**The book is not put through `match_name`.** `services/name_matcher.py`'s tier 3 is a
+bidirectional substring match with no score at all, which is right for six light rooms
+and wrong for four hundred people: "ana" would resolve to "Joana" as confidently as to
+"Ana". `score_contacts()` keeps the CLI's own scorer, which reports *how* good the match
+was and returns ambiguity rather than a best guess -- exactly what the confirm step
+needs. `match_name` is still used for the small `aliases` map, like the lights.
+
+**One Enter, never two.** After the message sends, focus moves to the record-audio
+button, so a retry press starts a voice recording instead of doing nothing. The centre
+click pywhatkit does is worse than useless: it often unfocuses the input so Enter never
+sends at all. `_focus_firefox` calls `SetForegroundWindow` only -- never `ShowWindow` or
+a restore, which made the window flash and minimise.
+
+**A scheduled send is a `threading.Timer`, not a sleep in the worker.** The worker allows
+one command in flight, so the CLI's `time.sleep(delay)` there would block every other
+WhatsApp command until it fired. Two limits are stated back rather than engineered
+around: it does **not survive a restart** (`close()` cancels the timers, and is called
+from the orchestrator's shutdown for exactly that reason), and at fire time it raises a
+Firefox window and takes the keyboard whether or not anyone is at the machine.
+
+**`_dispatch_whatsapp` speaks an interim line before a send**, via the same `say_now`
+hook `_ensure_playable` uses for a 25s CEC wake. The send takes ~15s and drives the
+keyboard and screen for all of it; without the line that reads as the laptop being taken
+over. It is only spoken when a send is actually about to happen -- announcing a read-back
+would be a lie with a fifteen-second shape.
+
+Setup: `uv sync --extra default`, log into web.whatsapp.com in Firefox once, export the
+phone's contacts as VCF and drop it at `whatsapp.contacts_path` (gitignored).
+
 ### StremioService
 
 `services/stremio_service.py` handles:
@@ -1492,16 +1593,17 @@ The Claude path supports:
 - Custom `control_tv` tool for Mi Box and TV control (23 actions)
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
+- Custom `control_whatsapp` tool for WhatsApp messaging (2 actions)
 
-With the committed `config.yaml` that is **4 tools** in every request: `web_search`,
-`control_tv`, `control_lights`, `control_vacuum`. Each custom tool's full schema is sent on
+With the committed `config.yaml` that is **5 tools** in every request: `web_search`,
+`control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`. Each custom tool's full schema is sent on
 every turn, so adding actions and parameters costs input tokens on every single exchange.
 Keep descriptions tight — see Cost Discipline. `control_vacuum` was deliberately held to a
 core five (`vacuum_clean_all`, `vacuum_clean_rooms`, `vacuum_stop`, `vacuum_dock`,
 `vacuum_status`); pause/resume/locate were left out until asked for by voice.
 
 The custom tools are gated by config: `control_tv` on `media.enabled`, `control_lights` on
-`govee.enabled`, `control_vacuum` on `deebot.enabled`. Web search runs server-side at
+`govee.enabled`, `control_vacuum` on `deebot.enabled`, `control_whatsapp` on `whatsapp.enabled`. Web search runs server-side at
 Anthropic and is **not** dispatched locally, which
 is why the Claude tool loop checks `block.name in LOCAL_TOOL_NAMES` instead of `block.type` alone.
 Widening that check to any `tool_use` block would break web search.
@@ -1536,6 +1638,15 @@ The `control_tv` schema in `services/llm.py` currently supports these TV-related
 - `vacuum_clean_all`, `vacuum_clean_rooms` (needs `rooms`, an array of names)
 - `vacuum_stop`, `vacuum_dock`
 - `vacuum_status` (battery + state; doubles as the pre-clean guard)
+
+`control_whatsapp` supports these actions, and deliberately only these two:
+
+- `whatsapp_send` (needs `to` and `message`; optional `at` as HH:MM, optional `confirm`)
+- `whatsapp_find_contact` (needs `to`; looks someone up without messaging them)
+
+Bulk send and image send exist in the CLI it was ported from and were left out: bulk has no
+spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
+capability with no voice phrasing.
 
 When tools are active:
 
@@ -2023,6 +2134,23 @@ Current automated coverage exists for:
 - `control_vacuum` dispatch: every spoken line, the status-first guard refusing a clean when
   the robot is unreachable or already cleaning, unknown room names refused before any status
   read, stop/dock skipping the guard, and failed results surfacing their message
+- WhatsApp: the self-disable matrix (flag off, non-Windows, missing pyautogui, missing
+  Firefox, missing or unparseable contact book), VCF parsing (soft line unfolding,
+  PREF/CELL ordering, `00` to `+`, bare 9-digit Portuguese numbers, short service codes
+  like `111` rejected), which match bands are certain and which read back, aliases
+  beating an ambiguous book, the one-in-flight refusal, the daemon worker, and that
+  `close()` cancels a scheduled send
+- The WhatsApp confirmation token: a fuzzy send reads back instead of sending, `confirm`
+  on a first attempt still reads back, a confirmation covers only that exact recipient
+  AND that exact message, an expired one asks again, and it is one-shot
+- A guard that `tests/test_whatsapp_service.py` never launches a browser or presses a
+  key. This is the keyboard equivalent of `test_unit_tests_never_shell_out_to_a_real_adb`
+  and it matters more than any other guard in the suite: a leaked `pyautogui.press`
+  puts an Enter into whatever window the person running the tests has focused
+- `control_whatsapp` dispatch: every spoken line, that a fuzzy match / an ambiguous name /
+  a missing body each call `send` zero times, that a lookup never sends, and that the
+  interim line is spoken before a send but not before a read-back
+- That the contact roster is never injected into the system prompt
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
@@ -2331,6 +2459,28 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 - On this Mi Box, the Stremio VPN path is best handled as a small calibrated DPAD sequence to Portugal
 - Same-app requests should preserve the active session and skip Surfshark, even if that means VPN policy is only enforced on cross-app transitions
 - Package launch plus named route tables is easier to maintain than scattering Surfshark timing and key sequences through the codebase
+- **A confirmation the model can set by itself is not a confirmation.** `confirm` is a
+  boolean in a tool call, so nothing stops a model writing `true` on a first attempt --
+  and the one time it does, someone gets a message meant for someone else. The flag had
+  to become a *check* against a pending record the service itself created, so the model
+  can ask to skip the read-back and simply not be able to. Prompt wording is a request;
+  a token is a guarantee
+- **A matcher tuned for six rooms is a hazard over four hundred people.** `match_name`'s
+  substring tier is bidirectional and unscored, which is exactly right for "the loft"
+  and exactly wrong for "ana", where it would reach "Joana" with the same confidence.
+  The reusable component was the wrong reuse: what this needed was a matcher that reports
+  *how* sure it is, because the whole feature turns on telling sure from unsure
+- **Every inventory in this project lists itself, and one must not.** Lights, playlists,
+  HDMI ports and vacuum rooms are all injected because they are small. A contact book is
+  the same shape and three orders of magnitude bigger, and the full prompt is re-sent on
+  every turn, so the pattern that made the other four correct would have made this one
+  the most expensive thing in the prompt. The guard is a test, because the pattern is
+  what someone would reach for next
+- **An import-time side effect is a boot-time failure on a machine you were not
+  thinking about.** A standalone script can `raise SystemExit` when Firefox is missing;
+  a service imported by the orchestrator cannot, and `pyautogui` does not merely fail to
+  import on a headless box, it raises. Porting a script into a service is mostly moving
+  its module scope into its constructor
 - Graceful fallback lines build trust more than pretending automation is perfect
 
 -----

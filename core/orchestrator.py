@@ -27,6 +27,7 @@ from services.media_service import MediaService
 from services.light_shadow import LightShadow
 from services.now_playing import NowPlaying
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
+from services.whatsapp_service import WhatsAppService
 from services.surfshark_service import SurfsharkService
 from services.youtube_playlist_resolver import resolve_playlist_choice
 from services.youtube_search import speakable_title, top_video
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _LIGHTS_UNREACHABLE = "I couldn't reach your lights just now."
 _VACUUM_UNREACHABLE = "I couldn't reach the vacuum just now."
+_WHATSAPP_UNREACHABLE = "I couldn't send that WhatsApp message just now."
 
 
 # Packages that more than one boot thread imports for the first time. Importing
@@ -948,6 +950,91 @@ def _dispatch_vacuum(params: dict, deebot_svc) -> str:
     return "unknown action"
 
 
+def _join_names(names: list[str]) -> str:
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + f" or {names[-1]}"
+
+
+def _dispatch_whatsapp(params: dict, whatsapp_svc, say_now=None) -> str:
+    """
+    WhatsApp messaging. Module-level and service-injected like the other three
+    dispatchers, so tests drive it with a bare Mock service.
+
+    Two things here that the TV, light and vacuum dispatchers do not need.
+
+    A loose name match is read back before anything is sent. Those three
+    devices are all recoverable and this one is not: a message goes to a real
+    person and cannot be taken back, Whisper already mangles names in this
+    project, and the contact book is full of people who share a first name. So
+    an exact hit or a spoken phone number sends, and anything weaker comes back
+    as a question. The `confirm` flag alone does not override that -- the
+    service holds the pending read-back and checks it, so a model that sets the
+    flag on a first attempt still gets asked.
+
+    And it speaks an interim line before sending, for the same reason
+    _ensure_playable does on a 25s CEC wake: the send takes about fifteen
+    seconds, and unlike a CEC wake it drives the keyboard and raises a browser
+    window for all of them. Saying so before it starts is the difference
+    between a pause and a machine that appears to have been taken over.
+    """
+    action = params.get("action")
+
+    if not whatsapp_svc or not getattr(whatsapp_svc, "enabled", False):
+        return "WhatsApp isn't set up right now"
+
+    hint = str(params.get("to") or "").strip()
+    if not hint:
+        return "Who should I message?"
+
+    match = whatsapp_svc.resolve_contact(hint)
+
+    if action == "whatsapp_find_contact":
+        found = whatsapp_svc.find_contacts(hint)
+        if not found:
+            return f"I don't have anyone called {hint} in the contact book."
+        if len(found) == 1:
+            name, phone = found[0]
+            return f"{name}, at {phone}."
+        listed = ", ".join(name for name, _ in found)
+        return f"I've got a few: {listed}."
+
+    if action == "whatsapp_send":
+        message = str(params.get("message") or "").strip()
+        if not message:
+            return "What do you want me to say?"
+
+        if match.candidates:
+            return (
+                f"I've got more than one {hint}: {_join_names(match.candidates)}. Which one?"
+            )
+        if not match:
+            return f"I don't have anyone called {hint} in the contact book."
+
+        confirm = bool(params.get("confirm"))
+        at = str(params.get("at") or "").strip()
+
+        if at:
+            result = whatsapp_svc.schedule(match, message, at, confirm=confirm)
+            if result:
+                return f"Set. I'll send that to {match.key} at {at}."
+            return result.message or _WHATSAPP_UNREACHABLE
+
+        # Only announce a send that is actually about to happen. A read-back is
+        # instant, and saying "hands off the keyboard" in front of a question
+        # would be a lie with a fifteen-second shape.
+        if match.certain or confirm:
+            if say_now:
+                say_now("Opening WhatsApp, hands off the keyboard for a few seconds.")
+
+        result = whatsapp_svc.send(match, message, confirm=confirm)
+        if result:
+            return f"Sent to {match.key}."
+        return result.message or _WHATSAPP_UNREACHABLE
+
+    return "unknown action"
+
+
 class Orchestrator:
     def __init__(self, config: dict):
         self.config = config
@@ -984,6 +1071,9 @@ class Orchestrator:
             # Construction only, no network: DeebotService authenticates lazily
             # on the first command, and self-disables without credentials.
             "deebot": lambda: DeebotService(config),
+            # Construction only, no browser: WhatsAppService reads the local
+            # contact book and probes the platform, and self-disables off Windows.
+            "whatsapp": lambda: WhatsAppService(config),
         }
         if media_enabled:
             # Construction only here — no network. MediaService.connect() is a
@@ -1001,6 +1091,7 @@ class Orchestrator:
         self.leds = built["leds"]
         self.govee_service = built["govee"]
         self.deebot_service = built["deebot"]
+        self.whatsapp_service = built["whatsapp"]
 
         if media_enabled:
             self.media_service = built["media"]
@@ -1180,6 +1271,9 @@ class Orchestrator:
             if self._stremio_sync_thread:
                 self._stremio_sync_thread.join(timeout=2)
             self.deebot_service.close()
+            # Also cancels any scheduled send, which would otherwise wake up
+            # after shutdown and drive the keyboard at an empty room.
+            self.whatsapp_service.close()
             mic_stream.stop()
             mic_stream.close()
             self.leds.off()
@@ -1723,6 +1817,10 @@ class Orchestrator:
             return _dispatch_lights(tool_input, self.govee_service, self.light_shadow)
         if tool_name == "control_vacuum":
             return _dispatch_vacuum(tool_input, self.deebot_service)
+        if tool_name == "control_whatsapp":
+            return _dispatch_whatsapp(
+                tool_input, self.whatsapp_service, say_now=self._say_now
+            )
         return "unknown tool"
 
     def _stremio_sync_loop(self, interval_minutes: int):
