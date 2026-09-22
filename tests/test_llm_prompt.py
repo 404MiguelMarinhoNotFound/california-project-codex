@@ -8,6 +8,8 @@ from services.llm import (
     CONTROL_TV_TOOL_OPENAI,
     CONTROL_VACUUM_TOOL,
     CONTROL_VACUUM_TOOL_OPENAI,
+    CONTROL_WHATSAPP_TOOL,
+    CONTROL_WHATSAPP_TOOL_OPENAI,
     LOCAL_TOOL_NAMES,
     LLMService,
 )
@@ -236,6 +238,93 @@ class VacuumInventoryPromptTests(unittest.TestCase):
         # if it ever goes back to being a comment.
         prompt = _build()._build_system_prompt()
         self.assertIn("The vacuum is called Sir Sucks-a-Lot.", prompt)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class WhatsAppPromptTests(unittest.TestCase):
+    """
+    The one inventory that is deliberately NOT a roster.
+
+    Every other device here lists everything it can reach. The contact book
+    runs to hundreds of cards and the whole prompt is re-sent on every turn, so
+    listing it would cost more per exchange than the rest of the prompt put
+    together. The model is told to pass the spoken name through instead, and
+    the service resolves it at call time.
+    """
+
+    def _service(self, **whatsapp):
+        config = _config()
+        config["whatsapp"] = {"enabled": True, **whatsapp}
+        with mock.patch.dict("os.environ", {"GROQ_API_KEY": "x"}), mock.patch("groq.Groq"):
+            return LLMService(config)
+
+    def test_the_prompt_explains_that_contacts_are_looked_up(self):
+        prompt = self._service()._build_system_prompt()
+        self.assertIn("WhatsApp contacts are looked up when you call the tool", prompt)
+
+    def test_configured_nicknames_are_listed(self):
+        prompt = self._service(aliases={"mum": "Someone Real", "the landlord": "Someone Else"})
+        prompt = prompt._build_system_prompt()
+        self.assertIn("These nicknames reach someone on WhatsApp: mum, the landlord.", prompt)
+
+    def test_an_alias_with_no_target_is_not_advertised(self):
+        service = self._service(aliases={"mum": "Someone Real", "ghost": ""})
+        self.assertEqual(service.whatsapp_aliases, ["mum"])
+
+    def test_no_nickname_line_without_aliases(self):
+        prompt = self._service(aliases={})._build_system_prompt()
+        self.assertNotIn("These nicknames reach", prompt)
+
+    def test_nothing_injected_when_disabled(self):
+        config = _config()
+        config["whatsapp"] = {"enabled": False, "aliases": {"mum": "Someone Real"}}
+        with mock.patch.dict("os.environ", {"GROQ_API_KEY": "x"}), mock.patch("groq.Groq"):
+            service = LLMService(config)
+        self.assertNotIn("WhatsApp", service._build_system_prompt())
+
+    def test_the_contact_roster_is_never_in_the_prompt(self):
+        """
+        The guard on the cost decision. If someone later "fixes" the missing
+        inventory by injecting the book the way the lights do, this fails.
+        """
+        service = self._service(aliases={"mum": "Someone Real"})
+        # Whatever the service loaded must not leak in; the prompt names only
+        # the nicknames, and nothing that looks like a phone number.
+        prompt = service._build_system_prompt()
+        self.assertNotIn("+351", prompt)
+        self.assertNotIn("Someone Real", prompt)
+
+    def test_the_tool_is_only_offered_when_enabled(self):
+        self.assertTrue(self._service().whatsapp_enabled)
+        config = _config()
+        config["whatsapp"] = {"enabled": False}
+        with mock.patch.dict("os.environ", {"GROQ_API_KEY": "x"}), mock.patch("groq.Groq"):
+            self.assertFalse(LLMService(config).whatsapp_enabled)
+
+    def test_control_whatsapp_is_two_actions_and_no_more(self):
+        # Same restraint as control_vacuum: every enum value is paid for on
+        # every turn. Bulk and image send were left out on purpose.
+        actions = CONTROL_WHATSAPP_TOOL["input_schema"]["properties"]["action"]["enum"]
+        self.assertEqual(actions, ["whatsapp_send", "whatsapp_find_contact"])
+
+    def test_the_openai_mirror_shares_the_same_schema_object(self):
+        self.assertIs(
+            CONTROL_WHATSAPP_TOOL_OPENAI["function"]["parameters"],
+            CONTROL_WHATSAPP_TOOL["input_schema"],
+        )
+
+    def test_it_is_dispatched_locally(self):
+        self.assertIn("control_whatsapp", LOCAL_TOOL_NAMES)
+
+    def test_the_description_tells_the_model_not_to_self_confirm(self):
+        # The service enforces this too, but the model should not be trying.
+        self.assertIn("never on a first attempt", CONTROL_WHATSAPP_TOOL["description"])
+
+    def test_the_shipped_config_enables_it(self):
+        self.assertTrue(config_for_tests()["whatsapp"]["enabled"])
 
 
 if __name__ == "__main__":

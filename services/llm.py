@@ -229,6 +229,61 @@ CONTROL_VACUUM_TOOL_OPENAI = {
     }
 }
 
+CONTROL_WHATSAPP_TOOL = {
+    "name": "control_whatsapp",
+    "description": (
+        "Sends WhatsApp messages from Master Miguel's laptop, and looks people up in "
+        "his contact book. Use whatsapp_send with `to` (a contact name exactly as he "
+        "said it, or a phone number) and `message`, and whatsapp_find_contact to check "
+        "whether someone is in the book without messaging them. The contact book is "
+        "looked up here, not listed in this prompt, so pass the name through as spoken "
+        "rather than guessing at a full name. If the name is only a loose match the "
+        "tool comes back with a recipient to read out and does NOT send: relay that "
+        "line and wait for his answer. Only set confirm true after he has said yes to "
+        "that read-back in this same turn, never on a first attempt. Optionally pass "
+        "`at` as HH:MM to schedule it. Not for the TV, the lights or the vacuum."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["whatsapp_send", "whatsapp_find_contact"],
+                "description": "Send a message, or just look a contact up."
+            },
+            "to": {
+                "type": "string",
+                "description": "Who to message: a contact name as spoken, or a phone number."
+            },
+            "message": {
+                "type": "string",
+                "description": "The message body, in his words. Required for whatsapp_send."
+            },
+            "at": {
+                "type": "string",
+                "description": "Optional 24-hour local send time as HH:MM, for example 17:30."
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": (
+                    "Only true when Master Miguel has just confirmed a recipient the "
+                    "tool read back to him. Never true on a first attempt."
+                )
+            }
+        },
+        "required": ["action"]
+    }
+}
+
+CONTROL_WHATSAPP_TOOL_OPENAI = {
+    "type": "function",
+    "function": {
+        "name": CONTROL_WHATSAPP_TOOL["name"],
+        "description": CONTROL_WHATSAPP_TOOL["description"],
+        "parameters": CONTROL_WHATSAPP_TOOL["input_schema"],
+    }
+}
+
 # Tools this project dispatches locally via tool_handler. Claude's built-in
 # web_search also arrives as a tool_use block but is executed server-side, so
 # the dispatch loop must check membership here rather than block.type alone.
@@ -236,6 +291,7 @@ LOCAL_TOOL_NAMES = {
     CONTROL_TV_TOOL["name"],
     CONTROL_LIGHTS_TOOL["name"],
     CONTROL_VACUUM_TOOL["name"],
+    CONTROL_WHATSAPP_TOOL["name"],
 }
 
 
@@ -276,6 +332,18 @@ class LLMService:
         # the model never saw, so "where is Sir Sucks-a-Lot" got "I don't do
         # location tracking" instead of a vacuum_status call.
         self.vacuum_nickname: str = str(deebot_cfg.get("nickname") or "").strip()
+
+        # WhatsApp: the one inventory that is deliberately NOT injected. The
+        # contact book is a VCF with hundreds of cards, and every one of them
+        # would be paid for on every turn; the service resolves the spoken name
+        # at call time instead. Only the handful of configured nicknames go in.
+        whatsapp_cfg = config.get("whatsapp", {}) or {}
+        self.whatsapp_enabled = bool(whatsapp_cfg.get("enabled", False))
+        self.whatsapp_aliases: list[str] = [
+            str(key).strip()
+            for key, value in (whatsapp_cfg.get("aliases") or {}).items()
+            if str(key).strip() and str(value or "").strip()
+        ]
 
         # Saved YouTube playlist categories, injected for the same reason as the
         # lights: "what playlists do you know" is an inventory question, and the
@@ -364,7 +432,7 @@ class LLMService:
         time_info = f"\nCurrent date and time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}."
         return (self.system_prompt + time_info + self._light_inventory()
                 + self._playlist_inventory() + self._hdmi_inventory()
-                + self._vacuum_inventory())
+                + self._vacuum_inventory() + self._contact_inventory())
 
     def _vacuum_inventory(self) -> str:
         """
@@ -391,6 +459,32 @@ class LLMService:
             rooms = ", ".join(self.vacuum_room_names)
             parts.append(f"\nVacuum rooms you can clean by name: {rooms}.")
         return "".join(parts)
+
+    def _contact_inventory(self) -> str:
+        """
+        Tell the model how WhatsApp names are resolved, without listing anyone.
+
+        Every other inventory here names its whole roster. This one must not:
+        the contact book runs to hundreds of cards, the full schema is sent on
+        every single turn, and a roster that size would cost more per exchange
+        than the rest of the prompt put together. The service does the lookup
+        at call time, so the model only needs to know to pass the name through
+        as heard rather than inventing a surname to go with it.
+
+        The configured nicknames ARE listed, because there are a handful and
+        nothing else could tell the model that "mum" is someone messageable.
+        """
+        if not self.whatsapp_enabled:
+            return ""
+        line = (
+            "\nWhatsApp contacts are looked up when you call the tool, so they are"
+            " not listed here. Pass the name exactly as Master Miguel said it and"
+            " let the tool find them, never guess at a fuller name."
+        )
+        if self.whatsapp_aliases:
+            names = ", ".join(self.whatsapp_aliases)
+            line += f" These nicknames reach someone on WhatsApp: {names}."
+        return line
 
     def _light_inventory(self) -> str:
         """
@@ -536,6 +630,13 @@ class LLMService:
                 "description": CONTROL_VACUUM_TOOL["description"],
                 "input_schema": CONTROL_VACUUM_TOOL["input_schema"],
             })
+        if self.whatsapp_enabled:
+            tools.append({
+                "type": "custom",
+                "name": CONTROL_WHATSAPP_TOOL["name"],
+                "description": CONTROL_WHATSAPP_TOOL["description"],
+                "input_schema": CONTROL_WHATSAPP_TOOL["input_schema"],
+            })
 
         messages = list(self.history)
 
@@ -627,6 +728,8 @@ class LLMService:
             tools_arg.append(CONTROL_LIGHTS_TOOL_OPENAI)
         if self.vacuum_enabled:
             tools_arg.append(CONTROL_VACUUM_TOOL_OPENAI)
+        if self.whatsapp_enabled:
+            tools_arg.append(CONTROL_WHATSAPP_TOOL_OPENAI)
 
         while True:
             create_kwargs = dict(
