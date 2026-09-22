@@ -16,6 +16,7 @@ behaviour she will get.
     uv run python tools/bench_tv_power.py wol-only  # WoL alone, box awake
     uv run python tools/bench_tv_power.py tv-standby --key KEY_POWER   # one press, outcome read off the bus
     uv run python tools/bench_tv_power.py standby-mode --hold 120      # the whole tv_only_standby round trip
+    uv run python tools/bench_tv_power.py stremio --from-off           # dark room -> Stremio playing, phase by phase
 
 Never sends KEYCODE_POWER -- it is a toggle, see CLAUDE.md. `soak` and `wake`
 put the room to sleep on purpose; run them when nobody is watching.
@@ -30,6 +31,7 @@ import time
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -285,6 +287,79 @@ def cmd_standby_mode(svc: MediaService, args) -> int:
     return 0
 
 
+def cmd_stremio(svc: MediaService, args) -> int:
+    """
+    The number that actually matters: "put on <title>" with the room off, to
+    something playing on screen.
+
+    Runs the real dispatch path -- _ensure_playable (which wakes the room) then
+    the stremio_play branch -- and times each phase, so a slow answer can be
+    blamed on the wake, on Stremio's own launch, or on the stream buffering,
+    rather than guessed at.
+
+    --from-off puts the room away first, the same way turn_off does, so the
+    measurement starts where Master Miguel actually starts: a dark television.
+    """
+    from core.orchestrator import _dispatch_tv, _ensure_playable  # noqa: PLC0415
+    from services.stremio_service import StremioService  # noqa: PLC0415
+
+    config = yaml.safe_load(Path(args.config).read_text("utf-8"))
+    stremio = StremioService(config, media_service=svc)
+    svc.tv_only_standby = bool(args.tv_only_standby)
+
+    if args.from_off:
+        if svc.is_awake() is not True:
+            print("Precondition for --from-off: the box must be awake and the TV on.")
+            return 2
+        if svc.tv_only_standby and svc.hdmi_state().tv_power != "on":
+            print("The bus does not say the TV is on, so the standby toggle would refuse.")
+            return 2
+        print(f"Putting the room away (tv_only_standby={svc.tv_only_standby})...", flush=True)
+        print("  turn_off() ->", svc.turn_off(), flush=True)
+        print(f"  waiting {args.settle:.0f}s so the room is properly away...", flush=True)
+        time.sleep(args.settle)
+
+    print("Room at the start:", _room(svc), flush=True)
+    t0 = time.monotonic()
+    spoken = []
+
+    line = _ensure_playable(svc, say_now=spoken.append)
+    t_wake = time.monotonic() - t0
+    print(f"  {_stamp(t0)} _ensure_playable -> {line!r}", flush=True)
+    if spoken:
+        print(f"  (she would have said: {spoken[0]!r} at ~0.0s)", flush=True)
+    if line:
+        print(f"RESULT: the room never became playable after {t_wake:.1f}s.")
+        return 1
+
+    reply = _dispatch_tv({"action": "stremio_play", "title": args.title}, svc,
+                         stremio, None, {}, None, None)
+    t_launch = time.monotonic() - t0
+    print(f"  {_stamp(t0)} stremio_play -> {reply!r}", flush=True)
+
+    # Playing is what the box says, never what the launch returned.
+    playing_at = None
+    deadline = time.monotonic() + args.watch
+    while time.monotonic() < deadline:
+        status = svc.room_status()
+        if getattr(status, "playing", None) is True:
+            playing_at = time.monotonic() - t0
+            print(f"  {_stamp(t0)} box reports playing: {getattr(status, 'title', None)!r}", flush=True)
+            break
+        time.sleep(1)
+
+    print()
+    print("PHASES")
+    print(f"  wake the room      {t_wake:6.1f}s")
+    print(f"  stremio launch     {t_launch - t_wake:6.1f}s  (cumulative {t_launch:.1f}s)")
+    if playing_at is None:
+        print(f"  playing            never within {args.watch:.0f}s of the start")
+    else:
+        print(f"  until playing      {playing_at - t_launch:6.1f}s")
+        print(f"  TOTAL to playing   {playing_at:6.1f}s")
+    return 0
+
+
 def _time_primitives(svc: MediaService, watch: float) -> dict:
     """Box half and TV half in parallel, timing every first."""
     t0 = time.monotonic()
@@ -375,6 +450,18 @@ def main() -> int:
     p.add_argument("--watch", type=float, default=12)
     p.add_argument("--force", action="store_true", help="send even if the bus cannot confirm the TV is on")
 
+    p = sub.add_parser("stremio",
+                       help="TIME TO PLAYING: 'put on <title>' from a dark room, phase by phase")
+    p.add_argument("--title", default="Fallout")
+    p.add_argument("--from-off", action="store_true",
+                   help="put the room away first, so the clock starts at a dark television")
+    p.add_argument("--tv-only-standby", action="store_true",
+                   help="use the TV-only standby for --from-off (box stays awake)")
+    p.add_argument("--settle", type=float, default=30,
+                   help="seconds to wait after turn_off before starting the clock")
+    p.add_argument("--watch", type=float, default=180,
+                   help="how long to wait for the box to report playing")
+
     p = sub.add_parser("standby-mode",
                        help="full tv_only_standby round trip: TV off, box kept awake, then turn_on timed")
     p.add_argument("--hold", type=float, default=120, help="seconds to watch the box stay awake")
@@ -390,6 +477,9 @@ def main() -> int:
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")
+    # Stremio and TMDB read their credentials from the environment, the same
+    # as main.py; without this the launch fails as "I couldn't find it".
+    load_dotenv()
     config = yaml.safe_load(Path(args.config).read_text("utf-8"))
     svc = MediaService(config)
     if not svc.cec_waker.available:
@@ -398,7 +488,7 @@ def main() -> int:
     return {
         "soak": cmd_soak, "otp": cmd_otp, "keys": cmd_keys,
         "wol-only": cmd_wol_only, "wake": cmd_wake, "tv-standby": cmd_tv_standby,
-        "standby-mode": cmd_standby_mode,
+        "standby-mode": cmd_standby_mode, "stremio": cmd_stremio,
     }[args.cmd](svc, args)
 
 
