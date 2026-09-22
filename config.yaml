@@ -728,10 +728,19 @@ media:
 #                      Needs: uv sync --extra govee
 #            "cloud" = Govee Developer v2 API. Only works for models on Govee's
 #                      whitelist: https://developer.govee.com/docs/support-product-model
+#            "tapo"  = TP-Link Tapo bulbs over the LAN (python-kasa for older
+#                      firmware, services/tapo_tpap.py for 1.4.2+). These can be
+#                      READ back. Needs TAPO_USERNAME / TAPO_PASSWORD in .env.
+#
+# TRANSPORT IS PER LIGHT, inferred from the fields each one carries: `mac` is
+# BLE, `host` is Tapo, `sku` + `device` is cloud. So the attic Govee strip and
+# the living-room Tapo bulb both work in the same run. The `transport:` key
+# below is only the tie-break for a light carrying fields for more than one,
+# and the transport whose requirements are named when a light has none at all.
 govee:
   enabled: true
-  transport: "ble"
-  default_light: "attic"        # used when a request names no room
+  transport: "ble"              # tie-break only; each light picks by its own fields
+  default_light: "living room"  # used when a request names no room
   ble:
     scan_timeout_ms: 15000
     connect_timeout_ms: 20000
@@ -740,15 +749,46 @@ govee:
   api_key: null                 # null = read GOVEE_API_KEY from .env
   base_url: "https://openapi.api.govee.com"
   request_timeout_ms: 10000
+  # Tapo-only settings, ignored unless transport is "tapo".
+  #
+  # This block is under `govee:` because GoveeService reads that key; the service
+  # is really a generic light service with pluggable transports and the block is
+  # due a rename, which is its own change.
+  #
+  # Set transport: "tapo" and give each light a `host` (its LAN address) instead
+  # of a `mac`. Credentials come from TAPO_USERNAME / TAPO_PASSWORD in .env --
+  # control traffic never leaves the LAN, but the handshake still authenticates
+  # against the TP-Link account, so the bulb must be onboarded in the Tapo app
+  # first. Find the address with: uv run python tools/probe_tapo_devices.py
+  # (python-kasa's own `kasa` CLI does NOT run here -- see that tool's docstring)
+  #
+  # Unlike the Govee strip these bulbs can be READ, so light_status answers with
+  # a fact instead of the shadow-memory hedge. That is the reason to switch.
+  tapo:
+    request_timeout_ms: 5000
+    retries: 2
+    username: null              # null = read TAPO_USERNAME from .env
+    password: null              # null = read TAPO_PASSWORD from .env
   lights:
+    living room:
+      host: "192.168.1.74"      # Tapo L530E(EU) "l530e sala", fw 1.4.2 (TPAP) -> TapoTransport
+                                # MAC 58-D8-12-23-49-85. This address is NOT self-healing:
+                                # unlike the Mi Box and TV there is no DeviceFinder ladder
+                                # here, so a DHCP lease change needs this line edited. Find
+                                # it again with: uv run python tools/probe_tapo_devices.py
+      aliases:
+        - "living room"
+        - "livingroom"
+        - "lounge"
+        - "sala"
+        - "the lights"
+        - "my lights"
     attic:
-      mac: "EE:2E:01:06:53:0E"  # Govee_H617E_530E, verified over BLE
+      mac: "EE:2E:01:06:53:0E"  # Govee_H617E_530E, verified over BLE -> BleTransport
       aliases:
         - "attic"
         - "loft"
         - "upstairs"
-        - "the lights"
-        - "my lights"
 
 # --- Deebot vacuum (Ecovacs DEEBOT N8+) ---
 # Talks to Ecovacs' cloud over REST only, one connection per command, with the

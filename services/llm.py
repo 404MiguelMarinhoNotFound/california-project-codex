@@ -128,12 +128,12 @@ CONTROL_TV_TOOL = {
 CONTROL_LIGHTS_TOOL = {
     "name": "control_lights",
     "description": (
-        "Controls Master Miguel's Govee smart lights: power, brightness, and colour. "
+        "Controls Master Miguel's smart lights: power, brightness, and colour. "
         "Use when asked to turn lights on or off, dim or brighten them, or change "
         "their colour, in any room. If no room is named, the default light is used. "
         "Brightness and colour only show on a light that is already on, so call "
-        "light_on first if it might be off. light_status reports the last command "
-        "sent, not a live reading, because the strip cannot be read back. "
+        "light_on first if it might be off. light_status says what the light is "
+        "doing, and says so itself when that is memory rather than a live reading. "
         "Do not use this for the TV."
     ),
     "input_schema": {

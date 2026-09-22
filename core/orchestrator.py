@@ -788,19 +788,58 @@ def _prune_clips(directory: str, max_files: int) -> list[str]:
     return doomed
 
 
-def _light_memory_line(key: str, memory) -> str:
+def _light_reading_line(key: str, reading) -> str:
+    """
+    Say what the bulb IS doing, with none of the memory hedge.
+
+    The counterpart to `_light_memory_line`, and the difference between them is
+    the whole point: that one has to say "that's memory, not a reading" because
+    the Govee strip cannot be read. This one must NOT, because a hedge on a fact
+    is just as misleading as a fact on a guess.
+
+    Brightness is only mentioned on a light that is on. The bulb keeps reporting
+    its last level while switched off, and "off at 60 percent" invites the reply
+    "no it isn't".
+    """
+    if not reading.power:
+        return f"The {key} light is off."
+    if reading.percent is None:
+        return f"The {key} light is on."
+    return f"The {key} light is on at {reading.percent} percent."
+
+
+def _light_memory_line(key: str, memory, unreachable: bool = False) -> str:
     """
     Say what she last sent the light, and say that it is what she SENT.
 
     The hedge lives in this string rather than in the system prompt because
     the string is what gets spoken. A prompt instruction can be forgotten six
     exchanges later; the tool result cannot.
+
+    `unreachable` splits two things that used to share one sentence, and they
+    need opposite responses from Master Miguel. "The strip can't tell me
+    anything back" is a permanent fact about the Govee hardware -- there is no
+    notify characteristic, nothing to go and fix. "I couldn't reach it just
+    now" is a Tapo bulb that normally answers and did not, which means the
+    power is off at the wall or it has dropped off Wi-Fi. Speaking the first
+    about the second is a false claim about the device, and it sends him
+    nowhere; it is the same mistake `needs_pairing` exists to avoid on the TV.
     """
-    if memory is None:
-        return (
-            f"I haven't touched the {key} light since I started up, and the strip "
+    if unreachable:
+        cannot_read = f"I couldn't reach the {key} light just now"
+        no_memory = (
+            f"I couldn't reach the {key} light just now, and I haven't sent it "
+            "anything since I started up, so I don't know."
+        )
+    else:
+        cannot_read = f"I can't read the {key} light back"
+        no_memory = (
+            f"I haven't touched the {key} light since I started up, and it "
             "can't tell me anything back, so I honestly don't know."
         )
+
+    if memory is None:
+        return no_memory
 
     bits = []
     if memory.power is not None:
@@ -814,7 +853,7 @@ def _light_memory_line(key: str, memory) -> str:
         return f"I don't have anything recorded for the {key} light."
     return (
         f"Last thing I sent the {key} light was {', '.join(bits)}, "
-        "and I can't read the strip back so that's memory, not a reading."
+        f"and {cannot_read} so that's memory, not a reading."
     )
 
 
@@ -847,9 +886,27 @@ def _dispatch_lights(params: dict, govee_svc, light_shadow=None) -> str:
         return "I don't have any lights saved yet."
 
     if action == "light_status":
-        # Nothing to ask the service: the characteristic is write-only.
+        # A Tapo bulb answers; the Govee strip's characteristic is write-only.
+        # `is True` rather than a truthiness check: the tests build govee_svc as
+        # a bare Mock, and every attribute of a Mock is truthy, so a loose check
+        # would claim a live reading off a service that cannot read at all.
+        unreachable = False
+        if getattr(govee_svc, "can_read_state", False) is True:
+            reading = govee_svc.get_state(key)
+            # power is None means the bulb did not answer, so there is no
+            # reading -- fall through to memory rather than narrate a blank.
+            if reading is not None and reading.power is not None:
+                return _light_reading_line(key, reading)
+            # Only a room that CAN be read gets the "couldn't reach it" hedge.
+            # `can_read_state` is service-wide, so ask the transport that owns
+            # this room -- otherwise the Govee strip, which never answers by
+            # design, would be reported as unreachable every single time.
+            transport = None
+            if hasattr(govee_svc, "transport_for"):
+                transport = govee_svc.transport_for(key)
+            unreachable = hasattr(transport, "get_state")
         remembered = light_shadow.remembered(key) if light_shadow else None
-        return _light_memory_line(key, remembered)
+        return _light_memory_line(key, remembered, unreachable=unreachable)
 
     if action in ("light_on", "light_off"):
         on = action == "light_on"
