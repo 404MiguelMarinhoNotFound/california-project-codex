@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock
 from unittest.mock import patch
 
+from services.cec_wake import WakeResult
 from services.media_service import (
     MediaService,
     _parse_active_source,
@@ -473,6 +474,16 @@ class EnsureActiveSourceTests(unittest.TestCase):
         svc.is_active_source = Mock(return_value=True)
         self.assertIs(svc.ensure_active_source(), True)
         svc.switch_hdmi.assert_not_called()
+
+    def test_a_rejected_token_stops_the_loop_and_is_recorded(self):
+        """Cycling will not fix a revoked pairing; the dispatcher needs to know why."""
+        svc = self._service()
+        svc.is_active_source = Mock(return_value=False)
+        svc.switch_hdmi.return_value = WakeResult(False, "token rejected", needs_pairing=True)
+        with patch("services.media_service.time.sleep"):
+            self.assertIs(svc.ensure_active_source(), False)
+        svc.cec_waker.cycle_input.assert_not_called()
+        self.assertIs(svc.last_input_result.needs_pairing, True)
         svc.cec_waker.cycle_input.assert_not_called()
 
     def test_unknown_state_never_touches_the_input(self):

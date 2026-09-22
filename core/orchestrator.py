@@ -302,39 +302,54 @@ def _ensure_playable(media_svc, say_now=None) -> str:
     and re-issue the action, two extra round trips. One tool call should produce
     one outcome.
 
-    The escalation is shorter than it looks, because CEC does most of it:
+    Reachable is NOT "ready to show something", and that used to be assumed:
 
-      reachable   -> the box's own wake already sent <Text View On> + <Active
-                     Source>, so the TV is on and showing HDMI 2. Only check that
-                     the input has not been parked elsewhere since.
-      unreachable -> ensure_connected() has already tried rediscovery by now, so
-                     the address is not the problem: wake through the television.
+      awake, TV on/unknown -> only check the input has not been parked elsewhere.
+      awake, TV in standby -> the television is dark under a running box (the
+                              tv_only_standby mode leaves it exactly so): turn_on
+                              does the TV half only.
+      asleep but reachable -> a deep link fired now lands on a black screen;
+                              turn_on wakes both halves in parallel (~10-15s).
+      unreachable          -> ensure_connected() has already tried rediscovery,
+                              so the address is not the problem: wake through
+                              the television over CEC (~52s).
 
-    `say_now` speaks an interim line without ending the turn. A CEC wake takes ~25s
-    and a tool call that blocks that long in silence reads as a hang.
+    `say_now` speaks an interim line without ending the turn. A wake takes 10s
+    to a minute and a tool call that blocks that long in silence reads as a hang.
     """
     if not media_svc:
         return "media service not available"
 
-    if media_svc.ensure_connected():
-        # Verified, not fire-and-forget: switch_input reports success on a key the
-        # TV accepted and ignored. None is "could not tell" and never switches.
-        if media_svc.ensure_active_source() is False:
-            return ("The box is awake but I can't get the TV onto its input. "
-                    "Switch to it with the remote and I'll take it from there.")
-        return ""
+    remote_line = ("The box is awake but I can't get the TV onto its input. "
+                   "Switch to it with the remote and I'll take it from there.")
+
+    # Identity checks throughout: a bare Mock's attributes are truthy.
+    if media_svc.is_awake() is True:
+        hdmi = media_svc.hdmi_state()
+        if getattr(hdmi, "tv_power", None) != "standby":
+            # Verified, not fire-and-forget: switch_input reports success on a
+            # key the TV accepted and ignored. None is "could not tell" and never
+            # switches; it fails open, as it always has.
+            if media_svc.ensure_active_source() is False:
+                return remote_line
+            return ""
 
     if say_now:
         say_now("Hold on, waking everything up.")
-    logger.info("Box unreachable for a playback action; attempting a wake")
+    logger.info("Room not ready for a playback action; attempting a wake")
     if media_svc.turn_on() and media_svc.ensure_connected():
-        # A CEC wake selects the box on its way up (One Touch Play), so this is
-        # normally already true and costs one dumpsys.
-        media_svc.ensure_active_source()
+        result = getattr(media_svc, "last_wake_result", None)
+        if result is not None and getattr(result, "needs_pairing", False) is True:
+            return ("The box is on, but the TV rejected my pairing token. Approve "
+                    "me on screen and I'll try again.")
+        if getattr(result, "tv_confirmed", None) is False:
+            return remote_line
+        # True, or None (unconfirmed): proceed. A deep link into a room that
+        # is probably fine beats refusing to play on a maybe.
         return ""
 
     result = getattr(media_svc, "last_wake_result", None)
-    if result is not None and getattr(result, "needs_pairing", False):
+    if result is not None and getattr(result, "needs_pairing", False) is True:
         return ("The TV rejected my pairing token. Approve me on screen and I'll "
                 "try again.")
     return _unreachable_line(media_svc)
@@ -648,19 +663,35 @@ def _dispatch_tv(
         media_svc.go_back()
         return "done"
 
-    # Power. turn_on may take ~20s: it fires a Bluetooth pair request and then
-    # waits for the box to rejoin Wi-Fi. Report what actually happened -- a
-    # failed wake needs the remote and saying otherwise strands Master Miguel.
+    # Power. turn_on takes ~10-15s while the box is still on the LAN (its
+    # KEYCODE_WAKEUP and the television's power-on run side by side) and up to
+    # ~52s from deep standby (the TV wakes it over CEC and it resumes). Report
+    # what actually happened -- a failed wake needs the remote and saying
+    # otherwise strands Master Miguel.
     elif action in ("turn_on", "wake"):
         if not media_svc:
             return "media service not available"
-        # Same interim line _ensure_playable uses, for the same ~47s of
-        # silence. The prompt promises "say you're on it and then wait", but
-        # the model's own preamble is not guaranteed and a direct turn_on
-        # never reached _ensure_playable, so nothing was said at all.
+        # Same interim line _ensure_playable uses, for the same silence. The
+        # prompt promises "say you're on it and then wait", but the model's own
+        # preamble is not guaranteed and a direct turn_on never reached
+        # _ensure_playable, so nothing was said at all.
         if say_now:
             say_now("Hold on, waking everything up.")
         if media_svc.turn_on():
+            # The box is up. The television is a separate claim, carried in
+            # tv_confirmed; compare by identity, a bare Mock is truthy.
+            result = getattr(media_svc, "last_wake_result", None)
+            if result is not None and getattr(result, "needs_pairing", False) is True:
+                logger.warning("turn_on: box up, pairing needed: %s", result.detail)
+                return "the box is on, but the TV needs me approved on screen again"
+            confirmed = getattr(result, "tv_confirmed", True)
+            if confirmed is False:
+                logger.warning("turn_on: box up, TV not showing it: %s", result.detail)
+                return ("the box is on but the TV isn't showing it, give it a second "
+                        "or grab the remote")
+            if confirmed is None:
+                logger.info("turn_on: box up, TV unconfirmed: %s", result.detail)
+                return "the box is on and the TV should be coming up"
             return "TV is on"
         # A rejected pairing token and a dead TV need opposite fixes. Saying
         # "use the remote" when the real answer is "approve me on screen" sends
@@ -676,6 +707,8 @@ def _dispatch_tv(
         if not media_svc:
             return "media service not available"
         if media_svc.turn_off():
+            if getattr(media_svc, "tv_only_standby", False) is True:
+                return "TV going to standby, the box stays up"
             return "TV going to standby"
         return "couldn't put the TV to sleep"
     elif action == "power_toggle":
