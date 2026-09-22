@@ -483,6 +483,10 @@ class MediaService:
         # on the box or the TV's own standby drags the box down with it.
         power_cfg = media_cfg.get("power", {}) or {}
         self.tv_only_standby = bool(power_cfg.get("tv_only_standby", False))
+        # How long to watch for the television's <Standby> to put the box down
+        # so it can be picked straight back up. The window before adbd suspends
+        # with it is ~3-5s (measured 2026-09-21).
+        self.tv_standby_settle_s = max(1, int(power_cfg.get("tv_standby_settle_ms", 10000))) / 1000
 
         # Set by turn_on so the dispatcher can tell a rejected pairing token
         # (needs a human at the screen) and an unconfirmed television from any
@@ -1281,21 +1285,89 @@ class MediaService:
         """
         Put the television into standby and leave the box awake.
 
-        KEY_POWEROFF over the websocket is discrete, so it is safe regardless of
-        what the CEC tail last said -- and **this UE49M5505 ignores it**
-        (measured 2026-09-21: two presses, no <Standby> on the bus, TV stayed
-        on). The next candidate is KEYCODE_TV_POWER from the box, which is
-        Android's own query-then-act (<Give Device Power Status> first, then
-        <Standby> or One Touch Play), still unmeasured. Until one of them is
-        proven the mode cannot deliver a dark television, which is why
-        tv_only_standby ships off. Never KEYCODE_SLEEP here: that is the whole
-        point of the mode.
+        Three measured facts make this harder than one key press, all
+        2026-09-21/22 on the real pair:
+
+        1. This UE49M5505 **ignores KEY_POWEROFF** (two presses, nothing on the
+           bus, TV stayed on). KEY_POWER works and is a toggle, so CecWaker
+           only sends it behind a fresh "on" reading of the CEC bus -- see
+           standby_tv().
+        2. When the set goes off it **broadcasts <Standby>**, and the framework
+           puts the box to sleep on it ("Going to sleep due to hdmi"). That is
+           the TV->box direction and it is NOT the "Device auto power off"
+           toggle (that one is box->TV, `hdmi_control_auto_device_off_enabled`,
+           already off here). It is gated by `persist.sys.hdmi.keep_awake`,
+           which is `exported2_system_prop` -- the shell cannot write it and
+           the box is unrooted, so the sleep cannot be prevented.
+        3. So the box is picked straight back up instead, inside the ~3-5s
+           window before adbd suspends with it. A plain wake would announce
+           <Text View On> + <Active Source> (One Touch Play) and turn the set
+           **straight back on**, so OTP is suppressed across the window and
+           restored afterwards. Measured: with
+           `hdmi_control_one_touch_play_enabled=0` the wake emits neither.
+
+        The suppression is transient on purpose. Leaving it off would mean the
+        physical remote no longer wakes the television either, which is Master
+        Miguel's living room, not ours. It is restored in a finally, and OTP
+        only ever fires on a wake, so restoring it while the box is already
+        awake cannot turn the set back on.
+
+        Never KEYCODE_SLEEP here: an awake box is the whole point of the mode.
         """
-        result = self.cec_waker.standby_tv()
+        # A fresh bus reading, because KEY_POWER is a toggle. "Could not tell"
+        # is not "on": a None here must never reach the key.
+        confirmed_on = self.hdmi_state().tv_power == "on"
+        result = self.cec_waker.standby_tv(confirmed_on)
         self.last_wake_result = result
         if not result:
             log.warning("Television standby did not go out: %s", result.detail)
-        return bool(result)
+            return False
+
+        previous_otp = self._one_touch_play_setting()
+        self._set_one_touch_play(False)
+        try:
+            self._catch_the_box_before_it_suspends()
+        finally:
+            # Restore whatever the box shipped with, defaulting to enabled: a
+            # box left unable to wake its own television is worse than a slow
+            # wake.
+            self._set_one_touch_play(previous_otp is not False)
+        return True
+
+    def _one_touch_play_setting(self) -> bool | None:
+        """True/False as the box has it, None when it could not be read."""
+        ok, out = self._adb("shell settings get global hdmi_control_one_touch_play_enabled")
+        if not ok:
+            return None
+        answer = (out or "").strip()
+        return {"1": True, "0": False}.get(answer)
+
+    def _set_one_touch_play(self, enabled: bool) -> bool:
+        value = "1" if enabled else "0"
+        return self._adb(f"shell settings put global hdmi_control_one_touch_play_enabled {value}")[0]
+
+    def _catch_the_box_before_it_suspends(self) -> bool:
+        """
+        Wait for the television's <Standby> to put the box to sleep, then wake
+        it again while it is still on the LAN. True when the box ends awake.
+        """
+        deadline = time.monotonic() + self.tv_standby_settle_s
+        while time.monotonic() < deadline:
+            state = self.is_awake()
+            if state is False:
+                self._send_wakeup()
+                if self._wait_for_awake(min(self.fast_wake_timeout_s, 5.0)):
+                    log.info("Box caught and kept awake with the television off")
+                    return True
+                break
+            if state is None:
+                break
+            time.sleep(0.5)
+        if self.is_awake() is True:
+            # It never followed the set down -- fine, that is the goal state.
+            return True
+        log.warning("Box followed the television into standby; the next wake pays the CEC chain")
+        return False
 
     def _send_wakeup(self) -> bool:
         """KEYCODE_WAKEUP: a no-op when already awake, never KEYCODE_POWER."""

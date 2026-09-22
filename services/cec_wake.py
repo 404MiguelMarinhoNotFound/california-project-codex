@@ -319,21 +319,28 @@ class CecWaker:
             return WakeResult(False, "TV not reachable")
         return self._send_keys([self.input_key, self.input_key])
 
-    def standby_tv(self) -> WakeResult:
+    def standby_tv(self, tv_confirmed_on: bool) -> WakeResult:
         """
         Put the television into standby WITHOUT sleeping the box.
 
-        KEY_POWEROFF is Samsung's discrete off key; it is never a toggle, so
-        sending it to a television that is already off changes nothing. Used by
-        MediaService.turn_off when media.power.tv_only_standby is on. KEY_POWER
-        is never sent from here: it toggles, and a toggle against an unknown
-        state is the same class of bug as KEYCODE_POWER on the box.
+        `tv_confirmed_on` must be a FRESH reading of the CEC bus saying the set
+        is on, and it is required rather than advisory. KEY_POWEROFF, Samsung's
+        discrete off key, would need no such proof -- but this UE49M5505
+        ignores it outright (measured 2026-09-21: two presses, nothing on the
+        bus, TV stayed on). What works is KEY_POWER, and that is a toggle, so
+        sending it against an unknown state is the same class of bug as
+        KEYCODE_POWER on the box: it would turn a dark television back on.
+
+        MediaService.tv_power_status() is the only honest source for that flag.
+        Never pass a REST probe: this set answers :8001 in standby.
         """
         if not self.available:
             return WakeResult(False, self.unavailable_reason)
+        if not tv_confirmed_on:
+            return WakeResult(False, "TV power unconfirmed; KEY_POWER is a toggle")
         if not self.resolve_tv_ip():
             return WakeResult(False, "TV not reachable")
-        return self._send_keys(["KEY_POWEROFF"])
+        return self._send_keys(["KEY_POWER"])
 
     def wake(self) -> WakeResult:
         """Power the TV, then toggle its input so CEC wakes the box."""

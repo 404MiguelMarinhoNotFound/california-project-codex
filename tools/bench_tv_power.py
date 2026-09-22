@@ -15,6 +15,7 @@ behaviour she will get.
     uv run python tools/bench_tv_power.py keys      # the proven KEY_HDMI pair, TV-on from shallow standby
     uv run python tools/bench_tv_power.py wol-only  # WoL alone, box awake
     uv run python tools/bench_tv_power.py tv-standby --key KEY_POWER   # one press, outcome read off the bus
+    uv run python tools/bench_tv_power.py standby-mode --hold 120      # the whole tv_only_standby round trip
 
 Never sends KEYCODE_POWER -- it is a toggle, see CLAUDE.md. `soak` and `wake`
 put the room to sleep on purpose; run them when nobody is watching.
@@ -231,6 +232,59 @@ def cmd_tv_standby(svc: MediaService, args) -> int:
     return 0
 
 
+def cmd_standby_mode(svc: MediaService, args) -> int:
+    """
+    The whole tv_only_standby round trip on the real room: turn_off() puts only
+    the television to sleep, the box is caught before it suspends, it stays
+    awake for `--hold` seconds, and then turn_on() is timed.
+
+    Forces media.power.tv_only_standby on for this run so the shipped config
+    does not have to be edited to measure it.
+    """
+    print("Room:", _room(svc))
+    if svc.is_awake() is not True:
+        print("Precondition: the box must be awake and reachable.")
+        return 2
+    before = svc.hdmi_state()
+    if before.tv_power != "on":
+        print(f"The bus does not say the TV is on (tv_power={before.tv_power}); "
+              f"turn_off would refuse to send a toggle. Turn the TV on first.")
+        return 2
+
+    svc.tv_only_standby = True
+    otp_before = svc._one_touch_play_setting()
+    print(f"one_touch_play before: {otp_before}")
+
+    t0 = time.monotonic()
+    ok = svc.turn_off()
+    print(f"  {_stamp(t0)} turn_off() -> {ok}; last={svc.last_wake_result}", flush=True)
+    print(f"  {_stamp(t0)} one_touch_play restored to: {svc._one_touch_play_setting()}")
+
+    deadline = time.monotonic() + args.hold
+    worst = None
+    while time.monotonic() < deadline:
+        awake = svc.is_awake()
+        hdmi = svc.hdmi_state(since=before.newest_stamp) if awake is not None else None
+        line = (f"  {_stamp(t0)} box_awake={awake}"
+                + (f" tv_power={hdmi.tv_power}" if hdmi else ""))
+        print(line, flush=True)
+        if awake is not True:
+            worst = awake
+        time.sleep(args.interval)
+
+    held = svc.is_awake()
+    print(f"After {args.hold:.0f}s: box_awake={held} (worst seen: {worst})")
+    print("Look at the television: it should be OFF and have stayed off.")
+
+    t1 = time.monotonic()
+    on = svc.turn_on()
+    print(f"turn_on() -> {on} in {time.monotonic()-t1:.1f}s; last={svc.last_wake_result}")
+    hdmi = svc.hdmi_state()
+    print(f"final: tv_power={hdmi.tv_power} active_source={hdmi.active_source} "
+          f"one_touch_play={svc._one_touch_play_setting()}")
+    return 0
+
+
 def _time_primitives(svc: MediaService, watch: float) -> dict:
     """Box half and TV half in parallel, timing every first."""
     t0 = time.monotonic()
@@ -321,6 +375,11 @@ def main() -> int:
     p.add_argument("--watch", type=float, default=12)
     p.add_argument("--force", action="store_true", help="send even if the bus cannot confirm the TV is on")
 
+    p = sub.add_parser("standby-mode",
+                       help="full tv_only_standby round trip: TV off, box kept awake, then turn_on timed")
+    p.add_argument("--hold", type=float, default=120, help="seconds to watch the box stay awake")
+    p.add_argument("--interval", type=float, default=15)
+
     p = sub.add_parser("wake", help="time the wake, primitives in parallel or the real turn_on()")
     p.add_argument("--runs", type=int, default=1)
     p.add_argument("--between-minutes", type=float, default=1)
@@ -339,6 +398,7 @@ def main() -> int:
     return {
         "soak": cmd_soak, "otp": cmd_otp, "keys": cmd_keys,
         "wol-only": cmd_wol_only, "wake": cmd_wake, "tv-standby": cmd_tv_standby,
+        "standby-mode": cmd_standby_mode,
     }[args.cmd](svc, args)
 
 

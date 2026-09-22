@@ -645,11 +645,17 @@ media:
   # (stay_on_while_plugged_in=3, sleep_timeout=-1, screensaver after 10 min).
   # REQUIRES on the box, or the TV's own standby drags it down with it:
   #   adb shell settings put global hdmi_control_auto_device_off_enabled 0
-  # OFF: measured 2026-09-21, this UE49M5505 ignores KEY_POWEROFF (no <Standby>
-  # on the bus, TV stayed on), so the mode cannot yet put the television to
-  # sleep. KEYCODE_TV_POWER from the box is the next candidate to measure.
+  # tv_only_standby: turn_off puts ONLY the television into standby and keeps
+  # the box awake, so the next turn_on is the ~2s path instead of the ~45s one.
+  # What it costs, measured 2026-09-22: the set broadcasts <Standby> and the
+  # framework sleeps the box on it (persist.sys.hdmi.keep_awake is not writable
+  # from shell), so the box is caught and woken again inside the ~3-5s window,
+  # with One Touch Play suppressed for exactly that long and then restored.
+  # KEY_POWEROFF is ignored by this set; KEY_POWER works and is a toggle, so it
+  # is only ever sent behind a fresh "the TV is on" reading of the CEC bus.
   power:
     tv_only_standby: false
+    tv_standby_settle_ms: 10000
 
   vpn_routing_enabled: false
   vpn_state_path: "vpn_state.json"
