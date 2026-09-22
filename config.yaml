@@ -638,13 +638,6 @@ media:
     otp_grace_ms: 4000
 
   # --- Standby depth ---
-  # tv_only_standby: turn_off puts ONLY the television into standby
-  # (KEY_POWEROFF over its websocket, a discrete key, never a toggle) and leaves
-  # the box awake on Home, so the next turn_on takes the fast path instead of
-  # paying ~30s for a resume from deep standby. The box never sleeps on its own
-  # (stay_on_while_plugged_in=3, sleep_timeout=-1, screensaver after 10 min).
-  # REQUIRES on the box, or the TV's own standby drags it down with it:
-  #   adb shell settings put global hdmi_control_auto_device_off_enabled 0
   # tv_only_standby: turn_off puts ONLY the television into standby and keeps
   # the box awake, so the next turn_on is the ~2s path instead of the ~45s one.
   # What it costs, measured 2026-09-22: the set broadcasts <Standby> and the
@@ -653,6 +646,9 @@ media:
   # with One Touch Play suppressed for exactly that long and then restored.
   # KEY_POWEROFF is ignored by this set; KEY_POWER works and is a toggle, so it
   # is only ever sent behind a fresh "the TV is on" reading of the CEC bus.
+  # Needs no box setting: the stock hdmi_control_auto_device_off_enabled=1 and
+  # hdmi_control_one_touch_play_enabled=1 are what it expects. Off until
+  # `tools/bench_tv_power.py standby-mode` has shown the box holds awake.
   power:
     tv_only_standby: false
     tv_standby_settle_ms: 10000

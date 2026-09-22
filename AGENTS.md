@@ -1238,7 +1238,7 @@ Recommended behavior:
 
 ### Operational Recommendation
 
-A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby` plus `hdmi_control_auto_device_off_enabled=0` on the box — see CLAUDE.md "Standby depth".
+A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby`, which needs no box setting — see CLAUDE.md "Standby depth". Both devices have static addresses outside the DHCP pool since 2026-09-22 (box `192.168.1.200`, device MAC `9c:12:21:1c:95:ae`; TV `192.168.1.201`) — see CLAUDE.md "Static addresses".
 
 ### Final VPN Routing Rules
 

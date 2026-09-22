@@ -664,7 +664,8 @@ or "stop".
 keyevent. On depends on standby depth: while the box is still on the LAN
 (shallow standby, or awake under a dark television) `KEYCODE_WAKEUP` and the
 television's own power-on run side by side and the CEC bus confirms the
-result, ~10-15s; once it has suspended, only the TV can reach it, over CEC.
+result, **2.2s measured**; once it has suspended, only the TV can reach it, over
+CEC, ~45-63s.
 The Mi Box goes to sleep on `KEYCODE_SLEEP` and its firmware **force-suspends
 ~15s later regardless of any wakelock** (`PowerManagerService: force-suspend
 now`, listing the wakelocks it ignores — measured 2026-09-21, which is why every
@@ -797,36 +798,63 @@ exactly that, three times, during this work. `MediaService` is now state-aware:
 `None` and `False` take different branches. **Do not collapse them into a
 boolean** — that is the whole wake path.
 
-#### Measured 2026-09-21, nobody in the room
+#### Measured 2026-09-21/22, nobody in the room
 
 | path | measured |
 |---|---|
 | already on (box awake, TV showing it) | 0.6s, nothing sent |
 | fast path, box asleep-but-reachable | **2.2s** (box awake 1.7s, active source at 1.9s) once the OTP grace was in; **20.7s** before it, because the first CEC read landed before the box's own One Touch Play re-asserted it and the loop went straight to `KEY_HDMI2` + cycle |
-| deep standby (CEC chain) | **45.3s** (TV had moved to `.86`, rediscovered on the way) |
+| deep standby (CEC chain) | **45.3s, 62.7s, 48.9s, 48.7s** over four runs; the last was after 600s idle, so idle time barely moves it |
 | box reachable after `KEYCODE_SLEEP` | **< 5s** — `adb shell` fails before the 15s force-suspend; the shallow window is ~3s |
 | `KEY_POWEROFF` to the TV | **ignored** by the UE49M5505: two presses, no `<Standby>` on the bus, TV stayed on |
+| `KEY_POWER` to the TV | **works**: `<Standby>` on the bus within ~2s. A toggle, so only ever sent behind a fresh "on" reading |
+| `KEYCODE_TV_POWER` from the box | **unhandled** on this Google TV build: WindowManager logs keycode 177 as "Unhandled key" to the launcher, nothing reaches HDMI control |
+| **dark room -> Fallout playing** (`bench stremio --from-off`) | **115.1s** after 25s idle, **130.9s** after 600s idle: wake ~49s, **Stremio launch 64-79s**, playing +2-3s |
 
 So today the fast path is the exception and the 45s chain the rule, because the
-box is gone within seconds of `turn_off`. The lever is below.
+box is gone within seconds of `turn_off`. The lever is below. And the wake is
+not the biggest half of "put on X" from a dark room -- the Stremio launch is;
+see "Known Bugs" at the end.
 
 #### Standby depth: what keeps the fast path available
 
 The box never sleeps on its own (`stay_on_while_plugged_in=3`, `sleep_timeout=-1`,
 screensaver after 10 min). It sleeps on `KEYCODE_SLEEP` (our `turn_off`) or when
-the television enters standby with `hdmi_control_auto_device_off_enabled=1`;
-either way it force-suspends ~15s later and the next wake costs ~30s of resume.
+the television enters standby; either way it force-suspends ~15s later and the
+next wake costs ~30s of resume.
+
 `media.power.tv_only_standby` makes `turn_off` put only the television into
-standby (`KEY_POWEROFF`, a discrete key, never a toggle), stop playback and park
-on Home, so the box stays awake and the next `turn_on` is the fast path. It
-needs `adb shell settings put global hdmi_control_auto_device_off_enabled 0` on
-the box first (set on 2026-09-21; the box then stays awake when the TV goes to
-standby by any route). **Off by default because the TV half is unproven**:
-`KEY_POWEROFF` is ignored by this set (measured), and `KEYCODE_TV_POWER` from
-the box — Android's query-then-act, `<Give Device Power Status>` then
-`<Standby>` or One Touch Play — is the next thing to measure. When a standby
-key works, the box stays awake (measured: still awake a minute after
-`turn_off` under the mode) and every `turn_on` is the ~2s path.
+standby and keep the box awake, so the next `turn_on` is the ~2s path. Three
+facts shape it, all measured on the real pair 2026-09-21/22:
+
+1. **The standby key is `KEY_POWER`, and it is a toggle.** `KEY_POWEROFF` is
+   ignored by this set and `KEYCODE_TV_POWER` never leaves the box (table
+   above). `CecWaker.standby_tv(tv_confirmed_on)` therefore *requires* a fresh
+   "on" reading from the CEC bus and refuses otherwise -- "could not tell" is
+   not "on", and a toggle against it would turn a dark set back on.
+2. **The TV's `<Standby>` broadcast sleeps the box, and that cannot be
+   switched off.** The log says `Going to sleep due to hdmi`. It is the
+   TV->box direction, NOT the "Device auto power off" toggle in Display & Sound
+   -> HDMI-CEC (`hdmi_control_auto_device_off_enabled`, which is box->TV:
+   `mAutoTvOff`). TV->box is gated by `persist.sys.hdmi.keep_awake`, an
+   `exported2_system_prop` read by `services.jar`: `setprop` from shell is
+   refused and there is no UI for it on this build.
+3. **So the box is caught and woken again** inside the ~3-5s before adbd
+   suspends (`_catch_the_box_before_it_suspends`). A plain wake would announce
+   `<Text View On>` + `<Active Source>` and turn the set straight back on, so
+   One Touch Play (`hdmi_control_one_touch_play_enabled`, shell-writable) is
+   suppressed for exactly that window and restored in a `finally`. Measured:
+   with OTP at 0 the wake emits neither message and the box stays awake. The
+   suppression is transient on purpose -- left off, the physical remote would
+   stop waking the television too -- and restoring it while the box is already
+   awake cannot fire it, because OTP only runs on a wake.
+
+It needs no box setting: stock `auto_device_off=1` and `one_touch_play=1` are
+what it expects (both were restored after the experiments). **Off by default
+until `tools/bench_tv_power.py standby-mode --hold 120` has shown the box
+holding awake with the TV dark**; that run needs a `KEY_POWER` send, which has
+to be started by hand. The trade when it is on: "turn off the TV" leaves the
+box running on its screensaver behind a dark set.
 
 **The power actions are deliberately absent from `_dispatch_tv`'s `requires_tv`
 set.** That gate returns `"TV is off or unreachable right now"` when
@@ -1508,7 +1536,7 @@ Recommended behavior:
 
 ### Operational Recommendation
 
-A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby` plus `hdmi_control_auto_device_off_enabled=0` on the box — see "Standby depth" above.
+A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby`, which needs no box setting — see "Standby depth" above. Both devices also have static addresses outside the DHCP pool since 2026-09-22 — see "Static addresses".
 
 ### Final VPN Routing Rules
 
@@ -2007,8 +2035,14 @@ Current automated coverage exists for:
   is awake, that a box that will not wake over ADB falls back to CEC, that the
   confirm loop never switches inputs on an unknown active source and sends the
   `KEY_HDMI` pair only when the bus says standby, that evidence older than the
-  wake is ignored, that `_wait_for_awake` never rediscovers, that
-  `tv_only_standby` never sleeps the box and never sends a toggle, that
+  wake is ignored, that a parked input gets the box's own One Touch Play
+  grace before any key is sent, that `_wait_for_awake` never rediscovers,
+  that `tv_only_standby` never sends `KEYCODE_SLEEP`, sends `KEY_POWER` only
+  on a fresh "on" reading (never on standby or unknown), catches the box
+  when the TV's standby puts it down and wakes it again, suppresses One Touch
+  Play across that window and restores it even when the catch raises (and
+  leaves it enabled when the box's value is unreadable), and never touches
+  OTP when the television command itself failed, that
   `is_awake()` keeps `None` distinct from `False`, that the wait loop clears
   the offline cooldown, and that `turn_on` survives the `requires_tv` gate
   while the TV is unreachable
@@ -2141,10 +2175,18 @@ Current automated coverage exists for:
 Useful live-debug commands:
 
 ```bash
+uv run python tools/bench_tv_power.py stremio --from-off --settle 600   # THE number: dark room -> playing, phase by phase
+uv run python tools/bench_tv_power.py standby-mode --hold 120         # tv_only_standby round trip (sends KEY_POWER: start it by hand)
+uv run python tools/bench_tv_power.py tv-standby --key KEY_POWER      # one power key, outcome read off the CEC bus
 uv run python tools/bench_tv_power.py otp                 # box asleep-but-reachable: does its own wake bring the TV on?
 uv run python tools/bench_tv_power.py soak --minutes 60   # how long after turn_off does the box stay on the LAN?
 uv run python tools/bench_tv_power.py wake --runs 3 --via-turn-on
 ```
+
+`bench_tv_power.py` loads `.env` like `main.py` (Stremio and TMDB credentials);
+a worktree needs its own copy, and without it the launch fails as "I couldn't
+find X". `stremio` starts the clock at a dark television with `--from-off`, or
+at whatever state the room is in without it.
 
 ```bash
 uv run python tools\debug_surfshark_sequence.py restart_autoconnect --capture --debug
@@ -2423,16 +2465,25 @@ A trace of notable multi-turn Claude Code sessions, so a future session (or
 Master Miguel) can find the conversation that produced a feature instead of
 just the commits.
 
-- **"1 minute really is unacceptable" (2026-09-21, branch `feat/fast-tv-wake`).**
-  After the Bluetooth route was ruled out (PR #33), rebuilt `turn_on` around
-  the fact that a box still on the LAN wakes in 1.3s: box half and TV half on
-  a thread pool, then a CEC-bus confirm with `tv_confirmed` carried on
-  `WakeResult`; `_ensure_playable` stopped treating "reachable" as "the TV is
-  on". Found on hardware that the firmware force-suspends ~15s after sleep
-  ignoring wakelocks, and that the CEC tail keeps saying "standby" after the
-  set is turned on by hand (hence `_parse_tv_power(since=)`). Added
-  `tools/bench_tv_power.py`; the `tv_only_standby` mode is in but off until
-  its soak test runs at a quiet hour.
+- **"1 minute really is unacceptable" (2026-09-21/22, branch `feat/fast-tv-wake`,
+  PR #34).** After the Bluetooth route was ruled out (PR #33), rebuilt
+  `turn_on` around the fact that a box still on the LAN wakes in 1.3s: box
+  half and TV half on a thread pool, then a CEC-bus confirm with
+  `tv_confirmed` carried on `WakeResult`; `_ensure_playable` stopped treating
+  "reachable" as "the TV is on". Hardware findings along the way: the
+  firmware force-suspends ~15s after sleep ignoring wakelocks; the CEC tail
+  keeps saying "standby" after the set is turned on by hand (hence
+  `_parse_tv_power(since=)` and TV enumeration traffic as "on" evidence); a
+  parked input needs the box's own One Touch Play grace (20.7s -> 2.2s);
+  `KEY_POWEROFF` and `KEYCODE_TV_POWER` do nothing on this pair while
+  `KEY_POWER` works; and the TV's `<Standby>` sleeps the box through a
+  property shell cannot write, which is why `tv_only_standby` catches and
+  re-wakes it with One Touch Play suppressed. Benchmarked the path Master
+  Miguel actually takes -- dark room to Fallout playing, 115-131s -- and
+  found the Stremio launch, not the wake, is the bigger half; left alone at
+  his call. Pinned both devices to static addresses outside a shrunken DHCP
+  pool, since the NOS portal has no reservations. `tv_only_standby` ships
+  off until its `standby-mode` run.
 
 - **"Deebot N8+ voice control" (2026-09-16, branch `feat/deebot-vacuum-exploration`).**
   Went from "search online for a deebot-client library" to a shipped
@@ -2517,6 +2568,22 @@ One more was found and fixed on **2026-09-03**, in the power path:
   **Verified end to end**: both devices fully off, recovered by script alone —
   WoL to the Samsung, HDMI toggle, box awake. See "Power: Off Is ADB, On Is The
   Television".
+
+Found on **2026-09-22**, not yet fixed (parked by Master Miguel):
+
+- **"Put on X" from a dark room takes 115-131s, and the Stremio launch is
+  64-79s of it** (`tools/bench_tv_power.py stremio --from-off`). Inside it: two
+  back-to-back library syncs, a 5.7s OK keyevent, and a provider scan whose
+  first two `uiautomator dump` calls timed out after 13.6s and 10.4s -- the
+  documented "a rendering video never lets the UI go idle" -- while the show
+  was already playing.
+- **The provider scan asks for a source while the show is on screen.** The
+  600s-idle run returned "I couldn't find Comet, MediaFusion, or Torrent for
+  Fallout. Want me to try the first available source?" and the box reported
+  `Fallout, The Strip` playing 2.9s later. The scan's media-session checks
+  missed a start that landed between them; the fix is to re-check playback
+  once more before returning the confirmation prompt, and to stop scanning
+  the moment it is confirmed.
 
 Confirmed **High-severity** backlog:
 
