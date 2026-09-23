@@ -17,6 +17,7 @@ back along the same relative path.
 | `models/.cache/huggingface/` | `hf_hub_download` cache bookkeeping left behind by `download_jarvis.py`. |
 | `sounds/activate/` | Superseded duplicate (2 files) of `sounds/california_activations/` (48 files), which is what `core/audio_pipeline.py:45` actually loads. |
 | `debug/surfshark/<11 dated folders>` | 14 MB of screenshots from one calibration session on 2026-03-12. The conclusions are recorded in CLAUDE.md ("Current Surfshark Route Calibration") and `surfshark_routes.json`. |
+| `tools/record_wakeword.py` | Moved 2026-09-23. Replaced by `tools/wakeword_dataset.py`: this one recorded a fixed 2.5s window through the default device, trimmed destructively at 6% of peak, accepted anything 200-2200ms over a peak of 1500, kept no record of distance, background or language, and left the holdout split to hand. The recordings it made are imported by `wakeword_dataset.py audit`. |
 
 ## Not moved, deliberately
 

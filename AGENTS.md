@@ -234,7 +234,7 @@ california/
 │   ├── probe_govee_devices.py      # Lists Govee devices with sku, device id, and capabilities
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
-│   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
+│   ├── wakeword_dataset.py         # Wake-word training data: record sessions, checks, review, audit, export
 │   ├── probe_stremio_sync.py       # Refreshes and inspects Stremio watch-state cache
 │   ├── debug_stremio_collections.py # Inspects raw Stremio collection payloads when sync is wrong
 │   ├── search_youtube_playlists.py # Finds public YouTube playlist candidates by search query
@@ -262,6 +262,7 @@ california/
 │   ├── test_vad_silence.py      # Grace window, saw-speech flag, Silero framing
 │   ├── test_wake_word_framing.py # openWakeWord native-frame buffering, consecutive frames, dither floor
 │   ├── test_score_wakeword.py   # Scorer bed padding, determinism, ok-captures excluded from negatives
+│   ├── test_wakeword_dataset.py # Dataset checks, transcript match, holdout leak guard, export
 │   ├── test_name_matcher.py     # Matcher tier order, despacing, "&" normalization
 │   ├── test_playlist_config.py  # Structural sweep of the real config.yaml playlist data
 │   ├── test_youtube_playlist_resolver.py # Matching, aliases, and random-selection coverage
@@ -1779,6 +1780,14 @@ Current automated coverage exists for:
   inside a 2s/1s bed, the last samples of the word reach the model, framed
   scoring gets the same bed, a file scores identically every run, and
   `--negatives` skips `*_ok.wav` captures while recall mode does not
+- The wake-word dataset tool (`tests/test_wakeword_dataset.py`): silence,
+  clipping, a blip and a word cut off by the window are rejected; a second
+  sound or a word under 10 dB is flagged, not rejected; too-long only flags
+  with a TV on; a short gap inside the word does not split it; Whisper's
+  renderings of "California"/"Califórnia" match and near-misses do not; only
+  ok/accepted takes export; a session or identical audio on both sides of the
+  split refuses the export; holdout room tone never becomes a training
+  background
 - Whisper hallucination rejection: the filler blocklist (and that live control
   words like "go" and "stop" are not in it), `no_speech_prob` / `avg_logprob`
   gating on the worst segment, and failing open on an unexpected response shape
@@ -1839,9 +1848,7 @@ uv run python tools\score_wakeword.py --dir training
 ecordings\holdout_pt
 uv run python tools\score_wakeword.py --dir training
 ecordings\holdout_en --model models\california.onnx --threshold 0.59
-uv run python tools
-ecord_wakeword.py --count 150 --out training
-ecordings\positive
+uv run python tools\wakeword_dataset.py record --lang pt --distance couch --background tv
 ```
 
 Targeted validation used for the latest Stremio resume work:
