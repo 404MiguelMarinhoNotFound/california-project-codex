@@ -128,12 +128,12 @@ CONTROL_TV_TOOL = {
 CONTROL_LIGHTS_TOOL = {
     "name": "control_lights",
     "description": (
-        "Controls Master Miguel's Govee smart lights: power, brightness, and colour. "
+        "Controls Master Miguel's smart lights: power, brightness, and colour. "
         "Use when asked to turn lights on or off, dim or brighten them, or change "
         "their colour, in any room. If no room is named, the default light is used. "
         "Brightness and colour only show on a light that is already on, so call "
-        "light_on first if it might be off. light_status reports the last command "
-        "sent, not a live reading, because the strip cannot be read back. "
+        "light_on first if it might be off. light_status says what the light is "
+        "doing, and says so itself when that is memory rather than a live reading. "
         "Do not use this for the TV."
     ),
     "input_schema": {
@@ -232,28 +232,33 @@ CONTROL_VACUUM_TOOL_OPENAI = {
 CONTROL_WHATSAPP_TOOL = {
     "name": "control_whatsapp",
     "description": (
-        "Sends WhatsApp messages from Master Miguel's laptop, and looks people up in "
-        "his contact book. Use whatsapp_send with `to` (a contact name exactly as he "
-        "said it, or a phone number) and `message`, and whatsapp_find_contact to check "
-        "whether someone is in the book without messaging them. The contact book is "
-        "looked up here, not listed in this prompt, so pass the name through as spoken "
-        "rather than guessing at a full name. If the name is only a loose match the "
-        "tool comes back with a recipient to read out and does NOT send: relay that "
-        "line and wait for his answer. Only set confirm true after he has said yes to "
-        "that read-back in this same turn, never on a first attempt. Optionally pass "
-        "`at` as HH:MM to schedule it. Not for the TV, the lights or the vacuum."
+        "Sends WhatsApp messages from Master Miguel's laptop, looks people up in "
+        "his contact book, and says what is unread. Use whatsapp_send with `to` (a "
+        "contact name exactly as he said it, or a phone number) and `message`, and "
+        "whatsapp_find_contact to check whether someone is in the book without "
+        "messaging them. The contact book is looked up here, not listed in this "
+        "prompt, so pass the name through as spoken rather than guessing at a full "
+        "name. If the name is only a loose match the tool comes back with a recipient "
+        "to read out and does NOT send: relay that line and wait for his answer. Only "
+        "set confirm true once he has said yes to that read-back, never on a first "
+        "attempt. Optionally pass `at` as HH:MM to schedule it. whatsapp_unread with "
+        "no `to` lists who has unread messages; with `to` it gives that person's "
+        "latest message. Not for the TV, the lights or the vacuum."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["whatsapp_send", "whatsapp_find_contact"],
-                "description": "Send a message, or just look a contact up."
+                "enum": ["whatsapp_send", "whatsapp_find_contact", "whatsapp_unread"],
+                "description": "Send a message, look a contact up, or check what is unread."
             },
             "to": {
                 "type": "string",
-                "description": "Who to message: a contact name as spoken, or a phone number."
+                "description": (
+                    "Who to message: a contact name as spoken, or a phone number. "
+                    "For whatsapp_unread, optional: whose latest unread message to read."
+                )
             },
             "message": {
                 "type": "string",
@@ -339,9 +344,13 @@ class LLMService:
         # at call time instead. Only the handful of configured nicknames go in.
         whatsapp_cfg = config.get("whatsapp", {}) or {}
         self.whatsapp_enabled = bool(whatsapp_cfg.get("enabled", False))
+        from services.whatsapp_service import load_alias_config
+
+        # The same loader the service uses, so the prompt advertises exactly the
+        # nicknames resolve_contact accepts -- including the gitignored file.
         self.whatsapp_aliases: list[str] = [
             str(key).strip()
-            for key, value in (whatsapp_cfg.get("aliases") or {}).items()
+            for key, value in load_alias_config(whatsapp_cfg).items()
             if str(key).strip() and str(value or "").strip()
         ]
 

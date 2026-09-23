@@ -36,3 +36,12 @@ device_state.json
 # address book -- a few hundred real people's phone numbers, so local-only for
 # the same reason .deebot_credentials.json is. Drop your own export here.
 contacts.vcf
+
+# The WhatsApp Web browser profile (whatsapp.profile_dir). It holds a linked-device
+# session for Master Miguel's account -- the session IS the credential, so it is
+# local-only for the same reason as the two files above.
+.whatsapp_profile/
+
+# WhatsApp nicknames (whatsapp.aliases_path). Says who his family, partner and
+# friends are, and the repository is public -- local-only like contacts.vcf.
+whatsapp_aliases.yaml

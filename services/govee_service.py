@@ -1,19 +1,28 @@
 """
 Govee Service — control for Govee smart lights.
 
-Two transports, selected by `govee.transport` in config.yaml:
+Three transports, and the transport is chosen PER LIGHT from the fields each one
+carries in config.yaml:
 
-  "ble"   — direct Bluetooth LE from this machine. Works with models Govee does
-            not expose over its cloud API, which includes every BLE-only strip.
-  "cloud" — Govee Developer v2 HTTP API. Only works for models on Govee's
-            published whitelist (https://developer.govee.com/docs/support-product-model)
-            AND only for Wi-Fi devices owned by the account the key belongs to.
+  "ble"   — `mac`. Direct Bluetooth LE from this machine. Works with models Govee
+            does not expose over its cloud API, which includes every BLE-only strip.
+  "cloud" — `sku` + `device`. Govee Developer v2 HTTP API. Only works for models on
+            Govee's published whitelist
+            (https://developer.govee.com/docs/support-product-model) AND only for
+            Wi-Fi devices owned by the account the key belongs to.
+  "tapo"  — `host`. TP-Link Tapo over the LAN, in services/tapo_transport.py. The
+            only one that can be READ back.
+
+`govee.transport` is now only the tie-break for a light carrying fields for more
+than one of them, and the transport whose requirements get named when a light
+carries fields for none. Until 2026-09-17 it selected one transport for the whole
+service and every light missing that field was skipped at boot, which meant the
+attic strip and the living-room bulb could not both be controlled in one run.
 
 Master Miguel's attic strip is an H617E, which is BLE-only: it is absent from the
 cloud whitelist, never appears in `GET /user/devices`, and does not join Wi-Fi at
-all (its setup flow pairs over Bluetooth and never asks for an SSID). Hence "ble"
-is the working default here. The cloud transport is kept for any future
-whitelisted device.
+all (its setup flow pairs over Bluetooth and never asks for an SSID). The living
+room is a Tapo L530E. Both are live at once.
 
 BLE protocol (reverse-engineered, confirmed working on H617A/E):
   characteristic 00010203-0405-0607-0809-0a0b0c0d2b11, Write Without Response
@@ -441,7 +450,28 @@ class CloudTransport:
         return payload.get("data") or []
 
 
-_TRANSPORTS = {"ble": BleTransport, "cloud": CloudTransport}
+_TRANSPORT_NAMES = ("ble", "cloud", "tapo")
+
+
+def _transport_class(name: str):
+    """
+    Look up a transport class by config name, importing Tapo's only on demand.
+
+    The lazy import is not an optimisation, it breaks a cycle: `tapo_transport`
+    imports `GoveeCommandResult` and `clamp_percent` from this module, so a
+    top-level import here would be circular. It also keeps python-kasa (and its
+    Python 3.14 import shim) out of the process entirely for the two transports
+    that have nothing to do with TP-Link.
+    """
+    if name == "ble":
+        return BleTransport
+    if name == "cloud":
+        return CloudTransport
+    if name == "tapo":
+        from services.tapo_transport import TapoTransport
+
+        return TapoTransport
+    return None
 
 
 class GoveeService:
@@ -451,62 +481,162 @@ class GoveeService:
         self.transport_name = str(govee_cfg.get("transport") or "ble").strip().lower()
         self.default_light = str(govee_cfg.get("default_light") or "").strip()
 
-        transport_cls = _TRANSPORTS.get(self.transport_name)
-        if transport_cls is None:
+        # Transport is per LIGHT, not per service. The attic strip is Govee over
+        # BLE and the living room is a Tapo bulb over the LAN; before 2026-09-17
+        # one `govee.transport` chose one of them and every light missing that
+        # transport's field was skipped at boot, so the two rooms could not both
+        # be controlled in the same run. Each light now gets the transport its
+        # own fields imply, and `govee.transport` is only the tie-break for a
+        # light that carries fields for more than one (the cloud fixture's
+        # attic has a `mac` AND a `sku`/`device` pair).
+        #
+        # `self.transport` remains the PRIMARY transport -- the one
+        # `govee.transport` names. It is what `transport_name` describes, and
+        # keeping it is not only back-compat: a light with no fields at all is
+        # reported against the primary's requirements, which is the error
+        # message that tells the operator what they meant to type.
+        self._transports: dict[str, object] = {}
+        self._light_transports: dict[str, object] = {}
+        self._govee_cfg = govee_cfg
+
+        if _transport_class(self.transport_name) is None:
             logger.error(
                 "Unknown govee.transport '%s'. Choose from: %s",
                 self.transport_name,
-                ", ".join(sorted(_TRANSPORTS)),
+                ", ".join(sorted(_TRANSPORT_NAMES)),
             )
             self.transport = None
             self.lights = {}
         else:
             # Never raise here. The orchestrator builds every service at startup
             # and a misconfigured light must not take the whole assistant down.
-            self.transport = transport_cls(govee_cfg)
-            self.lights = self._build_lights(
-                govee_cfg.get("lights", {}), transport_cls.required_fields
-            )
+            self.transport = self._transport(self.transport_name)
+            self.lights = self._build_lights(govee_cfg.get("lights", {}))
 
         configured = bool(govee_cfg.get("enabled", False))
-        self.enabled = bool(configured and self.transport and self.transport.available)
+        # "At least one light can actually be driven", rather than "the primary
+        # transport came up". With two transports in play, a missing bleak must
+        # not disable a Tapo bulb that is working perfectly well.
+        usable = any(
+            getattr(transport, "available", False)
+            for transport in self._light_transports.values()
+        )
+        self.enabled = bool(configured and self.transport and usable)
+
+        # Whether ANY configured light can tell us what it is ACTUALLY doing,
+        # rather than what we last sent it. True for Tapo; BLE has no notify
+        # characteristic and the cloud API cannot see the attic strip. The
+        # per-light answer is inside `get_state`, which returns None for a light
+        # whose own transport cannot read -- the caller already treats None as
+        # "fall back to shadow memory", so a mixed setup needs nothing else.
+        #
+        # A plain bool, and `_dispatch_lights` compares it with `is True` -- the
+        # light tests build the service as a bare Mock, which auto-stubs every
+        # attribute as truthy, so a loose check there would read "yes I can read
+        # the bulb" off a Mock that reads nothing.
+        self.can_read_state = bool(
+            self.enabled
+            and any(
+                hasattr(transport, "get_state")
+                for transport in self._light_transports.values()
+            )
+        )
 
         if self.enabled:
             logger.info(
-                "Govee initialized: transport=%s, %d light(s), default=%s",
-                self.transport_name,
+                "Govee initialized: %d light(s) over %s, default=%s",
                 len(self.lights),
+                ", ".join(sorted({self._name_of(t) for t in self._light_transports.values()})) or "nothing",
                 self.default_light or "none",
             )
 
-    @staticmethod
-    def _build_lights(raw: dict, required_fields: tuple) -> dict:
+    def _transport(self, name: str):
+        """One instance per transport name, built on first use and reused.
+
+        Reuse is load-bearing, not an optimisation: `BleTransport` caches the
+        `BLEDevice` it found and `TapoTransport` caches a protocol decision and
+        a live TPAP session per host. A fresh instance per light would throw
+        both away, and the BLE tests patch `service.transport._find`, which only
+        reaches the attic because the attic holds that same object.
+        """
+        if name not in self._transports:
+            transport_cls = _transport_class(name)
+            self._transports[name] = transport_cls(self._govee_cfg) if transport_cls else None
+        return self._transports[name]
+
+    def _name_of(self, transport) -> str:
+        return str(getattr(transport, "name", "") or "unknown")
+
+    def _build_lights(self, raw: dict) -> dict:
+        """
+        Load each light and bind it to the transport its own fields imply.
+
+        The preferred transport (`govee.transport`) is tried first so a light
+        carrying fields for two of them is not silently rerouted; only then do
+        the others get a look. A light with fields for none is skipped, and the
+        warning names what the PREFERRED transport wanted, because that is the
+        one the operator was configuring -- telling them the attic is "missing
+        host" when they are setting up a Govee strip would send them the wrong
+        way entirely.
+        """
         lights = {}
         for key, value in (raw or {}).items():
             if not isinstance(value, dict):
                 logger.warning("Govee light '%s' is not a mapping, skipping", key)
                 continue
-            entry = {}
-            missing = []
-            for field in required_fields:
-                field_value = str(value.get(field) or "").strip()
-                if not field_value:
-                    missing.append(field)
-                entry[field] = field_value
-            if missing:
+
+            entry = None
+            for name in (self.transport_name, *_TRANSPORT_NAMES):
+                transport_cls = _transport_class(name)
+                if transport_cls is None:
+                    continue
+                candidate = self._entry_for(value, transport_cls.required_fields)
+                if candidate is not None:
+                    entry = candidate
+                    transport_name = name
+                    break
+
+            if entry is None:
+                missing = [
+                    field
+                    for field in _transport_class(self.transport_name).required_fields
+                    if not str(value.get(field) or "").strip()
+                ]
                 logger.warning(
-                    "Govee light '%s' is missing %s for this transport, skipping",
+                    "Govee light '%s' is missing %s, and has no fields for another "
+                    "transport either, skipping",
                     key,
                     " and ".join(missing),
                 )
                 continue
+
             entry["aliases"] = [
                 str(alias).strip()
                 for alias in (value.get("aliases") or [])
                 if str(alias).strip()
             ]
-            lights[str(key)] = entry
+            light_key = str(key)
+            lights[light_key] = entry
+            self._light_transports[light_key] = self._transport(transport_name)
+            if transport_name != self.transport_name:
+                logger.info(
+                    "Govee light '%s' uses the %s transport (govee.transport is %s)",
+                    light_key,
+                    transport_name,
+                    self.transport_name,
+                )
         return lights
+
+    @staticmethod
+    def _entry_for(value: dict, required_fields: tuple) -> dict | None:
+        """The light's fields for one transport, or None when any is missing."""
+        entry = {}
+        for field in required_fields:
+            field_value = str(value.get(field) or "").strip()
+            if not field_value:
+                return None
+            entry[field] = field_value
+        return entry
 
     def resolve_light(self, hint: str = "") -> tuple[str | None, dict | None]:
         """
@@ -541,6 +671,16 @@ class GoveeService:
             return None, GoveeCommandResult(False, _MSG_NOT_CONFIGURED)
         return light, None
 
+    def transport_for(self, light_key: str):
+        """
+        The transport bound to one light, or the primary when it has none.
+
+        The fallback matters for a service built before any light loaded (an
+        unknown transport name) and keeps this from ever returning None into a
+        call site that is about to dereference it.
+        """
+        return self._light_transports.get(light_key) or self.transport
+
     # NOTE: these all test `error is not None`, never `if error`. A failed
     # GoveeCommandResult is falsy by design, so a truthiness check here would
     # fall through to the transport with light=None.
@@ -548,16 +688,40 @@ class GoveeService:
         light, error = self._light_for(light_key)
         if error is not None:
             return error
-        return self.transport.set_power(light, on)
+        return self.transport_for(light_key).set_power(light, on)
 
     def set_brightness(self, light_key: str, percent: int) -> GoveeCommandResult:
         light, error = self._light_for(light_key)
         if error is not None:
             return error
-        return self.transport.set_brightness(light, percent)
+        return self.transport_for(light_key).set_brightness(light, percent)
 
     def set_color(self, light_key: str, rgb: tuple) -> GoveeCommandResult:
         light, error = self._light_for(light_key)
         if error is not None:
             return error
-        return self.transport.set_color(light, rgb)
+        return self.transport_for(light_key).set_color(light, rgb)
+
+    def get_state(self, light_key: str):
+        """
+        A live reading off the light, or None when there is none to be had.
+
+        `None` covers every "I could not tell": the transport cannot read at all,
+        the light is unknown, the service is disabled, or the bulb did not answer.
+        The caller falls back to `light_shadow`'s memory, which is what the BLE
+        strip has always used, so a failed read degrades to the old behaviour
+        rather than to silence.
+        """
+        if not self.can_read_state:
+            return None
+        light, error = self._light_for(light_key)
+        if error is not None:
+            return None
+        transport = self.transport_for(light_key)
+        # Per-light, not per-service: `can_read_state` above only says SOME
+        # light is readable. The attic strip over BLE has no get_state at all,
+        # and returning None here is what sends the dispatcher to shadow memory
+        # for that room while the Tapo bulb still answers with a fact.
+        if not hasattr(transport, "get_state"):
+            return None
+        return transport.get_state(light)

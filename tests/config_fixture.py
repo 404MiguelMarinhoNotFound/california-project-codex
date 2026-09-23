@@ -66,4 +66,10 @@ def config_for_tests(**overrides) -> dict:
     keeps every other media key -- mibox_ip, apps, launch components -- exactly
     as it ships.
     """
-    return deep_merge(real_config(), overrides)
+    config = real_config()
+    # A path override, the first legitimate category: the real nicknames live
+    # in a gitignored whatsapp_aliases.yaml in the developer's CWD, and whether
+    # that file exists must never decide what a test asserts. A test that
+    # exercises the file sets its own path.
+    config.setdefault("whatsapp", {})["aliases_path"] = "/nonexistent/whatsapp_aliases.yaml"
+    return deep_merge(config, overrides)
