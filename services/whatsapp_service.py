@@ -9,14 +9,23 @@ the blocking work on a daemon worker thread with one command in flight.
 Three things make this service unlike the other three device services, and
 they drive most of what looks unusual below.
 
-- **It is GUI automation, not an API.** The send path opens
-  `web.whatsapp.com/send?phone=...&text=...` in a new Firefox tab, waits for
-  the page to put the text in the compose box, and presses Enter once. There
-  is no token and no request: auth is whatever Firefox profile is already
-  signed in to WhatsApp Web. So it needs a desktop session, it steals
-  keyboard focus for ~13s, and it exists on Windows only. Everywhere else
-  the service disables itself, exactly like services/bt_wake.py being Linux
-  only. Ported from Master Miguel's standalone wa_send.py.
+- **It is browser automation, not an API.** There is no token and no
+  request: auth is a WhatsApp Web session in a browser profile. Two backends,
+  picked by `whatsapp.backend`:
+
+  - `playwright` (default): services/whatsapp_web.py drives WhatsApp Web in
+    California's own profile (`whatsapp.profile_dir`, linked once with
+    tools/link_whatsapp.py). Enter goes to the compose box element, never the
+    OS keyboard, the page is kept open between sends, and "sent" means a sent
+    tick was seen. Runs anywhere Playwright does, the Pi included.
+  - `keyboard`: the original port of Master Miguel's wa_send.py. Opens a
+    Firefox tab, sleeps `wait_ms`, presses a real Enter with pyautogui. Takes
+    the keyboard for ~13s, cannot confirm delivery, Windows only. Kept as a
+    rollback while the Playwright backend proves itself.
+
+  Both run on ONE long-lived daemon worker thread. Playwright's sync API is
+  not thread-safe (its docs: one instance per thread), so the thread that
+  launched the browser is the only one that may touch it again.
 
 - **It messages real people, so a fuzzy name is confirmed before it sends.**
   The TV, the lights and the vacuum are all recoverable; a WhatsApp message
@@ -46,6 +55,8 @@ from __future__ import annotations
 import difflib
 import logging
 import os
+import queue
+import quopri
 import re
 import subprocess
 import sys
@@ -57,7 +68,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
 
-from services.name_matcher import match_name
+from services.name_matcher import match_name, normalize_text
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +76,26 @@ _MSG_NOT_CONFIGURED = "WhatsApp isn't set up right now."
 _MSG_UNREACHABLE = "I couldn't send that WhatsApp message just now."
 _MSG_BUSY = "I'm still sending the last WhatsApp message."
 _MSG_NO_BROWSER = "I couldn't open Firefox to send that."
+# Playwright outcomes. Each one names its own fix, because "scan the code",
+# "check the number" and "try again" are three different things to do -- the
+# same reason the TV has a needs_pairing line of its own.
+_MSG_NEEDS_LINK = (
+    "WhatsApp's logged out on the laptop. Run the link tool and scan the code with your phone."
+)
+_MSG_INVALID_NUMBER = "That number isn't on WhatsApp."
+_MSG_UNCONFIRMED = (
+    "It's in WhatsApp but hasn't gone out yet, so I can't say it's sent."
+)
+
+_MSG_READ_NEEDS_PLAYWRIGHT = "I can only check unread WhatsApps with the Playwright setup."
+_MSG_READ_FAILED = "I couldn't check WhatsApp just now."
+
+_BACKENDS = ("playwright", "keyboard")
+# A Playwright send has no fixed wait to schedule around; this is only the
+# floor for "too soon to schedule".
+_PLAYWRIGHT_MIN_LEAD_S = 5.0
+# On top of the send timeout: a cold browser launch plus WhatsApp Web's boot.
+_PLAYWRIGHT_LAUNCH_MARGIN_S = 25.0
 
 # Windows default. Overridable from config for a non-standard install.
 _DEFAULT_FIREFOX = r"C:\Program Files\Mozilla Firefox\firefox.exe"
@@ -135,6 +166,58 @@ def _unfold_vcf(text: str) -> str:
     return re.sub(r"\r?\n[ \t]", "", text)
 
 
+def _is_quoted_printable(line: str) -> bool:
+    """Whether a property line's PARAMETERS (before the first ':') say QUOTED-PRINTABLE."""
+    return "QUOTED-PRINTABLE" in line.split(":", 1)[0].upper()
+
+
+def _join_qp_soft_breaks(lines: list[str]) -> list[str]:
+    """
+    vCard 2.1 quoted-printable wraps a long value with a trailing '=' and
+    continues on the next line with NO leading space, so _unfold_vcf cannot see
+    it. Only lines whose own parameters say QUOTED-PRINTABLE are joined: a
+    base64 PHOTO line can end in '=' padding too, and joining that one would
+    swallow the next property.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _is_quoted_printable(line):
+            while line.endswith("=") and i + 1 < len(lines):
+                i += 1
+                line = line[:-1] + lines[i].strip()
+        out.append(line)
+        i += 1
+    return out
+
+
+def _prop_value(line: str) -> str:
+    """
+    A property's value, decoded.
+
+    Android's vCard 2.1 export stores any name that is not plain ASCII -- an
+    accent ("João") or an emoji ("ana 🫰🏽") -- as
+    `FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=6D=61...`. Read raw, those
+    names are a run of =XX codes that no spoken name can ever match: 41 cards
+    in the real book (2026-09-23). One of them shared a first name with
+    another contact, so "message <first name>" saw only one candidate and sent
+    straight to the other person instead of asking which.
+    """
+    params, _, value = line.partition(":")
+    if not _is_quoted_printable(line):
+        return value.strip()
+    charset = "utf-8"
+    m = re.search(r"CHARSET=([\w-]+)", params, flags=re.I)
+    if m:
+        charset = m.group(1)
+    raw = quopri.decodestring(value.encode("ascii", errors="ignore"))
+    try:
+        return raw.decode(charset, errors="replace").strip()
+    except LookupError:  # an unknown charset name
+        return raw.decode("utf-8", errors="replace").strip()
+
+
 def normalize_phone(raw: str, default_cc: str = _DEFAULT_COUNTRY) -> str | None:
     """
     Turn a VCF TEL line or a spoken number into an E.164-ish "+<digits>".
@@ -194,17 +277,16 @@ def load_vcf(path: Path, default_cc: str = _DEFAULT_COUNTRY) -> list[Contact]:
         n_parts: list[str] = []
         tels: list[tuple[int, str]] = []
 
-        for line in block.splitlines():
-            line = line.strip()
+        for line in _join_qp_soft_breaks([l.strip() for l in block.splitlines()]):
             if not line:
                 continue
             upper = line.upper()
             if upper.startswith("FN"):
-                fn = line.split(":", 1)[-1].strip()
+                fn = _prop_value(line)
             elif upper.startswith("ORG"):
-                org = line.split(":", 1)[-1].strip()
+                org = _prop_value(line)
             elif upper.startswith("N:") or upper.startswith("N;"):
-                raw = line.split(":", 1)[-1]
+                raw = _prop_value(line)
                 # N:Last;First;...
                 n_parts = [p.strip() for p in raw.split(";") if p.strip()]
             elif upper.startswith("TEL"):
@@ -257,7 +339,10 @@ def score_contacts(query: str, contacts: list[Contact], limit: int = 8) -> list[
         tokens = re.split(r"\W+", name)
         if name == q:
             score = 100.0
-        elif name.startswith(q) or q.startswith(name):
+        elif name.startswith(q + " ") or q.startswith(name + " "):
+            # A prefix only counts at a word boundary. Unbounded, a surname was a
+            # prefix-match (90, certain) for a contact named just "Z", and
+            # "mar" was certain for any full name starting "Mar" (2026-09-23).
             score = 90.0
         elif q in tokens:
             # An exact first-name token, e.g. "marta" in "Marta Zuka".
@@ -284,6 +369,37 @@ def looks_like_phone(value: str) -> bool:
     return len(digits) >= 9 and t[:1].isdigit()
 
 
+def load_alias_config(cfg: dict) -> dict:
+    """
+    The raw alias map: `whatsapp.aliases` from config.yaml, then the local file
+    at `whatsapp.aliases_path` merged over it.
+
+    The real nicknames live in that file, gitignored, because they are a map of
+    who Master Miguel's family, partner and friends are and the repository is
+    public -- the same reason contacts.vcf is gitignored. config.yaml keeps only
+    a made-up example. LLMService calls this too, so the nicknames the prompt
+    advertises are exactly the ones resolve_contact accepts.
+
+    Never raises: a missing or broken file is a warning and the config aliases.
+    """
+    merged = dict(cfg.get("aliases") or {})
+    path = Path(str(cfg.get("aliases_path") or "").strip() or "whatsapp_aliases.yaml")
+    if not path.is_file():
+        return merged
+    try:
+        import yaml
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 - a typo in a local file must not take the boot down
+        logger.warning("Could not read WhatsApp aliases from %s, ignoring it", path, exc_info=True)
+        return merged
+    if not isinstance(data, dict):
+        logger.warning("%s should be a mapping of nickname -> contact, ignoring it", path)
+        return merged
+    merged.update(data)
+    return merged
+
+
 def _as_int(value, default: int) -> int:
     try:
         return int(value)
@@ -303,17 +419,39 @@ class WhatsAppService:
         )
         self.contacts_path = Path(str(cfg.get("contacts_path") or "contacts.vcf"))
 
-        # Floor the SECONDS, not the milliseconds -- the same trap called out in
-        # deebot_service: max(6, ms) / 1000 reads like a 6s minimum and is a 6ms
-        # one, so wait_ms: 3 would fire Enter into a blank page.
-        self.wait_s = max(_MIN_WAIT_S, _as_int(cfg.get("wait_ms"), 12000) / 1000)
+        self.backend = str(cfg.get("backend") or "keyboard").strip().lower()
+        if self.backend not in _BACKENDS:
+            logger.warning(
+                "Unknown whatsapp.backend %r, expected one of %s; using keyboard",
+                self.backend,
+                ", ".join(_BACKENDS),
+            )
+            self.backend = "keyboard"
+
         self.confirm_timeout_s = max(
             10.0, _as_int(cfg.get("confirm_timeout_ms"), 120000) / 1000
         )
-        # The browser launch and the focus dance sit on top of the page wait.
-        self._wait_timeout_s = self.wait_s + _SEND_MARGIN_S
+        self.keep_warm = bool(cfg.get("keep_warm", True))
+        # 0 means never: the laptop has the memory, the Pi may not.
+        self.idle_close_s = max(0.0, _as_int(cfg.get("idle_close_minutes"), 30) * 60.0)
 
-        self.aliases = self._build_aliases(cfg.get("aliases") or {})
+        self._driver = None
+        if self.backend == "playwright":
+            from services.whatsapp_web import WhatsAppWebDriver
+
+            # Constructing it launches nothing; open_page() does, on the worker.
+            self._driver = WhatsAppWebDriver.from_config(cfg)
+            self.wait_s = _PLAYWRIGHT_MIN_LEAD_S
+            self._wait_timeout_s = self._driver.timeout_s + _PLAYWRIGHT_LAUNCH_MARGIN_S
+        else:
+            # Floor the SECONDS, not the milliseconds -- the same trap called out
+            # in deebot_service: max(6, ms) / 1000 reads like a 6s minimum and is
+            # a 6ms one, so wait_ms: 3 would fire Enter into a blank page.
+            self.wait_s = max(_MIN_WAIT_S, _as_int(cfg.get("wait_ms"), 12000) / 1000)
+            # The browser launch and the focus dance sit on top of the page wait.
+            self._wait_timeout_s = self.wait_s + _SEND_MARGIN_S
+
+        self.aliases, self.alias_prefer = self._build_aliases(load_alias_config(cfg))
 
         self.contacts: list[Contact] = []
         self._load_contacts()
@@ -334,13 +472,48 @@ class WhatsAppService:
         self._closed = False
         self._pending: tuple[str, str, float] | None = None
         self._timers: list[threading.Timer] = []
+        # The one thread every send runs on. Started lazily by _submit, so
+        # constructing the service (and every unit test) starts nothing.
+        self._jobs: queue.Queue = queue.Queue()
+        self._worker: threading.Thread | None = None
 
         if self.enabled:
             logger.info(
-                "WhatsApp initialized: %d contact(s), %d alias(es)",
+                "WhatsApp initialized (%s backend): %d contact(s), %d alias(es)",
+                self.backend,
                 len(self.contacts),
                 len(self.aliases),
             )
+
+    def start(self) -> None:
+        """
+        Warm the browser in the background so the first send skips the launch.
+
+        Deliberately not done in __init__: the orchestrator calls this once at
+        boot, and a unit test that only constructs the service must never start
+        a browser. Non-blocking -- the warm-up is a job on the worker thread,
+        and a send that arrives meanwhile simply queues behind it.
+        """
+        if not (self.enabled and self._driver is not None and self.keep_warm):
+            return
+
+        def _warm():
+            try:
+                state = self._driver.warm()
+            except Exception:  # noqa: BLE001 - a failed warm-up costs the first send a launch, nothing more
+                logger.warning("WhatsApp Web warm-up failed", exc_info=True)
+                self._driver.close()
+                return None
+            if state == "needs_link":
+                logger.warning(
+                    "WhatsApp Web is not linked in %s. Run: uv run python tools/link_whatsapp.py",
+                    self._driver.profile_dir,
+                )
+            else:
+                logger.info("WhatsApp Web warm: %s", state)
+            return state
+
+        self._submit(_warm)
 
     # ------------------------------------------------------------ self-disable
 
@@ -352,6 +525,9 @@ class WhatsAppService:
         because "wrong OS", "missing package" and "Firefox is somewhere else"
         are three different problems with three different answers.
         """
+        if self.backend == "playwright":
+            return self._probe_playwright()
+
         if sys.platform != "win32":
             logger.warning(
                 "WhatsApp control is Windows only (this is %s), disabled. "
@@ -380,20 +556,59 @@ class WhatsAppService:
 
         return True
 
+    def _probe_playwright(self) -> bool:
+        """
+        The Playwright backend needs the package and nothing else to be offered.
+
+        An unlinked profile does NOT disable the tool: disabling would hide
+        WhatsApp from the model entirely, and "it's logged out, run the link
+        tool" is far more useful to hear than silence. The first send reports
+        it through _MSG_NEEDS_LINK; this only warns at boot.
+        """
+        try:
+            import playwright.sync_api  # noqa: F401
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "playwright is not installed, WhatsApp control disabled. "
+                "Install it with: uv sync --extra default"
+            )
+            return False
+        if not self._driver.profile_dir.is_dir():
+            logger.warning(
+                "WhatsApp profile %s does not exist yet. Link it with: "
+                "uv run python tools/link_whatsapp.py",
+                self._driver.profile_dir,
+            )
+        return True
+
     # --------------------------------------------------------------- contacts
 
     @staticmethod
-    def _build_aliases(raw: dict) -> dict:
-        """Spoken nickname -> the exact contact name it means. Blank entries skipped."""
-        aliases = {}
+    def _build_aliases(raw: dict) -> tuple[dict, dict]:
+        """
+        Spoken nickname -> the exact contact name it means, plus nickname ->
+        preferred number prefix. Blank entries skipped.
+
+        A value is either the contact name, or a mapping
+        `{contact: "Maria Silva", prefer: "+351"}` for a contact with several numbers
+        where the one he messages is not the one the card ranks first. `prefer`
+        is a number prefix, which keeps the number itself out of config.yaml.
+        """
+        aliases, prefer = {}, {}
         for key, value in (raw or {}).items():
             spoken = str(key or "").strip()
+            wanted = ""
+            if isinstance(value, dict):
+                wanted = str(value.get("prefer") or "").strip()
+                value = value.get("contact")
             target = str(value or "").strip()
             if not spoken or not target:
                 logger.warning("WhatsApp alias %r has no target, skipping", key)
                 continue
             aliases[spoken] = target
-        return aliases
+            if wanted:
+                prefer[spoken] = wanted
+        return aliases, prefer
 
     def _load_contacts(self) -> None:
         """Read the VCF. A missing or unreadable book is a warning, never a raise."""
@@ -435,26 +650,63 @@ class WhatsAppService:
             # He said the digits, so there is nothing for him to confirm.
             return ContactMatch(key=phone, phone=phone, certain=True)
 
-        # Aliases are a handful of hand-written nicknames, so the shared
-        # matcher's cascade is the right tool here -- same as the light rooms.
-        if self.aliases:
-            matched = match_name(cleaned, {key: [key] for key in self.aliases})
-            if matched:
-                target = self.aliases[matched]
-                exact = [c for c in self.contacts if c.name.lower() == target.lower()]
-                if exact and exact[0].phone:
-                    return ContactMatch(key=exact[0].name, phone=exact[0].phone, certain=True)
-                if looks_like_phone(target):
-                    phone = normalize_phone(target, self.default_country)
-                    if phone:
-                        return ContactMatch(key=matched, phone=phone, certain=True)
-                logger.warning(
-                    "WhatsApp alias %r points at %r, which is not in the contact book",
-                    matched,
-                    target,
-                )
+        book = self._classify(score_contacts(cleaned, self.contacts))
 
-        return self._classify(score_contacts(cleaned, self.contacts))
+        # Aliases go through the shared matcher, whose substring tier is right
+        # for six light rooms and dangerous here: with an `ana` alias for one
+        # Ana, both "Ana Costa" and "Rui Pai Ana" (someone merely TAGGED with
+        # the name, as phone books do) matched it, so a message meant for them
+        # would have gone to the aliased Ana (measured on the real book
+        # 2026-09-23, before this ordering). So:
+        #   1. an EXACT alias ("ana", "gf") wins, even over a tie in the book
+        #      -- that is what the alias is for;
+        #   2. otherwise a certain book match wins ("Ana Costa" is Ana Costa);
+        #   3. only then may a loose alias match ("the mum") apply.
+        if self.aliases:
+            spoken = normalize_text(cleaned)
+            exact_alias = next(
+                (key for key in self.aliases if normalize_text(key) == spoken), None
+            )
+            if exact_alias is not None:
+                hit = self._alias_match(exact_alias)
+                if hit:
+                    return hit
+            if not book.certain:
+                loose = match_name(cleaned, {key: [key] for key in self.aliases})
+                if loose:
+                    hit = self._alias_match(loose)
+                    if hit:
+                        return hit
+
+        return book
+
+    def _alias_match(self, alias: str) -> ContactMatch | None:
+        """The contact an alias points at, or None (logged) when it points nowhere."""
+        target = self.aliases[alias]
+        exact = [c for c in self.contacts if c.name.lower() == target.lower()]
+        if exact and exact[0].phone:
+            contact = exact[0]
+            phone = contact.phone
+            wanted = self.alias_prefer.get(alias, "")
+            if wanted:
+                picked = next((p for p in contact.phones if p.startswith(wanted)), None)
+                if picked:
+                    phone = picked
+                else:
+                    # Say so, but still reach her on the number she has.
+                    logger.warning(
+                        "WhatsApp alias %r prefers %s but %r has no such number; using %s",
+                        alias, wanted, contact.name, phone,
+                    )
+            return ContactMatch(key=contact.name, phone=phone, certain=True)
+        if looks_like_phone(target):
+            phone = normalize_phone(target, self.default_country)
+            if phone:
+                return ContactMatch(key=alias, phone=phone, certain=True)
+        logger.warning(
+            "WhatsApp alias %r points at %r, which is not in the contact book", alias, target
+        )
+        return None
 
     @staticmethod
     def _classify(scored: list[tuple[float, Contact]]) -> ContactMatch:
@@ -474,7 +726,14 @@ class WhatsAppService:
             and best_score < 100
             and scored[1][0] >= best_score - _AMBIGUOUS_MARGIN
         ):
-            return ContactMatch(candidates=[c.name for _, c in scored if c.phone][:5])
+            # Only the contenders, not everyone the query touched: for "Ana"
+            # the tie is "Ana Costa" vs "ana 🫰🏽" at 90, and the 80s below
+            # them ("Rui Pai Ana") are other people tagged with
+            # her name. Offering those in "which one?" is noise.
+            floor = best_score - _AMBIGUOUS_MARGIN
+            return ContactMatch(
+                candidates=[c.name for s, c in scored if c.phone and s >= floor][:5]
+            )
 
         return ContactMatch(
             key=best.name,
@@ -509,8 +768,54 @@ class WhatsAppService:
         with self._lock:
             self._closed = True
             timers, self._timers = self._timers, []
+            worker = self._worker
         for timer in timers:
             timer.cancel()
+        # The browser can only be closed from the thread that opened it, so
+        # shutdown is a job too: the worker closes the driver and exits.
+        if worker is not None and worker.is_alive():
+            self._jobs.put(None)
+
+    # ----------------------------------------------------------------- worker
+
+    def _submit(self, work) -> Future:
+        """Queue `work` on the single worker thread, starting it if needed."""
+        future: Future = Future()
+        with self._lock:
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._worker_loop, name="whatsapp", daemon=True
+                )
+                self._worker.start()
+        self._jobs.put((work, future))
+        return future
+
+    def _worker_loop(self) -> None:
+        """
+        Run jobs forever on this one thread; close an idle browser.
+
+        The idle close is here rather than on a timer because only this thread
+        may touch the driver. A `get` that times out with the browser open is
+        the idle signal.
+        """
+        while True:
+            driver_open = self._driver is not None and self._driver.is_open
+            timeout = self.idle_close_s if (driver_open and self.idle_close_s) else None
+            try:
+                item = self._jobs.get(timeout=timeout)
+            except queue.Empty:
+                logger.info("WhatsApp Web idle for %.0f min, closing the browser", self.idle_close_s / 60)
+                self._driver.close()
+                continue
+            if item is None:
+                if self._driver is not None:
+                    self._driver.close()
+                return
+            work, future = item
+            try:
+                future.set_result(work())
+            except BaseException as exc:  # noqa: BLE001 - handed to the caller in _run
+                future.set_exception(exc)
 
     def _run(self, work):
         """
@@ -535,18 +840,14 @@ class WhatsAppService:
                 return WhatsAppCommandResult(False, _MSG_BUSY)
             self._busy = True
 
-        future: Future = Future()
-
         def _work():
             try:
-                future.set_result(work())
-            except BaseException as exc:  # noqa: BLE001 - handed to the caller below
-                future.set_exception(exc)
+                return work()
             finally:
                 with self._lock:
                     self._busy = False
 
-        threading.Thread(target=_work, name="whatsapp", daemon=True).start()
+        future = self._submit(_work)
         try:
             return future.result(timeout=self._wait_timeout_s)
         except FutureTimeoutError:
@@ -639,6 +940,35 @@ class WhatsAppService:
         pg.press("enter")
 
     def _send_now(self, phone: str, message: str) -> WhatsAppCommandResult:
+        """Send through whichever backend is configured. Runs on the worker."""
+        if self.backend == "playwright":
+            return self._send_playwright(phone, message)
+        return self._send_keyboard(phone, message)
+
+    def _send_playwright(self, phone: str, message: str) -> WhatsAppCommandResult:
+        from services import whatsapp_web as web
+
+        try:
+            outcome = self._driver.send(phone, message)
+        except Exception:  # noqa: BLE001 - a crashed browser is relaunched by the next send
+            logger.exception("WhatsApp Web send to %s failed", phone)
+            self._driver.close()
+            return WhatsAppCommandResult(False, _MSG_UNREACHABLE)
+
+        if outcome.status == web.SENT:
+            logger.info("WhatsApp message sent to %s (tick seen)", phone)
+            return WhatsAppCommandResult(True)
+        logger.warning("WhatsApp send to %s: %s %s", phone, outcome.status, outcome.detail)
+        return WhatsAppCommandResult(
+            False,
+            {
+                web.NOT_LINKED: _MSG_NEEDS_LINK,
+                web.INVALID_NUMBER: _MSG_INVALID_NUMBER,
+                web.UNCONFIRMED: _MSG_UNCONFIRMED,
+            }.get(outcome.status, _MSG_UNREACHABLE),
+        )
+
+    def _send_keyboard(self, phone: str, message: str) -> WhatsAppCommandResult:
         """Open the chat, wait out the page load, press Enter once."""
         try:
             self._open_chat(phone, message)
@@ -700,6 +1030,59 @@ class WhatsAppService:
             )
 
         return self._run(lambda: self._send_now(match.phone, message))
+
+    # ------------------------------------------------------------------ reading
+
+    def unread(self):
+        """
+        What is unread, off the chat list. Returns the driver's UnreadResult on
+        success and a falsy WhatsAppCommandResult (with its spoken line) on any
+        failure. Never opens a chat, so nothing is marked read.
+
+        Playwright only: the keyboard backend drives a browser it cannot see.
+        """
+        if not self.enabled:
+            return WhatsAppCommandResult(False, _MSG_NOT_CONFIGURED)
+        if self.backend != "playwright" or self._driver is None:
+            return WhatsAppCommandResult(False, _MSG_READ_NEEDS_PLAYWRIGHT)
+
+        from services import whatsapp_web as web
+
+        def _work():
+            try:
+                result = self._driver.unread_chats()
+            except Exception:  # noqa: BLE001 - a crashed browser is relaunched next time
+                logger.exception("WhatsApp unread read failed")
+                self._driver.close()
+                return WhatsAppCommandResult(False, _MSG_READ_FAILED)
+            if result.status == web.NOT_LINKED:
+                return WhatsAppCommandResult(False, _MSG_NEEDS_LINK)
+            if not result:
+                return WhatsAppCommandResult(False, _MSG_READ_FAILED)
+            return result
+
+        return self._run(_work)
+
+    def find_unread_chat(self, hint: str, chats: list):
+        """
+        The unread chat he asked about, or None.
+
+        Chat titles are the phone's contact names, so the same resolution as a
+        send applies first -- "mum" is the alias, the alias is a
+        contact name, the contact name is the chat title. Only then a direct
+        match on the titles, which covers groups and unsaved numbers.
+        """
+        if not hint or not chats:
+            return None
+        by_title = {c.name.lower(): c for c in chats}
+        match = self.resolve_contact(hint)
+        if match.key and match.key.lower() in by_title:
+            return by_title[match.key.lower()]
+        for name in match.candidates:
+            if name.lower() in by_title:
+                return by_title[name.lower()]
+        title = match_name(hint, {c.name: [c.name] for c in chats})
+        return next((c for c in chats if c.name == title), None) if title else None
 
     def schedule(
         self, match: ContactMatch, message: str, at: str, confirm: bool = False

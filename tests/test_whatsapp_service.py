@@ -25,6 +25,8 @@ from tests.config_fixture import config_for_tests
 
 from services import whatsapp_service
 from services.whatsapp_service import (
+    _CERTAIN_SCORE as _CERTAIN_SCORE_FOR_TESTS,
+    Contact,
     ContactMatch,
     WhatsAppCommandResult,
     WhatsAppService,
@@ -131,6 +133,8 @@ class NoKeyboardGuardTests(unittest.TestCase):
 
 
 class SelfDisableTests(unittest.TestCase):
+    # The platform checks below belong to the keyboard backend, so each of
+    # those tests selects it explicitly: the shipped config runs playwright.
     def test_enabled_with_flag_and_platform(self):
         self.assertTrue(_service().enabled)
 
@@ -143,14 +147,16 @@ class SelfDisableTests(unittest.TestCase):
 
     def test_non_windows_disables(self):
         with patch.object(whatsapp_service.sys, "platform", "linux"):
-            config = config_for_tests(whatsapp={"enabled": True, "contacts_path": str(_book())})
+            config = config_for_tests(
+                whatsapp={"enabled": True, "backend": "keyboard", "contacts_path": str(_book())}
+            )
             self.assertFalse(WhatsAppService(config).enabled)
 
     def test_missing_pyautogui_disables(self):
         with patch.object(whatsapp_service.sys, "platform", "win32"):
             with patch.dict(sys.modules, {"pyautogui": None}):
                 config = config_for_tests(
-                    whatsapp={"enabled": True, "contacts_path": str(_book())}
+                    whatsapp={"enabled": True, "backend": "keyboard", "contacts_path": str(_book())}
                 )
                 self.assertFalse(WhatsAppService(config).enabled)
 
@@ -160,6 +166,7 @@ class SelfDisableTests(unittest.TestCase):
                 config = config_for_tests(
                     whatsapp={
                         "enabled": True,
+                        "backend": "keyboard",
                         "contacts_path": str(_book()),
                         "firefox_path": "/nowhere/firefox.exe",
                     }
@@ -241,6 +248,73 @@ class VcfParsingTests(unittest.TestCase):
     def test_soft_line_breaks_are_unfolded(self):
         """A number split across a continuation line is one number, not two."""
         self.assertEqual(self.by_name["Long Name Person"].phone, "+351915000444")
+
+
+# Android's vCard 2.1 export, verbatim in shape: a name with an emoji or an
+# accent is stored quoted-printable, and a long one wraps with a trailing '='
+# and NO leading space on the next line.
+QP_VCF = """BEGIN:VCARD
+VERSION:2.1
+N:Lopes;Rita;;;
+FN:Rita Lopes
+TEL;CELL;PREF:912000111
+END:VCARD
+BEGIN:VCARD
+VERSION:2.1
+N;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:;=72=69=74=61=20=F0=9F=AB=B0=F0=9F=8F=BD;;;
+FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=72=69=74=61=20=F0=9F=AB=B0=F0=9F=8F=BD
+TEL;CELL:912000222
+END:VCARD
+BEGIN:VCARD
+VERSION:2.1
+FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=4A=6F=C3=A3=6F=20=43=6F=6E=63=65=69=C3=A7=C3=A3=
+=6F
+TEL;CELL:912000333
+PHOTO;ENCODING=BASE64;JPEG:QUJD=
+TEL;HOME:213000444
+END:VCARD
+BEGIN:VCARD
+VERSION:2.1
+FN:Clara Mae Rita
+TEL;CELL:912000555
+END:VCARD
+"""
+
+
+class QuotedPrintableTests(unittest.TestCase):
+    """
+    Live 2026-09-23: "message <first name>" went straight to one contact,
+    because the other one with that first name was saved with an emoji,
+    stored quoted-printable, and read as a run of =XX codes that could never
+    match. 41 cards in the real book.
+    """
+
+    def setUp(self):
+        self.by_name = {c.name: c for c in load_vcf(_book(QP_VCF))}
+
+    def test_an_emoji_name_is_decoded(self):
+        self.assertIn("rita \U0001FAF0\U0001F3FD", self.by_name)
+
+    def test_an_accented_name_split_by_a_soft_break_is_decoded(self):
+        self.assertIn("João Conceição", self.by_name)
+
+    def test_a_base64_line_ending_in_equals_does_not_swallow_the_next_property(self):
+        """PHOTO padding ends in '=' too; joining it would eat the HOME number."""
+        self.assertEqual(len(self.by_name["João Conceição"].phones), 2)
+
+    def test_no_name_is_left_as_raw_codes(self):
+        self.assertFalse([n for n in self.by_name if "=" in n])
+
+    def test_two_ritas_are_ambiguous_again(self):
+        service = _service(_book(QP_VCF))
+        match = service.resolve_contact("Rita")
+        self.assertFalse(match)
+        self.assertEqual(set(match.candidates), {"Rita Lopes", "rita \U0001FAF0\U0001F3FD"})
+
+    def test_people_only_tagged_with_the_name_are_not_offered(self):
+        """'Clara Mae Rita' is Rita's mum, 10 points behind; not a contender."""
+        match = _service(_book(QP_VCF)).resolve_contact("Rita")
+        self.assertNotIn("Clara Mae Rita", match.candidates)
 
 
 class MatchCertaintyTests(unittest.TestCase):
@@ -343,6 +417,108 @@ class AliasTests(unittest.TestCase):
     def test_a_blank_alias_is_dropped(self):
         service = _service(aliases={"mum": "", "dad": "Marta Zuka"})
         self.assertEqual(list(service.aliases), ["dad"])
+
+
+class AliasFileTests(unittest.TestCase):
+    """The real nicknames live in a gitignored file; config.yaml holds examples."""
+
+    def _file(self, text: str) -> str:
+        path = Path(tempfile.mkdtemp()) / "whatsapp_aliases.yaml"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_the_file_is_merged_over_the_config_block(self):
+        cfg = {"aliases": {"boss": "Ana Silva", "quim": "Ana Costa"},
+               "aliases_path": self._file('quim: "Joaquim Reis"\n')}
+        merged = whatsapp_service.load_alias_config(cfg)
+        self.assertEqual(merged, {"boss": "Ana Silva", "quim": "Joaquim Reis"})
+
+    def test_the_service_resolves_through_the_file(self):
+        service = _service(aliases_path=self._file('quim: "Joaquim Reis"\n'))
+        self.assertEqual(service.resolve_contact("quim").key, "Joaquim Reis")
+
+    def test_a_missing_file_is_just_the_config_block(self):
+        cfg = {"aliases": {"boss": "Ana Silva"}, "aliases_path": "/nowhere/aliases.yaml"}
+        self.assertEqual(whatsapp_service.load_alias_config(cfg), {"boss": "Ana Silva"})
+
+    def test_a_broken_file_is_ignored_not_raised(self):
+        for text in ("quim: [unclosed\n", "- just\n- a list\n"):
+            with self.subTest(text=text):
+                cfg = {"aliases": {"boss": "Ana Silva"}, "aliases_path": self._file(text)}
+                self.assertEqual(whatsapp_service.load_alias_config(cfg), {"boss": "Ana Silva"})
+
+
+class AliasPreferTests(unittest.TestCase):
+    """
+    A card that ranks a foreign number first, messaged on the +351 one.
+    `prefer` picks by prefix so the number itself stays out of config.yaml.
+    Joaquim Reis in the fixture has a +351 HOME landline behind his CELL.
+    """
+
+    def test_prefer_picks_the_matching_number(self):
+        service = _service(aliases={"quim": {"contact": "Joaquim Reis", "prefer": "+351213"}})
+        self.assertEqual(service.resolve_contact("quim").phone, "+351213000111")
+
+    def test_without_prefer_the_card_order_wins(self):
+        service = _service(aliases={"quim": "Joaquim Reis"})
+        self.assertEqual(service.resolve_contact("quim").phone, "+351914000333")
+
+    def test_a_prefix_no_number_has_falls_back_instead_of_failing(self):
+        service = _service(aliases={"quim": {"contact": "Joaquim Reis", "prefer": "+44"}})
+        match = service.resolve_contact("quim")
+        self.assertTrue(match.certain)
+        self.assertEqual(match.phone, "+351914000333")
+
+    def test_a_mapping_without_a_contact_is_skipped(self):
+        service = _service(aliases={"ghost": {"prefer": "+351"}, "quim": "Joaquim Reis"})
+        self.assertEqual(list(service.aliases), ["quim"])
+
+
+class AliasOrderingTests(unittest.TestCase):
+    """
+    The real-world shape: plain "rita" is aliased to one Rita, and the book
+    also holds "Rita Lopes" and "Clara Mae Rita" (someone tagged with the
+    name). Before 2026-09-23 the alias went through match_name's substring
+    tier FIRST, so both of those full names matched the `rita` alias and
+    would have messaged the aliased Rita.
+    """
+
+    GF = "rita \U0001FAF0\U0001F3FD"
+
+    def setUp(self):
+        self.service = _service(
+            _book(QP_VCF), aliases={"rita": self.GF, "my girlfriend": self.GF}
+        )
+
+    def test_the_exact_alias_wins_over_a_tie_in_the_book(self):
+        match = self.service.resolve_contact("Rita")
+        self.assertTrue(match.certain)
+        self.assertEqual(match.key, self.GF)
+
+    def test_a_full_contact_name_beats_a_loose_alias_match(self):
+        self.assertEqual(self.service.resolve_contact("Rita Lopes").key, "Rita Lopes")
+
+    def test_someone_merely_tagged_with_the_name_is_not_rerouted(self):
+        match = self.service.resolve_contact("Clara Mae Rita")
+        self.assertEqual(match.key, "Clara Mae Rita")
+
+    def test_a_loose_phrase_still_reaches_the_alias(self):
+        """Nothing in the book matches "the girlfriend", so the alias may."""
+        self.assertEqual(self.service.resolve_contact("my girlfriend").key, self.GF)
+
+
+class PrefixBoundaryTests(unittest.TestCase):
+    def test_a_one_letter_contact_is_not_a_prefix_of_every_z_word(self):
+        """Live: "Zuka" resolved, certain, to a contact named just "Z"."""
+        contacts = load_vcf(_book(VCF)) + [Contact(name="Z", phones=["+351910000999"])]
+        top_score, top = score_contacts("zuka", contacts)[0]
+        self.assertEqual(top.name, "Marta Zuka")
+        self.assertLess(top_score, 90.0)
+
+    def test_a_partial_first_name_is_not_certain(self):
+        contacts = load_vcf(_book(VCF))
+        scored = [s for s, c in score_contacts("mar", contacts) if c.name == "Marta Zuka"]
+        self.assertLess(scored[0], _CERTAIN_SCORE_FOR_TESTS)
 
 
 class ConfirmationTests(unittest.TestCase):

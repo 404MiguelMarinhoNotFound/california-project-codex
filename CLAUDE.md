@@ -48,7 +48,7 @@ No VPN preflight and no ADB on this path, and by default no network at all.
 | TV control | ADB over network to Mi Box / Android TV |
 | Light control | Govee over Bluetooth LE (`bleak`) or TP-Link Tapo over the LAN (`services/tapo_tpap.py` for firmware 1.4.2+, `python-kasa` for older); Govee cloud v2 API optional |
 | Vacuum control | Ecovacs Deebot N8+ via `deebot-client` over REST only; verification codes read from Gmail over IMAP |
-| WhatsApp | WhatsApp Web in Firefox, driven with `pyautogui`; contacts from a local VCF. **Windows only** |
+| WhatsApp | WhatsApp Web driven by Playwright in its own linked profile (Edge on Windows, Chromium on the Pi); contacts from a local VCF. Firefox + `pyautogui` kept as a Windows-only fallback backend |
 | Stremio state | Stremio private API + local `watch_state.json` cache |
 | Title resolution | TMDB |
 | Audio I/O | `sounddevice`, `soundfile` |
@@ -103,9 +103,12 @@ Required for the vacuum (`control_vacuum`):
   `ECOVACS_VERIFICATION_CODE` is set by hand once. See "DeebotService" below
 
 WhatsApp (`control_whatsapp`) needs **no credential at all**, and that is deliberate: the send
-path drives WhatsApp Web in an already-signed-in Firefox profile, so the session *is* the auth.
+path drives WhatsApp Web in a linked browser profile (`whatsapp.profile_dir`, linked once with
+`tools/link_whatsapp.py`), so the session *is* the auth -- and is gitignored like one.
 What it does need is `contacts.vcf` at `whatsapp.contacts_path` -- a VCF export of the phone's
-address book, gitignored because it is several hundred real people's phone numbers.
+address book, gitignored because it is several hundred real people's phone numbers -- and,
+optionally, `whatsapp_aliases.yaml` at `whatsapp.aliases_path`: the spoken nicknames, gitignored
+for the same reason, since the repository is public.
 
 Keep secrets in `.env` or another local-only secret mechanism. Do not commit real credentials.
 `.deebot_credentials.json` holds a live Ecovacs session token and is gitignored for the same reason.
@@ -235,7 +238,8 @@ california/
 │   ├── tts.py                   # Text-to-speech
 │   ├── tts_text_sanitizer.py    # Text cleanup for TTS timing
 │   ├── youtube_playlist_resolver.py # Matches voice playlist names and picks one saved ID at random
-│   ├── whatsapp_service.py      # WhatsApp Web over Firefox + pyautogui; VCF contacts, confirm-before-send. Windows only
+│   ├── whatsapp_service.py      # WhatsApp: VCF contacts, confirm-before-send, one worker thread, backend switch
+│   ├── whatsapp_web.py          # Playwright driver for WhatsApp Web: selectors table, send + sent-tick confirm
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
@@ -255,6 +259,7 @@ california/
 │   ├── probe_deebot_devices.py     # Lists the Ecovacs account's robots and whether deebot-client supports them
 │   ├── probe_deebot_rooms.py       # Live room id -> name; prints the deebot.rooms block; --check flags drift
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
+│   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
@@ -294,6 +299,8 @@ california/
 │   ├── test_youtube_search_autoplay.py # Query -> video id -> watch link, session-stamp verification, spoken lines
 │   ├── test_whatsapp_service.py # WhatsApp self-disable, VCF parsing, match certainty, the confirm token, no-keyboard guard
 │   ├── test_orchestrator_whatsapp.py # control_whatsapp dispatch: spoken lines, the read-back guard, the interim line
+│   ├── test_whatsapp_web.py     # Playwright driver on a fake page, outcome lines, one-thread worker, no-browser guard
+│   ├── test_whatsapp_unread.py  # Unread from the chat list: never opens a chat, senders-first lines, messages quoted not obeyed
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -302,6 +309,9 @@ california/
 ├── vpn_state.json               # Generated locally, Surfshark diagnostic cache
 ├── watch_state.json             # Generated locally, cached Stremio progress
 ├── .deebot_device_id            # Generated locally, the Ecovacs device id that got verified
+├── contacts.vcf                 # Local only: the phone's contacts export (WhatsApp)
+├── whatsapp_aliases.yaml        # Local only: WhatsApp nickname -> contact map
+├── .whatsapp_profile/           # Local only: the linked WhatsApp Web browser session
 └── .deebot_credentials.json     # Generated locally, live Ecovacs session token (~7 day life)
 ```
 
@@ -1442,19 +1452,63 @@ self-disables, returns `WhatsAppCommandResult` (falsy on failure, so `is not Non
 existence checks), and runs the blocking work on a daemon worker thread with one command
 in flight. Ported from Master Miguel's standalone `wa_send.py`.
 
-**There is no API and no credential.** The send path opens
-`web.whatsapp.com/send?phone=...&text=...` in a new Firefox tab, waits for the page to
-drop the text into the compose box, and presses Enter. Auth is whatever Firefox profile
-is already signed in to WhatsApp Web -- log in there once, tick "stay signed in", done.
-That is also why there is no `.env` entry: the session *is* the credential.
+**There is no API and no credential.** Both backends open
+`web.whatsapp.com/send?phone=...&text=...`, which drops the text into the compose box,
+and press Enter once. Auth is a WhatsApp Web session in a browser profile, which is why
+there is no `.env` entry: the session *is* the credential. `whatsapp.backend` picks how:
 
-**Windows only, and this is not a portability gap to close later.** It needs a desktop
-session, a real keyboard and `win32gui` to raise the window. `_probe_platform` checks
-four things -- `sys.platform == "win32"`, `pyautogui` imports, the configured Firefox
-binary exists, and each failure logs its own line naming its own fix, because "wrong OS",
-"missing package" and "Firefox lives somewhere else" are three different problems. On the
-Pi the service disables itself and `control_whatsapp` is never offered to the LLM, the
-same shape as `services/bt_wake.py` being Linux only.
+| | `playwright` (shipped since 2026-09-23) | `keyboard` (the original port) |
+|---|---|---|
+| Browser | California's own profile in `profile_dir`, Edge on Windows (no download), bundled Chromium elsewhere | Your everyday Firefox |
+| Enter goes to | the compose box element, inside the page | whatever window has OS focus |
+| Waits on | the element it needs | a fixed `wait_ms` (12s) |
+| "Sent" means | a new outgoing bubble **with a sent tick** was seen | Enter was pressed |
+| Laptop during a send | usable, headless by default | keyboard and screen taken for ~15s |
+| Runs on | anywhere Playwright does, 64-bit Pi OS included | Windows only |
+
+**Why the other options were rejected (researched 2026-09-22).** whatsmeow and Baileys
+speak WhatsApp's protocol directly and are faster still, but Meta's 2025-26 crackdown
+warned and banned *low-volume, legitimate* users of both (tulir/whatsmeow#810) -- not a
+risk to put on his personal number. The official Cloud API sends from a separate
+business number and needs paid templates to start a conversation, which is the wrong
+shape for "tell mum I'm late". The WhatsApp Desktop `whatsapp://send` link skips the
+browser load but still needs the OS keyboard and still cannot confirm. Playwright keeps
+the same risk profile as a person using WhatsApp Web and removes the keyboard.
+
+**Two rules from Playwright's own docs drive the design:**
+
+- **The sync API is not thread-safe**, one instance per thread. Every send, the warm-up,
+  the idle close and the shutdown close therefore run as jobs on ONE long-lived daemon
+  worker (`_submit` / `_worker_loop`). The old keyboard path started a fresh thread per
+  send, which cannot keep a page open across sends. `close()` is itself a job for the
+  same reason: only the thread that launched the browser may close it.
+  `test_every_send_runs_on_the_same_thread` pins it.
+- **Automating a default Chrome/Edge profile is unsupported.** The driver runs in its own
+  `profile_dir` (gitignored, since it holds the linked session), linked once as a
+  WhatsApp linked device with `uv run python tools/link_whatsapp.py`. A linked device
+  drops after roughly two weeks with the phone offline; run the tool again.
+
+**`services/whatsapp_web.py` keeps every selector in one table, `SELECTORS`.** WhatsApp
+redesigns its web client without notice. When it does, that table is the only thing to
+update, and until then the failure is `timeout` or `unconfirmed` -- never a false
+"sent". Each outcome has its own spoken line, because the fixes differ: `not_linked`
+("run the link tool"), `invalid_number` ("that number isn't on WhatsApp"),
+`unconfirmed` ("it hasn't gone out yet"), `timeout` (the generic line). An unlinked
+profile does **not** disable the tool: hiding WhatsApp from the model would turn "you
+need to relink" into silence.
+
+**The browser is warmed at boot and closed when idle.** `Orchestrator.__init__` calls
+`WhatsAppService.start()`, which queues a warm-up on the worker; it is deliberately not
+in `__init__`, so constructing the service -- as every unit test does -- never launches
+anything (`test_constructing_the_shipped_service_launches_nothing`, and the full suite
+passes with `sync_playwright` patched to raise). `idle_close_minutes` frees the ~200-300MB
+the browser holds; the next send relaunches it.
+
+**The keyboard backend is Windows only, and that was never a gap to close.** It needs a
+desktop session, a real keyboard and `win32gui` to raise the window. `_probe_platform`
+checks `sys.platform == "win32"`, that `pyautogui` imports, and that the Firefox binary
+exists, each failure logging its own fix. The Playwright backend's probe checks only
+that `playwright` imports.
 
 **Three import-time hazards from the CLI had to move, and all three would have taken the
 assistant down at boot on the Pi.** `wa_send.py` does `raise SystemExit` when Firefox is
@@ -1504,27 +1558,94 @@ and wrong for four hundred people: "ana" would resolve to "Joana" as confidently
 was and returns ambiguity rather than a best guess -- exactly what the confirm step
 needs. `match_name` is still used for the small `aliases` map, like the lights.
 
-**One Enter, never two.** After the message sends, focus moves to the record-audio
-button, so a retry press starts a voice recording instead of doing nothing. The centre
-click pywhatkit does is worse than useless: it often unfocuses the input so Enter never
-sends at all. `_focus_firefox` calls `SetForegroundWindow` only -- never `ShowWindow` or
-a restore, which made the window flash and minimise.
+**The phone's VCF export is vCard 2.1, and a name with an accent or an emoji is
+quoted-printable.** Android writes `FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=6D=61...`
+for any non-ASCII name, and wraps a long one with a trailing `=` and **no** leading space
+on the next line, so `_unfold_vcf` cannot see the wrap. Until 2026-09-23 the parser read
+those values raw: **41 of the real book's cards** were runs of `=XX` codes no spoken name
+could match. That is how "message <first name>" sent straight to one contact when a
+second person of that name existed -- the second was saved with an emoji, invisible, so
+there was no tie to ask about. `_prop_value` now decodes with the card's charset and
+`_join_qp_soft_breaks` joins only lines whose own parameters say QUOTED-PRINTABLE: a
+base64 `PHOTO` line can end in `=` padding too, and joining that one swallowed the next
+`TEL`. The "which one?" list offers only the contenders within `_AMBIGUOUS_MARGIN`,
+not everyone merely tagged with the name ("Clara Mae Rita" is Rita's mum, not a Rita).
+
+**A prefix only counts at a word boundary.** `score_contacts` used to give 90 (certain)
+to `name.startswith(q) or q.startswith(name)`, so a surname resolved, certain, to a
+contact named just "Z", and "mar" was certain for any full name starting "Mar". Both
+directions now require the next character to be a space.
+
+**Aliases live in a gitignored `whatsapp_aliases.yaml`, not in `config.yaml`.** The
+repository is public, and a nickname map says who his partner, family and friends are
+-- the same reason `contacts.vcf` is gitignored. `load_alias_config` merges the file at
+`whatsapp.aliases_path` over the (example-only) `whatsapp.aliases` block; `LLMService`
+calls the same function so the prompt advertises exactly the nicknames that resolve,
+and `tests/config_fixture.py` points `aliases_path` at a nonexistent file so the
+developer's own nicknames never decide a test. A value is a contact name or
+`{contact: "...", prefer: "+351"}`, where `prefer` is a number **prefix** choosing which
+of a card's numbers to use (a card that lists a foreign number first) without writing
+the number down. A prefix no number has falls back to the card's first number.
+
+**Alias resolution has an order, and the naive one sent messages to the wrong person.**
+Aliases went through `match_name`, whose substring tier is right for six light rooms:
+with an `ana` alias for one Ana, both "Ana Costa" and "Rui Pai Ana" (tagged with the
+name) matched it. Measured on the real book 2026-09-23, before the fix. Now: (1) an
+**exact** alias wins, even over a tie in the book -- that is what the alias is for;
+(2) otherwise a **certain** book match wins, so a full name reaches that person;
+(3) only then may a loose alias match ("the mum") apply. `AliasOrderingTests` pins it.
+
+**One Enter, never two, on both backends.** After the message sends, focus moves to the
+record-audio button, so a retry press starts a voice recording instead of doing nothing.
+The Playwright driver also refuses to press into a box the pre-filled text has not
+reached yet. On the keyboard backend, the centre click pywhatkit does is worse than
+useless: it often unfocuses the input so Enter never sends at all. `_focus_firefox` calls
+`SetForegroundWindow` only -- never `ShowWindow` or a restore, which made the window
+flash and minimise.
 
 **A scheduled send is a `threading.Timer`, not a sleep in the worker.** The worker allows
 one command in flight, so the CLI's `time.sleep(delay)` there would block every other
 WhatsApp command until it fired. Two limits are stated back rather than engineered
 around: it does **not survive a restart** (`close()` cancels the timers, and is called
-from the orchestrator's shutdown for exactly that reason), and at fire time it raises a
-Firefox window and takes the keyboard whether or not anyone is at the machine.
+from the orchestrator's shutdown for exactly that reason), and on the keyboard backend
+it raises a Firefox window and takes the keyboard at fire time whether or not anyone is
+at the machine.
 
 **`_dispatch_whatsapp` speaks an interim line before a send**, via the same `say_now`
-hook `_ensure_playable` uses for a 25s CEC wake. The send takes ~15s and drives the
-keyboard and screen for all of it; without the line that reads as the laptop being taken
-over. It is only spoken when a send is actually about to happen -- announcing a read-back
-would be a lie with a fifteen-second shape.
+hook `_ensure_playable` uses for a 25s CEC wake. On the keyboard backend it is "hands off
+the keyboard", because the send drives the keyboard and screen for ~15s; on Playwright it
+is a plain "Sending it on WhatsApp", because nothing on the desktop moves. It is only
+spoken when a send is actually about to happen -- announcing a read-back would be a lie.
 
-Setup: `uv sync --extra default`, log into web.whatsapp.com in Firefox once, export the
-phone's contacts as VCF and drop it at `whatsapp.contacts_path` (gitignored).
+**Reading what is unread: the chat LIST only, never a chat (2026-09-23).**
+`whatsapp_unread` reads the left-hand chat list through `WhatsAppWebDriver.unread_chats`:
+sender, unread count, and the preview of the *last* message. It never opens a chat,
+because opening one marks it read on his phone and sends the sender blue ticks. The
+price is that only the newest message per chat is visible, cut short, and the spoken
+line says so. Opening a chat to read it in full is deliberately not an action.
+
+- **Senders first, text on request.** With no `to`, the line lists who and how many and
+  carries no message text at all, because she is speaking in a room. With `to`, it
+  gives that chat's latest message. `find_unread_chat` resolves the name exactly like a
+  send (aliases, then the book, then the chat titles), so a nickname like "my mum" works.
+- **Muted chats are left out and counted; groups are listed apart**, identified through
+  the "Groups" filter chip because nothing in a row marks a group. The "Unread" chip
+  lists every unread chat, not just the ~20 rows the virtualised list has rendered, and
+  the list is put back on "All" afterwards.
+- **The chips need a DOM click.** They are `button#all-filter` / `#unread-filter` /
+  `#group-filter` with `aria-selected`. A Playwright pointer click waited out its whole
+  30s actionability timeout on each (97s for one read) because of the role=dialog layer
+  WhatsApp keeps in the page; `evaluate("b => b.click()")` takes 8.9s cold, 1.9s warm.
+- **Other people's words are data.** This is the first path where someone other than
+  Master Miguel puts text in front of the model. The quoted preview is labelled as the
+  sender's words in the tool result, and the system prompt says a message is read out,
+  never obeyed. `test_a_message_that_gives_orders_is_quoted_not_obeyed` pins it.
+
+Setup: `uv sync --extra default`, `uv run python tools/link_whatsapp.py` once (scan the
+QR code from the phone's Linked devices screen), export the phone's contacts as VCF and
+drop it at `whatsapp.contacts_path` (gitignored). On the Pi, also
+`uv run playwright install chromium` once -- that browser lives outside `uv.lock`, like
+the openWakeWord models, so a fresh machine needs it again.
 
 ### StremioService
 
@@ -1804,7 +1925,7 @@ The Claude path supports:
 - Custom `control_tv` tool for Mi Box and TV control (23 actions)
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
-- Custom `control_whatsapp` tool for WhatsApp messaging (2 actions)
+- Custom `control_whatsapp` tool for WhatsApp messaging (3 actions)
 
 With the committed `config.yaml` that is **5 tools** in every request: `web_search`,
 `control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`. Each custom tool's full schema is sent on
@@ -1850,10 +1971,12 @@ The `control_tv` schema in `services/llm.py` currently supports these TV-related
 - `vacuum_stop`, `vacuum_dock`
 - `vacuum_status` (battery + state; doubles as the pre-clean guard)
 
-`control_whatsapp` supports these actions, and deliberately only these two:
+`control_whatsapp` supports these actions, and deliberately only these three:
 
 - `whatsapp_send` (needs `to` and `message`; optional `at` as HH:MM, optional `confirm`)
 - `whatsapp_find_contact` (needs `to`; looks someone up without messaging them)
+- `whatsapp_unread` (optional `to`; who has unread messages, or one chat's latest message.
+  Reads the chat list only and never marks anything read)
 
 Bulk send and image send exist in the CLI it was ported from and were left out: bulk has no
 spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
@@ -2454,6 +2577,26 @@ Current automated coverage exists for:
 - `control_whatsapp` dispatch: every spoken line, that a fuzzy match / an ambiguous name /
   a missing body each call `send` zero times, that a lookup never sends, and that the
   interim line is spoken before a send but not before a read-back
+- The Playwright driver against a fake page: "sent" needs a new bubble AND a tick, a
+  bubble without a tick is `unconfirmed`, exactly one Enter lands on the compose box and
+  never into an empty one, a QR code is `not_linked` and WhatsApp's dialog is
+  `invalid_number` with nothing pressed, and the URL drops the `+` and quotes the text
+- The Playwright service: each outcome maps to its own spoken line, a crashed browser
+  is closed so the next send relaunches, every send runs on one thread, `close()` shuts
+  the browser on that thread, an idle browser is closed, `start()` warms only on the
+  Playwright backend with `keep_warm` on, and constructing the shipped service never
+  reaches `sync_playwright`
+- VCF quoted-printable: an emoji name and an accented name split by a soft break decode,
+  a base64 PHOTO line ending in `=` does not swallow the next number, no name is left as
+  `=XX` codes, and two people sharing a first name are ambiguous again
+- Alias resolution order: an exact alias beats a tie in the book, a full contact name
+  beats a loose alias match, someone merely tagged with a name is not rerouted; `prefer`
+  picks a number by prefix and falls back when no number matches; a prefix only counts
+  at a word boundary
+- Unread (`tests/test_whatsapp_unread.py`): read under the Unread chip, groups and mutes
+  carried, direction marks stripped, no chat ever opened, the list put back on All; lines
+  list senders without text, quote one chat's latest message labelled as the sender's
+  words, and a message that gives orders is read, never acted on
 - That the contact roster is never injected into the system prompt
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
@@ -2838,6 +2981,20 @@ just the commits.
   his call. Pinned both devices to static addresses outside a shrunken DHCP
   pool, since the NOS portal has no reservations. `tv_only_standby` ships
   off until its `standby-mode` run.
+
+- **"Search online more optimized ways of doing this WhatsApp thing" (2026-09-22/23,
+  branch `feat/whatsapp-tapo`).** Rebased the Tapo work onto master (which had just
+  gained `control_whatsapp`) as a fresh branch, then replaced the Firefox + `pyautogui`
+  send path with Playwright after ruling out whatsmeow/Baileys (2025-26 ban wave on
+  low-volume users) and the Cloud API (a separate business number). Live findings on
+  the real page: WhatsApp Web ships generated class names now, so every tutorial
+  selector was dead; emoji render as `<img>` and vanish from a bubble's text; the chat
+  list's rows are `role=row` too; the invalid-number dialog sits over a visible chat
+  list; the filter chips only take a DOM click. A live "message <name>" went to the
+  wrong one of two same-named contacts, which exposed the quoted-printable VCF bug
+  (41 unreadable cards) and, once aliases went in, an alias ordering that would have
+  rerouted full names. Added `whatsapp_unread` off the chat list. Aliases moved to a
+  gitignored file before committing, because the repository is public.
 
 - **"Deebot N8+ voice control" (2026-09-16, branch `feat/deebot-vacuum-exploration`).**
   Went from "search online for a deebot-client library" to a shipped

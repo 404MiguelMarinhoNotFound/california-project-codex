@@ -117,6 +117,7 @@ tapo = [
 # In `default` for the usual reason: default is defined as exactly what the
 # committed config.yaml selects, and config.yaml selects this.
 whatsapp = [
+    "playwright>=1.63",
     "pyautogui>=0.9.54; sys_platform == 'win32'",
     "pywin32>=306; sys_platform == 'win32'",
 ]
