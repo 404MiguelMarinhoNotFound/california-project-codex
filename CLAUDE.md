@@ -234,6 +234,7 @@ california/
 │   ├── sentence_chunker.py      # Splits streamed LLM output into sentences
 │   ├── stremio_service.py       # Stremio auth, sync, TMDB lookup, deep-link playback
 │   ├── surfshark_service.py     # Route-based Surfshark VPN automation for YouTube and Stremio
+│   ├── tv_volume.py             # The TV's own 0-100 volume and mute over UPnP RenderingControl (:9197)
 │   ├── stt.py                   # Speech-to-text
 │   ├── tts.py                   # Text-to-speech
 │   ├── tts_text_sanitizer.py    # Text cleanup for TTS timing
@@ -291,6 +292,7 @@ california/
 │   ├── test_stt_hallucination.py # Whisper non-speech filler and segment-probability gating
 │   ├── test_tts_chunking.py     # Terminal punctuation kept, fewer/longer chunks, two-sided audio trim
 │   ├── test_surfshark_service.py # Surfshark route execution and cache behavior
+│   ├── test_tv_volume.py        # UPnP TV volume: retry, cap-asked-twice, TV-off line, no-network guard
 │   ├── test_vad_silence.py      # Grace window, saw-speech flag, Silero framing
 │   ├── test_wake_word_framing.py # openWakeWord native-frame buffering, consecutive frames, dither floor
 │   ├── test_name_matcher.py     # Matcher tier order, despacing, "&" normalization
@@ -679,7 +681,7 @@ or "stop".
 - ADB connection management with cooldown when the TV is offline
 - Shared ADB execution helpers with a configurable default timeout from `media.adb_timeout_ms`
 - Basic playback controls like play, pause, stop, next, previous, rewind, and fast-forward
-- Volume controls including approximate percentage set
+- Box volume over ADB key presses -- only the fallback now; the TV's own volume goes through `TvVolume`, see below
 - App launching for Stremio, YouTube, Surfshark, and Spotify
 - Explicit activity launch when configured, with fallback to plain package launch
 - Navigation commands like home and back
@@ -689,6 +691,49 @@ or "stop".
 - Screenshot-byte helpers and UI dump flows reused by Stremio scans so raw ADB calls do not hang indefinitely
 - YouTube playlist and search deep links
 - YouTube warm launch plus one OK press to clear the profile picker on cold starts
+
+### Volume Is The Television's, Over UPnP
+
+`control_tv`'s volume actions used to press `KEYCODE_VOLUME_UP/DOWN` on the box:
+one `adb shell` per step, up to 30 for a `volume_set`, on the box's 0-15 scale.
+The box usually sits pinned at 15/15 while the room is ridden from the Samsung's
+remote, so "turn it up" was often a multi-second no-op.
+
+`services/tv_volume.py` (`TvVolume`) talks to the Samsung's UPnP
+`RenderingControl` service instead: SOAP to
+`http://<tv>:9197/upnp/control/RenderingControl1`, `GetVolume`/`SetVolume` on the
+TV's own 0-100 scale (the number it shows on screen), `GetMute`/`SetMute`. This
+is how Home Assistant's own samsungtv integration sets a level. **Measured on
+the UE49M5505, 2026-09-24:** `GetVolume` 36ms, `SetVolume` 46ms, a +2 round trip
+99ms with a matching readback; no pairing token and no `401` (other people's
+sets refuse hosts missing from the TV's device list -- this one does not).
+
+- **It only answers while the TV is on, and it flakes.** One connect to :9197
+  succeeded and the next, a moment later, was refused. Every call retries once,
+  and the retry re-resolves the address with `force=True` through
+  `CecWaker.resolve_tv_ip` -- the same MAC + duid ladder, so a moved TV
+  self-heals here too. Reachable means "GetVolume answered", never "the port
+  opened".
+- **TV off is spoken, never redirected.** An unreachable TV answers "the TV looks
+  off"; it does not quietly move the box's volume, which would report success
+  for a change nobody hears. The box path survives only as the fallback when
+  `media.tv_volume.enabled` is false.
+- **Volume actions run before `_dispatch_tv`'s `requires_tv` gate.** They need
+  neither the box nor ADB, so a box asleep under a lit television must not block
+  them.
+- **Rising past `max_percent` (40) needs the same number asked twice** within
+  `confirm_window_s`. Whisper hears "thirteen" as "thirty", and on a 0-100 scale
+  that mistake is loud. A plain "louder" that would cross the cap lands on it
+  instead. Coming down is never gated.
+- **`volume_steps` means TV volume points now** (default `step: 5`), not box key
+  presses. `volume_set` with no number asks rather than defaulting to 50.
+- **`mute` and `unmute` are explicit.** The box's `KEYCODE_VOLUME_MUTE` is a
+  toggle, so "unmute" could mute; `SetMute` cannot. `unmute` is the one enum
+  value added to `control_tv` for this, and `tests/test_llm_prompt.py` pins the
+  count at 24.
+- **`get_status` reports "TV volume N"** (or "TV muted"), skipped when the CEC bus
+  already says standby. The box's volume is then only mentioned when it is
+  below max, because that is the only case where it explains a quiet room.
 
 ### Power: Off Is ADB, On Depends On How Deep The Box Went
 
@@ -1922,7 +1967,7 @@ At the time of this update:
 The Claude path supports:
 
 - Anthropic web search via `web_search_20250305`
-- Custom `control_tv` tool for Mi Box and TV control (23 actions)
+- Custom `control_tv` tool for Mi Box and TV control (24 actions)
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 - Custom `control_whatsapp` tool for WhatsApp messaging (3 actions)
@@ -1958,7 +2003,7 @@ The `control_tv` schema in `services/llm.py` currently supports these TV-related
 
 - `play_pause`, `stop`, `next`, `prev`
 - `fast_forward`, `rewind`
-- `volume_up`, `volume_down`, `volume_set`, `mute`
+- `volume_up`, `volume_down`, `volume_set`, `mute`, `unmute` (the TV's own volume over UPnP; see "Volume Is The Television's")
 - `launch_app`, `go_home`, `go_back`
 - `turn_on`, `turn_off`, `switch_hdmi`
 - `get_status`
@@ -2156,7 +2201,10 @@ one connection, ~0.9s of ADB in total:
 Android values. Without it the title is dropped rather than pinned to a
 guessed verb -- "paused on X" must mean the box said paused.
 
-**Volume is the BOX's, not the television's.** `_parse_volume` scopes to the
+**The TV's volume now comes from UPnP** (see "Volume Is The Television's, Over
+UPnP"); what follows is the box's, which `room_status()` still reads.
+
+**This volume is the BOX's, not the television's.** `_parse_volume` scopes to the
 `- STREAM_MUSIC:` block, which matters: `STREAM_VOICE_CALL` sits above it
 with a Max of 5 and `- VOLUME GROUP AUDIO_STREAM_MUSIC` below with its own
 numbers, so a loose scan picks up whichever it meets first. This is the
@@ -2480,6 +2528,13 @@ Current automated coverage exists for:
 - That a CEC power report far older than the live log is not trusted, that a
   `<Standby>` broadcast after the last report wins and a newer report wins back,
   and that a `[S]` standby the box sent is not read as the television's state
+- TV volume over UPnP (`tests/test_tv_volume.py`): SOAP to RenderingControl on
+  :9197, one flake retried with a forced rediscovery, an unreadable TV as `None`
+  rather than 0, a step clamped at zero and landing on the cap, a rise past the
+  cap refused until the same number is asked twice in the window, coming down
+  never gated, explicit mute/unmute, TV off spoken rather than falling back to
+  the box, volume actions skipping the ADB gate, `get_status` skipping the TV on
+  a standby bus, and no real HTTP from the file
 - Volume parsed from a real `dumpsys audio` capture, scoped past
   STREAM_VOICE_CALL and the VOLUME GROUP block; that muted replaces the
   level rather than joining it, and an unreadable volume is not mentioned

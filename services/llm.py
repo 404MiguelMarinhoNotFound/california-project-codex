@@ -55,7 +55,7 @@ CONTROL_TV_TOOL = {
                 "enum": [
                     "play_pause", "stop", "next", "prev",
                     "fast_forward", "rewind",
-                    "volume_up", "volume_down", "volume_set", "mute",
+                    "volume_up", "volume_down", "volume_set", "mute", "unmute",
                     "launch_app", "go_home", "go_back",
                     "turn_on", "turn_off", "switch_hdmi",
                     "get_status",
@@ -75,12 +75,11 @@ CONTROL_TV_TOOL = {
             },
             "volume_steps": {
                 "type": "integer",
-                "description": "Steps for volume_up/volume_down. Default 10.",
-                "default": 10
+                "description": "How much volume_up/volume_down changes the TV's 0-100 volume. Omit for a normal step; use ~15 for 'way louder'."
             },
             "volume_percent": {
                 "type": "integer",
-                "description": "Target volume as 0-100 percentage. Required only for volume_set.",
+                "description": "For volume_set: the TV's own 0-100 volume, the number it shows on screen.",
                 "minimum": 0,
                 "maximum": 100
             },
