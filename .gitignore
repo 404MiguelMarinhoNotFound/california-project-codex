@@ -45,3 +45,6 @@ contacts.vcf
 # WhatsApp nicknames (whatsapp.aliases_path). Says who his family, partner and
 # friends are, and the repository is public -- local-only like contacts.vcf.
 whatsapp_aliases.yaml
+
+# Runtime logs (config logging.dir). Transcripts and replies, local only.
+logs/

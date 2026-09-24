@@ -166,6 +166,22 @@ audio:
   chunk_duration_ms: 40
   device: null                # null = system default mic, or device index/name
 
+# --- Runtime logs (core/turn_log.py) ---
+# Everything the console shows, and DEBUG besides, goes to logs/california.log
+# (rotated by size). One JSON line per wake goes to logs/turns.jsonl with ms
+# timings since the wake word: speech_end, stt_done, llm_first_token,
+# first_sentence, first_audio, reply_done, plus each tool call's duration.
+# Both are gitignored. They hold what he said and what she answered, so set
+# include_transcripts: false to keep only the timings.
+logging:
+  enabled: true
+  dir: "logs"
+  file_level: "DEBUG"
+  max_bytes: 5000000          # per file, before rotating
+  backup_count: 5             # california.log.1 .. .5
+  turns: true
+  include_transcripts: true
+
 # --- Speech-to-Text ---
 stt:
   provider: "groq"            # "groq" (cloud, fast, free) | "local" (whisper.cpp, slow)

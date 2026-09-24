@@ -217,6 +217,7 @@ california/
 │   ├── orchestrator.py          # Main state machine and tool dispatch
 │   ├── audio_pipeline.py        # Microphone capture and playback
 │   ├── wake_word.py             # Wake-word detection
+│   ├── turn_log.py              # Rotating log file + one timing record per turn (logs/)
 │   └── vad.py                   # Voice activity detection
 ├── services/
 │   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
@@ -2691,6 +2692,29 @@ Current automated coverage exists for:
   not end the turn; `_idle_loop` chains a barged-in turn into another activation
   on one speaker session; and a closed LLM generator keeps the partial answer
   in history
+
+### Runtime logs: read these before guessing at latency
+
+`core/turn_log.py`, configured under `logging:` in `config.yaml`. Both files live in
+`logs/` (gitignored: they hold what he said and what she answered;
+`include_transcripts: false` keeps only timings).
+
+- `logs/california.log` -- the console log plus DEBUG, rotated at 5MB x 5. SDK
+  clients (`anthropic`, `groq`, ...) are held at INFO, because at DEBUG they log
+  every request body and bury everything else.
+- `logs/turns.jsonl` -- one line per activation, ms since the wake word:
+  `speech_end`, `stt_done`, `llm_first_token`, `first_sentence`, `first_audio`,
+  `reply_done`, and `tools` (name, action, start, duration, result). A stage that
+  did not happen is absent, never zero. `outcome` is `reply`, `barged_in`,
+  `no_speech`, `short`, `empty_transcript`, `command` or `error`; a turn chained
+  after a barge-in has `chained: true`.
+
+`_handle_activation` owns the `TurnTimer` and finishes it in a `finally`, so every
+exit writes exactly one line; the work is in `_run_activation`. The timer is
+written from three threads and never raises. `Orchestrator._turn` defaults to a
+null turn at class level so `__new__`-built test orchestrators need no setup.
+`_timed_tokens` only watches the LLM stream: the orchestrator still closes the
+inner generator on a barge-in so `services/llm.py` sees `GeneratorExit`.
 
 Useful live-debug commands:
 

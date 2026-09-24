@@ -306,6 +306,13 @@ def main():
     # Load config
     config = load_config(args.config)
 
+    # Runtime log file (logs/california.log). The console keeps its level; the
+    # file gets logging.file_level. See core/turn_log.py.
+    from core.turn_log import setup_file_logging
+    log_path = setup_file_logging(config)
+    if log_path:
+        logging.getLogger(__name__).info("Logging to %s", log_path)
+
     # Run requested mode
     if args.test_mic:
         test_microphone(config)
