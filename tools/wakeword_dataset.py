@@ -632,11 +632,19 @@ class UtteranceCutter:
 
 
 def her_voice() -> np.ndarray:
-    """Her pre-rendered lines, concatenated, for the 'her' background."""
+    """
+    Her pre-rendered lines, concatenated, for the 'her' background.
+
+    Lines that say her own name ("California here.", california_live) are left
+    out: over one of those, a take whose transcript reads "California" might be
+    her saying it, and it would train her voice in as a positive.
+    """
     import soundfile as sf
 
     clips = []
     for f in sorted(ROOT.glob("sounds/**/google_en-US-Chirp3-HD-Aoede/**/*.wav")):
+        if "californ" in f.stem.lower():
+            continue
         x, sr = sf.read(str(f), dtype="float32", always_2d=True)
         x = x.mean(axis=1)
         if sr != 24000:
