@@ -197,6 +197,7 @@ california/
 ├── setup.ps1                    # uv bootstrap for Windows
 ├── generate_bootup_sounds.py    # Regenerates the startup one-liners in sounds/bootup/
 ├── generate_activation_phrases.py # Regenerates the post-wake acknowledgements
+├── generate_her_monologues.py   # Long replies in her voice, the background for wake-word takes over her
 ├── core/
 │   ├── orchestrator.py          # Main state machine and tool dispatch
 │   ├── audio_pipeline.py        # Microphone capture and playback

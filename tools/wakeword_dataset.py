@@ -80,6 +80,9 @@ MANIFEST_PATH = REC_DIR / "manifest.jsonl"
 # the pre-manifest folders (positive/, holdout_*/) so the two never mix.
 SESSIONS_DIR = REC_DIR / "new"
 LIVE_DIR = REC_DIR / "live"
+# Her long replies for --background her; written by generate_her_monologues.py
+# in the live voice (config.yaml tts.google.voice).
+HER_MONOLOGUE_DIR = ROOT / "sounds" / "her_monologues" / "google_en-US-Chirp3-HD-Aoede"
 EXPORT_DIR = REC_DIR / "export"
 
 LANGS = ("en", "pt")
@@ -633,25 +636,28 @@ class UtteranceCutter:
 
 def her_voice() -> np.ndarray:
     """
-    Her pre-rendered lines, concatenated, for the 'her' background.
+    Her long replies, back to back, for the 'her' background.
 
-    Lines that say her own name ("California here.", california_live) are left
-    out: over one of those, a take whose transcript reads "California" might be
-    her saying it, and it would train her voice in as a positive.
+    He interrupts a reply, not an acknowledgement: long, continuous speech. The
+    first 'her' session looped her short activation clips instead, which is
+    not what the barge-in case sounds like. generate_her_monologues.py writes
+    the replies, in the live voice, and none of them says her name: over a
+    line that did, a take whose transcript reads "California" might be her
+    saying it, and her voice would be trained in as a positive.
     """
     import soundfile as sf
 
     clips = []
-    for f in sorted(ROOT.glob("sounds/**/google_en-US-Chirp3-HD-Aoede/**/*.wav")):
-        if "californ" in f.stem.lower():
-            continue
+    for f in sorted(HER_MONOLOGUE_DIR.glob("*.wav")):
         x, sr = sf.read(str(f), dtype="float32", always_2d=True)
         x = x.mean(axis=1)
         if sr != 24000:
             x = np.interp(np.arange(0, len(x), sr / 24000), np.arange(len(x)), x)
-        clips += [x, np.zeros(int(0.4 * 24000), dtype=np.float32)]
+        clips += [x, np.zeros(int(0.6 * 24000), dtype=np.float32)]
     if not clips:
-        raise SystemExit("no Aoede clips under sounds/ - run generate_activation_phrases.py")
+        raise SystemExit(
+            f"no monologues in {rel(HER_MONOLOGUE_DIR)} - run: uv run python generate_her_monologues.py"
+        )
     return np.concatenate(clips)
 
 
@@ -687,7 +693,9 @@ def cmd_record(args) -> None:
 
     def background_on():
         if her is not None:
-            sd.play(her, 24000, loop=True)
+            # A random point each time, or every restart (after a beep or a
+            # replay) would put the same opening sentence under the next take.
+            sd.play(np.roll(her, -int(np.random.randint(len(her)))), 24000, loop=True)
 
     if args.background in ("tv", "music"):
         input(f"  Put the {args.background} on at its usual level, then press Enter ")
