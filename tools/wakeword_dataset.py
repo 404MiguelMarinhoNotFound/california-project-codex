@@ -739,10 +739,28 @@ def cmd_record(args) -> None:
             print(f"      {status:<8}  {describe(row)}")
         return row
 
+    def beep(times: int) -> None:
+        """Cues for hands-free, where the screen is out of sight. Never recorded:
+        every beep is followed by a drain of the mic buffer."""
+        t = np.arange(int(0.15 * SR)) / SR
+        tone = (0.3 * np.sin(2 * np.pi * 880 * t)).astype(np.float32)
+        gap = np.zeros(int(0.15 * SR), dtype=np.float32)
+        sd.play(np.concatenate([np.concatenate([tone, gap])] * times), SR, blocking=True)
+        background_on()
+
     stream = pipeline.create_mic_stream()
     stream.start()
     chunk = pipeline.chunk_samples
     try:
+        if args.hands_free:
+            print(f"\n  Walk to your spot. In {args.walk_time:.0f}s:")
+            print("    1 beep  = stay silent (room tone)")
+            print(f"    2 beeps = start saying \"{args.word}\", ~2s apart, varying how you say it")
+            print(f"    3 beeps = done ({args.takes} takes kept), come back")
+            time.sleep(args.walk_time)
+            beep(1)
+            pipeline.drain_mic_stream(stream)
+
         print(f"\n  Room tone: stay silent for {ROOMTONE_S:.0f}s (leave the background on)")
         tone = read_seconds(stream, ROOMTONE_S, chunk)
         write_wav(sdir / "roomtone.wav", tone)
@@ -750,9 +768,9 @@ def cmd_record(args) -> None:
         print(f"  room level RMS {floor:.0f}\n")
 
         if args.hands_free:
-            print(f"  Hands-free: say \"{args.word}\", pause a second, say it again.")
-            print("  Vary how you say it. Ctrl+C when done.\n")
+            print(f"  Hands-free: say \"{args.word}\", pause, say it again. Ctrl+C to stop early.\n")
             cutter = UtteranceCutter(floor, chunk)
+            beep(2)
             pipeline.drain_mic_stream(stream)
             while kept < args.takes:
                 data, _ = stream.read(chunk)
@@ -760,6 +778,7 @@ def cmd_record(args) -> None:
                 if take is not None:
                     print(f"[{kept + 1}/{args.takes}]", end="")
                     process(take, None)
+            beep(3)
         else:
             while kept < args.takes:
                 style = STYLES[index % len(STYLES)]
@@ -1133,6 +1152,12 @@ def main() -> None:
         "--hands-free",
         action="store_true",
         help="no keys: one take per utterance, for when you are away from the keyboard",
+    )
+    p.add_argument(
+        "--walk-time",
+        type=float,
+        default=15.0,
+        help="hands-free: seconds to get to your spot before the first beep (default 15)",
     )
     p.add_argument("--word", default="California")
     p.add_argument("--speaker", default="miguel")
