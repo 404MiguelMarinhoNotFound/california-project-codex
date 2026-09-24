@@ -260,7 +260,8 @@ california/
 ├── training/                    # Wake-word training, runs on Modal, see training/README.md
 │   ├── modal_train.py           # Modal app: setup / smoke / train entrypoints
 │   ├── california.yaml          # Run 1 config, kept for comparison
-│   ├── california_v2.yaml       # Current config: large head, wider TTS spread
+│   ├── california_v2.yaml       # Run 2 config: large head, wider TTS spread
+│   ├── california_v3.yaml       # Current config: v2 + reviewed real takes, her voice and room tone as backgrounds
 │   └── california_smoke.yaml    # Tiny end-to-end pipeline check
 ├── tools/
 │   ├── debug_surfshark_sequence.py # Runs named Surfshark routes with optional screenshot capture
@@ -3000,6 +3001,24 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 A trace of notable multi-turn Claude Code sessions, so a future session (or
 Master Miguel) can find the conversation that produced a feature instead of
 just the commits.
+
+- **"My wake word is super buggy" (2026-09-23/24, branch
+  `fix/wakeword-scorer-padding`).** Started as a retrain request and first
+  found that the measurement was wrong: `score_wakeword.py` scored 0.7s takes
+  bare after a reset, which is where "16-20% recall" came from (75/65% in a
+  bed of room noise). Replaced `record_wakeword.py` with
+  `tools/wakeword_dataset.py` (manifest, push-to-talk and hands-free
+  sessions, automatic rejects vs flags-for-review, per-session holdout, leak
+  guard, export) and recorded ~230 takes through the live mic, including
+  TV-on and over-her sessions. `generate_her_monologues.py` gives her long
+  replies as the barge-in background. Trained v3 on Modal (`--recordings v3`
+  so v2's unreviewed uploads stay out) and wired it at threshold 0.5 /
+  barge-in 0.3: on the 40 holdouts with a background mixed in, TV 7 -> 21 and
+  her voice 0 -> 8 of 40 against v2 at 0.81; quiet roughly level. Lessons: a
+  detached `modal run` still dies with its local client, so long runs are
+  deployed and started with `Function.spawn`; Git Bash rewrites `/volume/paths`
+  unless `MSYS_NO_PATHCONV=1`. Still open: a real TV/her holdout, and more
+  over-her takes (22 so far).
 
 - **"1 minute really is unacceptable" (2026-09-21/22, branch `feat/fast-tv-wake`,
   PR #34).** After the Bluetooth route was ruled out (PR #33), rebuilt

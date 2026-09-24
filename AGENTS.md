@@ -234,7 +234,8 @@ california/
 ├── training/                    # Wake-word training, runs on Modal, see training/README.md
 │   ├── modal_train.py           # Modal app: setup / smoke / train entrypoints
 │   ├── california.yaml          # Run 1 config, kept for comparison
-│   ├── california_v2.yaml       # Current config: large head, wider TTS spread
+│   ├── california_v2.yaml       # Run 2 config: large head, wider TTS spread
+│   ├── california_v3.yaml       # Current config: v2 + reviewed real takes, her voice and room tone as backgrounds
 │   └── california_smoke.yaml    # Tiny end-to-end pipeline check
 ├── tools/
 │   ├── debug_surfshark_sequence.py # Runs named Surfshark routes with optional screenshot capture
