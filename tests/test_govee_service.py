@@ -65,11 +65,18 @@ def _cloud_config(**overrides) -> dict:
 
 
 def _ble_config(**overrides) -> dict:
-    """The real govee block with BLE waits cut and a second room added.
+    """The real govee block, switched to the BLE transport, waits cut, a room added.
 
     attic's mac and aliases are the shipped ones, so a re-paired strip or a
     renamed alias fails a test rather than leaving these asserting against a
     device that no longer exists.
+
+    The transport and default are pinned here because the shipped config.yaml
+    selects "tapo" / "living room" since 2026-09-17 (the living-room L530E);
+    these tests exercise the BLE path, which is the same override the cloud
+    fixture above makes for its transport. The living-room entry still comes
+    through from the real file and is skipped for having no mac, exactly as
+    it is at boot with BLE selected.
     """
     lights = overrides.pop("lights", None)
     if lights is None:
@@ -77,20 +84,40 @@ def _ble_config(**overrides) -> dict:
             real_config()["govee"]["lights"], {"bedroom": {"mac": "AA:BB:CC:DD:EE:FF"}}
         )
     settings = {
-        "ble": {"scan_timeout_ms": 1000, "connect_timeout_ms": 1000, "retries": 2}
+        "transport": "ble",  # the flag under test; shipped config selects tapo
+        "default_light": "attic",
+        "ble": {"scan_timeout_ms": 1000, "connect_timeout_ms": 1000, "retries": 2},
     }
     settings.update(overrides)
     return _with_govee(lights, **settings)
 
 
+# Every credential a transport reads from the environment, blanked. Config is
+# not enough: each transport checks os.getenv FIRST, so a developer with these
+# exported (or a .env already loaded in the same process) changes what these
+# tests assert. That bit once already -- see the Stremio note in CLAUDE.md --
+# and it bit again the moment lights got per-light transports: with the real
+# config merged in, the living room's `host` binds a Tapo transport inside the
+# BLE and cloud fixtures, so ambient TAPO_* credentials made
+# `test_missing_bleak_disables_the_transport` and
+# `test_cloud_disabled_when_api_key_is_missing` pass or fail on the shell.
+_NO_TRANSPORT_CREDENTIALS = {
+    "GOVEE_API_KEY": "",
+    "TAPO_USERNAME": "",
+    "TAPO_PASSWORD": "",
+}
+
+
 def _cloud_service(**overrides) -> GoveeService:
-    """Blank the ambient GOVEE_API_KEY so a real key in .env cannot change assertions."""
-    with patch.dict(os.environ, {"GOVEE_API_KEY": ""}):
+    """Blank ambient credentials so a real key in .env cannot change assertions."""
+    with patch.dict(os.environ, _NO_TRANSPORT_CREDENTIALS):
         return GoveeService(_cloud_config(**overrides))
 
 
 def _ble_service(**overrides) -> GoveeService:
-    return GoveeService(_ble_config(**overrides))
+    """Blank ambient credentials for the same reason _cloud_service does."""
+    with patch.dict(os.environ, _NO_TRANSPORT_CREDENTIALS):
+        return GoveeService(_ble_config(**overrides))
 
 
 class BlePacketTests(unittest.TestCase):
@@ -199,6 +226,96 @@ class GoveeTransportSelectionTests(unittest.TestCase):
         service = _cloud_service(lights={"attic": {"sku": "H6199"}, "hall": {"sku": "H1", "device": "D1"}})
         self.assertNotIn("attic", service.lights)
         self.assertIn("hall", service.lights)
+
+
+class PerLightTransportTests(unittest.TestCase):
+    """
+    Each light is driven by the transport its own fields imply.
+
+    Until 2026-09-17 one `govee.transport` chose one transport for the whole
+    service and every light missing its field was skipped, so the Govee strip
+    in the attic and the Tapo bulb in the living room could not both work in
+    the same run. These pin that they can.
+    """
+
+    def _mixed(self, **overrides) -> GoveeService:
+        lights = {
+            "attic": {"mac": "EE:2E:01:06:53:0E", "aliases": ["loft"]},
+            # These tests are about which transport a field selects, not about
+            # where the bulb lives, so a synthetic host is the honest input.
+            "living room": {"host": "10.0.0.5", "aliases": ["sala"]},  # config-literal: synthetic, not the deployment's address
+        }
+        with patch.dict(os.environ, {**_NO_TRANSPORT_CREDENTIALS, "TAPO_USERNAME": "u", "TAPO_PASSWORD": "p"}):
+            return GoveeService(_ble_config(lights=lights, **overrides))
+
+    def test_both_rooms_load_under_one_service(self):
+        service = self._mixed()
+
+        self.assertEqual(sorted(service.lights), ["attic", "living room"])
+
+    def test_each_room_is_bound_to_its_own_transport(self):
+        service = self._mixed()
+
+        self.assertEqual(service.transport_for("attic").name, "ble")
+        self.assertEqual(service.transport_for("living room").name, "tapo")
+
+    def test_a_command_reaches_the_transport_that_owns_that_room(self):
+        service = self._mixed()
+        with patch.object(service.transport_for("attic"), "set_power") as ble, \
+             patch.object(service.transport_for("living room"), "set_power") as tapo:
+            service.set_power("living room", True)
+
+            tapo.assert_called_once()
+            ble.assert_not_called()
+
+    def test_one_transport_instance_is_shared_by_every_room_that_uses_it(self):
+        # Reuse is load-bearing: BleTransport caches the BLEDevice it found and
+        # TapoTransport caches a per-host protocol decision and a live session.
+        lights = {"a": {"mac": "AA:BB"}, "b": {"mac": "CC:DD"}}
+        service = _ble_service(lights=lights)
+
+        self.assertIs(service.transport_for("a"), service.transport_for("b"))
+        self.assertIs(service.transport_for("a"), service.transport)
+
+    def test_the_preferred_transport_wins_when_a_light_has_fields_for_two(self):
+        # The cloud fixture's attic carries a mac AND a sku/device pair. Field
+        # inference alone would reroute it to BLE and silently stop using the
+        # cloud the operator configured.
+        service = _cloud_service(
+            lights={"attic": {"mac": "AA:BB", "sku": "H6199", "device": "D1"}}
+        )
+
+        self.assertEqual(service.transport_for("attic").name, "cloud")
+
+    def test_a_light_with_no_usable_fields_is_still_skipped(self):
+        service = self._mixed()
+        self.assertNotIn("ghost", service.lights)
+
+        service = _ble_service(lights={"ghost": {"aliases": ["nowhere"]}})
+
+        self.assertEqual(service.lights, {})
+
+    def test_an_unreadable_room_reads_none_while_a_readable_one_answers(self):
+        # can_read_state is a service-level "some light can be read"; the
+        # per-light answer lives in get_state, and None is what sends the
+        # dispatcher to shadow memory for the strip while the bulb answers.
+        service = self._mixed()
+        self.assertTrue(service.can_read_state)
+        self.assertFalse(hasattr(service.transport_for("attic"), "get_state"))
+
+        with patch.object(service.transport_for("living room"), "get_state", return_value="reading"):
+            self.assertIsNone(service.get_state("attic"))
+            self.assertEqual(service.get_state("living room"), "reading")
+
+    def test_a_dead_transport_does_not_disable_a_working_one(self):
+        # Missing bleak used to take the whole service down with it. With the
+        # Tapo bulb working, light control must stay up for the room that works.
+        with patch.dict("sys.modules", {"bleak": None}):
+            service = self._mixed()
+
+        self.assertFalse(service.transport_for("attic").available)
+        self.assertTrue(service.transport_for("living room").available)
+        self.assertTrue(service.enabled)
 
 
 class GoveeResolveLightTests(unittest.TestCase):

@@ -31,7 +31,8 @@ Voice request -> LLM tool call (control_tv) -> Orchestrator VPN preflight -> Med
 ### Light Control Pipeline
 
 ```text
-Voice request -> LLM tool call (control_lights) -> GoveeService -> BleTransport -> Bluetooth LE -> light strip
+Voice request -> LLM tool call (control_lights) -> GoveeService -> BleTransport  -> Bluetooth LE      -> Govee strip (write only)
+                                                                -> TapoTransport -> LAN, TPAP (fw 1.4.2+) or python-kasa -> Tapo bulb (reads back)
 ```
 
 No VPN preflight and no ADB on this path, and by default no network at all.
@@ -45,7 +46,7 @@ No VPN preflight and no ADB on this path, and by default no network at all.
 | LLM | Anthropic Claude, Groq, Fireworks, or OpenAI-compatible |
 | TTS | Kokoro, Edge TTS, Piper, ElevenLabs, Google Cloud TTS |
 | TV control | ADB over network to Mi Box / Android TV |
-| Light control | Govee over Bluetooth LE (`bleak`); Govee cloud v2 API optional |
+| Light control | Govee over Bluetooth LE (`bleak`) or TP-Link Tapo over the LAN (`services/tapo_tpap.py` for firmware 1.4.2+, `python-kasa` for older); Govee cloud v2 API optional |
 | Stremio state | Stremio private API + local `watch_state.json` cache |
 | Title resolution | TMDB |
 | Audio I/O | `sounddevice`, `soundfile` |
@@ -74,6 +75,13 @@ Required for Stremio features:
 Required for TMDB fallback title resolution:
 
 - `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN`
+
+Optional, only for the Tapo transport (`govee.transport: "tapo"`):
+
+- `TAPO_USERNAME` / `TAPO_PASSWORD` - the TP-Link account the bulbs were onboarded
+  with. Control traffic never leaves the LAN, but the KLAP handshake still
+  authenticates against that account, so these are not optional for local control.
+  Without them `TapoTransport` disables itself and `control_lights` is not offered
 
 Optional, only for the Govee **cloud** transport:
 
@@ -209,6 +217,8 @@ california/
 │   ├── device_finder.py         # Shared find-by-MAC / verify-by-identity / cache-the-IP ladder
 │   ├── llm.py                   # Multi-provider LLM streaming + tool calling
 │   ├── govee_service.py         # Govee cloud v2 light control
+│   ├── tapo_transport.py        # TP-Link Tapo over the LAN; the one transport that reads state back
+│   ├── tapo_tpap.py             # TPAP (SPAKE2+/AES-CCM), the local protocol Tapo fw 1.4.2+ speaks and python-kasa cannot
 │   ├── name_matcher.py          # Shared fuzzy hint -> key matching: exact, despaced, substring, token overlap
 │   ├── media_service.py         # Generic Mi Box / Android TV ADB controls
 │   ├── sentence_chunker.py      # Splits streamed LLM output into sentences
@@ -233,6 +243,7 @@ california/
 │   ├── run_stremio_e2e.py          # Live end-to-end Stremio routing and playback test
 │   ├── run_youtube_playlist_e2e.py # Live end-to-end YouTube playlist routing test
 │   ├── probe_govee_devices.py      # Lists Govee devices with sku, device id, and capabilities
+│   ├── probe_tapo_devices.py       # Finds Tapo bulbs and prints their host; python-kasa's own CLI cannot run here
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── wakeword_dataset.py         # Wake-word training data: record sessions, checks, review, audit, export
@@ -248,6 +259,8 @@ california/
 │   ├── test_activation_capture.py # Activation clip naming and pruning
 │   ├── test_activation_phrases.py # Wake tiers, echo stripping, recording trim, dropped turns
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
+│   ├── test_tapo_transport.py   # RGB->HSV, credential self-disable, live reads, no-network guard
+│   ├── test_tapo_tpap.py        # SPAKE2+ handshake against a fake bulb, the encrypted channel, protocol routing
 │   ├── test_device_discovery.py # DeviceFinder ladder, cache, ARP parsing; no-network guard
 │   ├── test_media_power.py      # turn_on/turn_off, BT wake fallback, no blind KEYCODE_POWER
 │   ├── test_media_service.py    # YouTube / ADB unit tests
@@ -354,7 +367,7 @@ truth. `requirements.txt` has been deleted and must not be reintroduced.
 - **Optional/heavy providers go in `[project.optional-dependencies]`,** not in the core
   `dependencies` list. Current extras: `kokoro`, `piper`, `elevenlabs`, `openai`,
   `cec`,
-  `porcupine`, `silero`, `pi`, `govee`, and the aggregate `default`.
+  `porcupine`, `silero`, `pi`, `govee`, `tapo`, and the aggregate `default`.
 - **`uv sync --extra <name>` syncs ONLY that extra and uninstalls everything else.**
   It is not additive. Running `uv sync --extra govee` on this project removes kokoro,
   torch and spacy, which silently breaks TTS on the next launch because `config.yaml`
@@ -925,13 +938,128 @@ selected by `govee.transport` in `config.yaml`:
 |-----------|-------|-------------|------------|
 | `ble` (default) | Any Govee BLE device in Bluetooth range | none | `uv sync --extra govee` |
 | `cloud` | Only Wi-Fi models on Govee's published whitelist, owned by the key's account | `GOVEE_API_KEY` | core `requests` |
+| `tapo` | TP-Link Tapo bulbs on the LAN. **The only transport that can be read back.** Speaks TPAP natively; see below | `TAPO_USERNAME` / `TAPO_PASSWORD` | `uv sync --extra default` |
 
-**Why BLE is the default here.** Master Miguel's attic strip is an **H617E**, which is
+**The transport is chosen PER LIGHT, from the fields each one carries.** `mac` means
+BLE, `host` means Tapo, `sku` + `device` means cloud. So the attic Govee strip and the
+living-room Tapo bulb are both live in the same run, which is the shipped state since
+2026-09-17.
+
+Until that date `govee.transport` selected one transport for the entire service and
+`_build_lights` skipped every light missing that transport's required field. Switching
+to `tapo` for the L530E therefore silently dropped the attic -- it loaded zero lights
+it could drive, logged one warning nobody reads, and `_light_inventory()` stopped
+advertising the room at all, so "turn on the attic" answered *"I don't have a light
+called attic saved."* One room per run was never a design decision, just the shape the
+first transport happened to have.
+
+What `govee.transport` still does, and why it cannot simply be deleted:
+
+- **It is the tie-break** for a light carrying fields for more than one transport. The
+  cloud test fixture's attic has a `mac` AND a `sku`/`device` pair; pure field
+  inference would reroute it to BLE and quietly stop using the cloud the operator
+  configured. The preferred transport is tried first, the others only after.
+- **It names the requirements in the skip warning** for a light carrying fields for
+  none. Telling someone setting up a Govee strip that their light is "missing host"
+  would send them entirely the wrong way.
+
+**One transport instance is shared by every light that uses it**, and that is
+load-bearing rather than frugal: `BleTransport` caches the `BLEDevice` it found and
+`TapoTransport` caches a per-host protocol decision and a live TPAP session. A fresh
+instance per light would throw both away on every command.
+
+**`enabled` means "at least one light can be driven"**, not "the primary transport came
+up". With two transports in play, a missing `bleak` must not disable a Tapo bulb that
+is working perfectly well. `can_read_state` is the same shape -- "some light can be
+read" -- and the per-light answer lives in `get_state`, which returns `None` for a
+light whose own transport has no `get_state`. The caller already treats `None` as
+"fall back to shadow memory", so a mixed setup needed nothing else.
+
+**Why BLE is still the tie-break in the shipped config.** Master Miguel's attic strip is an **H617E**, which is
 BLE-only. It is absent from Govee's supported-model list, so `GET /user/devices` returns
 `code: 200, "success", data: []` with a perfectly valid API key, and it never joins Wi-Fi
 at all, so the LAN API cannot see it either. Its setup flow pairs over Bluetooth and never
 asks for an SSID, which is the tell. The cloud transport is kept for any future whitelisted
 device and is fully tested, just unused.
+
+### Tapo: the bulb speaks TPAP, and python-kasa does not
+
+**Firmware 1.4.2 (Build 260113, early 2026) moved Tapo bulbs to a new local
+protocol, and the library this transport was built on cannot talk to it.**
+Discovery on the living-room L530E(EU) at `192.168.1.74` answers
+`encrypt_type='TPAP', http_port=80, lv=2`, and python-kasa 0.10.2 -- the newest
+release -- raises `UnsupportedDeviceError` and stops. Upstream is stuck:
+[python-kasa#1590](https://github.com/python-kasa/python-kasa/issues/1590) is open,
+its two PRs ([#1592](https://github.com/python-kasa/python-kasa/pull/1592),
+[#1706](https://github.com/python-kasa/python-kasa/pull/1706)) are unmerged and
+incomplete, and Home Assistant's integration has the same open bug
+([home-assistant/core#167990](https://github.com/home-assistant/core/issues/167990)).
+The python-kasa authors believed the handshake needed cloud-issued certificates
+(NOC); it does not for `tls: 0, dac: 0` bulbs like this one.
+
+**The working reference is a .NET library, and `services/tapo_tpap.py` is a port
+of it.** [KasaTapoClient](https://github.com/oznetmaster/KasaTapoClient) (MIT,
+Neil Colvin) has TPAP running locally over plain HTTP with the L530E(EU) on its
+confirmed list. Its `TpapTransport.cs` is 1,800 lines because it covers cameras,
+hubs, TLS and DAC; the port is the ~150 lines a bulb needs. Verified against the
+real bulb 2026-09-17, handshake to colour, through the real `GoveeService` and
+`_dispatch_lights`.
+
+The protocol, so nobody has to re-derive it from C#:
+
+1. `POST /` `{"method":"login","params":{"sub_method":"discover"}}` -- no auth.
+   Returns the MAC and a `tpap` block: `pake: [2]` means "account password".
+2. `pake_register` -- we send 32 random bytes; the bulb returns its SPAKE2+ share,
+   a PBKDF2 salt, `iterations: 3000`, and `extra_crypt`
+   (`password_shadow`/`passwd_id: 2` = the password is SHA-1-hexed first).
+   The `username` field is `md5("admin")`, not the account email.
+3. `pake_share` -- SPAKE2+ on P-256 with the RFC 9383 M/N points, w0/w1 from
+   PBKDF2-SHA256 over the hashed password (80 bytes, split 40/40, each mod n).
+   Transcript is `PAKE V1` context hash then eight-byte little-endian
+   length-prefixed fields; `ConfirmationKeys` and `SharedKey` come out of HKDF
+   over its hash. We check the bulb's `dev_confirm`; it hands back `stok` and
+   `start_seq`.
+4. `POST /stok=<stok>/ds` with `[seq:4 BE][AES-128-CCM, 16-byte tag,
+   nonce = base_nonce[:8] + seq]` around the ordinary smart-protocol JSON --
+   `get_device_info`, `set_device_info {device_on|brightness|hue,saturation}` --
+   the same bodies python-kasa sends over KLAP. Plain JSON back on that endpoint
+   means the session is dead.
+
+**Every constant is load-bearing.** The M/N points, the `PAKE V1` tag, the
+little-endian `len8` prefixes, the sign-byte encoding of w0, the
+`tp-kdf-salt-aes128-key` / `-iv` HKDF strings: change any of them and the
+`dev_confirm` check fails, which is the right failure but says nothing about why.
+`tests/test_tapo_tpap.py` runs the *bulb's* side of SPAKE2+ against the port with
+the module's own curve helpers, so a broken constant fails offline.
+
+**How the transport decides.** `TapoTransport._with_device` is still the one
+network boundary. On the first command to a host it sends the discover POST
+(`tapo_tpap.probe`, ~30ms) and remembers "tpap" for the process; anything else
+falls through to python-kasa, and "kasa" is remembered only once a kasa command
+*succeeds* -- a bulb switched off at the wall fails the probe too, and caching that
+as "kasa" would send every later command down the wrong path once it came back.
+The three writes, `get_state`, the worker thread and the retry loop are
+protocol-blind; `TpapDevice` wears the slice of kasa's `Device`/`Light` surface
+the actions use, so the actions and their tests are untouched.
+
+**The TPAP session is cached per host.** The connect-per-command rule above is
+about kasa `Device` objects being bound to the event loop that made them; TPAP
+here is synchronous `requests` with no loop, so a session is safe to keep. A
+failed command drops it and the retry handshakes afresh. Measured on the
+laptop: **2.4s for the first command** (probe + three login round trips + five
+pure-Python P-256 scalar multiplications), **60-300ms per command after**.
+
+**Discovery: `255.255.255.255` finds nothing on this laptop, `192.168.1.255`
+finds the bulb every time.** Windows sends the global broadcast out the first
+adapter, which here is a virtual one on `192.168.128.0/20`. python-kasa's
+`Discover.discover` also *drops* TPAP bulbs silently as unsupported, so it
+reported "no devices" with a bulb answering on the LAN.
+`tools/probe_tapo_devices.py` now broadcasts to the global address and every
+local /24's directed broadcast, collects unsupported hits through
+`on_unsupported`, and describes each host through the transport (so a TPAP bulb
+prints as `l530e sala (L530, tpap) at 192.168.1.74 -- on at 100%`). A bulb that
+is off at the wall is not on the network at all, and the Tapo app showing it
+online means nothing about the LAN -- the app goes through the cloud.
 
 Common structure:
 
@@ -1310,7 +1438,7 @@ Widening that check to any `tool_use` block would break web search.
 `control_lights` supports these actions:
 
 - `light_on`, `light_off`
-- `light_status` (answers from shadow state, never a reading -- see Reading State Back)
+- `light_status` (a live reading on `tapo`, shadow memory on `ble`/`cloud` -- see Reading State Back)
 - `light_brightness` (needs `brightness_percent`, 1-100, clamped not rejected)
 - `light_color` (needs `color`)
 
@@ -1480,6 +1608,41 @@ label only exists there: `StremioService` holds an IMDb id and a deep link, and
 not remembered at all rather than read out loud later.
 
 ### The lights cannot be read, and saying so is the feature
+
+**Corrected 2026-09-17: that is true of the Govee strip, not of every light.**
+A TP-Link Tapo bulb answers, so `govee.transport: "tapo"` makes `light_status`
+a real reading and `_light_reading_line` states it with none of the hedge below.
+Everything in this section still holds for the attic strip over `ble` and for `cloud`.
+Both rooms are live at once since 2026-09-17, so the two hedges now coexist in one
+run, and the fallback is deliberate: a Tapo read that fails drops through to the same
+shadow memory rather than to silence.
+
+**"It cannot tell me" and "I could not reach it" are different sentences, and they
+need opposite responses.** `_light_memory_line(..., unreachable=)` splits them. The
+Govee strip's characteristic is write-only, so *"it can't tell me anything back"* is a
+permanent fact with nothing to go and fix. A Tapo bulb that normally answers and did
+not is *"I couldn't reach it just now"*, which means the wall switch is off or it has
+dropped off Wi-Fi. Speaking the first about the second is a false claim about the
+hardware and sends him nowhere -- the same mistake `needs_pairing` exists to avoid on
+the TV. The dispatcher decides by asking the transport that owns *that room* whether
+it has a `get_state`, never the service-wide `can_read_state`, which would report the
+write-only strip as unreachable on every single status call.
+
+Two rules carried over into the readable path:
+
+- **The hedge lives in the returned string, never in the system prompt**, which is
+  why one transport can hedge and another not without the prompt knowing anything.
+- **A field the bulb did not answer is not narrated.** `LightReading.power is None`
+  means "it did not tell me", and the dispatcher falls back to memory rather than
+  speaking a blank -- the same `None` contract `MediaService`'s readers use, and the
+  same trap that made a television in standby report as "on" for the life of that
+  feature.
+- **`GoveeService.can_read_state` is compared with `is True`, not truthiness.**
+  `_svc()` in `tests/test_orchestrator_lights.py` is a bare `Mock`, so every
+  attribute of it is truthy; a loose check would claim a live reading off a service
+  that reads nothing. `test_a_bare_mock_service_never_produces_a_reading_line`
+  pins it.
+
 
 The Govee characteristic `00010203-...-2b11` is **Write Without Response**, with
 no notify characteristic beside it, and the attic H617E is absent from Govee's
@@ -1755,6 +1918,37 @@ Current automated coverage exists for:
 - Surfshark route execution, route cache semantics, and debug route capture
 - Orchestrator VPN preflight routing and warning behavior
 - Govee transport selection, light resolution, BLE packet format, and cloud HTTP error mapping
+- Per-light transports: that a Govee strip and a Tapo bulb both load under one service,
+  that each room is bound to the transport its fields imply, that a command reaches the
+  transport owning that room and not the other, that one instance is shared by every
+  room using it, that the preferred transport wins for a light carrying fields for two,
+  that a light carrying fields for none is still skipped, that an unreadable room reads
+  `None` while a readable one answers, and that a dead transport does not disable a
+  working one
+- That a readable room which did not answer is spoken as unreachable while a write-only
+  room keeps the permanent hedge
+- That the light fixtures blank every transport credential (`GOVEE_API_KEY`,
+  `TAPO_USERNAME`, `TAPO_PASSWORD`), because each transport reads the environment
+  before config and ambient credentials otherwise decide whether `enabled` is true
+- Tapo transport: RGB->HSV conversion with the value component discarded so a dark
+  colour is not a dimmer, colour never touching brightness (`set_hsv(..., None)`),
+  brightness clamped rather than rejected, self-disable without credentials, a live
+  reading carrying power and brightness, an unreadable bulb reading `None` rather
+  than a blank, that a `LightReading` has no `__bool__` to re-create the falsy-result
+  trap, that work runs off the calling thread, and a guard that the file never opens
+  a socket
+- TPAP (`tests/test_tapo_tpap.py`): the SPAKE2+ M/N points are on P-256, the sign-byte
+  encoding of w0, the `password_shadow` credential pre-hash, that a full handshake
+  completes against a fake bulb running the device side of the protocol and the
+  encrypted channel round-trips with the sequence advancing, that a wrong password is
+  an authentication error carrying the bulb's lockout budget, that a forged
+  `dev_confirm` is rejected, that plain JSON on the `/ds` endpoint drops the session
+  as retryable, that an unsupported PAKE mode is named, that a TPAP bulb is driven
+  without importing kasa at all, that the session is reused across commands, that a
+  failed probe is not cached as "kasa", and that the file never opens a socket
+- `light_status` on a readable transport: a live reading stated without the memory
+  hedge, brightness not quoted on a light that is off, a failed read falling back to
+  memory, and a bare `Mock` service never producing a reading line
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
@@ -1823,6 +2017,8 @@ uv run python tools\check_stremio_adb.py --sync --json      # refresh library, m
 uv run python tools\check_stremio_adb.py --title Fallout --launch   # actually plays
 uv run python tools\probe_govee_devices.py
 uv run python tools\probe_govee_devices.py --transport cloud
+uv run python tools\probe_tapo_devices.py
+uv run python tools\probe_tapo_devices.py --host 192.168.1.42
 
 # Playlist rot. Exits nonzero when an ID is gone, so it can gate a curation pass.
 uv run python toolsalidate_youtube_playlists.py
@@ -2083,6 +2279,14 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 - Same-app requests should preserve the active session and skip Surfshark, even if that means VPN policy is only enforced on cross-app transitions
 - Package launch plus named route tables is easier to maintain than scattering Surfshark timing and key sequences through the codebase
 - Graceful fallback lines build trust more than pretending automation is perfect
+- **"Unsupported device" is a statement about the library, and "no devices found" is
+  a statement about the broadcast.** python-kasa's discovery heard the L530E, dropped
+  it as unsupported and reported nothing; a TCP sweep showed no port 80 open until the
+  bulb had been on for a minute; the global broadcast never reached it from a
+  two-adapter laptop. Three separate "it is not there" readings, none of which meant
+  the bulb was absent. The protocol itself was a solved problem in a .NET repo the
+  Python ecosystem had not noticed -- worth a search before concluding "upstream is
+  blocked, so we are"
 
 -----
 

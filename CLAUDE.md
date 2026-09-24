@@ -31,7 +31,8 @@ Voice request -> LLM tool call (control_tv) -> Orchestrator VPN preflight -> Med
 ### Light Control Pipeline
 
 ```text
-Voice request -> LLM tool call (control_lights) -> GoveeService -> BleTransport -> Bluetooth LE -> light strip
+Voice request -> LLM tool call (control_lights) -> GoveeService -> BleTransport  -> Bluetooth LE      -> Govee strip (write only)
+                                                                -> TapoTransport -> LAN, TPAP (fw 1.4.2+) or python-kasa -> Tapo bulb (reads back)
 ```
 
 No VPN preflight and no ADB on this path, and by default no network at all.
@@ -45,8 +46,9 @@ No VPN preflight and no ADB on this path, and by default no network at all.
 | LLM | Anthropic Claude, Groq, Fireworks, or OpenAI-compatible |
 | TTS | Kokoro, Edge TTS, Piper, ElevenLabs, Google Cloud TTS |
 | TV control | ADB over network to Mi Box / Android TV |
-| Light control | Govee over Bluetooth LE (`bleak`); Govee cloud v2 API optional |
+| Light control | Govee over Bluetooth LE (`bleak`) or TP-Link Tapo over the LAN (`services/tapo_tpap.py` for firmware 1.4.2+, `python-kasa` for older); Govee cloud v2 API optional |
 | Vacuum control | Ecovacs Deebot N8+ via `deebot-client` over REST only; verification codes read from Gmail over IMAP |
+| WhatsApp | WhatsApp Web driven by Playwright in its own linked profile (Edge on Windows, Chromium on the Pi); contacts from a local VCF. Firefox + `pyautogui` kept as a Windows-only fallback backend |
 | Stremio state | Stremio private API + local `watch_state.json` cache |
 | Title resolution | TMDB |
 | Audio I/O | `sounddevice`, `soundfile` |
@@ -76,6 +78,13 @@ Required for TMDB fallback title resolution:
 
 - `TMDB_API_KEY` or `TMDB_READ_ACCESS_TOKEN`
 
+Optional, only for the Tapo transport (`govee.transport: "tapo"`):
+
+- `TAPO_USERNAME` / `TAPO_PASSWORD` - the TP-Link account the bulbs were onboarded
+  with. Control traffic never leaves the LAN, but the KLAP handshake still
+  authenticates against that account, so these are not optional for local control.
+  Without them `TapoTransport` disables itself and `control_lights` is not offered
+
 Optional, only for the Govee **cloud** transport:
 
 - `GOVEE_API_KEY` - issued from the Govee Home app under profile -> settings -> Apply for API Key,
@@ -92,6 +101,14 @@ Required for the vacuum (`control_vacuum`):
   Ecovacs demands an emailed device-verification code roughly weekly; with this set the
   service reads the code itself over IMAP. Without it, the vacuum tool stalls until
   `ECOVACS_VERIFICATION_CODE` is set by hand once. See "DeebotService" below
+
+WhatsApp (`control_whatsapp`) needs **no credential at all**, and that is deliberate: the send
+path drives WhatsApp Web in a linked browser profile (`whatsapp.profile_dir`, linked once with
+`tools/link_whatsapp.py`), so the session *is* the auth -- and is gitignored like one.
+What it does need is `contacts.vcf` at `whatsapp.contacts_path` -- a VCF export of the phone's
+address book, gitignored because it is several hundred real people's phone numbers -- and,
+optionally, `whatsapp_aliases.yaml` at `whatsapp.aliases_path`: the spoken nicknames, gitignored
+for the same reason, since the repository is public.
 
 Keep secrets in `.env` or another local-only secret mechanism. Do not commit real credentials.
 `.deebot_credentials.json` holds a live Ecovacs session token and is gitignored for the same reason.
@@ -224,6 +241,8 @@ california/
 │   ├── deebot_session.py        # Ecovacs login: persisted token + device id, Gmail-read verification
 │   ├── gmail_verification_code.py # IMAP poller that pulls the Ecovacs verification code (stdlib only)
 │   ├── govee_service.py         # Govee cloud v2 light control
+│   ├── tapo_transport.py        # TP-Link Tapo over the LAN; the one transport that reads state back
+│   ├── tapo_tpap.py             # TPAP (SPAKE2+/AES-CCM), the local protocol Tapo fw 1.4.2+ speaks and python-kasa cannot
 │   ├── name_matcher.py          # Shared fuzzy hint -> key matching: exact, despaced, substring, token overlap
 │   ├── media_service.py         # Generic Mi Box / Android TV ADB controls
 │   ├── sentence_chunker.py      # Splits streamed LLM output into sentences
@@ -233,6 +252,8 @@ california/
 │   ├── tts.py                   # Text-to-speech
 │   ├── tts_text_sanitizer.py    # Text cleanup for TTS timing
 │   ├── youtube_playlist_resolver.py # Matches voice playlist names and picks one saved ID at random
+│   ├── whatsapp_service.py      # WhatsApp: VCF contacts, confirm-before-send, one worker thread, backend switch
+│   ├── whatsapp_web.py          # Playwright driver for WhatsApp Web: selectors table, send + sent-tick confirm
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
@@ -248,9 +269,11 @@ california/
 │   ├── run_stremio_e2e.py          # Live end-to-end Stremio routing and playback test
 │   ├── run_youtube_playlist_e2e.py # Live end-to-end YouTube playlist routing test
 │   ├── probe_govee_devices.py      # Lists Govee devices with sku, device id, and capabilities
+│   ├── probe_tapo_devices.py       # Finds Tapo bulbs and prints their host; python-kasa's own CLI cannot run here
 │   ├── probe_deebot_devices.py     # Lists the Ecovacs account's robots and whether deebot-client supports them
 │   ├── probe_deebot_rooms.py       # Live room id -> name; prints the deebot.rooms block; --check flags drift
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
+│   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── wakeword_dataset.py         # Wake-word training data: record sessions, checks, review, audit, export
@@ -267,6 +290,8 @@ california/
 │   ├── test_activation_phrases.py # Wake tiers, echo stripping, recording trim, dropped turns
 │   ├── test_deebot_service.py   # Vacuum self-disable, room fallback, auth-first retry-once, no-network guard
 │   ├── test_govee_service.py    # Govee resolution, control payloads, and error mapping
+│   ├── test_tapo_transport.py   # RGB->HSV, credential self-disable, live reads, no-network guard
+│   ├── test_tapo_tpap.py        # SPAKE2+ handshake against a fake bulb, the encrypted channel, protocol routing
 │   ├── test_device_discovery.py # DeviceFinder ladder, cache, ARP parsing; no-network guard
 │   ├── test_media_power.py      # turn_on/turn_off: fast path, CEC-bus confirm, deep-standby fallback, no blind KEYCODE_POWER
 │   ├── test_media_service.py    # YouTube / ADB unit tests
@@ -288,6 +313,10 @@ california/
 │   ├── test_playlist_config.py  # Structural sweep of the real config.yaml playlist data
 │   ├── test_youtube_playlist_resolver.py # Matching, aliases, and random-selection coverage
 │   ├── test_youtube_search_autoplay.py # Query -> video id -> watch link, session-stamp verification, spoken lines
+│   ├── test_whatsapp_service.py # WhatsApp self-disable, VCF parsing, match certainty, the confirm token, no-keyboard guard
+│   ├── test_orchestrator_whatsapp.py # control_whatsapp dispatch: spoken lines, the read-back guard, the interim line
+│   ├── test_whatsapp_web.py     # Playwright driver on a fake page, outcome lines, one-thread worker, no-browser guard
+│   ├── test_whatsapp_unread.py  # Unread from the chat list: never opens a chat, senders-first lines, messages quoted not obeyed
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -296,6 +325,9 @@ california/
 ├── vpn_state.json               # Generated locally, Surfshark diagnostic cache
 ├── watch_state.json             # Generated locally, cached Stremio progress
 ├── .deebot_device_id            # Generated locally, the Ecovacs device id that got verified
+├── contacts.vcf                 # Local only: the phone's contacts export (WhatsApp)
+├── whatsapp_aliases.yaml        # Local only: WhatsApp nickname -> contact map
+├── .whatsapp_profile/           # Local only: the linked WhatsApp Web browser session
 └── .deebot_credentials.json     # Generated locally, live Ecovacs session token (~7 day life)
 ```
 
@@ -376,7 +408,7 @@ truth. `requirements.txt` has been deleted and must not be reintroduced.
 - **Optional/heavy providers go in `[project.optional-dependencies]`,** not in the core
   `dependencies` list. Current extras: `kokoro`, `piper`, `elevenlabs`, `openai`,
   `cec`,
-  `porcupine`, `silero`, `pi`, `govee`, and the aggregate `default`.
+  `porcupine`, `silero`, `pi`, `govee`, `tapo`, and the aggregate `default`.
 - **`uv sync --extra <name>` syncs ONLY that extra and uninstalls everything else.**
   It is not additive. Running `uv sync --extra govee` on this project removes kokoro,
   torch and spacy, which silently breaks TTS on the next launch because `config.yaml`
@@ -1086,13 +1118,128 @@ selected by `govee.transport` in `config.yaml`:
 |-----------|-------|-------------|------------|
 | `ble` (default) | Any Govee BLE device in Bluetooth range | none | `uv sync --extra govee` |
 | `cloud` | Only Wi-Fi models on Govee's published whitelist, owned by the key's account | `GOVEE_API_KEY` | core `requests` |
+| `tapo` | TP-Link Tapo bulbs on the LAN. **The only transport that can be read back.** Speaks TPAP natively; see below | `TAPO_USERNAME` / `TAPO_PASSWORD` | `uv sync --extra default` |
 
-**Why BLE is the default here.** Master Miguel's attic strip is an **H617E**, which is
+**The transport is chosen PER LIGHT, from the fields each one carries.** `mac` means
+BLE, `host` means Tapo, `sku` + `device` means cloud. So the attic Govee strip and the
+living-room Tapo bulb are both live in the same run, which is the shipped state since
+2026-09-17.
+
+Until that date `govee.transport` selected one transport for the entire service and
+`_build_lights` skipped every light missing that transport's required field. Switching
+to `tapo` for the L530E therefore silently dropped the attic -- it loaded zero lights
+it could drive, logged one warning nobody reads, and `_light_inventory()` stopped
+advertising the room at all, so "turn on the attic" answered *"I don't have a light
+called attic saved."* One room per run was never a design decision, just the shape the
+first transport happened to have.
+
+What `govee.transport` still does, and why it cannot simply be deleted:
+
+- **It is the tie-break** for a light carrying fields for more than one transport. The
+  cloud test fixture's attic has a `mac` AND a `sku`/`device` pair; pure field
+  inference would reroute it to BLE and quietly stop using the cloud the operator
+  configured. The preferred transport is tried first, the others only after.
+- **It names the requirements in the skip warning** for a light carrying fields for
+  none. Telling someone setting up a Govee strip that their light is "missing host"
+  would send them entirely the wrong way.
+
+**One transport instance is shared by every light that uses it**, and that is
+load-bearing rather than frugal: `BleTransport` caches the `BLEDevice` it found and
+`TapoTransport` caches a per-host protocol decision and a live TPAP session. A fresh
+instance per light would throw both away on every command.
+
+**`enabled` means "at least one light can be driven"**, not "the primary transport came
+up". With two transports in play, a missing `bleak` must not disable a Tapo bulb that
+is working perfectly well. `can_read_state` is the same shape -- "some light can be
+read" -- and the per-light answer lives in `get_state`, which returns `None` for a
+light whose own transport has no `get_state`. The caller already treats `None` as
+"fall back to shadow memory", so a mixed setup needed nothing else.
+
+**Why BLE is still the tie-break in the shipped config.** Master Miguel's attic strip is an **H617E**, which is
 BLE-only. It is absent from Govee's supported-model list, so `GET /user/devices` returns
 `code: 200, "success", data: []` with a perfectly valid API key, and it never joins Wi-Fi
 at all, so the LAN API cannot see it either. Its setup flow pairs over Bluetooth and never
 asks for an SSID, which is the tell. The cloud transport is kept for any future whitelisted
 device and is fully tested, just unused.
+
+### Tapo: the bulb speaks TPAP, and python-kasa does not
+
+**Firmware 1.4.2 (Build 260113, early 2026) moved Tapo bulbs to a new local
+protocol, and the library this transport was built on cannot talk to it.**
+Discovery on the living-room L530E(EU) at `192.168.1.74` answers
+`encrypt_type='TPAP', http_port=80, lv=2`, and python-kasa 0.10.2 -- the newest
+release -- raises `UnsupportedDeviceError` and stops. Upstream is stuck:
+[python-kasa#1590](https://github.com/python-kasa/python-kasa/issues/1590) is open,
+its two PRs ([#1592](https://github.com/python-kasa/python-kasa/pull/1592),
+[#1706](https://github.com/python-kasa/python-kasa/pull/1706)) are unmerged and
+incomplete, and Home Assistant's integration has the same open bug
+([home-assistant/core#167990](https://github.com/home-assistant/core/issues/167990)).
+The python-kasa authors believed the handshake needed cloud-issued certificates
+(NOC); it does not for `tls: 0, dac: 0` bulbs like this one.
+
+**The working reference is a .NET library, and `services/tapo_tpap.py` is a port
+of it.** [KasaTapoClient](https://github.com/oznetmaster/KasaTapoClient) (MIT,
+Neil Colvin) has TPAP running locally over plain HTTP with the L530E(EU) on its
+confirmed list. Its `TpapTransport.cs` is 1,800 lines because it covers cameras,
+hubs, TLS and DAC; the port is the ~150 lines a bulb needs. Verified against the
+real bulb 2026-09-17, handshake to colour, through the real `GoveeService` and
+`_dispatch_lights`.
+
+The protocol, so nobody has to re-derive it from C#:
+
+1. `POST /` `{"method":"login","params":{"sub_method":"discover"}}` -- no auth.
+   Returns the MAC and a `tpap` block: `pake: [2]` means "account password".
+2. `pake_register` -- we send 32 random bytes; the bulb returns its SPAKE2+ share,
+   a PBKDF2 salt, `iterations: 3000`, and `extra_crypt`
+   (`password_shadow`/`passwd_id: 2` = the password is SHA-1-hexed first).
+   The `username` field is `md5("admin")`, not the account email.
+3. `pake_share` -- SPAKE2+ on P-256 with the RFC 9383 M/N points, w0/w1 from
+   PBKDF2-SHA256 over the hashed password (80 bytes, split 40/40, each mod n).
+   Transcript is `PAKE V1` context hash then eight-byte little-endian
+   length-prefixed fields; `ConfirmationKeys` and `SharedKey` come out of HKDF
+   over its hash. We check the bulb's `dev_confirm`; it hands back `stok` and
+   `start_seq`.
+4. `POST /stok=<stok>/ds` with `[seq:4 BE][AES-128-CCM, 16-byte tag,
+   nonce = base_nonce[:8] + seq]` around the ordinary smart-protocol JSON --
+   `get_device_info`, `set_device_info {device_on|brightness|hue,saturation}` --
+   the same bodies python-kasa sends over KLAP. Plain JSON back on that endpoint
+   means the session is dead.
+
+**Every constant is load-bearing.** The M/N points, the `PAKE V1` tag, the
+little-endian `len8` prefixes, the sign-byte encoding of w0, the
+`tp-kdf-salt-aes128-key` / `-iv` HKDF strings: change any of them and the
+`dev_confirm` check fails, which is the right failure but says nothing about why.
+`tests/test_tapo_tpap.py` runs the *bulb's* side of SPAKE2+ against the port with
+the module's own curve helpers, so a broken constant fails offline.
+
+**How the transport decides.** `TapoTransport._with_device` is still the one
+network boundary. On the first command to a host it sends the discover POST
+(`tapo_tpap.probe`, ~30ms) and remembers "tpap" for the process; anything else
+falls through to python-kasa, and "kasa" is remembered only once a kasa command
+*succeeds* -- a bulb switched off at the wall fails the probe too, and caching that
+as "kasa" would send every later command down the wrong path once it came back.
+The three writes, `get_state`, the worker thread and the retry loop are
+protocol-blind; `TpapDevice` wears the slice of kasa's `Device`/`Light` surface
+the actions use, so the actions and their tests are untouched.
+
+**The TPAP session is cached per host.** The connect-per-command rule above is
+about kasa `Device` objects being bound to the event loop that made them; TPAP
+here is synchronous `requests` with no loop, so a session is safe to keep. A
+failed command drops it and the retry handshakes afresh. Measured on the
+laptop: **2.4s for the first command** (probe + three login round trips + five
+pure-Python P-256 scalar multiplications), **60-300ms per command after**.
+
+**Discovery: `255.255.255.255` finds nothing on this laptop, `192.168.1.255`
+finds the bulb every time.** Windows sends the global broadcast out the first
+adapter, which here is a virtual one on `192.168.128.0/20`. python-kasa's
+`Discover.discover` also *drops* TPAP bulbs silently as unsupported, so it
+reported "no devices" with a bulb answering on the LAN.
+`tools/probe_tapo_devices.py` now broadcasts to the global address and every
+local /24's directed broadcast, collects unsupported hits through
+`on_unsupported`, and describes each host through the transport (so a TPAP bulb
+prints as `l530e sala (L530, tpap) at 192.168.1.74 -- on at 100%`). A bulb that
+is off at the wall is not on the network at all, and the Tapo app showing it
+online means nothing about the LAN -- the app goes through the cloud.
 
 Common structure:
 
@@ -1316,6 +1463,209 @@ elapsed but no total, same limit as the TV, so nothing implies a percentage.
 Setup: `uv sync --extra default`, put `ECOVACS_EMAIL`/`ECOVACS_PASSWORD`
 (+`GMAIL_APP_PASSWORD`) in `.env`, then `uv run python tools/probe_deebot_rooms.py`
 to print the `deebot.rooms` block after naming rooms in the ECOVACS HOME app.
+
+### WhatsAppService
+
+`services/whatsapp_service.py` sends WhatsApp messages behind the `control_whatsapp`
+tool. Same contract as `GoveeService` and `DeebotService`: never raises at construction,
+self-disables, returns `WhatsAppCommandResult` (falsy on failure, so `is not None` for
+existence checks), and runs the blocking work on a daemon worker thread with one command
+in flight. Ported from Master Miguel's standalone `wa_send.py`.
+
+**There is no API and no credential.** Both backends open
+`web.whatsapp.com/send?phone=...&text=...`, which drops the text into the compose box,
+and press Enter once. Auth is a WhatsApp Web session in a browser profile, which is why
+there is no `.env` entry: the session *is* the credential. `whatsapp.backend` picks how:
+
+| | `playwright` (shipped since 2026-09-23) | `keyboard` (the original port) |
+|---|---|---|
+| Browser | California's own profile in `profile_dir`, Edge on Windows (no download), bundled Chromium elsewhere | Your everyday Firefox |
+| Enter goes to | the compose box element, inside the page | whatever window has OS focus |
+| Waits on | the element it needs | a fixed `wait_ms` (12s) |
+| "Sent" means | a new outgoing bubble **with a sent tick** was seen | Enter was pressed |
+| Laptop during a send | usable, headless by default | keyboard and screen taken for ~15s |
+| Runs on | anywhere Playwright does, 64-bit Pi OS included | Windows only |
+
+**Why the other options were rejected (researched 2026-09-22).** whatsmeow and Baileys
+speak WhatsApp's protocol directly and are faster still, but Meta's 2025-26 crackdown
+warned and banned *low-volume, legitimate* users of both (tulir/whatsmeow#810) -- not a
+risk to put on his personal number. The official Cloud API sends from a separate
+business number and needs paid templates to start a conversation, which is the wrong
+shape for "tell mum I'm late". The WhatsApp Desktop `whatsapp://send` link skips the
+browser load but still needs the OS keyboard and still cannot confirm. Playwright keeps
+the same risk profile as a person using WhatsApp Web and removes the keyboard.
+
+**Two rules from Playwright's own docs drive the design:**
+
+- **The sync API is not thread-safe**, one instance per thread. Every send, the warm-up,
+  the idle close and the shutdown close therefore run as jobs on ONE long-lived daemon
+  worker (`_submit` / `_worker_loop`). The old keyboard path started a fresh thread per
+  send, which cannot keep a page open across sends. `close()` is itself a job for the
+  same reason: only the thread that launched the browser may close it.
+  `test_every_send_runs_on_the_same_thread` pins it.
+- **Automating a default Chrome/Edge profile is unsupported.** The driver runs in its own
+  `profile_dir` (gitignored, since it holds the linked session), linked once as a
+  WhatsApp linked device with `uv run python tools/link_whatsapp.py`. A linked device
+  drops after roughly two weeks with the phone offline; run the tool again.
+
+**`services/whatsapp_web.py` keeps every selector in one table, `SELECTORS`.** WhatsApp
+redesigns its web client without notice. When it does, that table is the only thing to
+update, and until then the failure is `timeout` or `unconfirmed` -- never a false
+"sent". Each outcome has its own spoken line, because the fixes differ: `not_linked`
+("run the link tool"), `invalid_number` ("that number isn't on WhatsApp"),
+`unconfirmed` ("it hasn't gone out yet"), `timeout` (the generic line). An unlinked
+profile does **not** disable the tool: hiding WhatsApp from the model would turn "you
+need to relink" into silence.
+
+**The browser is warmed at boot and closed when idle.** `Orchestrator.__init__` calls
+`WhatsAppService.start()`, which queues a warm-up on the worker; it is deliberately not
+in `__init__`, so constructing the service -- as every unit test does -- never launches
+anything (`test_constructing_the_shipped_service_launches_nothing`, and the full suite
+passes with `sync_playwright` patched to raise). `idle_close_minutes` frees the ~200-300MB
+the browser holds; the next send relaunches it.
+
+**The keyboard backend is Windows only, and that was never a gap to close.** It needs a
+desktop session, a real keyboard and `win32gui` to raise the window. `_probe_platform`
+checks `sys.platform == "win32"`, that `pyautogui` imports, and that the Firefox binary
+exists, each failure logging its own fix. The Playwright backend's probe checks only
+that `playwright` imports.
+
+**Three import-time hazards from the CLI had to move, and all three would have taken the
+assistant down at boot on the Pi.** `wa_send.py` does `raise SystemExit` when Firefox is
+missing (now a warning that sets `available = False` -- a service must never kill the
+boot), registers a `webbrowser` handler at import (dropped entirely; `_open_chat` uses
+`subprocess.Popen` directly anyway), and imports `pyautogui` at module scope. That last
+one matters most: `pyautogui` **raises on a headless box**, not merely fails to import,
+so a top-level import would break every `unittest discover` run on the Pi. It is imported
+inside `_press_send`, and `FAILSAFE`/`PAUSE` are set there too rather than at module
+scope, where `FAILSAFE = False` would disarm a corner-of-screen abort for the whole
+assistant.
+
+**A loosely matched name is read back before anything sends, and the check is
+server-side.** The TV, the lights and the vacuum are all recoverable; a message to a
+person is not. Whisper mangles names here (the vacuum's nickname has come back as
+"SirSoxalot") and the book is full of shared first names. So:
+
+| What he said | Score | Sends? |
+|---|---|---|
+| a phone number, or an alias hit | -- | yes |
+| the full name, or a prefix of it | 100 / 90 | yes |
+| an exact name token ("marta" in "Marta Zuka") | 80-85 | yes |
+| a bare substring ("oaquim") | 60 | **reads back first** |
+| a fuzzy `difflib` hit ("Martah") | < 55 ratio | **reads back first** |
+| two contacts within 5 points of each other | -- | asks which, sends nothing |
+
+`confirm=True` on its own does **not** send. `send()` stores
+`(contact_key, message, deadline)` in `self._pending` and `_confirmed()` requires a
+later call to match **both** the recipient and the exact message text, inside
+`confirm_timeout_ms`. A model that sets the flag on a first attempt therefore still gets
+the read-back, and agreeing to "tell Marta I'm late" does not carry over to a different
+body. The record is one-shot: a second message to the same person is read back again.
+
+**The contact roster is deliberately NOT injected into the system prompt**, and it is the
+only inventory in this project that is not. The lights, the playlists, the HDMI ports and
+the vacuum rooms all list themselves because they are small; the contact book is several
+hundred cards and the full prompt is re-sent on every turn, so listing it would cost more
+per exchange than everything else in the prompt put together. `_contact_inventory()`
+emits one line telling the model to pass the spoken name through unchanged, plus the
+handful of configured `whatsapp.aliases`. `test_llm_prompt.py` has a guard that the
+roster never appears -- if someone later "fixes" the missing inventory, it fails.
+
+**The book is not put through `match_name`.** `services/name_matcher.py`'s tier 3 is a
+bidirectional substring match with no score at all, which is right for six light rooms
+and wrong for four hundred people: "ana" would resolve to "Joana" as confidently as to
+"Ana". `score_contacts()` keeps the CLI's own scorer, which reports *how* good the match
+was and returns ambiguity rather than a best guess -- exactly what the confirm step
+needs. `match_name` is still used for the small `aliases` map, like the lights.
+
+**The phone's VCF export is vCard 2.1, and a name with an accent or an emoji is
+quoted-printable.** Android writes `FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=6D=61...`
+for any non-ASCII name, and wraps a long one with a trailing `=` and **no** leading space
+on the next line, so `_unfold_vcf` cannot see the wrap. Until 2026-09-23 the parser read
+those values raw: **41 of the real book's cards** were runs of `=XX` codes no spoken name
+could match. That is how "message <first name>" sent straight to one contact when a
+second person of that name existed -- the second was saved with an emoji, invisible, so
+there was no tie to ask about. `_prop_value` now decodes with the card's charset and
+`_join_qp_soft_breaks` joins only lines whose own parameters say QUOTED-PRINTABLE: a
+base64 `PHOTO` line can end in `=` padding too, and joining that one swallowed the next
+`TEL`. The "which one?" list offers only the contenders within `_AMBIGUOUS_MARGIN`,
+not everyone merely tagged with the name ("Clara Mae Rita" is Rita's mum, not a Rita).
+
+**A prefix only counts at a word boundary.** `score_contacts` used to give 90 (certain)
+to `name.startswith(q) or q.startswith(name)`, so a surname resolved, certain, to a
+contact named just "Z", and "mar" was certain for any full name starting "Mar". Both
+directions now require the next character to be a space.
+
+**Aliases live in a gitignored `whatsapp_aliases.yaml`, not in `config.yaml`.** The
+repository is public, and a nickname map says who his partner, family and friends are
+-- the same reason `contacts.vcf` is gitignored. `load_alias_config` merges the file at
+`whatsapp.aliases_path` over the (example-only) `whatsapp.aliases` block; `LLMService`
+calls the same function so the prompt advertises exactly the nicknames that resolve,
+and `tests/config_fixture.py` points `aliases_path` at a nonexistent file so the
+developer's own nicknames never decide a test. A value is a contact name or
+`{contact: "...", prefer: "+351"}`, where `prefer` is a number **prefix** choosing which
+of a card's numbers to use (a card that lists a foreign number first) without writing
+the number down. A prefix no number has falls back to the card's first number.
+
+**Alias resolution has an order, and the naive one sent messages to the wrong person.**
+Aliases went through `match_name`, whose substring tier is right for six light rooms:
+with an `ana` alias for one Ana, both "Ana Costa" and "Rui Pai Ana" (tagged with the
+name) matched it. Measured on the real book 2026-09-23, before the fix. Now: (1) an
+**exact** alias wins, even over a tie in the book -- that is what the alias is for;
+(2) otherwise a **certain** book match wins, so a full name reaches that person;
+(3) only then may a loose alias match ("the mum") apply. `AliasOrderingTests` pins it.
+
+**One Enter, never two, on both backends.** After the message sends, focus moves to the
+record-audio button, so a retry press starts a voice recording instead of doing nothing.
+The Playwright driver also refuses to press into a box the pre-filled text has not
+reached yet. On the keyboard backend, the centre click pywhatkit does is worse than
+useless: it often unfocuses the input so Enter never sends at all. `_focus_firefox` calls
+`SetForegroundWindow` only -- never `ShowWindow` or a restore, which made the window
+flash and minimise.
+
+**A scheduled send is a `threading.Timer`, not a sleep in the worker.** The worker allows
+one command in flight, so the CLI's `time.sleep(delay)` there would block every other
+WhatsApp command until it fired. Two limits are stated back rather than engineered
+around: it does **not survive a restart** (`close()` cancels the timers, and is called
+from the orchestrator's shutdown for exactly that reason), and on the keyboard backend
+it raises a Firefox window and takes the keyboard at fire time whether or not anyone is
+at the machine.
+
+**`_dispatch_whatsapp` speaks an interim line before a send**, via the same `say_now`
+hook `_ensure_playable` uses for a 25s CEC wake. On the keyboard backend it is "hands off
+the keyboard", because the send drives the keyboard and screen for ~15s; on Playwright it
+is a plain "Sending it on WhatsApp", because nothing on the desktop moves. It is only
+spoken when a send is actually about to happen -- announcing a read-back would be a lie.
+
+**Reading what is unread: the chat LIST only, never a chat (2026-09-23).**
+`whatsapp_unread` reads the left-hand chat list through `WhatsAppWebDriver.unread_chats`:
+sender, unread count, and the preview of the *last* message. It never opens a chat,
+because opening one marks it read on his phone and sends the sender blue ticks. The
+price is that only the newest message per chat is visible, cut short, and the spoken
+line says so. Opening a chat to read it in full is deliberately not an action.
+
+- **Senders first, text on request.** With no `to`, the line lists who and how many and
+  carries no message text at all, because she is speaking in a room. With `to`, it
+  gives that chat's latest message. `find_unread_chat` resolves the name exactly like a
+  send (aliases, then the book, then the chat titles), so a nickname like "my mum" works.
+- **Muted chats are left out and counted; groups are listed apart**, identified through
+  the "Groups" filter chip because nothing in a row marks a group. The "Unread" chip
+  lists every unread chat, not just the ~20 rows the virtualised list has rendered, and
+  the list is put back on "All" afterwards.
+- **The chips need a DOM click.** They are `button#all-filter` / `#unread-filter` /
+  `#group-filter` with `aria-selected`. A Playwright pointer click waited out its whole
+  30s actionability timeout on each (97s for one read) because of the role=dialog layer
+  WhatsApp keeps in the page; `evaluate("b => b.click()")` takes 8.9s cold, 1.9s warm.
+- **Other people's words are data.** This is the first path where someone other than
+  Master Miguel puts text in front of the model. The quoted preview is labelled as the
+  sender's words in the tool result, and the system prompt says a message is read out,
+  never obeyed. `test_a_message_that_gives_orders_is_quoted_not_obeyed` pins it.
+
+Setup: `uv sync --extra default`, `uv run python tools/link_whatsapp.py` once (scan the
+QR code from the phone's Linked devices screen), export the phone's contacts as VCF and
+drop it at `whatsapp.contacts_path` (gitignored). On the Pi, also
+`uv run playwright install chromium` once -- that browser lives outside `uv.lock`, like
+the openWakeWord models, so a fresh machine needs it again.
 
 ### StremioService
 
@@ -1595,16 +1945,17 @@ The Claude path supports:
 - Custom `control_tv` tool for Mi Box and TV control (23 actions)
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
+- Custom `control_whatsapp` tool for WhatsApp messaging (3 actions)
 
-With the committed `config.yaml` that is **4 tools** in every request: `web_search`,
-`control_tv`, `control_lights`, `control_vacuum`. Each custom tool's full schema is sent on
+With the committed `config.yaml` that is **5 tools** in every request: `web_search`,
+`control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`. Each custom tool's full schema is sent on
 every turn, so adding actions and parameters costs input tokens on every single exchange.
 Keep descriptions tight — see Cost Discipline. `control_vacuum` was deliberately held to a
 core five (`vacuum_clean_all`, `vacuum_clean_rooms`, `vacuum_stop`, `vacuum_dock`,
 `vacuum_status`); pause/resume/locate were left out until asked for by voice.
 
 The custom tools are gated by config: `control_tv` on `media.enabled`, `control_lights` on
-`govee.enabled`, `control_vacuum` on `deebot.enabled`. Web search runs server-side at
+`govee.enabled`, `control_vacuum` on `deebot.enabled`, `control_whatsapp` on `whatsapp.enabled`. Web search runs server-side at
 Anthropic and is **not** dispatched locally, which
 is why the Claude tool loop checks `block.name in LOCAL_TOOL_NAMES` instead of `block.type` alone.
 Widening that check to any `tool_use` block would break web search.
@@ -1612,7 +1963,7 @@ Widening that check to any `tool_use` block would break web search.
 `control_lights` supports these actions:
 
 - `light_on`, `light_off`
-- `light_status` (answers from shadow state, never a reading -- see Reading State Back)
+- `light_status` (a live reading on `tapo`, shadow memory on `ble`/`cloud` -- see Reading State Back)
 - `light_brightness` (needs `brightness_percent`, 1-100, clamped not rejected)
 - `light_color` (needs `color`)
 
@@ -1639,6 +1990,17 @@ The `control_tv` schema in `services/llm.py` currently supports these TV-related
 - `vacuum_clean_all`, `vacuum_clean_rooms` (needs `rooms`, an array of names)
 - `vacuum_stop`, `vacuum_dock`
 - `vacuum_status` (battery + state; doubles as the pre-clean guard)
+
+`control_whatsapp` supports these actions, and deliberately only these three:
+
+- `whatsapp_send` (needs `to` and `message`; optional `at` as HH:MM, optional `confirm`)
+- `whatsapp_find_contact` (needs `to`; looks someone up without messaging them)
+- `whatsapp_unread` (optional `to`; who has unread messages, or one chat's latest message.
+  Reads the chat list only and never marks anything read)
+
+Bulk send and image send exist in the CLI it was ported from and were left out: bulk has no
+spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
+capability with no voice phrasing.
 
 When tools are active:
 
@@ -1843,6 +2205,41 @@ label only exists there: `StremioService` holds an IMDb id and a deep link, and
 not remembered at all rather than read out loud later.
 
 ### The lights cannot be read, and saying so is the feature
+
+**Corrected 2026-09-17: that is true of the Govee strip, not of every light.**
+A TP-Link Tapo bulb answers, so `govee.transport: "tapo"` makes `light_status`
+a real reading and `_light_reading_line` states it with none of the hedge below.
+Everything in this section still holds for the attic strip over `ble` and for `cloud`.
+Both rooms are live at once since 2026-09-17, so the two hedges now coexist in one
+run, and the fallback is deliberate: a Tapo read that fails drops through to the same
+shadow memory rather than to silence.
+
+**"It cannot tell me" and "I could not reach it" are different sentences, and they
+need opposite responses.** `_light_memory_line(..., unreachable=)` splits them. The
+Govee strip's characteristic is write-only, so *"it can't tell me anything back"* is a
+permanent fact with nothing to go and fix. A Tapo bulb that normally answers and did
+not is *"I couldn't reach it just now"*, which means the wall switch is off or it has
+dropped off Wi-Fi. Speaking the first about the second is a false claim about the
+hardware and sends him nowhere -- the same mistake `needs_pairing` exists to avoid on
+the TV. The dispatcher decides by asking the transport that owns *that room* whether
+it has a `get_state`, never the service-wide `can_read_state`, which would report the
+write-only strip as unreachable on every single status call.
+
+Two rules carried over into the readable path:
+
+- **The hedge lives in the returned string, never in the system prompt**, which is
+  why one transport can hedge and another not without the prompt knowing anything.
+- **A field the bulb did not answer is not narrated.** `LightReading.power is None`
+  means "it did not tell me", and the dispatcher falls back to memory rather than
+  speaking a blank -- the same `None` contract `MediaService`'s readers use, and the
+  same trap that made a television in standby report as "on" for the life of that
+  feature.
+- **`GoveeService.can_read_state` is compared with `is True`, not truthiness.**
+  `_svc()` in `tests/test_orchestrator_lights.py` is a bare `Mock`, so every
+  attribute of it is truthy; a loose check would claim a live reading off a service
+  that reads nothing. `test_a_bare_mock_service_never_produces_a_reading_line`
+  pins it.
+
 
 The Govee characteristic `00010203-...-2b11` is **Write Without Response**, with
 no notify characteristic beside it, and the attic H617E is absent from Govee's
@@ -2131,6 +2528,37 @@ Current automated coverage exists for:
 - Surfshark route execution, route cache semantics, and debug route capture
 - Orchestrator VPN preflight routing and warning behavior
 - Govee transport selection, light resolution, BLE packet format, and cloud HTTP error mapping
+- Per-light transports: that a Govee strip and a Tapo bulb both load under one service,
+  that each room is bound to the transport its fields imply, that a command reaches the
+  transport owning that room and not the other, that one instance is shared by every
+  room using it, that the preferred transport wins for a light carrying fields for two,
+  that a light carrying fields for none is still skipped, that an unreadable room reads
+  `None` while a readable one answers, and that a dead transport does not disable a
+  working one
+- That a readable room which did not answer is spoken as unreachable while a write-only
+  room keeps the permanent hedge
+- That the light fixtures blank every transport credential (`GOVEE_API_KEY`,
+  `TAPO_USERNAME`, `TAPO_PASSWORD`), because each transport reads the environment
+  before config and ambient credentials otherwise decide whether `enabled` is true
+- Tapo transport: RGB->HSV conversion with the value component discarded so a dark
+  colour is not a dimmer, colour never touching brightness (`set_hsv(..., None)`),
+  brightness clamped rather than rejected, self-disable without credentials, a live
+  reading carrying power and brightness, an unreadable bulb reading `None` rather
+  than a blank, that a `LightReading` has no `__bool__` to re-create the falsy-result
+  trap, that work runs off the calling thread, and a guard that the file never opens
+  a socket
+- TPAP (`tests/test_tapo_tpap.py`): the SPAKE2+ M/N points are on P-256, the sign-byte
+  encoding of w0, the `password_shadow` credential pre-hash, that a full handshake
+  completes against a fake bulb running the device side of the protocol and the
+  encrypted channel round-trips with the sequence advancing, that a wrong password is
+  an authentication error carrying the bulb's lockout budget, that a forged
+  `dev_confirm` is rejected, that plain JSON on the `/ds` endpoint drops the session
+  as retryable, that an unsupported PAKE mode is named, that a TPAP bulb is driven
+  without importing kasa at all, that the session is reused across commands, that a
+  failed probe is not cached as "kasa", and that the file never opens a socket
+- `light_status` on a readable transport: a live reading stated without the memory
+  hedge, brightness not quoted on a light that is off, a failed read falling back to
+  memory, and a bare `Mock` service never producing a reading line
 - Deebot vacuum: self-disable (flag off, missing dependency, missing credentials), `Default`
   rooms dropped, room resolution by alias/despaced tier, the cached-id-then-live-name fallback
   and the stale-id re-resolve-and-retry, that `_with_auth` re-authenticates exactly once on a
@@ -2153,6 +2581,43 @@ Current automated coverage exists for:
 - `control_vacuum` dispatch: every spoken line, the status-first guard refusing a clean when
   the robot is unreachable or already cleaning, unknown room names refused before any status
   read, stop/dock skipping the guard, and failed results surfacing their message
+- WhatsApp: the self-disable matrix (flag off, non-Windows, missing pyautogui, missing
+  Firefox, missing or unparseable contact book), VCF parsing (soft line unfolding,
+  PREF/CELL ordering, `00` to `+`, bare 9-digit Portuguese numbers, short service codes
+  like `111` rejected), which match bands are certain and which read back, aliases
+  beating an ambiguous book, the one-in-flight refusal, the daemon worker, and that
+  `close()` cancels a scheduled send
+- The WhatsApp confirmation token: a fuzzy send reads back instead of sending, `confirm`
+  on a first attempt still reads back, a confirmation covers only that exact recipient
+  AND that exact message, an expired one asks again, and it is one-shot
+- A guard that `tests/test_whatsapp_service.py` never launches a browser or presses a
+  key. This is the keyboard equivalent of `test_unit_tests_never_shell_out_to_a_real_adb`
+  and it matters more than any other guard in the suite: a leaked `pyautogui.press`
+  puts an Enter into whatever window the person running the tests has focused
+- `control_whatsapp` dispatch: every spoken line, that a fuzzy match / an ambiguous name /
+  a missing body each call `send` zero times, that a lookup never sends, and that the
+  interim line is spoken before a send but not before a read-back
+- The Playwright driver against a fake page: "sent" needs a new bubble AND a tick, a
+  bubble without a tick is `unconfirmed`, exactly one Enter lands on the compose box and
+  never into an empty one, a QR code is `not_linked` and WhatsApp's dialog is
+  `invalid_number` with nothing pressed, and the URL drops the `+` and quotes the text
+- The Playwright service: each outcome maps to its own spoken line, a crashed browser
+  is closed so the next send relaunches, every send runs on one thread, `close()` shuts
+  the browser on that thread, an idle browser is closed, `start()` warms only on the
+  Playwright backend with `keep_warm` on, and constructing the shipped service never
+  reaches `sync_playwright`
+- VCF quoted-printable: an emoji name and an accented name split by a soft break decode,
+  a base64 PHOTO line ending in `=` does not swallow the next number, no name is left as
+  `=XX` codes, and two people sharing a first name are ambiguous again
+- Alias resolution order: an exact alias beats a tie in the book, a full contact name
+  beats a loose alias match, someone merely tagged with a name is not rerouted; `prefer`
+  picks a number by prefix and falls back when no number matches; a prefix only counts
+  at a word boundary
+- Unread (`tests/test_whatsapp_unread.py`): read under the Unread chip, groups and mutes
+  carried, direction marks stripped, no chat ever opened, the list put back on All; lines
+  list senders without text, quote one chat's latest message labelled as the sender's
+  words, and a message that gives orders is read, never acted on
+- That the contact roster is never injected into the system prompt
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
@@ -2235,6 +2700,8 @@ uv run python tools\check_stremio_adb.py --sync --json      # refresh library, m
 uv run python tools\check_stremio_adb.py --title Fallout --launch   # actually plays
 uv run python tools\probe_govee_devices.py
 uv run python tools\probe_govee_devices.py --transport cloud
+uv run python tools\probe_tapo_devices.py
+uv run python tools\probe_tapo_devices.py --host 192.168.1.42
 
 # Playlist rot. Exits nonzero when an ID is gone, so it can gate a curation pass.
 uv run python toolsalidate_youtube_playlists.py
@@ -2494,7 +2961,37 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 - On this Mi Box, the Stremio VPN path is best handled as a small calibrated DPAD sequence to Portugal
 - Same-app requests should preserve the active session and skip Surfshark, even if that means VPN policy is only enforced on cross-app transitions
 - Package launch plus named route tables is easier to maintain than scattering Surfshark timing and key sequences through the codebase
+- **A confirmation the model can set by itself is not a confirmation.** `confirm` is a
+  boolean in a tool call, so nothing stops a model writing `true` on a first attempt --
+  and the one time it does, someone gets a message meant for someone else. The flag had
+  to become a *check* against a pending record the service itself created, so the model
+  can ask to skip the read-back and simply not be able to. Prompt wording is a request;
+  a token is a guarantee
+- **A matcher tuned for six rooms is a hazard over four hundred people.** `match_name`'s
+  substring tier is bidirectional and unscored, which is exactly right for "the loft"
+  and exactly wrong for "ana", where it would reach "Joana" with the same confidence.
+  The reusable component was the wrong reuse: what this needed was a matcher that reports
+  *how* sure it is, because the whole feature turns on telling sure from unsure
+- **Every inventory in this project lists itself, and one must not.** Lights, playlists,
+  HDMI ports and vacuum rooms are all injected because they are small. A contact book is
+  the same shape and three orders of magnitude bigger, and the full prompt is re-sent on
+  every turn, so the pattern that made the other four correct would have made this one
+  the most expensive thing in the prompt. The guard is a test, because the pattern is
+  what someone would reach for next
+- **An import-time side effect is a boot-time failure on a machine you were not
+  thinking about.** A standalone script can `raise SystemExit` when Firefox is missing;
+  a service imported by the orchestrator cannot, and `pyautogui` does not merely fail to
+  import on a headless box, it raises. Porting a script into a service is mostly moving
+  its module scope into its constructor
 - Graceful fallback lines build trust more than pretending automation is perfect
+- **"Unsupported device" is a statement about the library, and "no devices found" is
+  a statement about the broadcast.** python-kasa's discovery heard the L530E, dropped
+  it as unsupported and reported nothing; a TCP sweep showed no port 80 open until the
+  bulb had been on for a minute; the global broadcast never reached it from a
+  two-adapter laptop. Three separate "it is not there" readings, none of which meant
+  the bulb was absent. The protocol itself was a solved problem in a .NET repo the
+  Python ecosystem had not noticed -- worth a search before concluding "upstream is
+  blocked, so we are"
 
 -----
 
@@ -2524,6 +3021,20 @@ just the commits.
   pool, since the NOS portal has no reservations. `tv_only_standby` ships
   off until its `standby-mode` run.
 
+- **"Search online more optimized ways of doing this WhatsApp thing" (2026-09-22/23,
+  branch `feat/whatsapp-tapo`).** Rebased the Tapo work onto master (which had just
+  gained `control_whatsapp`) as a fresh branch, then replaced the Firefox + `pyautogui`
+  send path with Playwright after ruling out whatsmeow/Baileys (2025-26 ban wave on
+  low-volume users) and the Cloud API (a separate business number). Live findings on
+  the real page: WhatsApp Web ships generated class names now, so every tutorial
+  selector was dead; emoji render as `<img>` and vanish from a bubble's text; the chat
+  list's rows are `role=row` too; the invalid-number dialog sits over a visible chat
+  list; the filter chips only take a DOM click. A live "message <name>" went to the
+  wrong one of two same-named contacts, which exposed the quoted-printable VCF bug
+  (41 unreadable cards) and, once aliases went in, an alias ordering that would have
+  rerouted full names. Added `whatsapp_unread` off the chat list. Aliases moved to a
+  gitignored file before committing, because the repository is public.
+
 - **"Deebot N8+ voice control" (2026-09-16, branch `feat/deebot-vacuum-exploration`).**
   Went from "search online for a deebot-client library" to a shipped
   `control_vacuum` tool. Covers, in order: evaluating `deebot-client`, hitting
@@ -2550,6 +3061,29 @@ just the commits.
   own voice at 0.053 (no self-wake risk) but drops from 10/40 to 1/40 on real
   takes with her voice on top. Ducking was simulated and rejected. Next step
   is a training run with her clips as `augmentation.background_paths`.
+- **"Try the Tapo thing with my L530E" (2026-09-17, branch
+  `claude/california-overview-u8hp9f`).** Testing the just-built Tapo transport
+  against the living-room bulb. In order: `uv sync` pulls python-kasa, the
+  3.14 `typing.ByteString` shim works; `.env` parse failure from a `"` inside
+  the password (single-quote it); discovery finds nothing, a port-80 sweep of
+  the /24 finds only the router, ARP shows the bulb appear a minute later at
+  `.74`; python-kasa then refuses it as `encrypt_type='TPAP'`, firmware 1.4.2.
+  Upstream python-kasa and Home Assistant both stuck on it; found
+  KasaTapoClient (.NET) with the L530E confirmed over TPAP, ported its
+  handshake to `services/tapo_tpap.py`, first prototype run authenticated and
+  read the bulb. Wired into `TapoTransport` behind the existing `_with_device`
+  boundary, config switched to `tapo` with the living room as default, every
+  `control_lights` action verified live through the real dispatcher, 41 Tapo
+  unit tests including a fake bulb running the server side of SPAKE2+.
+  Only one bulb was on the LAN during the test; "bulbs" in the living room
+  means the rest need their own `host` entries once they are found.
+  Switching `govee.transport` to `tapo` then silently dropped the attic
+  strip, which is what prompted the per-light transport change in the same
+  session: transports are now chosen per light from its own fields, both
+  rooms are live at once, and `govee.transport` is back to `ble` as the
+  tie-break only. The bulb went off the wall switch mid-session, which is
+  what exposed the shared hedge wording and produced the
+  unreachable-vs-unreadable split.
 
 -----
 

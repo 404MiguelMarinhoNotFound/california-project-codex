@@ -69,7 +69,11 @@ govee = ["bleak>=0.22.0"]
 # lying about which VAD ran for the life of the project. `default` is defined as
 # exactly what the committed config.yaml selects, and config.yaml selects silero, so
 # it belongs here. This adds torchaudio only, not the full ~2GB — torch is already in.
-default = ["california[kokoro]", "california[govee]", "california[silero]", "california[cec]", "california[deebot]"]
+#
+# tapo is selected per light, not by `govee.transport`: a light carrying a `host` is
+# driven over the LAN, and the living room does. So the attic strip keeping "ble" as
+# the tie-break does not make this optional.
+default = ["california[kokoro]", "california[govee]", "california[silero]", "california[cec]", "california[deebot]", "california[tapo]", "california[whatsapp]"]
 # cec belongs in default because the committed config.yaml sets
 # media.cec_wake.enabled: true, and turn_on cannot work without samsungtvws.
 # Same rule that put silero here: default == exactly what config.yaml selects.
@@ -90,6 +94,32 @@ cec = [
 # a wheel we'd never import. See tools/probe_deebot_devices.py.
 deebot = [
     "deebot-client>=18.5.0",
+]
+# Light control: TP-Link Tapo over the LAN (config.yaml `govee.transport: "tapo"`).
+# Unlike the Govee strip these bulbs can be READ back, which is the whole reason
+# they are here -- see services/tapo_transport.py. Local control still
+# authenticates with TP-Link cloud credentials (TAPO_USERNAME / TAPO_PASSWORD),
+# so this needs .env even though no traffic leaves the LAN.
+tapo = [
+    # AES-CCM for the TPAP session channel (services/tapo_tpap.py). It already
+    # arrives through python-kasa and deebot-client, but we import it directly,
+    # and a transitive dependency is one upstream cleanup from disappearing.
+    "cryptography>=42",
+    # KLAP/AES for pre-1.4.2 firmware, and the discovery broadcast. Bulbs on
+    # 1.4.2+ speak TPAP, which python-kasa cannot; see services/tapo_tpap.py.
+    "python-kasa>=0.10.0",
+]
+
+# WhatsApp messaging (config.yaml `whatsapp.enabled: true`). Drives WhatsApp
+# Web in Firefox with synthetic keystrokes, so it is Windows-only and both
+# entries carry the marker -- a Pi or a Linux CI box syncs this extra and
+# installs nothing, and services/whatsapp_service.py self-disables there.
+# In `default` for the usual reason: default is defined as exactly what the
+# committed config.yaml selects, and config.yaml selects this.
+whatsapp = [
+    "playwright>=1.63",
+    "pyautogui>=0.9.54; sys_platform == 'win32'",
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [tool.uv]
