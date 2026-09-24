@@ -76,7 +76,9 @@ sys.path.insert(0, str(ROOT / "tools"))
 SR = 16000
 REC_DIR = ROOT / "training" / "recordings"
 MANIFEST_PATH = REC_DIR / "manifest.jsonl"
-SESSIONS_DIR = REC_DIR / "sessions"
+# Everything recorded with this tool, one folder per session. Named apart from
+# the pre-manifest folders (positive/, holdout_*/) so the two never mix.
+SESSIONS_DIR = REC_DIR / "new"
 LIVE_DIR = REC_DIR / "live"
 EXPORT_DIR = REC_DIR / "export"
 
