@@ -108,7 +108,7 @@ def _setup_remote(config_text: str) -> None:
     _sh("du", "-sh", DATA_DIR)
 
 
-def _merge_recordings(model_name: str, replicate: int) -> int:
+def _merge_recordings(model_name: str, replicate: int, subdir: str = "") -> int:
     """Fold real recordings into the generated positives, before augmentation.
 
     Two details here are load-bearing:
@@ -128,7 +128,14 @@ def _merge_recordings(model_name: str, replicate: int) -> int:
     import re
     import shutil
 
-    src_dir = Path(RECORDINGS_DIR)
+    # One export at a time (/recordings/<subdir>), or everything uploaded when
+    # empty. The volume still holds v2's positive/ and positive_pt/, unreviewed
+    # and ~1 in 7 with its ending clipped, so a v3 run must name its export.
+    src_dir = Path(RECORDINGS_DIR) / subdir if subdir else Path(RECORDINGS_DIR)
+    if subdir and not any(src_dir.glob("**/*.wav")):
+        # A named export that is missing is a typo or a forgotten upload, and
+        # silently training synthetic-only would look exactly like success.
+        raise SystemExit(f"--recordings {subdir}: no .wav files under {src_dir}")
     dest_dir = Path(OUTPUT_DIR) / model_name / "positive_train"
     if not src_dir.is_dir():
         print(f"No recordings at {src_dir}, training on synthetic positives only.", flush=True)
@@ -166,7 +173,7 @@ def _merge_recordings(model_name: str, replicate: int) -> int:
     return written
 
 
-def _run_pipeline(config_text: str, model_name: str, replicate: int = 0) -> dict:
+def _run_pipeline(config_text: str, model_name: str, replicate: int = 0, recordings: str = "") -> dict:
     """generate -> augment -> train -> export -> eval, then save artifacts to the volume."""
     import json
     import shutil
@@ -184,7 +191,7 @@ def _run_pipeline(config_text: str, model_name: str, replicate: int = 0) -> dict
         # and augmentation. `livekit-wakeword run` would do all of it in one go
         # and leave no seam to merge into.
         _sh("livekit-wakeword", "generate", cfg)
-        _merge_recordings(model_name, replicate)
+        _merge_recordings(model_name, replicate, recordings)
         _sh("livekit-wakeword", "augment", cfg)
         _sh("livekit-wakeword", "train", cfg)
         _sh("livekit-wakeword", "export", cfg)
@@ -222,8 +229,8 @@ def _run_pipeline(config_text: str, model_name: str, replicate: int = 0) -> dict
     memory=32768,
     timeout=2 * 60 * 60,
 )
-def _run_smoke(config_text: str, model_name: str, replicate: int = 0) -> dict:
-    return _run_pipeline(config_text, model_name, replicate)
+def _run_smoke(config_text: str, model_name: str, replicate: int = 0, recordings: str = "") -> dict:
+    return _run_pipeline(config_text, model_name, replicate, recordings)
 
 
 @app.function(
@@ -234,8 +241,8 @@ def _run_smoke(config_text: str, model_name: str, replicate: int = 0) -> dict:
     memory=32768,
     timeout=24 * 60 * 60,
 )
-def _run_prod(config_text: str, model_name: str, replicate: int = 0) -> dict:
-    return _run_pipeline(config_text, model_name, replicate)
+def _run_prod(config_text: str, model_name: str, replicate: int = 0, recordings: str = "") -> dict:
+    return _run_pipeline(config_text, model_name, replicate, recordings)
 
 
 @app.local_entrypoint()
@@ -256,12 +263,13 @@ def smoke(config: str = "california_smoke.yaml"):
 
 
 @app.local_entrypoint()
-def train(config: str = "california_v2.yaml", replicate: int = 60):
+def train(config: str = "california_v2.yaml", replicate: int = 60, recordings: str = ""):
     """The real run on an L40S.
 
         uvx modal run --detach training/modal_train.py::train
         uvx modal run --detach training/modal_train.py::train --config california.yaml
         uvx modal run --detach training/modal_train.py::train --replicate 0
+        uvx modal run --detach training/modal_train.py::train --config california_v3.yaml --recordings v3
 
     Defaults to the current best config. model_name comes from the YAML, so runs
     do not overwrite each other on the volume and can be compared.
@@ -273,6 +281,9 @@ def train(config: str = "california_v2.yaml", replicate: int = 60):
     merge and
     trains on synthetic audio only. Having no recordings uploaded is not an error;
     the merge just no-ops.
+
+    `recordings` names one folder under /data/recordings (a wakeword_dataset.py
+    export, e.g. v3) so only that export is merged. Empty merges everything there.
     """
     text = _read_config(config)
-    _run_prod.remote(text, _model_name(text), replicate)
+    _run_prod.remote(text, _model_name(text), replicate, recordings)

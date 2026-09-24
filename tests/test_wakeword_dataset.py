@@ -162,6 +162,7 @@ class ExportTests(unittest.TestCase):
             mock.patch.object(wd, "MANIFEST_PATH", root / "manifest.jsonl"),
             mock.patch.object(wd, "SESSIONS_DIR", root / "sessions"),
             mock.patch.object(wd, "EXPORT_DIR", root / "export"),
+            mock.patch.object(wd, "HER_MONOLOGUE_DIR", root / "her"),
         ]
         for p in self.patches:
             p.start()
@@ -202,6 +203,18 @@ class ExportTests(unittest.TestCase):
         self.assertEqual([p.name for p in (out / "backgrounds").glob("*.wav")], ["a.wav"])
         manifest = json.loads((out / "export.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["train"], ["a/001"])
+
+    def test_her_monologues_go_in_as_16k_backgrounds(self):
+        # livekit reads backgrounds with no resampling; 24kHz TTS would play slow.
+        import soundfile as sf
+
+        (self.root / "her").mkdir()
+        t = np.arange(24000 * 2) / 24000
+        sf.write(self.root / "her" / "weather.wav", 0.3 * np.sin(2 * np.pi * 440 * t), 24000)
+        out = self._export([self._take("a/001", "a", "train")])
+        info = sf.info(out / "backgrounds" / "her_weather.wav")
+        self.assertEqual(info.samplerate, 16000)
+        self.assertAlmostEqual(info.duration, 2.0, delta=0.01)
 
     def test_export_refuses_a_leak(self):
         rows = [self._take("a/001", "a", "train"), self._take("a/002", "a", "holdout")]

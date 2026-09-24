@@ -162,6 +162,21 @@ def wav_bytes(audio: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def to_16k_int16(path: Path) -> np.ndarray:
+    """Any WAV as 16kHz mono int16, resampled with a polyphase filter."""
+    from math import gcd
+
+    import soundfile as sf
+    from scipy.signal import resample_poly
+
+    x, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    x = x.mean(axis=1)
+    if sr != SR:
+        g = gcd(SR, sr)
+        x = resample_poly(x, SR // g, sr // g)
+    return np.clip(np.round(x * 32767), -32768, 32767).astype(np.int16)
+
+
 def rms(audio: np.ndarray) -> float:
     if len(audio) == 0:
         return 0.0
@@ -1116,6 +1131,13 @@ def cmd_export(args) -> None:
             (out / "backgrounds").mkdir(parents=True, exist_ok=True)
             shutil.copy2(tone, out / "backgrounds" / f"{session}.wav")
 
+    # Her long replies, so the trainer mixes her voice under positives (the
+    # barge-in case) and under negatives (her talking alone is not a wake).
+    # livekit reads backgrounds with no resampling, so they must be 16kHz here:
+    # the 24kHz TTS output would otherwise play 1.5x slow under every clip.
+    for path in sorted(HER_MONOLOGUE_DIR.glob("*.wav")):
+        write_wav(out / "backgrounds" / f"her_{path.stem}.wav", to_16k_int16(path))
+
     with open(out / "export.json", "w", encoding="utf-8") as fh:
         json.dump(
             {
@@ -1134,11 +1156,12 @@ def cmd_export(args) -> None:
     for c in holdout_gaps(manifest.rows):
         print(f"  warning: no holdout for {c}")
     print(f"\nwritten to {rel(out)}/")
-    print("\nUpload (check `uvx modal volume ls california-wakeword-data /recordings` first:")
-    print("the trainer merges EVERY wav under /recordings, including old uploads):")
+    print("\nUpload, then train on this export only (--recordings keeps old uploads out):")
     print(f"  uvx modal volume put california-wakeword-data {rel(out / 'train')} /recordings/{args.name}")
     if (out / "backgrounds").exists():
         print(f"  uvx modal volume put california-wakeword-data {rel(out / 'backgrounds')} /backgrounds_{args.name}")
+    print(f"  uvx modal run --detach training/modal_train.py::train "
+          f"--config california_{args.name}.yaml --recordings {args.name}")
     print("Score a model against the holdout, one cell at a time:")
     print(f"  uv run python tools/score_wakeword.py --dir {rel(out / 'holdout')}/<cell> --framed")
 
