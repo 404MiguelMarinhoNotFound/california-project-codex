@@ -159,10 +159,12 @@ class ToolSchemaTests(unittest.TestCase):
 
     def test_control_tv_gained_no_new_action(self):
         # get_status already existed. Reading state back cost one enum value in
-        # total, on the lights side.
+        # total, on the lights side. The one addition since is "unmute": TV
+        # volume moved to UPnP, where mute is explicit rather than the box's
+        # KEYCODE_VOLUME_MUTE toggle, and "unmute" must never mute.
         actions = CONTROL_TV_TOOL["input_schema"]["properties"]["action"]["enum"]
         self.assertIn("get_status", actions)
-        self.assertEqual(len(actions), 23)
+        self.assertEqual(len(actions), 24)
 
     def test_control_vacuum_is_the_core_five_and_nothing_more(self):
         # Every enum value is paid for on every turn. Pause/resume/locate were

@@ -521,7 +521,24 @@ media:
   # TV tool call, which is why discovery exists.
   mibox_ip: "192.168.1.200"   # static, set on the box 2026-09-22 (DHCP pool is .2-.199)
   adb_port: 5555
-  volume_max_steps: 15            # Mi Box S hardware max — used by volume_set()
+  volume_max_steps: 15            # Mi Box S hardware max — ADB fallback only, when tv_volume is off
+
+  # --- Volume: the TELEVISION's, over UPnP ---
+  # The Samsung answers SOAP RenderingControl on :9197 while it is on: its own
+  # 0-100 volume (the number on screen), read and set in one call. Measured
+  # 2026-09-24 on the UE49M5505: GetVolume 36ms, SetVolume 46ms, no pairing, no
+  # 401. Replaces up to 30 ADB keyevents on the box's 0-15 scale, which on this
+  # setup usually sits at 15/15 so "louder" did nothing audible.
+  # The address comes from cec_wake's MAC + duid ladder. TV off = "the TV looks
+  # off", never a silent fallback to the box. Set enabled: false to go back to
+  # the old ADB path.
+  tv_volume:
+    enabled: true
+    port: 9197
+    step: 5                 # plain "louder"/"quieter"; the room sits around 13
+    max_percent: 40         # rising past this needs the same number asked twice
+    confirm_window_s: 60    # ...within this long
+    timeout_ms: 2000
 
   # --- Finding the box when its address moves ---
   discovery:

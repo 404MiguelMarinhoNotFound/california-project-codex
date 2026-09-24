@@ -29,6 +29,7 @@ from services.now_playing import NowPlaying
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
 from services.whatsapp_service import WhatsAppService
 from services.surfshark_service import SurfsharkService
+from services.tv_volume import TvVolume
 from services.youtube_playlist_resolver import resolve_playlist_choice
 from services.youtube_search import speakable_title, top_video
 
@@ -204,7 +205,7 @@ def _forget_launch(now_playing) -> None:
         now_playing.forget()
 
 
-def _status_line(status, launch=None) -> str:
+def _status_line(status, launch=None, tv_level=None, tv_muted=None) -> str:
     """
     Turn a RoomStatus into something speakable.
 
@@ -277,11 +278,22 @@ def _status_line(status, launch=None) -> str:
         where = _human_position(status.position_s) if named else None
         parts.append(f"{clause}, {where}" if where else clause)
 
-    # The box's own volume, which is the one volume_set moves. NOT the
-    # television's -- that lives on the Samsung and ADB cannot see it.
+    # The television's own volume, read over UPnP, is what the room hears and
+    # what volume_set moves when media.tv_volume is on.
+    if tv_muted is True:
+        parts.append("TV muted")
+    elif tv_level is not None:
+        parts.append(f"TV volume {tv_level}")
+
+    # The box's volume multiplies with the TV's. Once the TV's is known, the
+    # box is only worth a clause when it is NOT at max -- then it is a reason
+    # the room is quiet. Without the TV reading it is the only number we have.
+    tv_known = tv_muted is True or tv_level is not None
     if status.muted:
         parts.append("box muted")
-    elif status.volume is not None and status.volume_max:
+    elif status.volume is not None and status.volume_max and (
+        not tv_known or status.volume < status.volume_max
+    ):
         parts.append(f"box volume {status.volume} of {status.volume_max}")
 
     if status.awake is True:
@@ -355,6 +367,47 @@ def _ensure_playable(media_svc, say_now=None) -> str:
     return _unreachable_line(media_svc)
 
 
+_TV_VOLUME_ACTIONS = {"volume_up", "volume_down", "volume_set", "mute", "unmute"}
+
+
+def _dispatch_tv_volume(action: str, params: dict, tv_volume) -> str:
+    """
+    Volume on the television itself, over UPnP. No ADB, no box.
+
+    An unreachable TV is spoken as "the TV's off", never quietly redirected to
+    the box's volume: that would report success for a change nobody can hear.
+    """
+    off_line = "The TV looks off, so there's no volume to change."
+
+    if action in ("mute", "unmute"):
+        result = tv_volume.set_mute(action == "mute")
+        if result:
+            return "TV muted" if action == "mute" else "TV unmuted"
+        return off_line
+
+    if action == "volume_set":
+        if params.get("volume_percent") is None:
+            return "what volume? the TV goes 0 to 100"
+        result = tv_volume.set_volume(params["volume_percent"])
+    else:
+        # volume_steps is TV volume points here, not box key presses.
+        amount = params.get("volume_steps") or tv_volume.step
+        amount = abs(int(amount))
+        result = tv_volume.change(amount if action == "volume_up" else -amount)
+
+    if result:
+        if result.capped:
+            return (f"TV volume {result.level}, that's my cap. Ask for a number "
+                    "above it twice if you really want it louder")
+        if result.previous == result.level:
+            return f"TV volume already at {result.level}"
+        return f"TV volume {result.previous} to {result.level}"
+    if result.needs_confirm:
+        return (f"{result.target} is above my {tv_volume.max_percent} cap and the TV "
+                f"is at {result.previous}. Say it again if you really mean {result.target}")
+    return off_line
+
+
 def _dispatch_tv(
     params: dict,
     media_svc,
@@ -364,13 +417,20 @@ def _dispatch_tv(
     youtube_playlist_aliases: dict | None = None,
     say_now=None,
     now_playing=None,
+    tv_volume=None,
 ) -> str:
     action = params.get("action")
     route_warning = None
 
+    # The TV's own volume needs neither the box nor ADB, so it goes before the
+    # requires_tv gate: a box asleep under a lit television must not block it.
+    # Identity check, not truthiness: tests pass bare Mocks.
+    if action in _TV_VOLUME_ACTIONS and tv_volume is not None and getattr(tv_volume, "enabled", False) is True:
+        return _dispatch_tv_volume(action, params, tv_volume)
+
     requires_tv = {
         "play_pause", "stop", "next", "prev", "fast_forward", "rewind",
-        "volume_up", "volume_down", "volume_set", "mute",
+        "volume_up", "volume_down", "volume_set", "mute", "unmute",
         "launch_app", "go_home", "go_back",
         # Deliberately NOT the power actions. This gate returns early when the
         # TV is unreachable, and unreachable is precisely the state turn_on
@@ -454,7 +514,8 @@ def _dispatch_tv(
         media_svc.rewind()
         return "done"
 
-    # Volume
+    # Volume on the BOX, over ADB. Only reached with media.tv_volume disabled;
+    # otherwise the TV branch at the top of this function answered already.
     elif action == "volume_up":
         media_svc.volume_up(params.get("volume_steps", 10))
         return "done"
@@ -465,9 +526,11 @@ def _dispatch_tv(
         pct = params.get("volume_percent", 50)
         media_svc.volume_set(pct)
         return f"volume set to roughly {pct}%"
-    elif action == "mute":
+    elif action in ("mute", "unmute"):
+        # KEYCODE_VOLUME_MUTE is a toggle, so the box path cannot tell the two
+        # apart. The TV path above can.
         media_svc.mute()
-        return "muted"
+        return "mute toggled"
 
     # App launching
     elif action == "launch_app":
@@ -739,7 +802,15 @@ def _dispatch_tv(
         # comes off the CEC bus, where the TV actually said it.
         status = media_svc.room_status()
         launch = now_playing.current(status.app or "") if now_playing else None
-        return _status_line(status, launch)
+        tv_level = tv_muted = None
+        # Only ask the TV when the CEC bus has not already said it is in
+        # standby: :9197 is closed then, and asking costs a retry and a rescan.
+        if (tv_volume is not None and getattr(tv_volume, "enabled", False) is True
+                and status.tv_power != "standby"):
+            tv_level = tv_volume.get_volume()
+            if tv_level is not None:
+                tv_muted = tv_volume.get_mute()
+        return _status_line(status, launch, tv_level, tv_muted)
 
     return "unknown action"
 
@@ -1266,9 +1337,15 @@ class Orchestrator:
         if media_enabled:
             self.media_service = built["media"]
             self.surfshark_service = SurfsharkService(config, self.media_service)
+            # The TV's own volume over UPnP. It finds the TV through the
+            # CecWaker's MAC + duid ladder, so a moved TV self-heals here too.
+            self.tv_volume = TvVolume(
+                config, resolve_ip=self.media_service.cec_waker.resolve_tv_ip
+            )
         else:
             self.media_service = None
             self.surfshark_service = None
+            self.tv_volume = None
 
         # What she last put on the screen. The box knows which app is up and
         # whether something is playing, but never what -- she is the only one
@@ -1982,6 +2059,7 @@ class Orchestrator:
                 self.config.get("youtube_playlist_aliases") or {},
                 say_now=self._say_now,
                 now_playing=self.now_playing,
+                tv_volume=getattr(self, "tv_volume", None),
             )
         if tool_name == "control_lights":
             return _dispatch_lights(tool_input, self.govee_service, self.light_shadow)
