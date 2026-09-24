@@ -82,6 +82,15 @@ class CheckTests(unittest.TestCase):
         self.assertIn("extra_sounds", flags)
         self.assertAlmostEqual(metrics["word"][1], 2.1, delta=0.03)
 
+    def test_with_a_background_an_edge_only_flags_and_extra_sounds_pass(self):
+        # The TV rises over the room all through the take, so its sound reaches
+        # the edges and sits next to the word; the transcript decides instead.
+        rejects, flags = checked(window(word_at=(3.5, 4.0)), noisy=True)[1]
+        self.assertEqual(rejects, [])
+        self.assertIn("cut_off_end", flags)
+        rejects, flags = checked(window(extra=(3.0, 3.3)), noisy=True)[1]
+        self.assertEqual((rejects, flags), ([], []))
+
     def test_a_short_gap_inside_the_word_does_not_split_it(self):
         take = window(word_at=(1.5, 1.8), extra=(1.95, 2.3))
         metrics, (_, flags) = checked(take)

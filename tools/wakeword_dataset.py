@@ -257,8 +257,13 @@ def check(metrics: dict, *, noisy: bool, check_edges: bool) -> tuple[list[str], 
     """
     (reject reasons, flag reasons). Rejects are unambiguous junk; flags need an ear.
 
-    `noisy`: the session had TV, music or her voice playing, so extra sounds and
-    an over-long "word" are expected artefacts, not proof of a bad take.
+    `noisy`: the session had TV, music or her voice playing. The background
+    itself then rises over the room level all through the take, so the loudest
+    "sound" can run into an edge or past 1.4s, and there is always more than
+    one. Measured on the first TV session (2026-09-24): 17 of 52 takes rejected
+    as cut off at the start and 14 at the end, while the transcripts read
+    "California". So with a background those only flag, extra sounds are not
+    even flagged, and the transcript is what decides.
     `check_edges`: False for clips that were trimmed before they got here
     (legacy recordings, live captures), whose edges prove nothing.
     """
@@ -276,10 +281,10 @@ def check(metrics: dict, *, noisy: bool, check_edges: bool) -> tuple[list[str], 
         (flags if noisy else rejects).append("too_long")
     if check_edges:
         if word[0] < EDGE_S:
-            rejects.append("cut_off_start")
+            (flags if noisy else rejects).append("cut_off_start")
         if word[1] > metrics["duration_s"] - EDGE_S:
-            rejects.append("cut_off_end")
-    if len(metrics["segments"]) > 1:
+            (flags if noisy else rejects).append("cut_off_end")
+    if len(metrics["segments"]) > 1 and not noisy:
         flags.append("extra_sounds")
     if metrics["snr_db"] is not None and metrics["snr_db"] < MIN_SNR_DB:
         flags.append("low_snr")
@@ -511,10 +516,10 @@ def inspect_take(audio, floor_rms, *, noisy, check_edges, lang, transcriber, spe
         around = audio[max(0, int((s - REVIEW_CONTEXT_S) * SR)) : int((e + REVIEW_CONTEXT_S) * SR)]
         if speech is not None and speech(around) is False:
             flags.append("not_speech")
-        if transcriber is not None:
-            transcript = transcriber(around, lang)
-            if not transcript_matches(transcript):
-                flags.append("transcript" if transcript is not None else "no_transcript")
+        transcript = transcriber(around, lang) if transcriber is not None else None
+        if not transcript_matches(transcript):
+            # No transcript (--no-stt, no key, a failed call) is not a pass either.
+            flags.append("transcript" if transcript is not None else "no_transcript")
     return status_for(rejects, flags), rejects + flags, metrics, transcript
 
 
@@ -803,7 +808,10 @@ def cmd_review(args) -> None:
     queue = [
         r for r in manifest.rows
         if r["status"] in wanted and (not args.session or r["session"] == args.session)
+        and (not args.new or r["source"] == "session")
     ]
+    # New sessions first: the ~200 imported legacy takes would otherwise bury them.
+    queue.sort(key=lambda r: r["source"] != "session")
     if not queue:
         print("nothing to review")
         return
@@ -847,6 +855,52 @@ def cmd_review(args) -> None:
 
 
 # ─── audit (legacy) and import-live ──────────────────────────────────
+
+
+def cmd_recheck(args) -> None:
+    """
+    Re-grade recorded takes after the checks change. Nothing is re-recorded.
+
+    Takes a human kept or dropped are never touched. A transcript already on
+    the row is reused, so only takes that never got one (they were rejected
+    before Whisper ran) cost a call.
+    """
+    load_dotenv_quietly()
+    config = load_config()
+    manifest = Manifest()
+    transcriber = None if args.no_stt else Transcriber(config)
+    speech = SpeechCheck(config)
+
+    changes = Counter()
+    for row in manifest.rows:
+        if row["source"] != "session" or row["status"] in (ACCEPTED, DROPPED):
+            continue
+        if args.session and row["session"] != args.session:
+            continue
+        cached = row.get("transcript")
+
+        def transcribe(audio, lang, cached=cached):
+            if cached is not None:
+                return cached
+            return transcriber(audio, lang) if transcriber is not None else None
+
+        status, reasons, metrics, transcript = inspect_take(
+            read_wav(ROOT / row["path"]), row["metrics"]["floor_rms"],
+            noisy=row["background"] in NOISY_BACKGROUNDS, check_edges=True,
+            lang=row["lang"], transcriber=transcribe, speech=speech,
+        )
+        if "duplicate" in row["reasons"]:
+            status, reasons = REJECTED, reasons + ["duplicate"]
+        if status != row["status"]:
+            changes[(row["status"], status)] += 1
+        row.update(status=status, reasons=reasons, metrics=metrics,
+                   transcript=transcript if transcript is not None else cached)
+        manifest.save()
+
+    for (before, after), n in sorted(changes.items()):
+        print(f"  {before:>8} -> {after:<8} {n}")
+    if not changes:
+        print("  no take changed")
 
 
 def cmd_audit(args) -> None:
@@ -1083,7 +1137,13 @@ def main() -> None:
     p.add_argument("--all", action="store_true", help="also re-check takes that passed")
     p.add_argument("--rejected", action="store_true", help="also offer rejected takes")
     p.add_argument("--session")
+    p.add_argument("--new", action="store_true", help="only takes recorded with this tool")
     p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("recheck", help="re-grade recorded takes after the checks change")
+    p.add_argument("--session")
+    p.add_argument("--no-stt", action="store_true")
+    p.set_defaults(func=cmd_recheck)
 
     p = sub.add_parser("audit", help="import and check the pre-manifest recordings")
     p.add_argument("--stt", action="store_true", help="transcribe them too (~3s per take)")
