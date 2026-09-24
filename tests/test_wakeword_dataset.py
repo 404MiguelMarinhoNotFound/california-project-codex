@@ -207,6 +207,51 @@ class ExportTests(unittest.TestCase):
             self._export(rows)
 
 
+class CaptureModeTests(unittest.TestCase):
+    def test_push_to_talk_drops_both_key_clicks(self):
+        audio = np.zeros(2 * SR, dtype=np.int16)
+        audio[: int(0.2 * SR)] = 9000     # start key coming back up
+        audio[-int(0.08 * SR):] = 9000    # stop key going down
+        trimmed = wd.trim_key_clicks(audio)
+        self.assertEqual(int(np.abs(trimmed).max()), 0)
+        self.assertEqual(len(trimmed), 2 * SR - int(0.25 * SR) - int(0.10 * SR))
+
+    def test_a_take_shorter_than_the_guards_is_empty_not_negative(self):
+        self.assertEqual(len(wd.trim_key_clicks(np.ones(1000, dtype=np.int16))), 0)
+
+    def _cut(self, audio, floor=30.0, chunk=640):
+        cutter = wd.UtteranceCutter(floor, chunk)
+        takes = []
+        for i in range(0, len(audio) - chunk + 1, chunk):
+            take = cutter.feed(audio[i:i + chunk])
+            if take is not None:
+                takes.append(take)
+        return takes
+
+    def test_hands_free_cuts_one_take_per_utterance_with_room_either_side(self):
+        stream = np.concatenate([
+            window(word_at=(1.0, 1.6), seconds=3.0, seed=1),
+            window(word_at=(1.0, 1.5), seconds=3.0, seed=2),
+        ])
+        takes = self._cut(stream)
+        self.assertEqual(len(takes), 2)
+        for take in takes:
+            _, (rejects, flags) = checked(take)
+            self.assertEqual(rejects, [], "the word must not touch either edge")
+            self.assertNotIn("extra_sounds", flags)
+
+    def test_hands_free_ignores_a_single_loud_chunk(self):
+        stream = window(level=0, seconds=3.0)
+        stream[SR:SR + 640] = 9000
+        self.assertEqual(self._cut(stream), [])
+
+    def test_a_take_that_never_goes_quiet_is_closed_at_the_limit(self):
+        stream = window(word_at=(0.5, 11.5), seconds=12.0)
+        takes = self._cut(stream)
+        self.assertEqual(len(takes), 1)
+        self.assertLessEqual(len(takes[0]) / SR, wd.MAX_TAKE_S + 0.1)
+
+
 class ManifestTests(unittest.TestCase):
     def test_rows_survive_a_round_trip_and_ids_stay_unique(self):
         with tempfile.TemporaryDirectory() as tmp:

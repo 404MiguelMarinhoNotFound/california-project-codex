@@ -11,7 +11,10 @@ Everything here goes through one manifest,
 training/recordings/manifest.jsonl, one row per take. A take is only ever
 exported for training if it passed every automatic check or a human kept it.
 
-  record       one session: a language, a distance, a background, ~15 takes
+  record       one session: a language, a distance, a background, ~15 takes.
+               Enter starts a take and Enter stops it. --hands-free instead
+               cuts one take per utterance, for when the keyboard is out of
+               reach (mid, couch)
   review       listen to flagged takes and keep or drop them
   audit        import the pre-manifest recordings and check them the same way
   import-live  copy her own activation captures in as candidates for review
@@ -39,8 +42,9 @@ The model's own score is recorded on every take and is NEVER a gate. The
 takes the current model scores lowest are the ones it most needs to learn
 from; filtering on them would train it on what it already knows.
 
-Why the raw window is kept: trimming is decided at export, from the segment
-stored in the manifest, so a better trim later does not need a re-record.
+Why the whole take is kept, not just the word: trimming is decided at
+export, from the segment stored in the manifest, so a better trim later does
+not need a re-record.
 
 Holdout is decided per SESSION, at record time (--holdout), and never
 re-rolled. Takes from one sitting share a mic position, a mood and a room, so
@@ -81,8 +85,12 @@ DISTANCES = ("near", "mid", "couch")
 BACKGROUNDS = ("quiet", "tv", "music", "her")
 NOISY_BACKGROUNDS = {"tv", "music", "her"}
 
-WINDOW_S = 4.0          # one take
-CUE_S = 1.0             # "say it now" is printed this far into the window
+MAX_TAKE_S = 10.0       # a take that runs this long stops on its own
+KEY_GUARD_START_S = 0.25  # push-to-talk: the start key's release click
+KEY_GUARD_END_S = 0.10    # push-to-talk: the stop key's click
+HANDS_FREE_FACTOR = 3.0   # hands-free: a take opens this far above the room
+HANDS_FREE_PREROLL_S = 0.6
+HANDS_FREE_HANG_S = 0.7   # hands-free: quiet this long closes the take
 ROOMTONE_S = 20.0       # recorded before the first take of every session
 EDGE_S = 0.05           # speech closer than this to an edge was cut off
 MIN_WORD_S = 0.3
@@ -546,6 +554,76 @@ def read_seconds(stream, seconds: float, chunk: int) -> np.ndarray:
     return np.concatenate(parts)[: int(seconds * SR)]
 
 
+def trim_key_clicks(audio: np.ndarray) -> np.ndarray:
+    """
+    Cut the Enter presses off a push-to-talk take.
+
+    The start key clicks again on its way back up, ~100ms after it registers,
+    and the stop key clicks as it registers. Left in, a laptop mic hears both as
+    sounds of their own and every take would be flagged extra_sounds.
+    """
+    a = int(KEY_GUARD_START_S * SR)
+    b = len(audio) - int(KEY_GUARD_END_S * SR)
+    return audio[a:b] if b > a else audio[:0]
+
+
+def record_push_to_talk(stream, chunk: int) -> np.ndarray:
+    """Read the mic until Enter is pressed, or MAX_TAKE_S."""
+    import threading
+
+    pressed = threading.Event()
+    threading.Thread(target=lambda: (input(), pressed.set()), daemon=True).start()
+    parts, n, limit = [], 0, int(MAX_TAKE_S * SR)
+    while not pressed.is_set() and n < limit:
+        data, _ = stream.read(chunk)
+        parts.append(np.frombuffer(data, dtype=np.int16))
+        n += len(parts[-1])
+    if not pressed.is_set():
+        print(f"      stopped at {MAX_TAKE_S:.0f}s - press Enter", flush=True)
+        pressed.wait()  # or the waiting input() would eat the next prompt's Enter
+    return trim_key_clicks(np.concatenate(parts))
+
+
+class UtteranceCutter:
+    """
+    Hands-free takes: cut one take per utterance out of a continuous stream.
+
+    A take opens after two chunks louder than the room and closes after
+    HANDS_FREE_HANG_S of quiet, with HANDS_FREE_PREROLL_S kept from before the
+    onset, so the word never touches either edge of its window.
+    """
+
+    def __init__(self, floor_rms: float, chunk: int):
+        from collections import deque
+
+        self.threshold = max(floor_rms * HANDS_FREE_FACTOR, SEGMENT_MIN_RMS)
+        self.chunk = chunk
+        self.preroll = deque(maxlen=max(1, int(HANDS_FREE_PREROLL_S * SR / chunk)))
+        self.parts = None
+        self.loud_run = 0
+        self.quiet_s = 0.0
+
+    def feed(self, audio: np.ndarray) -> np.ndarray | None:
+        loud = rms(audio) > self.threshold
+        if self.parts is None:
+            self.preroll.append(audio)
+            self.loud_run = self.loud_run + 1 if loud else 0
+            if self.loud_run >= 2:
+                self.parts = list(self.preroll)
+                self.quiet_s = 0.0
+            return None
+        self.parts.append(audio)
+        self.quiet_s = 0.0 if loud else self.quiet_s + len(audio) / SR
+        length = sum(len(p) for p in self.parts) / SR
+        if self.quiet_s >= HANDS_FREE_HANG_S or length >= MAX_TAKE_S:
+            take = np.concatenate(self.parts)
+            self.parts = None
+            self.loud_run = 0
+            self.preroll.clear()
+            return take
+        return None
+
+
 def her_voice() -> np.ndarray:
     """Her pre-rendered lines, concatenated, for the 'her' background."""
     import soundfile as sf
@@ -581,80 +659,125 @@ def cmd_record(args) -> None:
     noisy = args.background in NOISY_BACKGROUNDS
 
     print(f"\nSession {session}")
-    print(f"  mic: {device}   {args.takes} takes kept   split: {split}")
+    print(f"  mic: {device}   {args.takes} takes to keep   split: {split}")
+    if args.hands_free and noisy:
+        print("  note: hands-free cuts a take at every sound, so with a background")
+        print("  playing expect extra takes; the checks and review sort them out")
     print("  loading checks...")
     transcriber = None if args.no_stt else Transcriber(config)
     speech = SpeechCheck(config)
     scorer = None if args.no_score else Scorer(config)
 
-    if args.background == "her":
-        sd.play(her_voice() * args.her_volume, 24000, loop=True)
-    elif args.background in ("tv", "music"):
+    her = her_voice() * args.her_volume if args.background == "her" else None
+
+    def background_on():
+        if her is not None:
+            sd.play(her, 24000, loop=True)
+
+    if args.background in ("tv", "music"):
         input(f"  Put the {args.background} on at its usual level, then press Enter ")
+    background_on()
+
+    kept = rejected = index = 0
+    last = None  # (row, audio) of the previous take, for replay / undo
+
+    def process(audio: np.ndarray, style: str | None) -> dict:
+        nonlocal kept, rejected, index
+        path = sdir / f"take_{index:03d}.wav"
+        write_wav(path, audio)
+        status, reasons, metrics, transcript = inspect_take(
+            audio, floor, noisy=noisy, check_edges=True,
+            lang=args.lang, transcriber=transcriber, speech=speech,
+        )
+        if sha1(audio) in manifest.hashes():
+            status, reasons = REJECTED, reasons + ["duplicate"]
+        row = {
+            "id": f"{session}/{index:03d}",
+            "source": "session",
+            "session": session,
+            "path": rel(path),
+            "lang": args.lang,
+            "distance": args.distance,
+            "background": args.background,
+            "style": style,
+            "mode": "hands_free" if args.hands_free else "push_to_talk",
+            "speaker": args.speaker,
+            "device": device,
+            "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            "split": split,
+            "status": status,
+            "reasons": reasons,
+            "metrics": metrics,
+            "transcript": transcript,
+            "score": scorer(path) if scorer else None,
+            "model": scorer.model if scorer else None,
+            "sha1": sha1(audio),
+            "note": "",
+        }
+        manifest.add(row)
+        index += 1
+        if status == REJECTED:
+            rejected += 1
+            print(f"      rejected  {describe(row)}  - say it again")
+        else:
+            kept += 1
+            print(f"      {status:<8}  {describe(row)}")
+        return row
 
     stream = pipeline.create_mic_stream()
     stream.start()
+    chunk = pipeline.chunk_samples
     try:
         print(f"\n  Room tone: stay silent for {ROOMTONE_S:.0f}s (leave the background on)")
-        tone = read_seconds(stream, ROOMTONE_S, pipeline.chunk_samples)
+        tone = read_seconds(stream, ROOMTONE_S, chunk)
         write_wav(sdir / "roomtone.wav", tone)
         floor = float(np.median(frame_rms(tone)))
         print(f"  room level RMS {floor:.0f}\n")
 
-        kept = rejected = index = 0
-        while kept < args.takes:
-            style = STYLES[index % len(STYLES)]
-            print(f"[{kept + 1}/{args.takes}] say \"{args.word}\" {style}")
+        if args.hands_free:
+            print(f"  Hands-free: say \"{args.word}\", pause a second, say it again.")
+            print("  Vary how you say it. Ctrl+C when done.\n")
+            cutter = UtteranceCutter(floor, chunk)
             pipeline.drain_mic_stream(stream)
-            head = read_seconds(stream, CUE_S, pipeline.chunk_samples)
-            print("      >>> NOW", flush=True)
-            tail = read_seconds(stream, WINDOW_S - CUE_S, pipeline.chunk_samples)
-            audio = np.concatenate([head, tail])
-
-            path = sdir / f"take_{index:03d}.wav"
-            write_wav(path, audio)
-            status, reasons, metrics, transcript = inspect_take(
-                audio, floor, noisy=noisy, check_edges=True,
-                lang=args.lang, transcriber=transcriber, speech=speech,
-            )
-            if sha1(audio) in manifest.hashes():
-                status, reasons = REJECTED, reasons + ["duplicate"]
-            row = {
-                "id": f"{session}/{index:03d}",
-                "source": "session",
-                "session": session,
-                "path": rel(path),
-                "lang": args.lang,
-                "distance": args.distance,
-                "background": args.background,
-                "style": style,
-                "speaker": args.speaker,
-                "device": device,
-                "recorded_at": datetime.now().isoformat(timespec="seconds"),
-                "split": split,
-                "status": status,
-                "reasons": reasons,
-                "metrics": metrics,
-                "transcript": transcript,
-                "score": scorer(path) if scorer else None,
-                "model": scorer.model if scorer else None,
-                "sha1": sha1(audio),
-                "note": "",
-            }
-            manifest.add(row)
-            index += 1
-            if status == REJECTED:
-                rejected += 1
-                print(f"      rejected  {describe(row)}  - say it again")
-            else:
-                kept += 1
-                print(f"      {status:<8}  {describe(row)}")
+            while kept < args.takes:
+                data, _ = stream.read(chunk)
+                take = cutter.feed(np.frombuffer(data, dtype=np.int16))
+                if take is not None:
+                    print(f"[{kept + 1}/{args.takes}]", end="")
+                    process(take, None)
+        else:
+            while kept < args.takes:
+                style = STYLES[index % len(STYLES)]
+                print(f"[{kept + 1}/{args.takes}] say \"{args.word}\" {style}")
+                choice = input("      Enter = record   p = replay last   u = undo last   q = quit > ")
+                choice = choice.strip().lower()
+                if choice == "q":
+                    break
+                if choice == "p" and last:
+                    sd.play(last[1], SR, blocking=True)
+                    background_on()
+                    continue
+                if choice == "u" and last:
+                    row = last[0]
+                    if row["status"] != REJECTED:
+                        kept -= 1
+                    row["status"], row["note"] = DROPPED, "undone while recording"
+                    manifest.save()
+                    print(f"      dropped {row['id']}")
+                    last = None
+                    continue
+                if choice:
+                    continue
+                pipeline.drain_mic_stream(stream)
+                print("      ● recording - Enter to stop", flush=True)
+                audio = record_push_to_talk(stream, chunk)
+                last = (process(audio, style), audio)
     except KeyboardInterrupt:
-        print("\n  stopped early; everything recorded so far is in the manifest")
+        print("\n  stopped; everything recorded so far is in the manifest")
     finally:
         stream.stop()
         stream.close()
-        if args.background == "her":
+        if her is not None:
             sd.stop()
 
     flagged = sum(1 for r in manifest.rows if r["session"] == session and r["status"] == FLAGGED)
@@ -942,6 +1065,11 @@ def main() -> None:
     p.add_argument("--background", choices=BACKGROUNDS, required=True)
     p.add_argument("--takes", type=int, default=15, help="takes to keep (default 15)")
     p.add_argument("--holdout", action="store_true", help="this whole session is holdout")
+    p.add_argument(
+        "--hands-free",
+        action="store_true",
+        help="no keys: one take per utterance, for when you are away from the keyboard",
+    )
     p.add_argument("--word", default="California")
     p.add_argument("--speaker", default="miguel")
     p.add_argument("--her-volume", type=float, default=0.6, help="for --background her")

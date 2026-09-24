@@ -233,7 +233,9 @@ was kept or thrown out. See the tool's docstring for exactly what it rejects.
 
 Record in **sessions**, one per cell: a language, a distance, a background.
 Each session records 20s of room tone first, then ~15 takes through the same
-mic the assistant listens on.
+mic the assistant listens on. Enter starts a take and Enter stops it; for mid
+and couch, where the keyboard is out of reach, `--hands-free` cuts one take
+per utterance instead.
 
 ```bash
 uv run python tools/wakeword_dataset.py record --lang pt --distance couch --background tv
