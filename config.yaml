@@ -401,7 +401,14 @@ sounds:
 stremio:
   email: "likebot99@gmail.com"
   password: null
-  autoplay_delay_ms: 2500
+  autoplay_delay_ms: 2500         # fallback path only, see stream_list_timeout_ms
+  # The ready-list path (CLAUDE.md "The ready-list path"): wait for the stream
+  # list, press OK once, confirm the player, wait for state=3. Measured
+  # 2026-09-25: list 2.2-2.7s after a clear-task link (warm), player 1.8s after
+  # OK, playing ~7s after OK on a torrent stream.
+  stream_list_timeout_ms: 20000
+  player_start_timeout_ms: 6000
+  playback_timeout_ms: 45000
   library_sync_interval_minutes: 60
   history_refresh_max_age_minutes: 5
   watch_state_path: "watch_state.json"

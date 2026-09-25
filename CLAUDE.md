@@ -1805,11 +1805,18 @@ When asked to play or continue a title:
 4. For series with no tracked progress, open the series detail page instead of inventing episode numbers
 5. Build the Stremio deep link for either an episode target or a detail-page target
 6. Try the remembered source first, then `comet`, then `mediafusion`, then `torrent` / `torrentio`
-7. Launch on Mi Box with ADB
-8. Wait `stremio.autoplay_delay_ms`
-9. Press OK once
-10. Check `dumpsys media_session`
-11. Retry OK one time if playback still is not active
+7. Launch on Mi Box with ADB, **clearing Stremio's task** (`am start -f 0x10008000`),
+   never a force-stop -- see "The ready-list path" below
+8. A series with no tracked episode stops here, on its detail page, with no key pressed
+9. Wait for the stream list to be on screen (`dumpsys activity top`: a visible
+   `stream_card_stub_inflated`, no visible `meta_details_loading_frame`), then press OK
+   **once** -- the first card is focused
+10. Confirm the player opened (`exo_*` views, or a Stremio media session), then wait for
+    Stremio's **own** session to reach `state=3`. Still buffering at the deadline is
+    "loading, give it a moment", never "hit OK" -- a second OK into a player is pause
+11. Only if the list never showed (steps 12-13 below then run as before, OK first) or
+    OK opened no player (straight to step 12, no second OK):
+    wait `stremio.autoplay_delay_ms`, press OK, check `dumpsys media_session`, retry once
 12. Scan the visible stream list for the preferred providers, page by page. Before every `uiautomator dump`, and once more before giving up, re-read `dumpsys media_session`: a torrent stream picked by step 9 or 11 can take longer to buffer than the autoplay wait, and a rendering video keeps `uiautomator dump` from ever going idle, so the scan would otherwise time out for minutes over a show that is already on (seen live 2026-09-16 with Fallout). `state=3` at any of those checks ends the request as a success.
 13. The whole scan is capped by `stremio.provider_scan_timeout_s` (45s); past it, no further dumps are attempted and the request falls through to the fallback policy.
 
@@ -1818,6 +1825,50 @@ If playback still does not start, use this exact fallback line:
 ```text
 Stremio's open but it didn't start on its own. Just hit OK on the remote.
 ```
+
+### The ready-list path (2026-09-25)
+
+Measured on the real box with Fallout S2E9. The old launch force-stopped
+Stremio, waited a fixed 2.5s after it reached the foreground, and pressed OK --
+onto the **splash screen**, because a cold Stremio shows its list ~8-10s after the
+link. So it pressed again, then ran the uiautomator scan over a video that was
+already playing: 27-30s, and on 2026-09-22 a "which source?" question with the
+show on screen. Now **20.0s** from an idle room to confirmed playing, one key:
+
+| step | at |
+|---|---|
+| clear-task deep link | 3.5s |
+| stream list visible | 10.8s |
+| the one OK | 12.1s |
+| ExoPlayer views up | 13.3s |
+| Stremio session `state=3` | 20.0s (~7s is the torrent buffering) |
+
+- **The force-stop was hiding a real bug, so it was replaced, not removed.** A
+  deep link into a *warm* Stremio opened **S01E01's** streams for a link to S2E9.
+  Clearing the task (`FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK`) rebuilds
+  the screen inside the running process: right episode both ways (checked on
+  screen, S1E1 -> S01E01 files, S2E9 -> S02 packs), list in 2.2-2.7s instead of
+  ~10s. The "S01E01 - The End" header Stremio shows is its own quirk; the stream
+  list is what plays.
+- **`dumpsys activity top`, not `uiautomator dump`.** ~0.6s, readable while a video
+  renders, and it gives each view's visibility flag (`V`/`I`/`G`) and id. Real
+  captures are in `tests/fixtures/activity_top_stremio_{streams,player}.txt`.
+- **Stremio's own session.** `_is_playing` matches `state=3` anywhere in
+  `media_session`, so another app can answer for Stremio. The new path reads only
+  the `com.stremio.one` block (`_stremio_playback_state`).
+- **A screenshot shows nothing while video plays** (secure surface, a white
+  frame) -- the view dump is the only look at a playing screen.
+- **The box's own load decides the numbers.** `flar2.homebutton` (Button Mapper,
+  an enabled accessibility service) was holding 10 media players and 14 audio
+  decoders it never released: mediaserver + media.extractor at ~330% of 400% CPU,
+  ~38 CPU-hours accumulated, `dumpsys power` at 7-8s instead of 0.4s, and OK
+  presses timing out at 15-17s. Restarting it fixed that. `am force-stop` alone
+  leaves its service "Crashed" and unbound; deleting and re-putting
+  `secure enabled_accessibility_services` rebinds it. **Do not reboot the box to
+  clear it**: `persist.adb.tcp.port` is empty, so ADB over Wi-Fi may not come back.
+  4K HEVC playback itself also loads the box to ~250%, which slows every ADB call
+  made during it.
+- The library sync before a resume is **0.16s** and was left alone.
 
 ### Watch-State Cache
 
@@ -2583,6 +2634,13 @@ Current automated coverage exists for:
   port) with no direct `KEY_HDMI<n>`; keys sent with `key_press_delay=0` and the
   connection closed; and an auth failure flagged `needs_pairing` while other
   failures are not
+- The Stremio ready-list path (`tests/test_stremio_ready_list.py`, real
+  `dumpsys activity top` captures): the list reads as ready and the player as a
+  player, no key while the list is loading or showing its error frame, exactly
+  one OK, a player still buffering spoken as loading and never as "hit OK", no
+  second blind OK after one that opened nothing, a series with no progress
+  pressing nothing, the launch clearing the task instead of force-stopping, and
+  Stremio's session read apart from another app's `state=3`
 - The rebuilt power path (2026-09-25): a dark TV under an awake box is powered
   and then the input verified, never a box wake; deep standby presses no key
   when the box comes up by itself, rescues through the Source menu once, and
@@ -3296,15 +3354,19 @@ One more was found and fixed on **2026-09-03**, in the power path:
   WoL to the Samsung, HDMI toggle, box awake. See "Power: Off Is ADB, On Is The
   Television".
 
-Found on **2026-09-22**, not yet fixed (parked by Master Miguel):
+Found on **2026-09-22**, fixed **2026-09-25** -- see "turn_on, rebuilt" and "The
+ready-list path". "Put on X" from a room left by California's turn_off is now
+~5s of TV plus ~20s of Stremio, most of the latter the stream buffering:
 
-- **"Put on X" from a dark room takes 115-131s, and the Stremio launch is
-  64-79s of it** (`tools/bench_tv_power.py stremio --from-off`). Inside it: two
+- ~~**"Put on X" from a dark room takes 115-131s, and the Stremio launch is
+  64-79s of it**~~ (`tools/bench_tv_power.py stremio --from-off`). Inside it: two
   back-to-back library syncs, a 5.7s OK keyevent, and a provider scan whose
   first two `uiautomator dump` calls timed out after 13.6s and 10.4s -- the
   documented "a rendering video never lets the UI go idle" -- while the show
   was already playing.
-- **The provider scan asks for a source while the show is on screen.** The
+- ~~**The provider scan asks for a source while the show is on screen.**~~ The
+  ready-list path never reaches the scan when the player opens; the scan remains
+  only as the fallback, with its media-session re-check. The
   600s-idle run returned "I couldn't find Comet, MediaFusion, or Torrent for
   Fallout. Want me to try the first available source?" and the box reported
   `Fallout, The Strip` playing 2.9s later. The scan's media-session checks
