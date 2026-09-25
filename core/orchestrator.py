@@ -338,8 +338,13 @@ def _ensure_playable(media_svc, say_now=None) -> str:
 
     # Identity checks throughout: a bare Mock's attributes are truthy.
     if media_svc.is_awake() is True:
-        hdmi = media_svc.hdmi_state()
-        if getattr(hdmi, "tv_power", None) != "standby":
+        # The TV's UPnP port is the live power reading; the CEC tail can be hours
+        # stale, and after tv_only_standby a dark set under an awake box is the
+        # normal state. Identity checks: a bare Mock's `available` is truthy.
+        waker = getattr(media_svc, "cec_waker", None)
+        tv = waker.tv_power() if getattr(waker, "available", False) is True else None
+        hdmi = media_svc.hdmi_state() if tv is None else None
+        if tv == "on" or (tv is None and getattr(hdmi, "tv_power", None) != "standby"):
             # Verified, not fire-and-forget: switch_input reports success on a
             # key the TV accepted and ignored. None is "could not tell" and never
             # switches; it fails open, as it always has.
@@ -1540,6 +1545,10 @@ class Orchestrator:
             if self._stremio_sync_thread:
                 self._stremio_sync_thread.join(timeout=2)
             self.deebot_service.close()
+            # A TV-only standby may still be switching the box's HDMI-CEC back on;
+            # leaving it off would stop the Xiaomi remote turning the TV on.
+            if self.media_service is not None:
+                self.media_service._finish_pending_standby()
             # Also cancels any scheduled send, which would otherwise wake up
             # after shutdown and drive the keyboard at an empty room.
             self.whatsapp_service.close()

@@ -748,8 +748,12 @@ pairing token is a hard dependency. That is why a rejected token gets its own
 - **Sleeping the box switches the TV off too** (`mAutoTvOff: true`,
   `hdmi_control_auto_device_off_enabled=1`). Intended — "turn off the TV" means
   both — but it is why the wake must WoL the TV first
-- The Mi Box is CEC physical address `0x2000` = **HDMI 2**. `KEY_HDMI` toggles
-  HDMI2 <-> HDMI1 on this set, so **odd presses select the box**
+- The Mi Box is CEC physical address `0x2000` = **HDMI 2**; HDMI 1 is a tuner
+  (CEC logical address 3). **Corrected 2026-09-25:** `KEY_HDMI` cycles only
+  inputs with a live signal, so it cannot select a sleeping box, and
+  `KEY_HDMI1`/`KEY_HDMI2` are accepted and ignored. The Source menu lists TV,
+  HDMI 1, HDMI 2 and LEFT does not wrap, so `KEY_SOURCE`, LEFT x4, RIGHT x port,
+  `KEY_ENTER` selects any port from anywhere (`CecWaker.select_input`)
 - `tv_ip` is a **cached hint, not configuration.** Identity keys off `tv_mac` and
   `tv_duid`, both stable. On a miss `resolve_tv_ip()` goes cached -> hint -> ARP by
   MAC -> TCP scan on :8001, verifying the duid at every step, and caches the answer
@@ -1412,7 +1416,7 @@ Recommended behavior:
 
 ### Operational Recommendation
 
-A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby`, which needs no box setting — see CLAUDE.md "Standby depth". Both devices have static addresses outside the DHCP pool since 2026-09-22 (box `192.168.1.200`, device MAC `9c:12:21:1c:95:ae`; TV `192.168.1.201`) — see CLAUDE.md "Static addresses".
+A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby`, on since 2026-09-25: "off" leaves the box awake behind a dark set and "on" is ~5s -- see CLAUDE.md "turn_on, rebuilt" before touching the power path. Both devices have static addresses outside the DHCP pool since 2026-09-22 (box `192.168.1.200`, device MAC `9c:12:21:1c:95:ae`; TV `192.168.1.201`) — see CLAUDE.md "Static addresses".
 
 ### Final VPN Routing Rules
 

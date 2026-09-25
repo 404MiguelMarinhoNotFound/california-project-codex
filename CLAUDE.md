@@ -738,6 +738,11 @@ sets refuse hosts missing from the TV's device list -- this one does not).
 
 ### Power: Off Is ADB, On Depends On How Deep The Box Went
 
+**Rebuilt 2026-09-25 -- read "turn_on, rebuilt" below first.** With
+`tv_only_standby` (now on) "off" leaves the box awake behind a dark set and
+"on" is **~5s**; from deep standby it is **34-42s with no key pressed**. Much of
+what follows is the history that led there, and is corrected where it was wrong.
+
 **Turning the box off and turning it on are not symmetric.** Off is one ADB
 keyevent. On depends on standby depth: while the box is still on the LAN
 (shallow standby, or awake under a dark television) `KEYCODE_WAKEUP` and the
@@ -829,19 +834,24 @@ is still on the LAN. Two halves on a two-thread pool, then a confirm loop:
 input), `None` (could not tell). `_dispatch_tv` and `_ensure_playable` read it
 by identity and say different things for each; they never truthiness-test it.
 
-**The deep-standby fallback** — `services/cec_wake.py`, two steps:
+**The deep-standby fallback** — `services/cec_wake.py`. **Corrected 2026-09-25:**
 
-1. **Wake-on-LAN the Samsung TV.** Needs no IP and no token — it is a MAC
-   broadcast — which is what makes the whole chain recoverable. Took 2 attempts
-   in testing.
-2. **Toggle the TV's HDMI input** over its WebSocket API. The TV emits
-   `<Routing Change>` + `<Set Stream Path>` on the CEC bus and the box wakes.
+1. **Wake-on-LAN the Samsung TV** and press nothing. Once its CEC side is up
+   (~37s after a cold power-on) it announces the input it came up on, and the
+   box on HDMI 2 wakes. Box on the LAN at 34-42s, measured three times.
+2. **Only if the box has not appeared by `settle_ms`**, select HDMI 2 through
+   the Source menu (`CecWaker.select_box_input`) and give it `rescue_settle_ms`.
 
-**Step 2 is load-bearing.** The box was still unreachable after the TV powered
-on and only woke after the input toggle, so WoL alone is not enough and the
-pairing token is a hard dependency. That is why a rejected token gets its own
-`WakeResult.needs_pairing` and its own spoken line — "approve me on screen" and
-"use the remote" are opposite fixes, and giving the wrong one strands him.
+**The old step 2 -- a `KEY_HDMI` "away and back" pair -- was the bug, not the
+load-bearing part.** While the box is asleep it sends no signal, and the
+Samsung's cycle key **skips an input with no signal**: the pair moved a TV that
+was already on HDMI 2 onto HDMI 1 and never back, and the box never woke.
+Measured 2026-09-25: the old chain spent 3 x 45s failing (167s), and Master
+Miguel found the TV sitting on HDMI 1 -- "booted on HDMI 1, never switched".
+The earlier "only woke after the input toggle" observation predates the cycle
+skipping being understood. A rejected token still gets its own
+`WakeResult.needs_pairing` and spoken line, now from `KEY_POWER` or the Source
+menu -- "approve me on screen" and "use the remote" are opposite fixes.
 
 - **`dumpsys hdmi_control` history is a capped ring buffer (~246 entries).**
   Counting entries to detect new CEC traffic reports `+0` and looks exactly like
@@ -850,8 +860,12 @@ pairing token is a hard dependency. That is why a rejected token gets its own
 - **Sleeping the box switches the TV off too** (`mAutoTvOff: true`,
   `hdmi_control_auto_device_off_enabled=1`). Intended — "turn off the TV" means
   both — but it is why the wake must WoL the TV first
-- The Mi Box is CEC physical address `0x2000` = **HDMI 2**. `KEY_HDMI` toggles
-  HDMI2 <-> HDMI1 on this set, so **odd presses select the box**
+- The Mi Box is CEC physical address `0x2000` = **HDMI 2**; HDMI 1 is a tuner
+  (CEC logical address 3). **Corrected 2026-09-25:** `KEY_HDMI` cycles only
+  inputs with a live signal, so it cannot select a sleeping box, and
+  `KEY_HDMI1`/`KEY_HDMI2` are accepted and ignored. The Source menu lists TV,
+  HDMI 1, HDMI 2 and LEFT does not wrap, so `KEY_SOURCE`, LEFT x4, RIGHT x port,
+  `KEY_ENTER` selects any port from anywhere (`CecWaker.select_input`)
 - `tv_ip` is a **cached hint, not configuration.** Identity keys off `tv_mac` and
   `tv_duid`, both stable. On a miss `resolve_tv_ip()` goes cached -> hint -> ARP by
   MAC -> TCP scan on :8001, verifying the duid at every step, and caches the answer
@@ -902,8 +916,9 @@ the television enters standby; either way it force-suspends ~15s later and the
 next wake costs ~30s of resume.
 
 `media.power.tv_only_standby` makes `turn_off` put only the television into
-standby and keep the box awake, so the next `turn_on` is the ~2s path. Three
-facts shape it, all measured on the real pair 2026-09-21/22:
+standby and keep the box awake, so the next `turn_on` is the ~5s path. **It is
+on since 2026-09-25, and point 2 and 3 below are superseded** -- see "turn_on,
+rebuilt". The history, measured on the real pair 2026-09-21/22:
 
 1. **The standby key is `KEY_POWER`, and it is a toggle.** `KEY_POWEROFF` is
    ignored by this set and `KEYCODE_TV_POWER` never leaves the box (table
@@ -927,12 +942,68 @@ facts shape it, all measured on the real pair 2026-09-21/22:
    stop waking the television too -- and restoring it while the box is already
    awake cannot fire it, because OTP only runs on a wake.
 
-It needs no box setting: stock `auto_device_off=1` and `one_touch_play=1` are
-what it expects (both were restored after the experiments). **Off by default
-until `tools/bench_tv_power.py standby-mode --hold 120` has shown the box
-holding awake with the TV dark**; that run needs a `KEY_POWER` send, which has
-to be started by hand. The trade when it is on: "turn off the TV" leaves the
-box running on its screensaver behind a dark set.
+It needs no box setting. **The trade:** "turn off the TV" leaves the box
+running on its screensaver behind a dark set, a few watts.
+
+#### turn_on, rebuilt (2026-09-25)
+
+Every number here is from the real pair on 2026-09-25.
+
+**Off: the box never hears the TV's `<Standby>`.** Android 11's
+`HdmiCecLocalDevice.handleStandby()` only calls `standby()` when
+`isControlEnabled()`, which is `hdmi_control_enabled` -- shell-writable. So
+`_standby_tv_only` switches the box's HDMI-CEC **off**, sends `KEY_POWER` (behind a
+fresh "on" reading), waits for the set to go dark plus `cec_reenable_delay_ms`,
+and switches HDMI-CEC **back on**. Box still awake 50s+ and a 15-minute soak
+later, settings stock. This replaced catching the box inside the ~3-5s before
+adbd suspended, with One Touch Play suppressed across the window. And
+`persist.sys.hdmi.keep_awake`, named above as the gate, is not: in Android 11 it
+only picks a wakelock (`HdmiCecLocalDevicePlayback`) and is not consulted on
+the `<Standby>` path.
+
+- **CEC must come back on.** Left off, the Xiaomi remote cannot turn the TV on:
+  a box wake announces `<Text View On>` over CEC. The tail runs on a thread so
+  the spoken "done" returns in ~3.5s, and that thread is **not a daemon** -- a
+  daemon one died with a script that exited straight after `turn_off` and left
+  the real box at `hdmi_control_enabled=0`. `_finish_pending_standby()` is
+  joined before any later power command and at orchestrator shutdown.
+- **Only California's `turn_off` keeps the box up.** The Samsung remote's power
+  button still broadcasts `<Standby>` to a box with CEC on, so the box sleeps
+  and the next `turn_on` is the ~35s path (observed 18:41 that day).
+
+**On, box awake (the normal case): ~5s.** `tv_power()` reads the TV's UPnP
+port: **:9197 closes within 6s of standby while :8001 stays up ~15s** (shallow
+standby, where WoL does nothing), then both close (deep). `ensure_tv_on` sends
+`KEY_POWER` for shallow -- only after reading standby twice, because a set
+mid-power-on answers :8001 ~1s before :9197 -- and Wake-on-LAN for deep. Then
+`ensure_active_source`: the box's own `mIsActiveSource` is live (it went False
+the instant the TV switched to HDMI 1), so the box only claims its input when it
+says it is not on screen. **Re-enabling HDMI-CEC does not turn a TV on** -- it
+sends `<Active Source>` and the set answers "standby" -- which is why the TV is
+powered from the network side first.
+
+**Selecting the box's input: the box claims it.** `claim_active_source()`
+switches the box's HDMI-CEC off and on in one shell; it re-announces
+`<Active Source>` and the Samsung follows in ~1s from any input (confirmed by
+the TV's `<Routing Change> 20:00` on a later key). The TV's own tell that it
+switched to us is `<Give Deck Status> 04:1A`. The Source menu is the rescue.
+`KEY_HDMI2` is never sent (the old loop's first attempt, always wasted), and
+cycling is gone.
+
+**Keys go out without samsungtvws' hidden second.** `send_key` sleeps 1s after
+every key unless `key_press_delay=0`; the 7-key Source sequence went from 11.3s
+to 2.5s. That hidden second is also where most of the old 6s "pair" went.
+
+| path | before | after |
+|---|---|---|
+| box awake, TV dark (tv_only_standby) | race; off by default | **4.9-5.4s** |
+| everything off, TV last on HDMI 2 | 45-63s, or 167s and fail | **34-42s**, no key |
+| everything off, TV left on HDMI 1 | never | Source rescue, box 7.9s after Enter |
+| `turn_off` (tv_only_standby) | -- | **3.3-4.2s** spoken, CEC back on ~12s |
+
+Deep standby cannot beat ~37s from the software side: that is the Samsung's CEC
+start after a cold power-on, and resending keys every 4s did not bring the wake
+forward. A box that never went deep is the only faster route without root.
 
 **The power actions are deliberately absent from `_dispatch_tv`'s `requires_tv`
 set.** That gate returns `"TV is off or unreachable right now"` when
@@ -1932,7 +2003,7 @@ Recommended behavior:
 
 ### Operational Recommendation
 
-A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby`, which needs no box setting — see "Standby depth" above. Both devices also have static addresses outside the DHCP pool since 2026-09-22 — see "Static addresses".
+A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby`, on since 2026-09-25 — see "turn_on, rebuilt" above. Both devices also have static addresses outside the DHCP pool since 2026-09-22 — see "Static addresses".
 
 ### Final VPN Routing Rules
 
@@ -2492,9 +2563,24 @@ Current automated coverage exists for:
   `is_awake()` keeps `None` distinct from `False`, that the wait loop clears
   the offline cooldown, and that `turn_on` survives the `requires_tv` gate
   while the TV is unreachable
-- CEC wake: self-disabling without `tv_mac`/`tv_duid`, WoL skipped when the TV
-  already answers and retried when it does not, the input key sent exactly twice,
-  and an auth failure flagged `needs_pairing` while other failures are not
+- CEC wake: self-disabling without `tv_mac`/`tv_duid`; `tv_power()` reading
+  :9197 not :8001, and one refused :9197 probe never read as standby;
+  `ensure_tv_on` sending nothing to a lit TV, `KEY_POWER` to shallow standby only
+  after two standby reads, Wake-on-LAN (never `KEY_POWER`) to deep standby;
+  `wake()` pressing no input key; the Source-menu sequence (LEFT x4, RIGHT x
+  port) with no direct `KEY_HDMI<n>`; keys sent with `key_press_delay=0` and the
+  connection closed; and an auth failure flagged `needs_pairing` while other
+  failures are not
+- The rebuilt power path (2026-09-25): a dark TV under an awake box is powered
+  and then the input verified, never a box wake; deep standby presses no key
+  when the box comes up by itself, rescues through the Source menu once, and
+  gives up after it; `claim_active_source` toggles HDMI-CEC off then on in one
+  shell and never switches on a CEC its owner turned off; `ensure_active_source`
+  claims first, menus second, and never sends `KEY_HDMI2`; `tv_only_standby`
+  switches CEC off before `KEY_POWER` and back on after (also when the key
+  raises, and on when the box answered nothing), needs a positive "on" reading,
+  returns before the restore finishes, runs that restore on a **non-daemon**
+  thread, and makes the next power command wait for it
 - TV discovery: a cached IP that verifies skips discovery entirely, a wrong duid
   at that IP is rejected rather than trusted, warm ARP then the TCP scan are what
   ships and are tried in that order, total failure returns `""` instead of raising,
@@ -3124,6 +3210,22 @@ just the commits.
   tie-break only. The bulb went off the wall switch mid-session, which is
   what exposed the shared hedge wording and produced the
   unreachable-vs-unreadable split.
+
+- **"We need to fix all these logical flaws" (2026-09-25, branch
+  `feat/runtime-logs`).** Started as "something is weird with the HDMI switch";
+  Master Miguel had booted on HDMI 1 and it never switched. Live on the real
+  pair: `KEY_HDMI` skips an input with no signal, so the blind pair parked the
+  TV on HDMI 1 and the old chain failed in 167s; the Source menu is ordered TV,
+  HDMI 1, HDMI 2 and LEFT does not wrap; toggling the box's HDMI-CEC makes it
+  claim its input; :9197 is the TV's live power reading; samsungtvws hides a 1s
+  sleep per key. Ruled out along the way: an ADB command for a box in deep
+  standby (no ping, no ARP), and wake-on-Wi-Fi without root (`WowEnable` is in
+  `/proc/net/wlan/cfg` but SELinux denies the shell's write). Then the
+  no-root win: Android 11 ignores the TV's `<Standby>` while
+  `hdmi_control_enabled` is 0, so `tv_only_standby` became a gate instead of a
+  race and shipped on. "On" 42s -> ~5s. A daemon restore thread left the real
+  box with CEC off once; it is non-daemon now. Root research is in
+  `research/` (not yet acted on).
 
 -----
 

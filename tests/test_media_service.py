@@ -456,9 +456,10 @@ class EnsureActiveSourceTests(unittest.TestCase):
     """
     Selecting the box's input must be VERIFIED, because the TV lies by omission.
 
-    switch_input sends KEY_HDMI<n>, the websocket accepts it, and this set
-    ignores it -- so "the send succeeded" says nothing about what is on screen.
-    Measured 2026-09-05: three switch_hdmi(2) calls left the TV on HDMI 1.
+    The websocket accepts KEY_HDMI2 and this set ignores it (measured
+    2026-09-05), and the KEY_HDMI cycle skips an input with no signal. So the
+    box claims its own input (HDMI-CEC off and on re-announces <Active Source>),
+    the Source menu is the rescue, and the box's mIsActiveSource is the witness.
     """
 
     def _service(self):
@@ -467,52 +468,52 @@ class EnsureActiveSourceTests(unittest.TestCase):
         )
         svc = MediaService(cfg, cec_waker=Mock())
         svc.switch_hdmi = Mock()
+        # Unpatched this is a real `adb shell settings put` at whatever box adb
+        # is attached to -- it would switch the real box's HDMI-CEC off and on.
+        svc.claim_active_source = Mock(return_value=True)
+        svc.cec_waker.select_box_input.return_value = WakeResult(True, "selected HDMI 2")
         return svc
 
     def test_already_on_screen_changes_nothing(self):
         svc = self._service()
         svc.is_active_source = Mock(return_value=True)
         self.assertIs(svc.ensure_active_source(), True)
+        svc.claim_active_source.assert_not_called()
         svc.switch_hdmi.assert_not_called()
 
-    def test_a_rejected_token_stops_the_loop_and_is_recorded(self):
-        """Cycling will not fix a revoked pairing; the dispatcher needs to know why."""
+    def test_a_rejected_token_stops_the_rescue_and_is_recorded(self):
+        """The Source menu will not fix a revoked pairing; the dispatcher needs to know why."""
         svc = self._service()
         svc.is_active_source = Mock(return_value=False)
-        svc.switch_hdmi.return_value = WakeResult(False, "token rejected", needs_pairing=True)
+        svc.cec_waker.select_box_input.return_value = WakeResult(False, "token rejected", needs_pairing=True)
         with patch("services.media_service.time.sleep"):
             self.assertIs(svc.ensure_active_source(), False)
-        svc.cec_waker.cycle_input.assert_not_called()
         self.assertIs(svc.last_input_result.needs_pairing, True)
-        svc.cec_waker.cycle_input.assert_not_called()
 
     def test_unknown_state_never_touches_the_input(self):
-        """Cycling from an unknown input is not idempotent -- do not guess."""
+        """Do not guess: None is "could not tell", never "not on screen"."""
         svc = self._service()
         svc.is_active_source = Mock(return_value=None)
         self.assertIsNone(svc.ensure_active_source())
-        svc.switch_hdmi.assert_not_called()
-        svc.cec_waker.cycle_input.assert_not_called()
+        svc.claim_active_source.assert_not_called()
+        svc.cec_waker.select_box_input.assert_not_called()
 
-    def test_it_escalates_from_direct_addressing_to_cycling(self):
-        """
-        Direct first (one deterministic press when it works), then cycling, which
-        is the mechanism actually proven on this set. A direct-only loop never
-        converges here.
-        """
+    def test_the_box_claims_first_and_the_source_menu_rescues(self):
         svc = self._service()
         svc.is_active_source = Mock(side_effect=[False, False, True])
         with patch("services.media_service.time.sleep"):
             self.assertIs(svc.ensure_active_source(), True)
-        svc.switch_hdmi.assert_called_once_with(svc.mibox_hdmi_port)
-        svc.cec_waker.cycle_input.assert_called_once()
+        svc.claim_active_source.assert_called_once()
+        svc.cec_waker.select_box_input.assert_called_once()
+        svc.switch_hdmi.assert_not_called()
 
-    def test_it_gives_up_rather_than_cycling_forever(self):
+    def test_it_gives_up_after_one_claim_and_one_menu_selection(self):
         svc = self._service()
         svc.is_active_source = Mock(return_value=False)
         with patch("services.media_service.time.sleep"):
             self.assertIs(svc.ensure_active_source(attempts=3), False)
-        self.assertEqual(svc.cec_waker.cycle_input.call_count, 2)
+        svc.claim_active_source.assert_called_once()
+        svc.cec_waker.select_box_input.assert_called_once()
 
     def test_a_dumpsys_that_stops_answering_mid_loop_returns_none(self):
         svc = self._service()
