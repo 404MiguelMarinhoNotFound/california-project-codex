@@ -168,7 +168,9 @@ Common things to adjust:
 - VAD sensitivity
 - LLM provider and model
 - TTS provider and voice
-- Stremio sync interval and autoplay delay
+- Stremio sync interval and the stream-list / playback timeouts
+- TV power behaviour (`media.power.tv_only_standby`: "turn off" keeps the box awake behind a dark TV, so "turn on" takes ~5s)
+- runtime logs (`logging:` -- `logs/california.log`, and per-turn timings in `logs/turns.jsonl`)
 - YouTube saved playlist categories
 - ADB target device settings for the Mi Box / Android TV
 
@@ -241,8 +243,8 @@ Stremio playback follows a reliability-first flow:
 1. check `watch_state.json`
 2. fall back to TMDB if needed
 3. resolve IMDb ID
-4. launch Stremio via ADB
-5. retry autoplay confirmation if playback does not start
+4. launch Stremio via ADB with a clear-task deep link (the app stays warm and the right episode opens)
+5. wait for the stream list, press OK once, and confirm playback from Stremio's own media session
 
 YouTube support is intentionally simple:
 
@@ -257,7 +259,8 @@ YouTube support is intentionally simple:
 - `watch_state.json` is a generated local cache and should stay disposable
 - `core/orchestrator.py` is the main coordinator for speech flow and tool dispatch
 - most integrations live under `services/`
-- for stable ADB behavior on the Mi Box, Wakelock Revamp is a useful deployment-side helper
+- wakelock apps (Wakelock Revamp included) do not keep the Mi Box reachable: its firmware force-suspends ~15s after sleep regardless. `media.power.tv_only_standby` is the lever -- see CLAUDE.md "turn_on, rebuilt"
+- each voice turn's timings land in `logs/turns.jsonl`; read them before guessing at latency
 
 ## Cost Target
 
