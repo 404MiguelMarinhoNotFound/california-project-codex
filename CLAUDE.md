@@ -822,10 +822,11 @@ is still on the LAN. Two halves on a two-thread pool, then a confirm loop:
 3. **Confirm on the CEC bus:** `_confirm_tv_showing_box` polls `hdmi_state()`
    until `tv_power == "on"` and the box is the active source. The input is
    selected only on a definitive `active_source is False`, never on `None`. If
-   the bus says the TV is still in **standby**, the proven `KEY_HDMI` pair is
-   sent once (`CecWaker.press_input_pair`) — **WoL does not lift a television
-   out of shallow standby**; the box's own `<Text View On>` + `<Active Source>`
-   or that pair does. Only evidence stamped **after the wake started** counts
+   the bus says the TV is still in **standby**, it is powered once with
+   `CecWaker.ensure_tv_on` — **WoL does not lift a television out of shallow
+   standby**, so that sends `KEY_POWER` there and WoL only for deep standby.
+   (This used to send the `KEY_HDMI` pair; removed 2026-09-25, see "turn_on,
+   rebuilt".) Only evidence stamped **after the wake started** counts
    (`_parse_tv_power(..., since=)`), because the tail read "standby" for good
    after the set was switched back on by hand (2026-09-21).
 
@@ -2613,16 +2614,12 @@ Current automated coverage exists for:
   that the fast path fires `KEYCODE_WAKEUP` and WoL once each and concurrently
   (a barrier test), that a TV-half failure or exception never fails a box that
   is awake, that a box that will not wake over ADB falls back to CEC, that the
-  confirm loop never switches inputs on an unknown active source and sends the
-  `KEY_HDMI` pair only when the bus says standby, that evidence older than the
+  confirm loop never switches inputs on an unknown active source and powers
+  the TV only when the bus says standby, that evidence older than the
   wake is ignored, that a parked input gets the box's own One Touch Play
   grace before any key is sent, that `_wait_for_awake` never rediscovers,
-  that `tv_only_standby` never sends `KEYCODE_SLEEP`, sends `KEY_POWER` only
-  on a fresh "on" reading (never on standby or unknown), catches the box
-  when the TV's standby puts it down and wakes it again, suppresses One Touch
-  Play across that window and restores it even when the catch raises (and
-  leaves it enabled when the box's value is unreadable), and never touches
-  OTP when the television command itself failed, that
+  that `tv_only_standby` never sends `KEYCODE_SLEEP` (its CEC-off gate is in
+  "The rebuilt power path" below), that
   `is_awake()` keeps `None` distinct from `False`, that the wait loop clears
   the offline cooldown, and that `turn_on` survives the `requires_tv` gate
   while the TV is unreachable
