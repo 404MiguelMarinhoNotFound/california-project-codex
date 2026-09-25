@@ -954,8 +954,20 @@ Every number here is from the real pair on 2026-09-25.
 `isControlEnabled()`, which is `hdmi_control_enabled` -- shell-writable. So
 `_standby_tv_only` switches the box's HDMI-CEC **off**, sends `KEY_POWER` (behind a
 fresh "on" reading), waits for the set to go dark plus `cec_reenable_delay_ms`,
-and switches HDMI-CEC **back on**. Box still awake 50s+ and a 15-minute soak
-later, settings stock. This replaced catching the box inside the ~3-5s before
+and switches HDMI-CEC **back on**. Box still awake 50s+ later, settings stock.
+
+**The soak was interrupted -- it is NOT a clean long-idle result.** A 90-minute
+once-a-minute `mWakefulness` poll was started at 18:51 with the TV dark. The box
+read Awake in all 72 samples it took, but the idle was broken twice by our own
+testing: a live `turn_on`/`turn_off` at 19:07-19:09 (between samples, so absent
+from the log), and from 19:37 the Stremio tests had the TV on. The longest
+stretch actually left alone with the TV dark was **~27 minutes** (19:09-19:36),
+after a clean 16 (18:51-19:07). So "no hidden idle timer" is shown for ~30
+minutes, not for a night. Re-run it undisturbed -- `tools/bench_tv_power.py soak`,
+or the poll above for several hours -- before trusting it overnight. The
+worst case if a timer exists is the ~35s deep-standby wake, not a failure.
+
+This replaced catching the box inside the ~3-5s before
 adbd suspended, with One Touch Play suppressed across the window. And
 `persist.sys.hdmi.keep_awake`, named above as the gate, is not: in Android 11 it
 only picks a wakelock (`HdmiCecLocalDevicePlayback`) and is not consulted on
