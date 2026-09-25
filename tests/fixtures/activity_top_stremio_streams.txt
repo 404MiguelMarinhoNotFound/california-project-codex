@@ -1,0 +1,350 @@
+TASK 10090:com.stremio.one id=3121 userId=0
+  ACTIVITY com.stremio.one/com.stremio.tv.MainActivity 4b0284c pid=12171
+    Local Activity 90a4cdc State:
+      mResumed=true mStopped=false mFinished=false
+      mIsInMultiWindowMode=false mIsInPictureInPictureMode=false
+      mChangingConfigurations=false
+      mCurrentConfig={1.0 ?mcc?mnc [en_US] ldltr sw540dp w960dp h540dp 320dpi lrg long land television -touch -keyb/v/h dpad/v winConfig={ mBounds=Rect(0, 0 - 1920, 1080) mAppBounds=Rect(0, 0 - 1920, 1080) mWindowingMode=fullscreen mDisplayWindowingMode=fullscreen mActivityType=standard mAlwaysOnTop=undefined mRotation=ROTATION_0} s.2}
+      mLoadersStarted=true
+      Active Fragments in 9af687a:
+        #0: ReportFragment{9e0d82b #0 androidx.lifecycle.LifecycleDispatcher.report_fragment_tag}
+          mFragmentId=#0 mContainerId=#0 mTag=androidx.lifecycle.LifecycleDispatcher.report_fragment_tag
+          mState=5 mIndex=0 mWho=android:fragment:0 mBackStackNesting=0
+          mAdded=true mRemoving=false mFromLayout=false mInLayout=false
+          mHidden=false mDetached=false mMenuVisible=true mHasMenu=false
+          mRetainInstance=false mRetaining=false mUserVisibleHint=true
+          mFragmentManager=FragmentManager{9af687a in HostCallbacks{2db5488}}
+          mHost=android.app.Activity$HostCallbacks@2db5488
+          Child FragmentManager{4549e21 in ReportFragment{9e0d82b}}:
+            FragmentManager misc state:
+              mHost=android.app.Activity$HostCallbacks@2db5488
+              mContainer=android.app.Fragment$1@ebb9246
+              mParent=ReportFragment{9e0d82b #0 androidx.lifecycle.LifecycleDispatcher.report_fragment_tag}
+              mCurState=5 mStateSaved=false mDestroyed=false
+      Added Fragments:
+        #0: ReportFragment{9e0d82b #0 androidx.lifecycle.LifecycleDispatcher.report_fragment_tag}
+      FragmentManager misc state:
+        mHost=android.app.Activity$HostCallbacks@2db5488
+        mContainer=android.app.Activity$HostCallbacks@2db5488
+        mCurState=5 mStateSaved=false mDestroyed=false
+    ViewRoot:
+      mAdded=true mRemoved=false
+      mConsumeBatchedInputScheduled=false
+      mConsumeBatchedInputImmediatelyScheduled=false
+      mPendingInputEventCount=0
+      mProcessInputEventsScheduled=false
+      mTraversalScheduled=true      mIsAmbientMode=false      mUnbufferedInputSource=0 (barrier=5017)
+      android.view.ViewRootImpl$NativePreImeInputStage: mQueueLength=0
+      android.view.ViewRootImpl$ImeInputStage: mQueueLength=0
+      android.view.ViewRootImpl$NativePostImeInputStage: mQueueLength=0
+    Choreographer:
+      mFrameScheduled=true
+      mLastFrameTime=143956460 (15 ms ago)
+    
+InsetsController:
+      InsetsState
+        InsetsSource type=ITYPE_IME frame=[0,0][0,0] visible=false
+    View Hierarchy:
+      DecorView@414bc72[MainActivity]
+        android.widget.LinearLayout{54d8e1f V.E...... ......I. 0,0-1920,1080}
+          android.view.ViewStub{492cc07 G.E...... ......I. 0,0-0,0 #10201af android:id/action_mode_bar_stub}
+          android.widget.FrameLayout{bee2dbe V.E...... ......I. 0,0-1920,1080}
+            androidx.appcompat.widget.FitWindowsLinearLayout{7bb1c79 V.E...... ......I. 0,0-1920,1080 #7f0b003e app:id/action_bar_root}
+              androidx.appcompat.widget.ViewStubCompat{1153134 G.E...... ......I. 0,0-0,0 #7f0b004c app:id/action_mode_bar_stub}
+              androidx.appcompat.widget.ContentFrameLayout{dddf540 V.E...... ......I. 0,0-1920,1080 #1020002 android:id/content}
+                android.widget.FrameLayout{6b28c3 V.E...... ......I. 0,0-1920,1080}
+                  androidx.fragment.app.FragmentContainerView{d2fa127 VFE...... ......I. 0,0-1920,1080 #7f0b025a app:id/nav_host_fragment aid=1073741825}
+                    androidx.fragment.app.FragmentContainerView{cee21ae V.E...... ......I. 0,0-1920,1080 #7f0b025a app:id/nav_host_fragment}
+                      android.widget.FrameLayout{a3b8b4f V.E...... ......I. 0,0-1920,1080}
+                        androidx.appcompat.widget.AppCompatImageView{7457561 V.ED..... ........ 0,0-1920,1080 #7f0b021c app:id/meta_details_background}
+                        android.view.View{c04a57d V.ED..... ........ 0,0-1920,1080}
+                        com.stremio.tv.layout.FixedFocusLinearLayout{7bd7109 V.E...... ......I. 184,0-1920,1080}
+                          android.widget.FrameLayout{5c80735 G.E...... ......ID 0,0-1736,1080 #7f0b0222 app:id/meta_details_loading_frame}
+                            android.widget.ProgressBar{e4d256c V.ED..... ......ID 820,492-916,588}
+                          android.widget.LinearLayout{d3bfb5d G.E...... ......I. 0,0-0,0 #7f0b021e app:id/meta_details_error_frame}
+                            androidx.appcompat.widget.AppCompatImageView{e8cd2 V.ED..... ......ID 0,0-0,0}
+                            androidx.appcompat.widget.AppCompatTextView{18621a3 V.ED..... ......I. 0,0-0,0}
+                          android.widget.LinearLayout{e798210 V.E...... ......I. 0,0-1736,1080 #7f0b021f app:id/meta_details_frame}
+                            android.widget.LinearLayout{a5ca6d3 V.E...... ........ 60,60-1460,441}
+                              android.widget.FrameLayout{8a428c2 V.E...... ........ 0,0-666,160}
+                                androidx.appcompat.widget.AppCompatImageView{6d7d10d V.ED..... ........ 0,0-666,160 #7f0b0230 app:id/meta_preview_logo}
+                              androidx.appcompat.widget.AppCompatTextView{d032a85 V.ED..... ........ 0,160-323,236 #7f0b0220 app:id/meta_details_label}
+                              androidx.appcompat.widget.AppCompatTextView{92bd0da V.ED..... ........ 0,236-406,291 #7f0b0226 app:id/meta_details_video_label}
+                              android.widget.FrameLayout{6dc83fc V.E...... ........ 0,291-1400,381}
+                                androidx.appcompat.widget.AppCompatTextView{7bc0cef V.ED..... ........ 0,20-184,90 #7f0b021d app:id/meta_details_description}
+                            android.widget.LinearLayout{9a9eecd V.E...... ......I. 0,471-1736,892 #7f0b0221 app:id/meta_details_list_view}
+                              androidx.fragment.app.FragmentContainerView{b6e2ca0 G.E...... ......I. 0,0-0,0 #7f0b0223 app:id/meta_details_seasons}
+                                androidx.leanback.widget.VerticalGridView{de692dc VFE...... ......I. 0,0-0,0 #7f0b00c9 app:id/container_list}
+                              androidx.fragment.app.FragmentContainerView{2de0c64 V.E...... ......I. 0,0-1736,127 #7f0b021b app:id/meta_details_addons}
+                                androidx.leanback.widget.VerticalGridView{e13bfe5 VFE...... ......I. 0,0-1736,127 #7f0b00c9 app:id/container_list}
+                                  androidx.leanback.widget.RowContainerView{dbcbef5 V.E...... ........ 0,0-1736,127}
+                                    androidx.leanback.widget.NonOverlappingLinearLayout{20a248a V.E...... ........ 0,0-1736,0 #7f0b01cf app:id/lb_row_container_header_dock}
+                                      android.widget.LinearLayout{341f059 G.E...... ......I. 0,0-0,0}
+                                        androidx.leanback.widget.RowHeaderView{824a41e V.ED..... ......I. 0,0-0,0 #7f0b02a5 app:id/row_header}
+                                        androidx.appcompat.widget.AppCompatTextView{ecf34ff V.ED..... ......I. 0,0-0,0 #7f0b02a6 app:id/row_header_description}
+                                    androidx.leanback.widget.ListRowView{7541718 V.E...... .....A.. 0,0-1736,127}
+                                      androidx.leanback.widget.HorizontalGridView{22fcafb VFE...... .....A.. 0,0-1736,127 #7f0b02a4 app:id/row_content}
+                                        androidx.leanback.widget.ShadowOverlayContainer{6c69e73 V.ED..... .....A.. 60,32-133,87}
+                                          com.stremio.tv.layout.RelativeLayoutCheckable{6cab130 VFE...... .....A.. 0,0-73,55 aid=1073741826}
+                                            android.widget.LinearLayout{bf5a32e V.E...... .....A.. 0,0-73,55}
+                                              androidx.appcompat.widget.AppCompatTextView{16a41a9 V.ED..... .....A.. 20,10-53,45}
+                                        androidx.leanback.widget.ShadowOverlayContainer{70568eb V.ED..... .....A.. 149,32-353,87}
+                                          com.stremio.tv.layout.RelativeLayoutCheckable{4077648 VFE...... .....A.. 0,0-204,55}
+                                            android.widget.LinearLayout{1a2ea06 V.E...... .....A.. 0,0-204,55}
+                                              androidx.appcompat.widget.AppCompatTextView{e77ce1 V.ED..... .....A.. 20,10-184,45}
+                              androidx.fragment.app.FragmentContainerView{c9972cc G.E...... ......I. 0,0-0,0 #7f0b0227 app:id/meta_details_videos}
+                                androidx.leanback.widget.VerticalGridView{2feaaba VFE...... ......I. 0,0-0,0 #7f0b00c9 app:id/container_list}
+                              androidx.fragment.app.FragmentContainerView{ee1b05c V.E...... ......I. 0,107-1736,421 #7f0b0224 app:id/meta_details_streams}
+                                androidx.leanback.widget.VerticalGridView{44f8d6b VFE...... ......I. 0,0-1736,314 #7f0b00c9 app:id/container_list}
+                                  androidx.leanback.widget.RowContainerView{59fe88c V.E...... ........ 0,0-1736,314}
+                                    androidx.leanback.widget.NonOverlappingLinearLayout{4183915 G.E...... ......I. 0,0-0,0 #7f0b01cf app:id/lb_row_container_header_dock}
+                                      android.widget.LinearLayout{af2e42a G.E...... ......I. 0,0-0,0}
+                                        androidx.leanback.widget.RowHeaderView{d6c221b V.ED..... ......I. 0,0-0,0 #7f0b02a5 app:id/row_header}
+                                        androidx.appcompat.widget.AppCompatTextView{550efb8 V.ED..... ......I. 0,0-0,0 #7f0b02a6 app:id/row_header_description}
+                                    androidx.leanback.widget.ListRowView{432e9bf V.E...... ........ 0,0-1736,314}
+                                      androidx.leanback.widget.HorizontalGridView{e2733de VFE...... ........ 0,0-1736,314 #7f0b02a4 app:id/row_content}
+                                        androidx.leanback.widget.ShadowOverlayContainer{35df216 V.ED..... ..S..... 60,24-780,274}
+                                          androidx.cardview.widget.CardView{3a85b31 VFE...C.. .FS..... 0,0-720,250 aid=1073741827}
+                                            android.widget.LinearLayout{e029bd8 V.E...... ..S..... 0,0-720,250 #7f0b02f5 app:id/stream_card_stub_inflated}
+                                              androidx.appcompat.widget.AppCompatTextView{7a66abb V.ED..... ..S..... 20,109-160,140}
+                                              androidx.appcompat.widget.AppCompatTextView{1c6f797 V.ED..... ..S..... 160,17-600,233}
+                                              android.widget.FrameLayout{af6796d V.E...... ..S..... 600,0-696,250}
+                                                android.view.View{6f19d84 V.ED..... ..S..... 0,77-96,173}
+                                                androidx.appcompat.widget.AppCompatImageView{b3f19a2 V.ED..... ..S..... 24,101-72,149}
+                                        androidx.leanback.widget.ShadowOverlayContainer{a4378ab V.ED..... ........ 816,24-1536,274}
+                                          androidx.cardview.widget.CardView{66e3afa VFE...C.. ........ 0,0-720,250}
+                                            android.widget.LinearLayout{c26925 V.E...... ........ 0,0-720,250 #7f0b02f5 app:id/stream_card_stub_inflated}
+                                              androidx.appcompat.widget.AppCompatTextView{16d191c V.ED..... ........ 20,109-160,140}
+                                              androidx.appcompat.widget.AppCompatTextView{cc0ab08 V.ED..... ........ 160,32-600,218}
+                                              android.widget.FrameLayout{d50cc6 V.E...... ........ 600,0-696,250}
+                                                android.view.View{25572a1 V.ED..... ........ 0,77-96,173}
+                                                androidx.appcompat.widget.AppCompatImageView{bbef487 V.ED..... ........ 24,101-72,149}
+                                        androidx.leanback.widget.ShadowOverlayContainer{cf8d4d9 V.ED..... ........ 1572,24-2292,274}
+                                          androidx.cardview.widget.CardView{4d7d320 VFE...C.. ........ 0,0-720,250}
+                                            android.widget.LinearLayout{68c5223 V.E...... ........ 0,0-720,250 #7f0b02f5 app:id/stream_card_stub_inflated}
+                                              androidx.appcompat.widget.AppCompatTextView{6852f52 V.ED..... ........ 20,109-160,140}
+                                              androidx.appcompat.widget.AppCompatTextView{fa2ee9e V.ED..... ........ 160,17-600,233}
+                                              android.widget.FrameLayout{d37014c V.E...... ........ 600,0-696,250}
+                                                android.view.View{947ed7f V.ED..... ........ 0,77-96,173}
+                                                androidx.appcompat.widget.AppCompatImageView{f98e595 V.ED..... ........ 24,101-72,149}
+                            android.widget.LinearLayout{1d04df6 V.E...... ........ 60,892-1736,1020}
+                              androidx.appcompat.widget.AppCompatButton{5fd3a91 VFED..C.. ........ 0,32-100,128 #7f0b0218 app:id/meta_detail_btn_trailer}
+                              androidx.appcompat.widget.AppCompatButton{2e2aecf VFED..C.. ........ 120,32-220,128 #7f0b0214 app:id/meta_detail_btn_library}
+                              androidx.appcompat.widget.AppCompatButton{fb655f7 VFED..C.. ........ 240,32-340,128 #7f0b0219 app:id/meta_detail_btn_watched}
+                              androidx.appcompat.widget.AppCompatButton{cd05191 GFED..C.. ......I. 0,0-0,0 #7f0b0217 app:id/meta_detail_btn_toggle_notifications}
+                              androidx.appcompat.widget.AppCompatButton{4b318f6 GFED..C.. ......I. 0,0-0,0 #7f0b0215 app:id/meta_detail_btn_rate_like}
+                              androidx.appcompat.widget.AppCompatButton{620c4f7 GFED..C.. ......I. 0,0-0,0 #7f0b0216 app:id/meta_detail_btn_rate_love}
+                              androidx.appcompat.widget.AppCompatTextView{6014f64 G.ED..... ......ID 0,0-0,0 #7f0b0225 app:id/meta_details_streams_label}
+                  androidx.fragment.app.FragmentContainerView{b8bafd4 V.E...... ........ 0,0-370,1080 #7f0b02d1 app:id/side_menu_fragment}
+                    androidx.compose.ui.platform.ComposeView{eb800c8 V.E...... ........ 0,0-370,1080}
+                      androidx.compose.ui.platform.AndroidComposeView{1af64d3 VFED..... ........ 0,0-370,1080 aid=1073741824}
+                        androidx.compose.ui.platform.AndroidViewsHandler{2cc9441 V.E...... ......ID 0,0-370,1080}
+    Looper (main, tid 2) {1775cd}
+      Message 0: { when=-16ms barrier=5017 }
+      Message 1: { when=+6m50s358ms callback=androidx.work.impl.background.greedy.DelayedWorkTracker$1 target=android.os.Handler }
+      (Total messages: 2, polling=false, quitting=false)
+    AutofillManager:
+      sessionId: 2147483647
+      state: UNKNOWN
+      context: com.stremio.tv.MainActivity@90a4cdc
+      client: com.stremio.tv.MainActivity@90a4cdc (android.os.BinderProxy@785d17b)
+      enabled: false
+      enabledAugmentedOnly: false
+      hasService: true
+      hasCallback: true
+      onInvisibleCalled false
+      last autofilled data: null
+      id of last fill UI shown: null
+      tracked views: null
+      fillable ids: null
+      entered ids: null
+      save trigger id: null
+      save on finish(): false
+      options: logLvl=0, compatMode=false, augmented=false, appDisabledExpiration=0
+      compat mode enabled: false
+      debug: false verbose: false
+    Autofill Compat Mode: false
+    No ContentCaptureManager
+    ResourcesManager:
+      cached apks: 0 [cache disabled]
+      total apks: 7
+      resources: 10
+      resource impls: 5
+    Local FragmentActivity 90a4cdc State:
+      mCreated=true mResumed=true mStopped=false    Active Fragments:
+    NavigationMenuFragment{12b993} (64211f04-77a1-4e6a-9752-2d9ece4795c1 id=0x7f0b02d1)
+        mFragmentId=#7f0b02d1 mContainerId=#7f0b02d1 mTag=null
+        mState=7 mWho=64211f04-77a1-4e6a-9752-2d9ece4795c1 mBackStackNesting=0
+        mAdded=true mRemoving=false mFromLayout=false mInLayout=false
+        mHidden=false mDetached=false mMenuVisible=true mHasMenu=false
+        mRetainInstance=false mUserVisibleHint=true
+        mFragmentManager=FragmentManager{735fdd0 in HostCallbacks{432a1c9}}}
+        mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+        mPopDirection=false
+        mContainer=androidx.fragment.app.FragmentContainerView{b8bafd4 V.E...... ........ 0,0-370,1080 #7f0b02d1 app:id/side_menu_fragment}
+        mView=androidx.compose.ui.platform.ComposeView{eb800c8 V.E...... ........ 0,0-370,1080}
+        Child FragmentManager{15050ce in NavigationMenuFragment{12b993}}}:
+          Back Stack Index: 0
+          FragmentManager misc state:
+            mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+            mContainer=androidx.fragment.app.Fragment$5@5255bef
+            mParent=NavigationMenuFragment{12b993} (64211f04-77a1-4e6a-9752-2d9ece4795c1 id=0x7f0b02d1)
+            mCurState=7 mStateSaved=false mStopped=false mDestroyed=false
+    NavHostFragment{cc526fc} (f728545e-89f9-49ce-ad94-c28355218637 id=0x7f0b025a)
+        mFragmentId=#7f0b025a mContainerId=#7f0b025a mTag=null
+        mState=7 mWho=f728545e-89f9-49ce-ad94-c28355218637 mBackStackNesting=0
+        mAdded=true mRemoving=false mFromLayout=false mInLayout=false
+        mHidden=false mDetached=false mMenuVisible=true mHasMenu=false
+        mRetainInstance=false mUserVisibleHint=true
+        mFragmentManager=FragmentManager{735fdd0 in HostCallbacks{432a1c9}}}
+        mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+        mPopDirection=false
+        mContainer=androidx.fragment.app.FragmentContainerView{d2fa127 VFE...... ......I. 0,0-1920,1080 #7f0b025a app:id/nav_host_fragment aid=1073741825}
+        mView=androidx.fragment.app.FragmentContainerView{cee21ae V.E...... ......I. 0,0-1920,1080 #7f0b025a app:id/nav_host_fragment}
+        Child FragmentManager{4ba9185 in NavHostFragment{cc526fc}}}:
+          Active Fragments:
+          LoginFragment{8a81be} (8eb873c9-a681-42b5-b791-2c722a34ecfb id=0x7f0b025a tag=4e103168-266a-4d23-bcef-9aed3ca97114)
+              mFragmentId=#7f0b025a mContainerId=#7f0b025a mTag=4e103168-266a-4d23-bcef-9aed3ca97114
+              mState=1 mWho=8eb873c9-a681-42b5-b791-2c722a34ecfb mBackStackNesting=2
+              mAdded=false mRemoving=true mFromLayout=false mInLayout=false
+              mHidden=false mDetached=false mMenuVisible=true mHasMenu=false
+              mRetainInstance=false mUserVisibleHint=true
+              mFragmentManager=FragmentManager{4ba9185 in NavHostFragment{cc526fc}}}
+              mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+              mParentFragment=NavHostFragment{cc526fc} (f728545e-89f9-49ce-ad94-c28355218637 id=0x7f0b025a)
+              mArguments=Bundle[{android-support-nav:controller:deepLinkIntent=Intent { act=android.intent.action.VIEW dat=stremio:///detail/series/tt12637874/tt12637874:2:9 flg=0x1000c000 cmp=com.stremio.one/com.stremio.tv.MainActivity }, id=tt12637874, type=series, videoId=tt12637874:2:9, autoPlay=false}]
+              mPopDirection=false
+              Child FragmentManager{da4abda in LoginFragment{8a81be}}}:
+                Back Stack Index: 0
+                FragmentManager misc state:
+                  mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+                  mContainer=androidx.fragment.app.Fragment$5@15c80b
+                  mParent=LoginFragment{8a81be} (8eb873c9-a681-42b5-b791-2c722a34ecfb id=0x7f0b025a tag=4e103168-266a-4d23-bcef-9aed3ca97114)
+                  mCurState=1 mStateSaved=false mStopped=false mDestroyed=false
+          MetaDetailsFragment{575521f} (5d3a0a6a-c35c-404c-97ee-90c19cea7f47 id=0x7f0b025a tag=039e81ca-dcbd-4f43-8111-e7c24568b1e9)
+              mFragmentId=#7f0b025a mContainerId=#7f0b025a mTag=039e81ca-dcbd-4f43-8111-e7c24568b1e9
+              mState=7 mWho=5d3a0a6a-c35c-404c-97ee-90c19cea7f47 mBackStackNesting=2
+              mAdded=true mRemoving=false mFromLayout=false mInLayout=false
+              mHidden=false mDetached=false mMenuVisible=true mHasMenu=false
+              mRetainInstance=false mUserVisibleHint=true
+              mFragmentManager=FragmentManager{4ba9185 in NavHostFragment{cc526fc}}}
+              mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+              mParentFragment=NavHostFragment{cc526fc} (f728545e-89f9-49ce-ad94-c28355218637 id=0x7f0b025a)
+              mArguments=Bundle[{android-support-nav:controller:deepLinkIntent=Intent { act=android.intent.action.VIEW dat=stremio:///detail/series/tt12637874/tt12637874:2:9 flg=0x1000c000 cmp=com.stremio.one/com.stremio.tv.MainActivity }, id=tt12637874, type=series, videoId=tt12637874:2:9, autoPlay=false}]
+              mPopDirection=false
+              mContainer=androidx.fragment.app.FragmentContainerView{cee21ae V.E...... ......I. 0,0-1920,1080 #7f0b025a app:id/nav_host_fragment}
+              mView=android.widget.FrameLayout{a3b8b4f V.E...... ......I. 0,0-1920,1080}
+              Child FragmentManager{fbbb6e8 in MetaDetailsFragment{575521f}}}:
+                Active Fragments:
+                StreamsListFragment{417c101} (e29ad501-181d-44ee-96ee-0def070bae57 id=0x7f0b0224 tag=binding_12)
+                    mFragmentId=#7f0b0224 mContainerId=#7f0b0224 mTag=binding_12
+                    mState=7 mWho=e29ad501-181d-44ee-96ee-0def070bae57 mBackStackNesting=0
+                    mAdded=true mRemoving=false mFromLayout=false mInLayout=false
+                    mHidden=false mDetached=false mMenuVisible=true mHasMenu=false
+                    mRetainInstance=false mUserVisibleHint=true
+                    mFragmentManager=FragmentManager{fbbb6e8 in MetaDetailsFragment{575521f}}}
+                    mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+                    mParentFragment=MetaDetailsFragment{575521f} (5d3a0a6a-c35c-404c-97ee-90c19cea7f47 id=0x7f0b025a tag=039e81ca-dcbd-4f43-8111-e7c24568b1e9)
+                    mPopDirection=false
+                    mContainer=androidx.fragment.app.FragmentContainerView{ee1b05c V.E...... ......I. 0,107-1736,421 #7f0b0224 app:id/meta_details_streams}
+                    mView=androidx.leanback.widget.VerticalGridView{44f8d6b VFE...... ......I. 0,0-1736,314 #7f0b00c9 app:id/container_list}
+                    Child FragmentManager{2b1aba6 in StreamsListFragment{417c101}}}:
+                      Back Stack Index: 0
+                      FragmentManager misc state:
+                        mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+                        mContainer=androidx.fragment.app.Fragment$5@56d9e7
+                        mParent=StreamsListFragment{417c101} (e29ad501-181d-44ee-96ee-0def070bae57 id=0x7f0b0224 tag=binding_12)
+                        mCurState=7 mStateSaved=false mStopped=false mDestroyed=false
+                AddonsListFragment{b095994} (aec780cc-f358-49ff-99a9-f1834050d356 id=0x7f0b021b tag=binding_10)
+                    mFragmentId=#7f0b021b mContainerId=#7f0b021b mTag=binding_10
+                    mState=7 mWho=aec780cc-f358-49ff-99a9-f1834050d356 mBackStackNesting=0
+                    mAdded=true mRemoving=false mFromLayout=false mInLayout=false
+                    mHidden=false mDetached=false mMenuVisible=true mHasMenu=false
+                    mRetainInstance=false mUserVisibleHint=true
+                    mFragmentManager=FragmentManager{fbbb6e8 in MetaDetailsFragment{575521f}}}
+                    mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+                    mParentFragment=MetaDetailsFragment{575521f} (5d3a0a6a-c35c-404c-97ee-90c19cea7f47 id=0x7f0b025a tag=039e81ca-dcbd-4f43-8111-e7c24568b1e9)
+                    mPopDirection=false
+                    mContainer=androidx.fragment.app.FragmentContainerView{2de0c64 V.E...... ......I. 0,0-1736,127 #7f0b021b app:id/meta_details_addons}
+                    mView=androidx.leanback.widget.VerticalGridView{e13bfe5 VFE...... ......I. 0,0-1736,127 #7f0b00c9 app:id/container_list}
+                    Child FragmentManager{8be6c3d in AddonsListFragment{b095994}}}:
+                      Back Stack Index: 0
+                      FragmentManager misc state:
+                        mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+                        mContainer=androidx.fragment.app.Fragment$5@23cdc32
+                        mParent=AddonsListFragment{b095994} (aec780cc-f358-49ff-99a9-f1834050d356 id=0x7f0b021b tag=binding_10)
+                        mCurState=7 mStateSaved=false mStopped=false mDestroyed=false
+                VideosListFragment{fad2d83} (7531e2b5-76de-4e23-8fc3-f05faecf1625 id=0x7f0b0227 tag=binding_11)
+                    mFragmentId=#7f0b0227 mContainerId=#7f0b0227 mTag=binding_11
+                    mState=7 mWho=7531e2b5-76de-4e23-8fc3-f05faecf1625 mBackStackNesting=0
+                    mAdded=true mRemoving=false mFromLayout=false mInLayout=false
+                    mHidden=false mDetached=false mMenuVisible=true mHasMenu=false
+                    mRetainInstance=false mUserVisibleHint=true
+                    mFragmentManager=FragmentManager{fbbb6e8 in MetaDetailsFragment{575521f}}}
+                    mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+                    mParentFragment=MetaDetailsFragment{575521f} (5d3a0a6a-c35c-404c-97ee-90c19cea7f47 id=0x7f0b025a tag=039e81ca-dcbd-4f43-8111-e7c24568b1e9)
+                    mPopDirection=false
+                    mContainer=androidx.fragment.app.FragmentContainerView{c9972cc G.E...... ......I. 0,0-0,0 #7f0b0227 app:id/meta_details_videos}
+                    mView=androidx.leanback.widget.VerticalGridView{2feaaba VFE...... ......I. 0,0-0,0 #7f0b00c9 app:id/container_list}
+                    Child FragmentManager{6ec7b00 in VideosListFragment{fad2d83}}}:
+                      Back Stack Index: 0
+                      FragmentManager misc state:
+                        mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+                        mContainer=androidx.fragment.app.Fragment$5@22a8f39
+                        mParent=VideosListFragment{fad2d83} (7531e2b5-76de-4e23-8fc3-f05faecf1625 id=0x7f0b0227 tag=binding_11)
+                        mCurState=7 mStateSaved=false mStopped=false mDestroyed=false
+                SeasonsListFragment{2d8897e} (76ef731e-d783-4eb5-b2e8-bd19e927d9b5 id=0x7f0b0223 tag=binding_9)
+                    mFragmentId=#7f0b0223 mContainerId=#7f0b0223 mTag=binding_9
+                    mState=7 mWho=76ef731e-d783-4eb5-b2e8-bd19e927d9b5 mBackStackNesting=0
+                    mAdded=true mRemoving=false mFromLayout=false mInLayout=false
+                    mHidden=false mDetached=false mMenuVisible=true mHasMenu=false
+                    mRetainInstance=false mUserVisibleHint=true
+                    mFragmentManager=FragmentManager{fbbb6e8 in MetaDetailsFragment{575521f}}}
+                    mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+                    mParentFragment=MetaDetailsFragment{575521f} (5d3a0a6a-c35c-404c-97ee-90c19cea7f47 id=0x7f0b025a tag=039e81ca-dcbd-4f43-8111-e7c24568b1e9)
+                    mPopDirection=false
+                    mContainer=androidx.fragment.app.FragmentContainerView{b6e2ca0 G.E...... ......I. 0,0-0,0 #7f0b0223 app:id/meta_details_seasons}
+                    mView=androidx.leanback.widget.VerticalGridView{de692dc VFE...... ......I. 0,0-0,0 #7f0b00c9 app:id/container_list}
+                    Child FragmentManager{58b1edf in SeasonsListFragment{2d8897e}}}:
+                      Back Stack Index: 0
+                      FragmentManager misc state:
+                        mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+                        mContainer=androidx.fragment.app.Fragment$5@f1e472c
+                        mParent=SeasonsListFragment{2d8897e} (76ef731e-d783-4eb5-b2e8-bd19e927d9b5 id=0x7f0b0223 tag=binding_9)
+                        mCurState=7 mStateSaved=false mStopped=false mDestroyed=false
+                Added Fragments:
+                  #0: SeasonsListFragment{2d8897e} (76ef731e-d783-4eb5-b2e8-bd19e927d9b5 id=0x7f0b0223 tag=binding_9)
+                  #1: AddonsListFragment{b095994} (aec780cc-f358-49ff-99a9-f1834050d356 id=0x7f0b021b tag=binding_10)
+                  #2: VideosListFragment{fad2d83} (7531e2b5-76de-4e23-8fc3-f05faecf1625 id=0x7f0b0227 tag=binding_11)
+                  #3: StreamsListFragment{417c101} (e29ad501-181d-44ee-96ee-0def070bae57 id=0x7f0b0224 tag=binding_12)
+                Back Stack Index: 0
+                FragmentManager misc state:
+                  mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+                  mContainer=androidx.fragment.app.Fragment$5@19be5f5
+                  mParent=MetaDetailsFragment{575521f} (5d3a0a6a-c35c-404c-97ee-90c19cea7f47 id=0x7f0b025a tag=039e81ca-dcbd-4f43-8111-e7c24568b1e9)
+                  mCurState=7 mStateSaved=false mStopped=false mDestroyed=false
+          Added Fragments:
+            #0: MetaDetailsFragment{575521f} (5d3a0a6a-c35c-404c-97ee-90c19cea7f47 id=0x7f0b025a tag=039e81ca-dcbd-4f43-8111-e7c24568b1e9)
+          Back Stack:
+            #0: BackStackEntry{fefbf8a #0 039e81ca-dcbd-4f43-8111-e7c24568b1e9}
+              mName=039e81ca-dcbd-4f43-8111-e7c24568b1e9 mIndex=0 mCommitted=true
+              Operations:
+                Op #0: UNSET_PRIMARY_NAV LoginFragment{8a81be} (8eb873c9-a681-42b5-b791-2c722a34ecfb id=0x7f0b025a tag=4e103168-266a-4d23-bcef-9aed3ca97114)
+                Op #1: REMOVE LoginFragment{8a81be} (8eb873c9-a681-42b5-b791-2c722a34ecfb id=0x7f0b025a tag=4e103168-266a-4d23-bcef-9aed3ca97114)
+                Op #2: ADD MetaDetailsFragment{575521f} (5d3a0a6a-c35c-404c-97ee-90c19cea7f47 id=0x7f0b025a tag=039e81ca-dcbd-4f43-8111-e7c24568b1e9)
+                Op #3: UNSET_PRIMARY_NAV null
+                Op #4: SET_PRIMARY_NAV MetaDetailsFragment{575521f} (5d3a0a6a-c35c-404c-97ee-90c19cea7f47 id=0x7f0b025a tag=039e81ca-dcbd-4f43-8111-e7c24568b1e9)
+          Back Stack Index: 1
+          FragmentManager misc state:
+            mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+            mContainer=androidx.fragment.app.Fragment$5@42cc9fb
+            mParent=NavHostFragment{cc526fc} (f728545e-89f9-49ce-ad94-c28355218637 id=0x7f0b025a)
+            mCurState=7 mStateSaved=false mStopped=false mDestroyed=false
+    Added Fragments:
+      #0: NavHostFragment{cc526fc} (f728545e-89f9-49ce-ad94-c28355218637 id=0x7f0b025a)
+      #1: NavigationMenuFragment{12b993} (64211f04-77a1-4e6a-9752-2d9ece4795c1 id=0x7f0b02d1)
+    Back Stack Index: 0
+    FragmentManager misc state:
+      mHost=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+      mContainer=androidx.fragment.app.FragmentActivity$HostCallbacks@432a1c9
+      mCurState=7 mStateSaved=false mStopped=false mDestroyed=false

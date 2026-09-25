@@ -237,8 +237,9 @@ def cmd_tv_standby(svc: MediaService, args) -> int:
 def cmd_standby_mode(svc: MediaService, args) -> int:
     """
     The whole tv_only_standby round trip on the real room: turn_off() puts only
-    the television to sleep, the box is caught before it suspends, it stays
-    awake for `--hold` seconds, and then turn_on() is timed.
+    the television to sleep with the box's HDMI-CEC off so it never hears the
+    set's <Standby>, the box stays awake for `--hold` seconds, and then
+    turn_on() is timed.
 
     Forces media.power.tv_only_standby on for this run so the shipped config
     does not have to be edited to measure it.
@@ -248,19 +249,19 @@ def cmd_standby_mode(svc: MediaService, args) -> int:
         print("Precondition: the box must be awake and reachable.")
         return 2
     before = svc.hdmi_state()
-    if before.tv_power != "on":
-        print(f"The bus does not say the TV is on (tv_power={before.tv_power}); "
-              f"turn_off would refuse to send a toggle. Turn the TV on first.")
+    tv = svc.cec_waker.tv_power()
+    if tv != "on":
+        print(f"The TV does not read as on (tv_power={tv}); turn_off would refuse "
+              f"to send a toggle. Turn the TV on first.")
         return 2
 
     svc.tv_only_standby = True
-    otp_before = svc._one_touch_play_setting()
-    print(f"one_touch_play before: {otp_before}")
+    print(f"hdmi_control_enabled before: {svc._hdmi_control_setting()}")
 
     t0 = time.monotonic()
     ok = svc.turn_off()
     print(f"  {_stamp(t0)} turn_off() -> {ok}; last={svc.last_wake_result}", flush=True)
-    print(f"  {_stamp(t0)} one_touch_play restored to: {svc._one_touch_play_setting()}")
+    print(f"  {_stamp(t0)} hdmi_control_enabled after: {svc._hdmi_control_setting()}")
 
     deadline = time.monotonic() + args.hold
     worst = None
@@ -282,8 +283,8 @@ def cmd_standby_mode(svc: MediaService, args) -> int:
     on = svc.turn_on()
     print(f"turn_on() -> {on} in {time.monotonic()-t1:.1f}s; last={svc.last_wake_result}")
     hdmi = svc.hdmi_state()
-    print(f"final: tv_power={hdmi.tv_power} active_source={hdmi.active_source} "
-          f"one_touch_play={svc._one_touch_play_setting()}")
+    print(f"final: tv_power={svc.cec_waker.tv_power()} active_source={hdmi.active_source} "
+          f"hdmi_control_enabled={svc._hdmi_control_setting()}")
     return 0
 
 

@@ -166,6 +166,22 @@ audio:
   chunk_duration_ms: 40
   device: null                # null = system default mic, or device index/name
 
+# --- Runtime logs (core/turn_log.py) ---
+# Everything the console shows, and DEBUG besides, goes to logs/california.log
+# (rotated by size). One JSON line per wake goes to logs/turns.jsonl with ms
+# timings since the wake word: speech_end, stt_done, llm_first_token,
+# first_sentence, first_audio, reply_done, plus each tool call's duration.
+# Both are gitignored. They hold what he said and what she answered, so set
+# include_transcripts: false to keep only the timings.
+logging:
+  enabled: true
+  dir: "logs"
+  file_level: "DEBUG"
+  max_bytes: 5000000          # per file, before rotating
+  backup_count: 5             # california.log.1 .. .5
+  turns: true
+  include_transcripts: true
+
 # --- Speech-to-Text ---
 stt:
   provider: "groq"            # "groq" (cloud, fast, free) | "local" (whisper.cpp, slow)
@@ -385,7 +401,14 @@ sounds:
 stremio:
   email: "likebot99@gmail.com"
   password: null
-  autoplay_delay_ms: 2500
+  autoplay_delay_ms: 2500         # fallback path only, see stream_list_timeout_ms
+  # The ready-list path (CLAUDE.md "The ready-list path"): wait for the stream
+  # list, press OK once, confirm the player, wait for state=3. Measured
+  # 2026-09-25: list 2.2-2.7s after a clear-task link (warm), player 1.8s after
+  # OK, playing ~7s after OK on a torrent stream.
+  stream_list_timeout_ms: 20000
+  player_start_timeout_ms: 6000
+  playback_timeout_ms: 45000
   library_sync_interval_minutes: 60
   history_refresh_max_age_minutes: 5
   watch_state_path: "watch_state.json"
@@ -584,12 +607,16 @@ media:
   #     to the box and Wake-on-LAN to the Samsung run side by side, then the CEC
   #     bus is read until the TV reports on and the box is the active source.
   #     2.2s measured 2026-09-21 (box awake at 1.7s).
-  #   None (deep standby): the TELEVISION wakes it. Wake-on-LAN the Samsung, then
-  #     toggle its HDMI input, which makes it emit <Routing Change> + <Set Stream
-  #     Path> on the CEC bus, which wakes the box. Proven end to end 2026-09-03;
-  #     52s measured 2026-09-18 and 45.3s on 2026-09-21, most of it the box
-  #     resuming. The box is unreachable within ~5s of KEYCODE_SLEEP, so this
-  #     is the common path until tv_only_standby works.
+  #   None (deep standby): the TELEVISION wakes it. Wake-on-LAN the Samsung and
+  #     press nothing: once its CEC side is up (~37s after a cold power-on) it
+  #     announces the input it came up on, and the box on HDMI 2 wakes. 34-42s
+  #     measured 2026-09-25. If the box is not up by settle_ms the TV came up on
+  #     another input, and the Source menu selects HDMI 2 (the rescue). The old
+  #     KEY_HDMI "away and back" pair broke this: the cycle skips an input with
+  #     no signal, so it parked a TV that was already on HDMI 2 on HDMI 1 for good.
+  #   True with the TV dark (the normal state with tv_only_standby): power the TV
+  #     (Wake-on-LAN, or KEY_POWER in shallow standby) and the box claims its
+  #     input. ~3s measured 2026-09-25.
   cec_wake:
     enabled: true
     # Identity keys off things that do not move. tv_ip is only a cached hint --
@@ -607,10 +634,16 @@ media:
     # Re-pair with: uv run python tools/pair_samsung_tv.py
     token_path: "samsung_token.txt"
     input_key: "KEY_HDMI"
-    key_delay_ms: 6000            # settle between the away press and the back press
+    # Gap between keys of one sequence. samsungtvws adds a hidden 1s per key
+    # unless told not to; with it off the Source-menu sequence takes ~2.5s.
+    key_delay_ms: 250
+    # The Source menu (TV, HDMI 1, HDMI 2, left to right on this set) needs this
+    # long to open before it takes LEFT/RIGHT. LEFT does not wrap, so LEFT x
+    # source_menu_left_presses then RIGHT x <port> selects a port from anywhere.
+    source_menu_open_ms: 800
+    source_menu_left_presses: 4
     wol_attempts: 5               # the TV took 2 in testing
     tv_boot_timeout_ms: 40000
-    wake_attempts: 3
     # Deep-standby fallback only. How long to wait for the box to rejoin the
     # network after the CEC wake.
     # MEASURED 2026-09-05 over three clean cold wakes: 32.4s, 32.4s, 31.1s from
@@ -625,10 +658,14 @@ media:
     # sys.boot_completed and returns as soon as Android says it is up, so a
     # fast boot no longer costs the whole budget.
     settle_ms: 45000
+    # Then, if the box still is not up, the Source-menu rescue gets this long.
+    # 7.9s measured from a lit TV (2026-09-25).
+    rescue_settle_ms: 20000
     poll_interval_ms: 2000
-    # Mi Box is at CEC physical address 0x2000 == HDMI 2. KEY_HDMI toggles
-    # HDMI2 <-> HDMI1 on this set, so ODD presses select the box. Only HDMI 2
-    # is known; fill in the others as you learn them. Drives the system-prompt
+    # Mi Box is at CEC physical address 0x2000 == HDMI 2; HDMI 1 is a tuner
+    # (CEC logical address 3). KEY_HDMI cycles only inputs with a live signal,
+    # so it cannot select a sleeping box -- inputs are selected through the
+    # Source menu, or by the box claiming its own. Drives the system-prompt
     # inventory, so a name here is what California will actually offer.
     hdmi_ports:
       2: "mi box"
@@ -654,22 +691,27 @@ media:
     # One Touch Play ~1s later. Selecting the input before that lands cost 20.7s
     # instead of 2.2s (measured 2026-09-21), so a parked input gets this grace.
     otp_grace_ms: 4000
+    # The box claims its input by switching its HDMI-CEC off and on, which
+    # re-announces <Active Source>; the TV follows in ~1s. Read the result after:
+    claim_settle_ms: 1500
 
   # --- Standby depth ---
   # tv_only_standby: turn_off puts ONLY the television into standby and keeps
-  # the box awake, so the next turn_on is the ~2s path instead of the ~45s one.
-  # What it costs, measured 2026-09-22: the set broadcasts <Standby> and the
-  # framework sleeps the box on it (persist.sys.hdmi.keep_awake is not writable
-  # from shell), so the box is caught and woken again inside the ~3-5s window,
-  # with One Touch Play suppressed for exactly that long and then restored.
-  # KEY_POWEROFF is ignored by this set; KEY_POWER works and is a toggle, so it
-  # is only ever sent behind a fresh "the TV is on" reading of the CEC bus.
-  # Needs no box setting: the stock hdmi_control_auto_device_off_enabled=1 and
-  # hdmi_control_one_touch_play_enabled=1 are what it expects. Off until
-  # `tools/bench_tv_power.py standby-mode` has shown the box holds awake.
+  # the box awake, so the next turn_on is ~3s instead of ~42s. The set
+  # broadcasts <Standby> on its way off and the box obeys it -- but Android 11
+  # only acts on it while HDMI control is enabled, so the box's
+  # hdmi_control_enabled is switched off before KEY_POWER and back on once the
+  # set is dark (cec_reenable_delay_ms later). Measured 2026-09-25: box still
+  # awake 50s+ after, settings back to stock. KEY_POWEROFF is ignored by this
+  # set; KEY_POWER works and is a toggle, so it is only sent behind a fresh "on"
+  # reading (UPnP :9197 answering, or the CEC bus).
+  # The trade: the box idles on its screensaver behind a dark set, a few watts.
+  # And only California's turn_off does this -- the Samsung remote's power
+  # button still sleeps the box, and the next turn_on is then the ~35s path.
   power:
-    tv_only_standby: false
+    tv_only_standby: true
     tv_standby_settle_ms: 10000
+    cec_reenable_delay_ms: 5000
 
   vpn_routing_enabled: false
   vpn_state_path: "vpn_state.json"

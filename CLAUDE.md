@@ -217,6 +217,7 @@ california/
 │   ├── orchestrator.py          # Main state machine and tool dispatch
 │   ├── audio_pipeline.py        # Microphone capture and playback
 │   ├── wake_word.py             # Wake-word detection
+│   ├── turn_log.py              # Rotating log file + one timing record per turn (logs/)
 │   └── vad.py                   # Voice activity detection
 ├── services/
 │   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
@@ -737,6 +738,11 @@ sets refuse hosts missing from the TV's device list -- this one does not).
 
 ### Power: Off Is ADB, On Depends On How Deep The Box Went
 
+**Rebuilt 2026-09-25 -- read "turn_on, rebuilt" below first.** With
+`tv_only_standby` (now on) "off" leaves the box awake behind a dark set and
+"on" is **~5s**; from deep standby it is **34-42s with no key pressed**. Much of
+what follows is the history that led there, and is corrected where it was wrong.
+
 **Turning the box off and turning it on are not symmetric.** Off is one ADB
 keyevent. On depends on standby depth: while the box is still on the LAN
 (shallow standby, or awake under a dark television) `KEYCODE_WAKEUP` and the
@@ -828,19 +834,24 @@ is still on the LAN. Two halves on a two-thread pool, then a confirm loop:
 input), `None` (could not tell). `_dispatch_tv` and `_ensure_playable` read it
 by identity and say different things for each; they never truthiness-test it.
 
-**The deep-standby fallback** — `services/cec_wake.py`, two steps:
+**The deep-standby fallback** — `services/cec_wake.py`. **Corrected 2026-09-25:**
 
-1. **Wake-on-LAN the Samsung TV.** Needs no IP and no token — it is a MAC
-   broadcast — which is what makes the whole chain recoverable. Took 2 attempts
-   in testing.
-2. **Toggle the TV's HDMI input** over its WebSocket API. The TV emits
-   `<Routing Change>` + `<Set Stream Path>` on the CEC bus and the box wakes.
+1. **Wake-on-LAN the Samsung TV** and press nothing. Once its CEC side is up
+   (~37s after a cold power-on) it announces the input it came up on, and the
+   box on HDMI 2 wakes. Box on the LAN at 34-42s, measured three times.
+2. **Only if the box has not appeared by `settle_ms`**, select HDMI 2 through
+   the Source menu (`CecWaker.select_box_input`) and give it `rescue_settle_ms`.
 
-**Step 2 is load-bearing.** The box was still unreachable after the TV powered
-on and only woke after the input toggle, so WoL alone is not enough and the
-pairing token is a hard dependency. That is why a rejected token gets its own
-`WakeResult.needs_pairing` and its own spoken line — "approve me on screen" and
-"use the remote" are opposite fixes, and giving the wrong one strands him.
+**The old step 2 -- a `KEY_HDMI` "away and back" pair -- was the bug, not the
+load-bearing part.** While the box is asleep it sends no signal, and the
+Samsung's cycle key **skips an input with no signal**: the pair moved a TV that
+was already on HDMI 2 onto HDMI 1 and never back, and the box never woke.
+Measured 2026-09-25: the old chain spent 3 x 45s failing (167s), and Master
+Miguel found the TV sitting on HDMI 1 -- "booted on HDMI 1, never switched".
+The earlier "only woke after the input toggle" observation predates the cycle
+skipping being understood. A rejected token still gets its own
+`WakeResult.needs_pairing` and spoken line, now from `KEY_POWER` or the Source
+menu -- "approve me on screen" and "use the remote" are opposite fixes.
 
 - **`dumpsys hdmi_control` history is a capped ring buffer (~246 entries).**
   Counting entries to detect new CEC traffic reports `+0` and looks exactly like
@@ -849,8 +860,12 @@ pairing token is a hard dependency. That is why a rejected token gets its own
 - **Sleeping the box switches the TV off too** (`mAutoTvOff: true`,
   `hdmi_control_auto_device_off_enabled=1`). Intended — "turn off the TV" means
   both — but it is why the wake must WoL the TV first
-- The Mi Box is CEC physical address `0x2000` = **HDMI 2**. `KEY_HDMI` toggles
-  HDMI2 <-> HDMI1 on this set, so **odd presses select the box**
+- The Mi Box is CEC physical address `0x2000` = **HDMI 2**; HDMI 1 is a tuner
+  (CEC logical address 3). **Corrected 2026-09-25:** `KEY_HDMI` cycles only
+  inputs with a live signal, so it cannot select a sleeping box, and
+  `KEY_HDMI1`/`KEY_HDMI2` are accepted and ignored. The Source menu lists TV,
+  HDMI 1, HDMI 2 and LEFT does not wrap, so `KEY_SOURCE`, LEFT x4, RIGHT x port,
+  `KEY_ENTER` selects any port from anywhere (`CecWaker.select_input`)
 - `tv_ip` is a **cached hint, not configuration.** Identity keys off `tv_mac` and
   `tv_duid`, both stable. On a miss `resolve_tv_ip()` goes cached -> hint -> ARP by
   MAC -> TCP scan on :8001, verifying the duid at every step, and caches the answer
@@ -901,8 +916,9 @@ the television enters standby; either way it force-suspends ~15s later and the
 next wake costs ~30s of resume.
 
 `media.power.tv_only_standby` makes `turn_off` put only the television into
-standby and keep the box awake, so the next `turn_on` is the ~2s path. Three
-facts shape it, all measured on the real pair 2026-09-21/22:
+standby and keep the box awake, so the next `turn_on` is the ~5s path. **It is
+on since 2026-09-25, and point 2 and 3 below are superseded** -- see "turn_on,
+rebuilt". The history, measured on the real pair 2026-09-21/22:
 
 1. **The standby key is `KEY_POWER`, and it is a toggle.** `KEY_POWEROFF` is
    ignored by this set and `KEYCODE_TV_POWER` never leaves the box (table
@@ -926,12 +942,80 @@ facts shape it, all measured on the real pair 2026-09-21/22:
    stop waking the television too -- and restoring it while the box is already
    awake cannot fire it, because OTP only runs on a wake.
 
-It needs no box setting: stock `auto_device_off=1` and `one_touch_play=1` are
-what it expects (both were restored after the experiments). **Off by default
-until `tools/bench_tv_power.py standby-mode --hold 120` has shown the box
-holding awake with the TV dark**; that run needs a `KEY_POWER` send, which has
-to be started by hand. The trade when it is on: "turn off the TV" leaves the
-box running on its screensaver behind a dark set.
+It needs no box setting. **The trade:** "turn off the TV" leaves the box
+running on its screensaver behind a dark set, a few watts.
+
+#### turn_on, rebuilt (2026-09-25)
+
+Every number here is from the real pair on 2026-09-25.
+
+**Off: the box never hears the TV's `<Standby>`.** Android 11's
+`HdmiCecLocalDevice.handleStandby()` only calls `standby()` when
+`isControlEnabled()`, which is `hdmi_control_enabled` -- shell-writable. So
+`_standby_tv_only` switches the box's HDMI-CEC **off**, sends `KEY_POWER` (behind a
+fresh "on" reading), waits for the set to go dark plus `cec_reenable_delay_ms`,
+and switches HDMI-CEC **back on**. Box still awake 50s+ later, settings stock.
+
+**The soak was interrupted -- it is NOT a clean long-idle result.** A 90-minute
+once-a-minute `mWakefulness` poll was started at 18:51 with the TV dark. The box
+read Awake in all 72 samples it took, but the idle was broken twice by our own
+testing: a live `turn_on`/`turn_off` at 19:07-19:09 (between samples, so absent
+from the log), and from 19:37 the Stremio tests had the TV on. The longest
+stretch actually left alone with the TV dark was **~27 minutes** (19:09-19:36),
+after a clean 16 (18:51-19:07). So "no hidden idle timer" is shown for ~30
+minutes, not for a night. Re-run it undisturbed -- `tools/bench_tv_power.py soak`,
+or the poll above for several hours -- before trusting it overnight. The
+worst case if a timer exists is the ~35s deep-standby wake, not a failure.
+
+This replaced catching the box inside the ~3-5s before
+adbd suspended, with One Touch Play suppressed across the window. And
+`persist.sys.hdmi.keep_awake`, named above as the gate, is not: in Android 11 it
+only picks a wakelock (`HdmiCecLocalDevicePlayback`) and is not consulted on
+the `<Standby>` path.
+
+- **CEC must come back on.** Left off, the Xiaomi remote cannot turn the TV on:
+  a box wake announces `<Text View On>` over CEC. The tail runs on a thread so
+  the spoken "done" returns in ~3.5s, and that thread is **not a daemon** -- a
+  daemon one died with a script that exited straight after `turn_off` and left
+  the real box at `hdmi_control_enabled=0`. `_finish_pending_standby()` is
+  joined before any later power command and at orchestrator shutdown.
+- **Only California's `turn_off` keeps the box up.** The Samsung remote's power
+  button still broadcasts `<Standby>` to a box with CEC on, so the box sleeps
+  and the next `turn_on` is the ~35s path (observed 18:41 that day).
+
+**On, box awake (the normal case): ~5s.** `tv_power()` reads the TV's UPnP
+port: **:9197 closes within 6s of standby while :8001 stays up ~15s** (shallow
+standby, where WoL does nothing), then both close (deep). `ensure_tv_on` sends
+`KEY_POWER` for shallow -- only after reading standby twice, because a set
+mid-power-on answers :8001 ~1s before :9197 -- and Wake-on-LAN for deep. Then
+`ensure_active_source`: the box's own `mIsActiveSource` is live (it went False
+the instant the TV switched to HDMI 1), so the box only claims its input when it
+says it is not on screen. **Re-enabling HDMI-CEC does not turn a TV on** -- it
+sends `<Active Source>` and the set answers "standby" -- which is why the TV is
+powered from the network side first.
+
+**Selecting the box's input: the box claims it.** `claim_active_source()`
+switches the box's HDMI-CEC off and on in one shell; it re-announces
+`<Active Source>` and the Samsung follows in ~1s from any input (confirmed by
+the TV's `<Routing Change> 20:00` on a later key). The TV's own tell that it
+switched to us is `<Give Deck Status> 04:1A`. The Source menu is the rescue.
+`KEY_HDMI2` is never sent (the old loop's first attempt, always wasted), and
+cycling is gone.
+
+**Keys go out without samsungtvws' hidden second.** `send_key` sleeps 1s after
+every key unless `key_press_delay=0`; the 7-key Source sequence went from 11.3s
+to 2.5s. That hidden second is also where most of the old 6s "pair" went.
+
+| path | before | after |
+|---|---|---|
+| box awake, TV dark (tv_only_standby) | race; off by default | **4.9-5.4s** |
+| everything off, TV last on HDMI 2 | 45-63s, or 167s and fail | **34-42s**, no key |
+| everything off, TV left on HDMI 1 | never | Source rescue, box 7.9s after Enter |
+| `turn_off` (tv_only_standby) | -- | **3.3-4.2s** spoken, CEC back on ~12s |
+
+Deep standby cannot beat ~37s from the software side: that is the Samsung's CEC
+start after a cold power-on, and resending keys every 4s did not bring the wake
+forward. A box that never went deep is the only faster route without root.
 
 **The power actions are deliberately absent from `_dispatch_tv`'s `requires_tv`
 set.** That gate returns `"TV is off or unreachable right now"` when
@@ -1721,11 +1805,18 @@ When asked to play or continue a title:
 4. For series with no tracked progress, open the series detail page instead of inventing episode numbers
 5. Build the Stremio deep link for either an episode target or a detail-page target
 6. Try the remembered source first, then `comet`, then `mediafusion`, then `torrent` / `torrentio`
-7. Launch on Mi Box with ADB
-8. Wait `stremio.autoplay_delay_ms`
-9. Press OK once
-10. Check `dumpsys media_session`
-11. Retry OK one time if playback still is not active
+7. Launch on Mi Box with ADB, **clearing Stremio's task** (`am start -f 0x10008000`),
+   never a force-stop -- see "The ready-list path" below
+8. A series with no tracked episode stops here, on its detail page, with no key pressed
+9. Wait for the stream list to be on screen (`dumpsys activity top`: a visible
+   `stream_card_stub_inflated`, no visible `meta_details_loading_frame`), then press OK
+   **once** -- the first card is focused
+10. Confirm the player opened (`exo_*` views, or a Stremio media session), then wait for
+    Stremio's **own** session to reach `state=3`. Still buffering at the deadline is
+    "loading, give it a moment", never "hit OK" -- a second OK into a player is pause
+11. Only if the list never showed (steps 12-13 below then run as before, OK first) or
+    OK opened no player (straight to step 12, no second OK):
+    wait `stremio.autoplay_delay_ms`, press OK, check `dumpsys media_session`, retry once
 12. Scan the visible stream list for the preferred providers, page by page. Before every `uiautomator dump`, and once more before giving up, re-read `dumpsys media_session`: a torrent stream picked by step 9 or 11 can take longer to buffer than the autoplay wait, and a rendering video keeps `uiautomator dump` from ever going idle, so the scan would otherwise time out for minutes over a show that is already on (seen live 2026-09-16 with Fallout). `state=3` at any of those checks ends the request as a success.
 13. The whole scan is capped by `stremio.provider_scan_timeout_s` (45s); past it, no further dumps are attempted and the request falls through to the fallback policy.
 
@@ -1734,6 +1825,50 @@ If playback still does not start, use this exact fallback line:
 ```text
 Stremio's open but it didn't start on its own. Just hit OK on the remote.
 ```
+
+### The ready-list path (2026-09-25)
+
+Measured on the real box with Fallout S2E9. The old launch force-stopped
+Stremio, waited a fixed 2.5s after it reached the foreground, and pressed OK --
+onto the **splash screen**, because a cold Stremio shows its list ~8-10s after the
+link. So it pressed again, then ran the uiautomator scan over a video that was
+already playing: 27-30s, and on 2026-09-22 a "which source?" question with the
+show on screen. Now **20.0s** from an idle room to confirmed playing, one key:
+
+| step | at |
+|---|---|
+| clear-task deep link | 3.5s |
+| stream list visible | 10.8s |
+| the one OK | 12.1s |
+| ExoPlayer views up | 13.3s |
+| Stremio session `state=3` | 20.0s (~7s is the torrent buffering) |
+
+- **The force-stop was hiding a real bug, so it was replaced, not removed.** A
+  deep link into a *warm* Stremio opened **S01E01's** streams for a link to S2E9.
+  Clearing the task (`FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK`) rebuilds
+  the screen inside the running process: right episode both ways (checked on
+  screen, S1E1 -> S01E01 files, S2E9 -> S02 packs), list in 2.2-2.7s instead of
+  ~10s. The "S01E01 - The End" header Stremio shows is its own quirk; the stream
+  list is what plays.
+- **`dumpsys activity top`, not `uiautomator dump`.** ~0.6s, readable while a video
+  renders, and it gives each view's visibility flag (`V`/`I`/`G`) and id. Real
+  captures are in `tests/fixtures/activity_top_stremio_{streams,player}.txt`.
+- **Stremio's own session.** `_is_playing` matches `state=3` anywhere in
+  `media_session`, so another app can answer for Stremio. The new path reads only
+  the `com.stremio.one` block (`_stremio_playback_state`).
+- **A screenshot shows nothing while video plays** (secure surface, a white
+  frame) -- the view dump is the only look at a playing screen.
+- **The box's own load decides the numbers.** `flar2.homebutton` (Button Mapper,
+  an enabled accessibility service) was holding 10 media players and 14 audio
+  decoders it never released: mediaserver + media.extractor at ~330% of 400% CPU,
+  ~38 CPU-hours accumulated, `dumpsys power` at 7-8s instead of 0.4s, and OK
+  presses timing out at 15-17s. Restarting it fixed that. `am force-stop` alone
+  leaves its service "Crashed" and unbound; deleting and re-putting
+  `secure enabled_accessibility_services` rebinds it. **Do not reboot the box to
+  clear it**: `persist.adb.tcp.port` is empty, so ADB over Wi-Fi may not come back.
+  4K HEVC playback itself also loads the box to ~250%, which slows every ADB call
+  made during it.
+- The library sync before a resume is **0.16s** and was left alone.
 
 ### Watch-State Cache
 
@@ -1931,7 +2066,7 @@ Recommended behavior:
 
 ### Operational Recommendation
 
-A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby`, which needs no box setting — see "Standby depth" above. Both devices also have static addresses outside the DHCP pool since 2026-09-22 — see "Static addresses".
+A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby`, on since 2026-09-25 — see "turn_on, rebuilt" above. Both devices also have static addresses outside the DHCP pool since 2026-09-22 — see "Static addresses".
 
 ### Final VPN Routing Rules
 
@@ -2491,9 +2626,31 @@ Current automated coverage exists for:
   `is_awake()` keeps `None` distinct from `False`, that the wait loop clears
   the offline cooldown, and that `turn_on` survives the `requires_tv` gate
   while the TV is unreachable
-- CEC wake: self-disabling without `tv_mac`/`tv_duid`, WoL skipped when the TV
-  already answers and retried when it does not, the input key sent exactly twice,
-  and an auth failure flagged `needs_pairing` while other failures are not
+- CEC wake: self-disabling without `tv_mac`/`tv_duid`; `tv_power()` reading
+  :9197 not :8001, and one refused :9197 probe never read as standby;
+  `ensure_tv_on` sending nothing to a lit TV, `KEY_POWER` to shallow standby only
+  after two standby reads, Wake-on-LAN (never `KEY_POWER`) to deep standby;
+  `wake()` pressing no input key; the Source-menu sequence (LEFT x4, RIGHT x
+  port) with no direct `KEY_HDMI<n>`; keys sent with `key_press_delay=0` and the
+  connection closed; and an auth failure flagged `needs_pairing` while other
+  failures are not
+- The Stremio ready-list path (`tests/test_stremio_ready_list.py`, real
+  `dumpsys activity top` captures): the list reads as ready and the player as a
+  player, no key while the list is loading or showing its error frame, exactly
+  one OK, a player still buffering spoken as loading and never as "hit OK", no
+  second blind OK after one that opened nothing, a series with no progress
+  pressing nothing, the launch clearing the task instead of force-stopping, and
+  Stremio's session read apart from another app's `state=3`
+- The rebuilt power path (2026-09-25): a dark TV under an awake box is powered
+  and then the input verified, never a box wake; deep standby presses no key
+  when the box comes up by itself, rescues through the Source menu once, and
+  gives up after it; `claim_active_source` toggles HDMI-CEC off then on in one
+  shell and never switches on a CEC its owner turned off; `ensure_active_source`
+  claims first, menus second, and never sends `KEY_HDMI2`; `tv_only_standby`
+  switches CEC off before `KEY_POWER` and back on after (also when the key
+  raises, and on when the box answered nothing), needs a positive "on" reading,
+  returns before the restore finishes, runs that restore on a **non-daemon**
+  thread, and makes the next power command wait for it
 - TV discovery: a cached IP that verifies skips discovery entirely, a wrong duid
   at that IP is rejected rather than trusted, warm ARP then the TCP scan are what
   ships and are tried in that order, total failure returns `""` instead of raising,
@@ -2691,6 +2848,29 @@ Current automated coverage exists for:
   not end the turn; `_idle_loop` chains a barged-in turn into another activation
   on one speaker session; and a closed LLM generator keeps the partial answer
   in history
+
+### Runtime logs: read these before guessing at latency
+
+`core/turn_log.py`, configured under `logging:` in `config.yaml`. Both files live in
+`logs/` (gitignored: they hold what he said and what she answered;
+`include_transcripts: false` keeps only timings).
+
+- `logs/california.log` -- the console log plus DEBUG, rotated at 5MB x 5. SDK
+  clients (`anthropic`, `groq`, ...) are held at INFO, because at DEBUG they log
+  every request body and bury everything else.
+- `logs/turns.jsonl` -- one line per activation, ms since the wake word:
+  `speech_end`, `stt_done`, `llm_first_token`, `first_sentence`, `first_audio`,
+  `reply_done`, and `tools` (name, action, start, duration, result). A stage that
+  did not happen is absent, never zero. `outcome` is `reply`, `barged_in`,
+  `no_speech`, `short`, `empty_transcript`, `command` or `error`; a turn chained
+  after a barge-in has `chained: true`.
+
+`_handle_activation` owns the `TurnTimer` and finishes it in a `finally`, so every
+exit writes exactly one line; the work is in `_run_activation`. The timer is
+written from three threads and never raises. `Orchestrator._turn` defaults to a
+null turn at class level so `__new__`-built test orchestrators need no setup.
+`_timed_tokens` only watches the LLM stream: the orchestrator still closes the
+inner generator on a barge-in so `services/llm.py` sees `GeneratorExit`.
 
 Useful live-debug commands:
 
@@ -3101,6 +3281,22 @@ just the commits.
   what exposed the shared hedge wording and produced the
   unreachable-vs-unreadable split.
 
+- **"We need to fix all these logical flaws" (2026-09-25, branch
+  `feat/runtime-logs`).** Started as "something is weird with the HDMI switch";
+  Master Miguel had booted on HDMI 1 and it never switched. Live on the real
+  pair: `KEY_HDMI` skips an input with no signal, so the blind pair parked the
+  TV on HDMI 1 and the old chain failed in 167s; the Source menu is ordered TV,
+  HDMI 1, HDMI 2 and LEFT does not wrap; toggling the box's HDMI-CEC makes it
+  claim its input; :9197 is the TV's live power reading; samsungtvws hides a 1s
+  sleep per key. Ruled out along the way: an ADB command for a box in deep
+  standby (no ping, no ARP), and wake-on-Wi-Fi without root (`WowEnable` is in
+  `/proc/net/wlan/cfg` but SELinux denies the shell's write). Then the
+  no-root win: Android 11 ignores the TV's `<Standby>` while
+  `hdmi_control_enabled` is 0, so `tv_only_standby` became a gate instead of a
+  race and shipped on. "On" 42s -> ~5s. A daemon restore thread left the real
+  box with CEC off once; it is non-daemon now. Root research is in
+  `research/` (not yet acted on).
+
 -----
 
 ## Known Bugs / Audit
@@ -3158,15 +3354,19 @@ One more was found and fixed on **2026-09-03**, in the power path:
   WoL to the Samsung, HDMI toggle, box awake. See "Power: Off Is ADB, On Is The
   Television".
 
-Found on **2026-09-22**, not yet fixed (parked by Master Miguel):
+Found on **2026-09-22**, fixed **2026-09-25** -- see "turn_on, rebuilt" and "The
+ready-list path". "Put on X" from a room left by California's turn_off is now
+~5s of TV plus ~20s of Stremio, most of the latter the stream buffering:
 
-- **"Put on X" from a dark room takes 115-131s, and the Stremio launch is
-  64-79s of it** (`tools/bench_tv_power.py stremio --from-off`). Inside it: two
+- ~~**"Put on X" from a dark room takes 115-131s, and the Stremio launch is
+  64-79s of it**~~ (`tools/bench_tv_power.py stremio --from-off`). Inside it: two
   back-to-back library syncs, a 5.7s OK keyevent, and a provider scan whose
   first two `uiautomator dump` calls timed out after 13.6s and 10.4s -- the
   documented "a rendering video never lets the UI go idle" -- while the show
   was already playing.
-- **The provider scan asks for a source while the show is on screen.** The
+- ~~**The provider scan asks for a source while the show is on screen.**~~ The
+  ready-list path never reaches the scan when the player opens; the scan remains
+  only as the fallback, with its media-session re-check. The
   600s-idle run returned "I couldn't find Comet, MediaFusion, or Torrent for
   Fallout. Want me to try the first available source?" and the box reported
   `Fallout, The Strip` playing 2.9s later. The scan's media-session checks

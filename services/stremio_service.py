@@ -43,6 +43,14 @@ GENERIC_UI_LABELS = {
 }
 UI_DUMP_REMOTE_PATH = "/sdcard/window_dump.xml"
 IMDB_ID_RE = re.compile(r"(tt\d+)")
+_CLEAR_TASK_FLAGS = "0x10008000"
+# One view in `dumpsys activity top`: "Class{hash V.E...... ... app:id/<name>}".
+# The first flag is visibility -- V visible, I invisible, G gone.
+_VISIBLE_VIEW_RE = re.compile(r"\{[0-9a-f]+ V\S* .*app:id/(\w+)\}")
+
+
+class _StreamListFailed(Exception):
+    """Stremio showed its error frame instead of a stream list."""
 
 
 class _PlaybackStartedDuringScan(Exception):
@@ -85,6 +93,12 @@ class StremioService:
         self.email = os.getenv("STREMIO_EMAIL") or stremio_cfg.get("email")
         self.password = os.getenv("STREMIO_PASSWORD") or stremio_cfg.get("password")
         self.autoplay_delay_ms = int(stremio_cfg.get("autoplay_delay_ms", 2500))
+        # The ready-list path (_play_when_ready). Measured 2026-09-25, cold after
+        # the force-stop: stream list visible ~8s after the deep link, player
+        # views 1.8s after OK, state=3 5.8s after OK on a torrent stream.
+        self.stream_list_timeout_s = max(1, int(stremio_cfg.get("stream_list_timeout_ms", 20000))) / 1000
+        self.player_start_timeout_s = max(1, int(stremio_cfg.get("player_start_timeout_ms", 6000))) / 1000
+        self.playback_timeout_s = max(1, int(stremio_cfg.get("playback_timeout_ms", 45000))) / 1000
         self.history_refresh_max_age = timedelta(
             minutes=int(stremio_cfg.get("history_refresh_max_age_minutes", 5))
         )
@@ -576,20 +590,34 @@ class StremioService:
         source_order = self._source_preference_order(remembered_source)
         found_preferred_source = False
 
-        if self.media_service is not None:
-            self.media_service.force_stop_app("stremio")
-            time.sleep(0.3)
-
+        # No force-stop. A deep link into a warm Stremio is routed wrongly --
+        # measured 2026-09-25, a link to Fallout S2E9 opened S01E01's streams --
+        # which is what the force-stop was for, at the price of a cold start:
+        # stream list ~10s after the link. _launch_uri clears the task instead,
+        # which recreates the screen in the running process: right episode both
+        # ways (S1E1 -> S01E01 files, S2E9 -> S02 packs), list in 2.2-2.7s.
         self._launch_uri(uri)
         if not self._wait_for_stremio_foreground():
             log.warning("Stremio did not become foreground within wait window")
-        time.sleep(self.autoplay_delay_ms / 1000)
+
+        # A series with no tracked episode opens its detail page and stops there:
+        # pressing OK would play whatever the page focuses, which is the guessing
+        # the lookup order rules out.
+        if target_mode == "series_detail":
+            return StremioPlayResult(success=True, played_source=None, target_mode=target_mode)
+
+        result, pressed = self._play_when_ready(target_mode, title_label or title_key)
+        if result is not None:
+            return result
+        if not pressed:
+            log.info("Stream list never became ready; falling back to the OK-and-scan path")
+            time.sleep(self.autoplay_delay_ms / 1000)
 
         # Stremio TV typically focuses Play/Resume on the detail page, so
-        # pressing OK lets its built-in autoplay pick a source. This is the
-        # documented happy-path in CLAUDE.md and avoids the slow uiautomator
-        # scan that hangs while Stremio is still resolving streams.
-        if self._try_stremio_autoplay():
+        # pressing OK lets its built-in autoplay pick a source. Only when the
+        # ready-list path pressed nothing: a second OK into a player that is
+        # still loading is play/pause.
+        if not pressed and self._try_stremio_autoplay():
             return StremioPlayResult(
                 success=True,
                 played_source=None,
@@ -669,6 +697,105 @@ class StremioService:
             target_mode=target_mode,
         )
 
+    # ------------------------------------------------------- ready-list path ---
+
+    def _stremio_views(self) -> set[str] | None:
+        """
+        The view ids Stremio has VISIBLE right now, from `dumpsys activity top`.
+
+        ~0.6s, and it works while a video renders -- unlike `uiautomator dump`,
+        which waits for an idle UI that a playing video never gives it (5-14s
+        timeouts measured). None when the dump could not be read or Stremio is
+        not in it.
+        """
+        ok, output = self._run_shell("dumpsys activity top")
+        if not ok or not output or "com.stremio.one" not in output:
+            return None
+        block = output.split("com.stremio.one", 1)[1]
+        visible = set()
+        for line in block.splitlines():
+            match = _VISIBLE_VIEW_RE.search(line)
+            if match:
+                visible.add(match.group(1))
+        return visible
+
+    def _stremio_playback_state(self) -> int | None:
+        """
+        Stremio's OWN media-session state, or None when it holds no session.
+
+        `_is_playing` matches state=3 anywhere in the dump, so another app's
+        session can answer for Stremio. After the force-stop Stremio starts with
+        no session at all, so a state here is one this launch published.
+        """
+        _, output = self._run_shell("dumpsys media_session")
+        for part in (output or "").split("package=")[1:]:
+            if part.startswith("com.stremio.one"):
+                match = re.search(r"state=PlaybackState \{state=(\d+)", part)
+                return int(match.group(1)) if match else None
+        return None
+
+    def _poll(self, check, timeout_s: float, interval_s: float = 0.3) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if check():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(interval_s)
+
+    def _play_when_ready(self, target_mode: str, title: str | None) -> tuple[StremioPlayResult | None, bool]:
+        """
+        Wait for the stream list, press OK once, confirm the player, wait for play.
+
+        Returns (result, pressed). A result ends the request. (None, False) means
+        the list never showed and nothing was pressed -- the old OK-and-scan path
+        takes over. (None, True) means OK went in but no player opened, so only
+        the provider scan may follow: never a second blind OK.
+
+        Measured 2026-09-25 (Fallout S2E9, cold): the list is visible ~8s after
+        the deep link, the ExoPlayer views 1.8s after OK, state=3 5.8s after OK.
+        The old path pressed OK at a fixed ~3s -- onto the splash screen -- then
+        again, then ran a uiautomator scan over a video that was already on:
+        27-30s, and on 2026-09-22 a "which source?" question over a playing show.
+        """
+        def list_ready():
+            views = self._stremio_views()
+            if views is None:
+                return False
+            if "meta_details_error_frame" in views:
+                raise _StreamListFailed()
+            return "stream_card_stub_inflated" in views and "meta_details_loading_frame" not in views
+
+        try:
+            if not self._poll(list_ready, self.stream_list_timeout_s):
+                return None, False
+        except _StreamListFailed:
+            log.warning("Stremio showed its error frame instead of streams")
+            return None, False
+
+        self._keyevent(23)
+
+        def player_opened():
+            views = self._stremio_views() or set()
+            return any(v.startswith("exo_") for v in views) or self._stremio_playback_state() is not None
+
+        if not self._poll(player_opened, self.player_start_timeout_s):
+            log.warning("OK went in on the stream list but no player opened")
+            return None, True
+
+        if self._poll(lambda: self._stremio_playback_state() == 3, self.playback_timeout_s, 0.5):
+            return StremioPlayResult(success=True, played_source=None, target_mode=target_mode), True
+
+        # The player is up and still buffering: a torrent that is slow to start.
+        # Pressing anything now is play/pause, and "hit OK on the remote" would
+        # be the wrong advice. Say what is true.
+        label = title or "it"
+        return StremioPlayResult(
+            success=False,
+            message=f"{label} is loading on Stremio but hasn't started yet. Give it a moment.",
+            target_mode=target_mode,
+        ), True
+
     def _attempt_provider(self, provider_key: str) -> StremioPlayResult | None:
         candidate = self._find_provider_candidate(provider_key)
         if not candidate:
@@ -695,7 +822,10 @@ class StremioService:
         return StremioPlayResult(success=False, message=AUTOPLAY_FALLBACK_LINE)
 
     def _launch_uri(self, uri: str):
-        self._run_shell(f'am start -a android.intent.action.VIEW -d "{uri}"')
+        # 0x10008000 = FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK: the
+        # activity is rebuilt around this intent, so a warm Stremio cannot keep
+        # showing the page it had. See _play_deep_link.
+        self._run_shell(f'am start -f {_CLEAR_TASK_FLAGS} -a android.intent.action.VIEW -d "{uri}"')
 
     def _try_stremio_autoplay(self) -> bool:
         self._keyevent(23)

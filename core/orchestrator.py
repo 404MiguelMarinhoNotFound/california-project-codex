@@ -32,6 +32,7 @@ from services.surfshark_service import SurfsharkService
 from services.tv_volume import TvVolume
 from services.youtube_playlist_resolver import resolve_playlist_choice
 from services.youtube_search import speakable_title, top_video
+from core.turn_log import NULL_TURN, TurnLogWriter, TurnTimer
 
 logger = logging.getLogger(__name__)
 
@@ -337,8 +338,13 @@ def _ensure_playable(media_svc, say_now=None) -> str:
 
     # Identity checks throughout: a bare Mock's attributes are truthy.
     if media_svc.is_awake() is True:
-        hdmi = media_svc.hdmi_state()
-        if getattr(hdmi, "tv_power", None) != "standby":
+        # The TV's UPnP port is the live power reading; the CEC tail can be hours
+        # stale, and after tv_only_standby a dark set under an awake box is the
+        # normal state. Identity checks: a bare Mock's `available` is truthy.
+        waker = getattr(media_svc, "cec_waker", None)
+        tv = waker.tv_power() if getattr(waker, "available", False) is True else None
+        hdmi = media_svc.hdmi_state() if tv is None else None
+        if tv == "on" or (tv is None and getattr(hdmi, "tv_power", None) != "standby"):
             # Verified, not fire-and-forget: switch_input reports success on a
             # key the TV accepted and ignored. None is "could not tell" and never
             # switches; it fails open, as it always has.
@@ -815,6 +821,20 @@ def _dispatch_tv(
     return "unknown action"
 
 
+def _timed_tokens(token_stream, turn):
+    """
+    Pass the LLM stream through, marking the first real text token.
+
+    The orchestrator keeps its own handle on `token_stream` and closes THAT on
+    a barge-in, so the LLM service still sees GeneratorExit and saves the
+    partial answer; this wrapper only watches.
+    """
+    for token in token_stream:
+        if isinstance(token, str) and token:
+            turn.mark_once("llm_first_token")
+        yield token
+
+
 def _drain_queue(q: queue.Queue) -> None:
     """Throw away everything queued, without blocking."""
     while True:
@@ -1273,6 +1293,11 @@ def _dispatch_whatsapp(params: dict, whatsapp_svc, say_now=None) -> str:
 
 
 class Orchestrator:
+    # Class-level defaults so an Orchestrator built with __new__ (as the tests
+    # do) still has a turn to mark: the null turn records nothing.
+    _turn = NULL_TURN
+    _turn_writer = None
+
     def __init__(self, config: dict):
         self.config = config
 
@@ -1458,6 +1483,8 @@ class Orchestrator:
         # _say_now uses it to speak from inside a long tool call.
         self._active_tts_queue = None
         self._last_record_outcome = "ok"  # "ok" | "no_speech" | "short"
+        # One timing record per activation, appended to logs/turns.jsonl.
+        self._turn_writer = TurnLogWriter(config)
 
         logger.info("All components initialized in %.1fs", time.monotonic() - boot_start)
 
@@ -1518,6 +1545,10 @@ class Orchestrator:
             if self._stremio_sync_thread:
                 self._stremio_sync_thread.join(timeout=2)
             self.deebot_service.close()
+            # A TV-only standby may still be switching the box's HDMI-CEC back on;
+            # leaving it off would stop the Xiaomi remote turning the TV on.
+            if self.media_service is not None:
+                self.media_service._finish_pending_standby()
             # Also cancels any scheduled send, which would otherwise wake up
             # after shutdown and drive the keyboard at an empty room.
             self.whatsapp_service.close()
@@ -1576,6 +1607,27 @@ class Orchestrator:
 
     def _handle_activation(self, mic_stream, pre_roll=None) -> bool:
         """
+        One activation, timed. The work is in _run_activation; this wraps it in
+        a TurnTimer so every way a turn can end -- dropped, empty, command,
+        reply, barge-in, exception -- leaves one record in logs/turns.jsonl.
+        A chained turn (after a barge-in) has no pre-roll and is flagged.
+        """
+        self._turn = TurnTimer(self._turn_writer, chained=pre_roll is None)
+        barged_in = False
+        try:
+            barged_in = self._run_activation(mic_stream, pre_roll)
+            return barged_in
+        except BaseException:
+            self._turn.set(outcome="error")
+            raise
+        finally:
+            if barged_in:
+                self._turn.set(outcome="barged_in")
+            self._turn.finish()
+            self._turn = NULL_TURN
+
+    def _run_activation(self, mic_stream, pre_roll=None) -> bool:
+        """
         Handle a wake word activation:
         1. Start the activation line (does not block the microphone)
         2. Record user speech, gating out the line's own bleed
@@ -1599,6 +1651,7 @@ class Orchestrator:
         # First wake of the run gets a long line, the rest get short ones.
         tier = resolve_tier(self._wake_count)
         self._wake_count += 1
+        self._turn.set(tier=tier)
 
         # Playback does not block: recording starts now and the EchoGate inside
         # _record_speech discards whatever the mic picks up of the line itself.
@@ -1613,8 +1666,13 @@ class Orchestrator:
         # --- LISTENING: Record until silence ---
         self.leds.set_state("listening")
         audio_data = self._record_speech(mic_stream, playback)
+        self._turn.mark("speech_end")
+        rate = getattr(self.audio, "sample_rate", None)
+        if audio_data is not None and len(audio_data) and isinstance(rate, (int, float)) and rate:
+            self._turn.set(speech_s=round(len(audio_data) / rate, 2))
 
         if audio_data is None or len(audio_data) == 0:
+            self._turn.set(outcome=self._last_record_outcome)
             logger.info("No speech after the wake word — returning to idle without asking")
             self._capture_activation(pre_roll, None, self._last_record_outcome)
             self.audio.stop_playback()
@@ -1634,6 +1692,7 @@ class Orchestrator:
         # Convert to WAV and transcribe
         wav_bytes = self.audio.numpy_to_wav_bytes(audio_data)
         transcript = self.stt.transcribe(wav_bytes)
+        self._turn.mark("stt_done")
 
         # Safety net for any of the activation line that survived the audio trim
         # and reached Whisper as a prefix. Conservative by design: see
@@ -1645,18 +1704,22 @@ class Orchestrator:
                 transcript = cleaned
 
         if not transcript or transcript.strip() == "":
+            self._turn.set(outcome="empty_transcript")
             logger.info("Empty transcription, returning to idle")
             return False
 
+        self._turn.set(transcript=transcript)
         logger.info(f"User said: '{transcript}'")
         print(f"\n  👤 You: {transcript}")
 
         # Check for special commands
         if self._handle_command(transcript):
+            self._turn.set(outcome="command")
             return False
 
         # --- STREAMING: LLM → Sentence Chunker → TTS ---
         self.leds.set_state("thinking")
+        self._turn.set(outcome="reply")
         return self._stream_response(transcript, mic_stream)
 
     def _drain_mic(self, mic_stream, why: str):
@@ -1874,7 +1937,7 @@ class Orchestrator:
             token_stream = self.llm.stream_response(user_text)
             first_sentence = True
 
-            for sentence in chunk_sentences(token_stream):
+            for sentence in chunk_sentences(_timed_tokens(token_stream, self._turn)):
                 if self._interrupted.is_set():
                     # Close the LLM stream now rather than whenever the
                     # generator is collected; stream_response records what was
@@ -1887,12 +1950,14 @@ class Orchestrator:
 
                 if first_sentence:
                     self.leds.set_state("speaking")
+                    self._turn.mark("first_sentence")
                     first_sentence = False
 
                 tts_queue.put(sentence)
 
         except Exception as e:
-            logger.error(f"Streaming error: {e}")
+            logger.exception(f"Streaming error: {e}")
+            self._turn.set(outcome="error", error=str(e)[:200])
             tts_queue.put("Sorry, something went wrong.")
 
         finally:
@@ -1908,8 +1973,10 @@ class Orchestrator:
             if listener is not None:
                 listener.join()
 
+        self._turn.mark("reply_done")
         full_response = " ".join(full_response_parts)
         if full_response:
+            self._turn.set(reply=full_response)
             print(f"  🌴 California: {full_response}")
 
         return self._interrupted.is_set()
@@ -2022,6 +2089,7 @@ class Orchestrator:
                 break
 
             audio_data, sample_rate, text = item
+            self._turn.mark_once("first_audio")
             # Published for the reply listener's own-name guard.
             self._speaking_text = text
             try:
@@ -2048,7 +2116,17 @@ class Orchestrator:
         active.put(text)
 
     def _handle_tool_call(self, tool_name: str, tool_input: dict) -> str:
-        """Dispatch tool calls from the LLM."""
+        """Dispatch tool calls from the LLM, timing each one into the turn record."""
+        started = self._turn.now_ms()
+        result = None
+        try:
+            result = self._dispatch_tool(tool_name, tool_input)
+            return result
+        finally:
+            action = tool_input.get("action") if isinstance(tool_input, dict) else None
+            self._turn.tool(tool_name, action, started, result if result is not None else "<raised>")
+
+    def _dispatch_tool(self, tool_name: str, tool_input: dict) -> str:
         if tool_name == "control_tv":
             return _dispatch_tv(
                 tool_input,

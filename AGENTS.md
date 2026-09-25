@@ -196,6 +196,7 @@ california/
 │   ├── orchestrator.py          # Main state machine and tool dispatch
 │   ├── audio_pipeline.py        # Microphone capture and playback
 │   ├── wake_word.py             # Wake-word detection
+│   ├── turn_log.py              # Rotating log file + one timing record per turn (logs/)
 │   └── vad.py                   # Voice activity detection
 ├── services/
 │   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
@@ -747,8 +748,12 @@ pairing token is a hard dependency. That is why a rejected token gets its own
 - **Sleeping the box switches the TV off too** (`mAutoTvOff: true`,
   `hdmi_control_auto_device_off_enabled=1`). Intended — "turn off the TV" means
   both — but it is why the wake must WoL the TV first
-- The Mi Box is CEC physical address `0x2000` = **HDMI 2**. `KEY_HDMI` toggles
-  HDMI2 <-> HDMI1 on this set, so **odd presses select the box**
+- The Mi Box is CEC physical address `0x2000` = **HDMI 2**; HDMI 1 is a tuner
+  (CEC logical address 3). **Corrected 2026-09-25:** `KEY_HDMI` cycles only
+  inputs with a live signal, so it cannot select a sleeping box, and
+  `KEY_HDMI1`/`KEY_HDMI2` are accepted and ignored. The Source menu lists TV,
+  HDMI 1, HDMI 2 and LEFT does not wrap, so `KEY_SOURCE`, LEFT x4, RIGHT x port,
+  `KEY_ENTER` selects any port from anywhere (`CecWaker.select_input`)
 - `tv_ip` is a **cached hint, not configuration.** Identity keys off `tv_mac` and
   `tv_duid`, both stable. On a miss `resolve_tv_ip()` goes cached -> hint -> ARP by
   MAC -> TCP scan on :8001, verifying the duid at every step, and caches the answer
@@ -1411,7 +1416,7 @@ Recommended behavior:
 
 ### Operational Recommendation
 
-A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby`, which needs no box setting — see CLAUDE.md "Standby depth". Both devices have static addresses outside the DHCP pool since 2026-09-22 (box `192.168.1.200`, device MAC `9c:12:21:1c:95:ae`; TV `192.168.1.201`) — see CLAUDE.md "Static addresses".
+A wakelock app on the Mi Box does **not** help: the firmware force-suspends ~15s after sleep while listing the wakelocks it ignores (measured 2026-09-21). The deployment-side lever is `media.power.tv_only_standby`, on since 2026-09-25: "off" leaves the box awake behind a dark set and "on" is ~5s -- see CLAUDE.md "turn_on, rebuilt" before touching the power path. Both devices have static addresses outside the DHCP pool since 2026-09-22 (box `192.168.1.200`, device MAC `9c:12:21:1c:95:ae`; TV `192.168.1.201`) — see CLAUDE.md "Static addresses".
 
 ### Final VPN Routing Rules
 
@@ -2022,6 +2027,29 @@ Current automated coverage exists for:
   not end the turn; `_idle_loop` chains a barged-in turn into another activation
   on one speaker session; and a closed LLM generator keeps the partial answer
   in history
+
+### Runtime logs: read these before guessing at latency
+
+`core/turn_log.py`, configured under `logging:` in `config.yaml`. Both files live in
+`logs/` (gitignored: they hold what he said and what she answered;
+`include_transcripts: false` keeps only timings).
+
+- `logs/california.log` -- the console log plus DEBUG, rotated at 5MB x 5. SDK
+  clients (`anthropic`, `groq`, ...) are held at INFO, because at DEBUG they log
+  every request body and bury everything else.
+- `logs/turns.jsonl` -- one line per activation, ms since the wake word:
+  `speech_end`, `stt_done`, `llm_first_token`, `first_sentence`, `first_audio`,
+  `reply_done`, and `tools` (name, action, start, duration, result). A stage that
+  did not happen is absent, never zero. `outcome` is `reply`, `barged_in`,
+  `no_speech`, `short`, `empty_transcript`, `command` or `error`; a turn chained
+  after a barge-in has `chained: true`.
+
+`_handle_activation` owns the `TurnTimer` and finishes it in a `finally`, so every
+exit writes exactly one line; the work is in `_run_activation`. The timer is
+written from three threads and never raises. `Orchestrator._turn` defaults to a
+null turn at class level so `__new__`-built test orchestrators need no setup.
+`_timed_tokens` only watches the LLM stream: the orchestrator still closes the
+inner generator on a barge-in so `services/llm.py` sees `GeneratorExit`.
 
 Useful live-debug commands:
 

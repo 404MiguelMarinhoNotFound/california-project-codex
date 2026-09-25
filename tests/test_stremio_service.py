@@ -66,6 +66,9 @@ class StremioServiceTests(unittest.TestCase):
                 "watch_state_path": str(watch_state_path),
                 "autoplay_delay_ms": 1,
                 "provider_scan_delay_ms": 1,
+                "stream_list_timeout_ms": 1,
+                "player_start_timeout_ms": 1,
+                "playback_timeout_ms": 1,
                 "email": None,
                 "password": None,
             },
@@ -415,6 +418,8 @@ class StremioServiceTests(unittest.TestCase):
                     result = svc._play_deep_link(
                         imdb_id="tt0903747",
                         media_type="series",
+                        season=1,
+                        episode=1,
                         title_key="fallout",
                         title_label="Fallout",
                         allow_unknown_source=False,
@@ -422,7 +427,7 @@ class StremioServiceTests(unittest.TestCase):
 
             self.assertFalse(result.success)
             self.assertTrue(result.requires_confirmation)
-            self.assertEqual(result.target_mode, "series_detail")
+            self.assertEqual(result.target_mode, "episode")
             self.assertEqual(attempt_provider.call_count, 3)
             self.assertIn("Want me to try the first available source?", result.message)
             unknown_attempt.assert_not_called()
@@ -442,6 +447,8 @@ class StremioServiceTests(unittest.TestCase):
                         svc._play_deep_link(
                             imdb_id="tt0903747",
                             media_type="series",
+                            season=1,
+                            episode=1,
                             title_key="fallout",
                             title_label="Fallout",
                             allow_unknown_source=True,
@@ -465,6 +472,8 @@ class StremioServiceTests(unittest.TestCase):
                     result = svc._play_deep_link(
                         imdb_id="tt0903747",
                         media_type="series",
+                        season=1,
+                        episode=1,
                         title_key="fallout",
                         title_label="Fallout",
                         allow_unknown_source=True,
@@ -472,7 +481,7 @@ class StremioServiceTests(unittest.TestCase):
 
             self.assertTrue(result.success)
             self.assertEqual(result.played_source, "Torrentio")
-            self.assertEqual(result.target_mode, "series_detail")
+            self.assertEqual(result.target_mode, "episode")
             unknown_attempt.assert_called_once()
 
     def test_successful_play_updates_last_successful_source(self):
@@ -527,6 +536,9 @@ class StremioServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             watch_state = Path(tmp) / "watch_state.json"
             media_service = Mock()
+            # The ready-list path reads `dumpsys activity top` through _adb;
+            # an unreadable answer sends it to the scan these tests exercise.
+            media_service._adb.return_value = (False, "")
             media_service.is_app_foreground.return_value = True
             media_service.dump_ui_hierarchy.return_value = "<hierarchy />"
             svc = StremioService(self._config(watch_state), media_service=media_service)
@@ -539,6 +551,8 @@ class StremioServiceTests(unittest.TestCase):
                     result = svc._play_deep_link(
                         imdb_id="tt12637874",
                         media_type="series",
+                        season=1,
+                        episode=1,
                         title_key="fallout",
                         title_label="Fallout",
                         allow_unknown_source=False,
@@ -547,7 +561,7 @@ class StremioServiceTests(unittest.TestCase):
             self.assertTrue(result.success)
             self.assertFalse(result.requires_confirmation)
             self.assertIsNone(result.played_source)
-            self.assertEqual(result.target_mode, "series_detail")
+            self.assertEqual(result.target_mode, "episode")
             media_service.dump_ui_hierarchy.assert_called_once_with()
             media_service.tap.assert_not_called()
             self.assertIsNone(svc._scan_deadline)
@@ -564,6 +578,8 @@ class StremioServiceTests(unittest.TestCase):
                         result = svc._play_deep_link(
                             imdb_id="tt12637874",
                             media_type="series",
+                            season=1,
+                            episode=1,
                             title_key="fallout",
                             title_label="Fallout",
                             allow_unknown_source=False,
@@ -578,6 +594,9 @@ class StremioServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             watch_state = Path(tmp) / "watch_state.json"
             media_service = Mock()
+            # The ready-list path reads `dumpsys activity top` through _adb;
+            # an unreadable answer sends it to the scan these tests exercise.
+            media_service._adb.return_value = (False, "")
             media_service.is_app_foreground.return_value = True
             media_service.dump_ui_hierarchy.return_value = "<hierarchy />"
             config = self._config(watch_state)
@@ -589,6 +608,8 @@ class StremioServiceTests(unittest.TestCase):
                     result = svc._play_deep_link(
                         imdb_id="tt12637874",
                         media_type="series",
+                        season=1,
+                        episode=1,
                         title_key="fallout",
                         title_label="Fallout",
                         allow_unknown_source=False,
