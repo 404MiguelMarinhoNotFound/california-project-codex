@@ -226,27 +226,49 @@ So every synthetic positive is American English. The model has never heard
 */ka.li.ˈfɔɾ.ni.ɐ/*, only */ˌkæ.lɪ.ˈfɔɹ.njə/*. Raising `model_size` would only
 teach it the English pronunciation more thoroughly.
 
-The fix is real audio. Record yourself, and the pipeline folds it in as extra
-positives:
+The fix is real audio. Record yourself with `tools/wakeword_dataset.py`, which
+runs every take through the same checks and keeps a manifest
+(`training/recordings/manifest.jsonl`) of what was recorded, where, and why it
+was kept or thrown out. See the tool's docstring for exactly what it rejects.
+
+Record in **sessions**, one per cell: a language, a distance, a background.
+Each session records 20s of room tone first, then ~15 takes through the same
+mic the assistant listens on. Enter starts a take and Enter stops it; for mid
+and couch, where the keyboard is out of reach, `--hands-free` cuts one take
+per utterance instead.
 
 ```bash
-uv run python tools/record_wakeword.py --count 140
+uv run python tools/wakeword_dataset.py record --lang pt --distance couch --background tv
+uv run python tools/wakeword_dataset.py record --lang en --distance mid --background her
+uv run python tools/wakeword_dataset.py review
+uv run python tools/wakeword_dataset.py summary
 ```
 
-About ten minutes. The prompts cycle through delivery styles deliberately —
-a model trained only on careful pronunciations learns to require one. Clips are
-trimmed tightly at both ends, which matters because livekit's `align_clip_to_end`
-places positives at the END of the 2s window with 200ms jitter, so trailing
-silence would shift the word out of position relative to the Piper clips.
+`--background her` plays her own Aoede lines through the speaker while you
+talk, which is the barge-in case: the wake word over her voice scores 0/40 on
+the current model.
 
-**Hold some back.** Move roughly 20 takes into a separate directory and do not
-upload them. They are the only honest measure of whether this worked, because
-livekit's eval scores against synthetic Piper audio and therefore cannot tell you
-anything about your own voice.
+**Hold some back, by session.** `--holdout` makes a whole session holdout. Takes
+from one sitting share a mic position and a mood, so splitting a session leaks.
+Record the holdout session for a cell on a different day from its train ones.
+`summary` lists cells that still have none. livekit's eval scores against
+synthetic Piper audio and cannot tell you anything about your own voice; the
+holdout is the only honest measure.
+
+The pre-manifest recordings (`positive/`, `positive_pt/`, `holdout_*`) come in
+through `audit`, and her own real-room wakes through `import-live`. Both land
+flagged, so nothing reaches training without a listen.
 
 ```bash
-uvx modal volume put california-wakeword-data training/recordings/positive /recordings/positive
+uv run python tools/wakeword_dataset.py export --name v3
+uvx modal volume put california-wakeword-data training/recordings/export/v3/train /recordings/v3
 ```
+
+The trainer merges **every** wav under `/recordings` on the volume, so check
+`uvx modal volume ls california-wakeword-data /recordings` for old uploads first.
+Export trims train takes to the word plus 40ms, because livekit's
+`align_clip_to_end` places positives at the END of the 2s window with 200ms
+jitter; holdout takes keep their full window, which scores more honestly.
 
 ```bash
 uvx modal run --detach training/modal_train.py::train
@@ -255,7 +277,8 @@ uvx modal run --detach training/modal_train.py::train
 Then score the held-out takes against the old model and the new one:
 
 ```bash
-uv run python tools/score_wakeword.py --dir training/recordings/holdout
+uv run python tools/score_wakeword.py --dir training/recordings/export/v3/holdout/<cell> --framed
+uv run python tools/score_wakeword.py --dir training/recordings/export/v3/holdout/<cell> --framed --model models/california_v3.onnx
 ```
 
 ### How the merge works

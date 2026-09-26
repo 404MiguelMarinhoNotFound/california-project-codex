@@ -20,43 +20,78 @@ wake_word:
   # so the Porcupine backend and the .ppn models in sounds/wake_word_california/
   # no longer load, failing with PorcupineActivationRefusedError regardless of the
   # model file.
-  model: "models/california_v2.onnx"
+  # v3 since 2026-09-24: trained on the reviewed wakeword_dataset.py export (216
+  # takes through the live mic, incl. TV-on and over-her sessions) with her long
+  # replies and every session's room tone as training backgrounds. The 40
+  # held-out takes, mixed with a background at a real-room level (framed, hits
+  # of 40 at 0.5 / 0.7 / 0.81):
+  #
+  #                     v2            v3
+  #   quiet         36/32/28      31/29/26
+  #   TV at 300     12/11/ 7      21/16/ 9
+  #   her at 300     0/ 0/ 0       8/ 4/ 1
+  #   her at 480     0/ 0/ 0       2/ 1/ 0
+  #
+  # Quiet is slightly down, and tilted against v3: v2 trained on other takes
+  # from the same sittings as these holdouts, v3 never heard those sessions.
+  # Her five minutes of monologues peak at 0.06 on v3 (0.04 on v2) and the TV
+  # room tone at 0.34 (0.04), so neither wakes it at 0.5. Back to v2 is this
+  # line plus `threshold: 0.81` and `barge_in_threshold: 0.5`.
+  model: "models/california_v3.onnx"
   # 0.81 is california_v2_eval.json's optimal_threshold, chosen deliberately as the
   # false-positive-safe end. That figure is computed against synthetic Piper
   # validation audio, so treat it as a starting point, never as a measurement.
   #
-  # Re-measured 2026-09-03: 4-seed average, cf=2, framed decision (not peak score),
-  # recall over the 40 held-out recordings, false fires against 150s of the real
-  # quiet room. The dither column is what runs now - see dither_rms below.
+  # Re-measured 2026-09-23 with the fixed scorer: cf=2, framed decision, dither
+  # on, recall over the 40 held-out recordings (20 EN / 20 PT), each take scored
+  # inside a bed of room-level noise (2s before, 1s after):
   #
-  #     thr | NO DITHER: EN   PT   fires/h  | DITHER 10: EN   PT   fires/h
-  #   ---------------------------------------------------------------------
-  #    0.25 |    40%   51%     264.0        |    43%   55%       0.0
-  #    0.45 |    35%   41%     144.0        |    32%   41%       0.0
-  #    0.55 |    32%   34%      72.0        |    29%   36%       0.0
-  #    0.70 |    26%   29%       0.0        |    21%   29%       0.0
-  #    0.81 |    19%   25%       0.0        |    16%   20%       0.0   <- here
-  #    0.90 |    15%   16%       0.0        |    10%    8%       0.0
+  #     thr |  EN    PT
+  #   ------------------
+  #    0.25 |  95%   95%
+  #    0.45 |  90%   90%
+  #    0.55 |  85%   85%
+  #    0.70 |  85%   75%
+  #    0.80 |  80%   65%    (0.81 itself: 75% / 65%)   <- here
+  #    0.90 |  55%   60%
   #
-  # Read the left column before touching this number: undithered, lowering the
-  # threshold detonates (264 false fires/hour at 0.25), and that entire cliff is
-  # the gated-silence artefact dither_rms removes. Raising it does not work either
+  # THE OLD TABLE HERE WAS WRONG BY ~4x. It read 16% EN / 20% PT at 0.81 because
+  # tools/score_wakeword.py scored each ~0.7s take bare, straight after a model
+  # reset: the classifier's ~1.3s window was mostly reset filler, and the last
+  # partial frame - the end of the word - was never scored. The same takes with
+  # --no-pad still give 20% / 25%. Every recall figure before 2026-09-23 in this
+  # file, CLAUDE.md or a commit message measured the harness, not the model.
+  #
+  # These holdouts are close-mic in a quiet room, so this is a best case, not
+  # "across the room with the TV on". That is what the next training round's
+  # recording sessions exist to measure.
+  #
+  # No false-fire column: the only speech-bearing negatives are 9 no_speech
+  # captures, each one selected BECAUSE she fired on it (some are probably him
+  # saying the name and then pausing), so a per-hour rate off them is noise.
+  # The 2026-09-03 finding still stands: with dither_rms 0, lowering the
+  # threshold detonated (264 false fires/hour at 0.25 on 150s of quiet room),
+  # and that whole cliff is the gated-silence artefact dither_rms removes.
+  #
+  # Raising the threshold does not work either
   # - the observed false wakes were 0.896 and 0.927, and real wake words peak in
   # exactly that band (0.89/0.94/0.95/0.97/0.97/0.97), so no threshold separates
   # them. 0.90 costs 5-11 points of recall and leaves the worst ambient score
   # untouched at 0.801.
   #
-  # With the dither the false-fire column is flat zero, so this is a free
-  # parameter again - but that 150s sample has no speech, music or TV in it. It
-  # says nothing about false fires from actual talking. Before dropping to 0.55,
-  # live a day with wake_word.capture on and run:
-  #   uv run python tools/score_wakeword.py --negatives debug/activations --sweep
+  # With the dither, 150s of quiet room produced zero false fires at any
+  # threshold, but that sample has no speech, music or TV in it. Before dropping
+  # toward 0.55, collect real speech/TV negatives and run:
+  #   uv run python tools/score_wakeword.py --negatives <dir> --sweep --framed
+  # (--negatives skips *_ok.wav captures: their pre-roll holds a real wake word.)
   #
-  # Reproducibility trap: openwakeword.utils.AudioFeatures.reset() re-seeds its
-  # feature buffer from the GLOBAL numpy RNG, so a single pass over a directory is
-  # not repeatable. Seed numpy and average several runs, or two honest measurements
-  # of the same thing will disagree by a couple of files.
-  threshold: 0.81
+  # Reproducibility: openwakeword.utils.AudioFeatures.reset() re-seeds its feature
+  # buffer from the GLOBAL numpy RNG. The scorer now seeds it (and the dither RNG)
+  # per file, so its numbers repeat exactly; ad-hoc scripts must do the same.
+  # 0.5 for v3 (0.81 was v2's). v3's scores sit lower, so 0.81 throws away most
+  # of what it gained with the TV on (21 -> 9 of 40). If false wakes show up in
+  # debug/activations, step to 0.6 before anything else.
+  threshold: 0.5
   sensitivity: 0.6          # Porcupine-specific alias, unused on this backend
   # Native openWakeWord frames (1280 samples / 80ms each) that must clear the
   # threshold back to back. 2 = 160ms of sustained detection.
@@ -78,15 +113,22 @@ wake_word:
   # Measured 2026-09-16 with 45s of her own voice recorded through this mic at
   # the current speaker volume (RMS ~480): her peak score is 0.053, zero fires at
   # any threshold down to 0.2. So this can sit far below `threshold` safely.
-  # What it cannot fix is recall: the same 40 real takes that fire 10/40 clean
-  # fire 1/40 mixed with her voice at 0.81 and 5/40 at 0.5. The model was never
-  # trained on the wake word spoken OVER speech, and no runtime trick recovers
-  # that (ducking her volume 150-400ms into the word was simulated: 7/40 at
-  # best). The fix is training-side - add her clips as a background source in
-  # training/california_v2.yaml `augmentation.background_paths`. Until then,
+  # What it cannot fix is recall. The 2026-09-16 figures (10/40 clean, 1/40 over
+  # her voice) came from the bare-clip scorer; re-measured 2026-09-23 with the
+  # bed fix and her Aoede clips mixed under the word, it is 28/40 clean at 0.81
+  # and 0/40 over her voice at bleed RMS 300 or 480, at 0.81 AND at 0.5. So the
+  # conclusion holds and is starker: the model was never trained on the wake
+  # word spoken OVER speech, and no runtime trick recovers that (ducking her
+  # volume 150-400ms into the word was simulated: 7/40 at best). The same gap
+  # probably costs recall with the TV talking. The fix is training-side - her
+  # clips and TV speech as background sources in `augmentation.background_paths`
+  # for the next training run. Until then,
   # expect to say it twice, and read the "Reply listener: peak wake score" log
   # line to see how close it got.
-  barge_in_threshold: 0.5
+  # 0.3 for v3: over her voice at RMS 300 it catches 12/40 held-out takes at 0.3
+  # against 8/40 at 0.5, and her own voice peaks at 0.06, a 5x margin. Her lines
+  # that say "California" are covered by the own-name guard, not this number.
+  barge_in_threshold: 0.3
 
   # Inaudible white-noise floor (int16 RMS) mixed into each frame before scoring.
   # THIS IS THE FALSE-POSITIVE FIX, and it is counter-intuitive: she was waking on

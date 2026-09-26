@@ -189,8 +189,21 @@ Keep secrets in `.env` or another local-only secret mechanism. Do not commit rea
 > **Wake-word measurements are not reproducible unless you seed numpy.**
 > `openwakeword.utils.AudioFeatures.reset()` re-seeds its feature buffer from the
 > **global** numpy RNG, so a single pass over a directory varies run to run — two
-> honest measurements of the same thing will disagree by a couple of files. Seed
-> and average before trusting any recall number, including the ones in `config.yaml`.
+> honest measurements of the same thing will disagree by a couple of files.
+> `tools/score_wakeword.py` now seeds it, and the dither RNG, per file from the
+> file name, so its numbers repeat exactly. Ad-hoc scripts must do the same.
+>
+> **A short clip scored straight after a reset measures the reset, not the
+> model.** Until 2026-09-23 `score_wakeword.py` fed each ~0.7s held-out take
+> bare: the classifier's ~1.3s window was mostly reset filler, and the loop
+> dropped the last partial 1280-sample frame, which is where the word ends. That
+> is where "16% EN / 20% PT recall" came from. The same 40 takes scored inside a
+> bed of room-level noise (2s before, 1s after — `Bed` in the tool, `--bed` for a
+> real room-tone WAV, `--no-pad` to reproduce the old numbers) fire **75% EN /
+> 65% PT** at 0.81, framed. Every recall figure recorded before that date,
+> including the barge-in ones below and in commit messages, came off the broken
+> harness. `--negatives` also used to count `*_ok.wav` captures as false fires;
+> their pre-roll holds a real wake word, and they are now skipped.
 >
 > Do not reintroduce Porcupine without a paid key.
 
@@ -213,6 +226,7 @@ california/
 ├── setup.ps1                    # uv bootstrap for Windows
 ├── generate_bootup_sounds.py    # Regenerates the startup one-liners in sounds/bootup/
 ├── generate_activation_phrases.py # Regenerates the post-wake acknowledgements
+├── generate_her_monologues.py   # Long replies in her voice, the background for wake-word takes over her
 ├── core/
 │   ├── orchestrator.py          # Main state machine and tool dispatch
 │   ├── audio_pipeline.py        # Microphone capture and playback
@@ -248,7 +262,8 @@ california/
 ├── training/                    # Wake-word training, runs on Modal, see training/README.md
 │   ├── modal_train.py           # Modal app: setup / smoke / train entrypoints
 │   ├── california.yaml          # Run 1 config, kept for comparison
-│   ├── california_v2.yaml       # Current config: large head, wider TTS spread
+│   ├── california_v2.yaml       # Run 2 config: large head, wider TTS spread
+│   ├── california_v3.yaml       # Current config: v2 + reviewed real takes, her voice and room tone as backgrounds
 │   └── california_smoke.yaml    # Tiny end-to-end pipeline check
 ├── tools/
 │   ├── debug_surfshark_sequence.py # Runs named Surfshark routes with optional screenshot capture
@@ -264,7 +279,7 @@ california/
 │   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
-│   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
+│   ├── wakeword_dataset.py         # Wake-word training data: record sessions, checks, review, audit, export
 │   ├── probe_stremio_sync.py       # Refreshes and inspects Stremio watch-state cache
 │   ├── debug_stremio_collections.py # Inspects raw Stremio collection payloads when sync is wrong
 │   ├── search_youtube_playlists.py # Finds public YouTube playlist candidates by search query
@@ -296,6 +311,8 @@ california/
 │   ├── test_tv_volume.py        # UPnP TV volume: retry, cap-asked-twice, TV-off line, no-network guard
 │   ├── test_vad_silence.py      # Grace window, saw-speech flag, Silero framing
 │   ├── test_wake_word_framing.py # openWakeWord native-frame buffering, consecutive frames, dither floor
+│   ├── test_score_wakeword.py   # Scorer bed padding, determinism, ok-captures excluded from negatives
+│   ├── test_wakeword_dataset.py # Dataset checks, transcript match, holdout leak guard, export
 │   ├── test_name_matcher.py     # Matcher tier order, despacing, "&" normalization
 │   ├── test_playlist_config.py  # Structural sweep of the real config.yaml playlist data
 │   ├── test_youtube_playlist_resolver.py # Matching, aliases, and random-selection coverage
@@ -633,7 +650,11 @@ or "stop".
 - **The model cannot hear him over her, and that is a training gap, not a
   runtime one.** Same session, same 40 real holdout takes (EN+PT): 10/40 fire
   clean at 0.81, **1/40** mixed with her voice at 0.81, 5/40 at 0.5, 9/40 at
-  0.2. Even a clean mix at bleed RMS 300 — below his own voice at ~840 — takes
+  0.2. Those came off the bare-clip scorer (see the wake-word note at the top);
+  re-measured 2026-09-23 inside a bed, with her Aoede clips mixed under the
+  word, it is **28/40 clean and 0/40 over her voice** at bleed RMS 300 or 480,
+  at 0.81 and at 0.5. The conclusion holds and is starker. Even a clean mix at
+  bleed RMS 300 — below his own voice at ~840 — takes
   the median peak from 0.81 to 0.01. Ducking her volume once he starts was
   simulated before being built: cutting her to 15% or even to zero 150-400ms
   into the word recovers at best 7/40, because the model decides on the onset
@@ -2829,6 +2850,18 @@ Current automated coverage exists for:
 - The wake-word dither floor: that it reaches the model, clips instead of
   overflowing int16, leaves framing and the carried remainder untouched, and is
   bit-exact identity at `dither_rms: 0`
+- The wake-word scorer (`tests/test_score_wakeword.py`): every file is scored
+  inside a 2s/1s bed, the last samples of the word reach the model, framed
+  scoring gets the same bed, a file scores identically every run, and
+  `--negatives` skips `*_ok.wav` captures while recall mode does not
+- The wake-word dataset tool (`tests/test_wakeword_dataset.py`): silence,
+  clipping, a blip and a word cut off by the window are rejected; a second
+  sound or a word under 10 dB is flagged, not rejected; too-long only flags
+  with a TV on; a short gap inside the word does not split it; Whisper's
+  renderings of "California"/"Califórnia" match and near-misses do not; only
+  ok/accepted takes export; a session or identical audio on both sides of the
+  split refuses the export; holdout room tone never becomes a training
+  background
 - Whisper hallucination rejection: the filler blocklist (and that live control
   words like "go" and "stop" are not in it), `no_speech_prob` / `avg_logprob`
   gating on the worst segment, and failing open on an unexpected response shape
@@ -2928,9 +2961,7 @@ uv run python tools\score_wakeword.py --dir training
 ecordings\holdout_pt
 uv run python tools\score_wakeword.py --dir training
 ecordings\holdout_en --model models\california.onnx --threshold 0.59
-uv run python tools
-ecord_wakeword.py --count 150 --out training
-ecordings\positive
+uv run python tools\wakeword_dataset.py record --lang pt --distance couch --background tv
 ```
 
 Targeted validation used for the latest Stremio resume work:
@@ -3006,7 +3037,16 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
   **25%** of real English utterances and **0%** of Portuguese ones. Run 2 reported 93.3%
   at its `optimal_threshold` of 0.81 and caught **40%**. Both were measured against the
   same Piper voices that generated the training data, so they measure self-consistency,
-  not detection. Always hold back real recordings and score those instead
+  not detection. Always hold back real recordings and score those instead.
+  (The 25% / 40% real-audio figures were themselves measured bare — see the
+  next learning — so they understate both runs.)
+- **A clip scored in isolation is not a clip heard in a room.** The live mic
+  never stops, so the model always has a second of audio before the word and
+  audio after it. Scoring a trimmed 0.7s take straight after a reset gave it
+  neither, and reported 16-20% recall for a model that catches 65-75% of the
+  same takes in a bed of room noise. The harness was believed for three weeks
+  and drove a retrain plan; test the measuring tool against a case where you
+  know the answer before trusting what it says about the model
 - **An accent absent from the training data is absent from the model, and no threshold
   recovers it.** Piper's checkpoint is `en-us-libritts-high` and `synthesis.py` reads its
   espeak voice from that checkpoint's own JSON, so every synthetic positive is American
@@ -3193,6 +3233,24 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 A trace of notable multi-turn Claude Code sessions, so a future session (or
 Master Miguel) can find the conversation that produced a feature instead of
 just the commits.
+
+- **"My wake word is super buggy" (2026-09-23/24, branch
+  `fix/wakeword-scorer-padding`).** Started as a retrain request and first
+  found that the measurement was wrong: `score_wakeword.py` scored 0.7s takes
+  bare after a reset, which is where "16-20% recall" came from (75/65% in a
+  bed of room noise). Replaced `record_wakeword.py` with
+  `tools/wakeword_dataset.py` (manifest, push-to-talk and hands-free
+  sessions, automatic rejects vs flags-for-review, per-session holdout, leak
+  guard, export) and recorded ~230 takes through the live mic, including
+  TV-on and over-her sessions. `generate_her_monologues.py` gives her long
+  replies as the barge-in background. Trained v3 on Modal (`--recordings v3`
+  so v2's unreviewed uploads stay out) and wired it at threshold 0.5 /
+  barge-in 0.3: on the 40 holdouts with a background mixed in, TV 7 -> 21 and
+  her voice 0 -> 8 of 40 against v2 at 0.81; quiet roughly level. Lessons: a
+  detached `modal run` still dies with its local client, so long runs are
+  deployed and started with `Function.spawn`; Git Bash rewrites `/volume/paths`
+  unless `MSYS_NO_PATHCONV=1`. Still open: a real TV/her holdout, and more
+  over-her takes (22 so far).
 
 - **"1 minute really is unacceptable" (2026-09-21/22, branch `feat/fast-tv-wake`,
   PR #34).** After the Bluetooth route was ruled out (PR #33), rebuilt
