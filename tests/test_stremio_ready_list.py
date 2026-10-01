@@ -31,6 +31,18 @@ ERROR = STREAM_LIST.replace(
     "V.E...... ......I. 0,0-0,0 #7f0b021e app:id/meta_details_error_frame",
 )
 
+# A stream list as uiautomator sees it: a header up top, then cards whose
+# addon name is its own text node. Synthetic -- the box was not on this
+# screen when it was written -- so it tests the reading, not Stremio's layout.
+STREAM_CARDS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  <node text="Lanterns" bounds="[60,40][900,120]" />
+  <node text="S01E01" bounds="[60,130][400,180]" />
+  <node text="Comet" bounds="[700,400][900,440]" />
+  <node text="MediaFusion" bounds="[700,560][900,600]" />
+  <node text="Torrentio" bounds="[700,720][900,760]" />
+</hierarchy>"""
+
 
 def _session(package="com.stremio.one", state=3):
     return (f"  Sessions Stack - have 1 sessions:\n    x package={package}\n"
@@ -128,6 +140,32 @@ class PlayWhenReadyTests(unittest.TestCase):
         svc = _service(box)
         svc.player_start_timeout_s = 0.01
         self.assertEqual(svc._play_when_ready("episode", "Fallout"), (None, True))
+
+    # --- which source went in ----------------------------------------------
+
+    def test_the_first_cards_source_is_read_before_ok_and_reported(self, _sleep):
+        box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
+        svc = _service(box)
+        order = []
+        svc.media_service.dump_ui_hierarchy = Mock(
+            side_effect=lambda: order.append("dump") or STREAM_CARDS_XML)
+        svc._keyevent = Mock(side_effect=lambda k: order.append("ok"))
+
+        result, _ = svc._play_when_ready("episode", "Lanterns")
+
+        self.assertEqual(result.played_source, "Comet")
+        self.assertEqual(order, ["dump", "ok"], "the dump must come before the player is up")
+
+    def test_an_unreadable_list_still_gets_its_one_ok(self, _sleep):
+        box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
+        svc = _service(box)
+        svc.media_service.dump_ui_hierarchy = Mock(side_effect=RuntimeError("dump hung"))
+
+        result, pressed = svc._play_when_ready("episode", "Lanterns")
+
+        self.assertTrue(result.success)
+        self.assertIsNone(result.played_source)
+        self.assertEqual(box.keys, [23])
 
 
 @patch("services.stremio_service.time.sleep")

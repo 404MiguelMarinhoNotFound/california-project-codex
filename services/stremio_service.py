@@ -608,6 +608,14 @@ class StremioService:
 
         result, pressed = self._play_when_ready(target_mode, title_label or title_key)
         if result is not None:
+            if result.success:
+                self._remember_successful_source(
+                    title_key=title_key,
+                    title_label=title_label,
+                    imdb_id=imdb_id,
+                    media_type=media_type,
+                    source_label=result.played_source,
+                )
             return result
         if not pressed:
             log.info("Stream list never became ready; falling back to the OK-and-scan path")
@@ -773,6 +781,8 @@ class StremioService:
             log.warning("Stremio showed its error frame instead of streams")
             return None, False
 
+        source = self._first_card_label()
+        log.info("Stream list ready; first card: %s", source or "unreadable")
         self._keyevent(23)
 
         def player_opened():
@@ -784,7 +794,8 @@ class StremioService:
             return None, True
 
         if self._poll(lambda: self._stremio_playback_state() == 3, self.playback_timeout_s, 0.5):
-            return StremioPlayResult(success=True, played_source=None, target_mode=target_mode), True
+            log.info("Playing from %s", source or "an unread source")
+            return StremioPlayResult(success=True, played_source=source, target_mode=target_mode), True
 
         # The player is up and still buffering: a torrent that is slow to start.
         # Pressing anything now is play/pause, and "hit OK on the remote" would
@@ -795,6 +806,26 @@ class StremioService:
             message=f"{label} is loading on Stremio but hasn't started yet. Give it a moment.",
             target_mode=target_mode,
         ), True
+
+    def _first_card_label(self) -> str | None:
+        """
+        The source label of the first stream card, read before the one OK.
+
+        The stream list is the one moment a uiautomator dump is safe: nothing
+        is rendering yet, so the UI goes idle. After OK the player is up and a
+        dump hangs for its full timeout. Only for the log and the remembered
+        source -- which addon comes first is decided by the addon order on the
+        Stremio account (Comet first since 2026-10-01), not here. Any failure
+        is None, never a reason to skip the OK.
+        """
+        try:
+            candidates = self._extract_candidates_from_ui_xml(self._dump_ui_hierarchy())
+        except Exception:
+            log.debug("Could not read the stream list before OK", exc_info=True)
+            return None
+        known = [c for c in candidates if c.provider_key in self.provider_aliases]
+        first = (known or candidates or [None])[0]
+        return first.label if first else None
 
     def _attempt_provider(self, provider_key: str) -> StremioPlayResult | None:
         candidate = self._find_provider_candidate(provider_key)

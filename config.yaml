@@ -408,7 +408,11 @@ stremio:
   # OK, playing ~7s after OK on a torrent stream.
   stream_list_timeout_ms: 20000
   player_start_timeout_ms: 6000
-  playback_timeout_ms: 45000
+  # Comet over Real-Debrid is the first stream addon on the account since
+  # 2026-10-01, and a debrid stream starts in seconds. 45s was sized for plain
+  # torrents and made a stuck stream (Lanterns S1E1, 2026-10-01) cost 50s of
+  # silence before she said so. Raise it again if the addon order changes.
+  playback_timeout_ms: 15000
   library_sync_interval_minutes: 60
   history_refresh_max_age_minutes: 5
   watch_state_path: "watch_state.json"
