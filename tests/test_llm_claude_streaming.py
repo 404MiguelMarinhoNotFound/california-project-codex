@@ -20,12 +20,14 @@ from tests.config_fixture import config_for_tests
 class _Block:
     """Stands in for an Anthropic content block."""
 
-    def __init__(self, type, text=None, name=None, input=None, id=None):
+    def __init__(self, type, text=None, name=None, input=None, id=None,
+                 tool_use_id=None):
         self.type = type
         self.text = text
         self.name = name
         self.input = input
         self.id = id
+        self.tool_use_id = tool_use_id
 
 
 class _FinalMessage:
@@ -384,6 +386,125 @@ class ClaudeStreamingTests(unittest.TestCase):
         self.assertEqual([m["content"] for m in starts], ["turn 6", "turn 7"])
         self.assertEqual(svc.history[0], {"role": "user", "content": "turn 6"})
         self.assertEqual(len(svc.history), 8)   # 2 exchanges x 4 messages
+
+    # --- a web search and a local tool in one response ----------------------
+    #
+    # 2026-10-01: "open Stremio and search online what I should watch" came
+    # back as server_tool_use(web_search) + tool_use(launch_app) with the
+    # search still unrun. The turn worked; the next request runs the search.
+    # But that message stayed in history without its result, and every turn
+    # after it was a 400 until a restart.
+
+    def _search_and_launch_turns(self):
+        search_call = _Block("server_tool_use", name="web_search", input={}, id="srv1")
+        launch = _Block("tool_use", name="control_tv",
+                        input={"action": "launch_app", "app_name": "stremio"}, id="t1")
+        first = [_Block("text", text="I'll search and open Stremio."), search_call, launch]
+        second = [
+            _Block("web_search_tool_result", tool_use_id="srv1"),
+            _Block("text", text="Star City is trending."),
+        ]
+        return search_call, first, [
+            (["I'll search and open Stremio."], first, "tool_use"),
+            (["Star City is trending."], second, "end_turn"),
+            (["Opening it."], [_Block("text", text="Opening it.")], "end_turn"),
+        ]
+
+    def test_an_unanswered_web_search_is_kept_out_of_history(self):
+        search_call, _, turns = self._search_and_launch_turns()
+        svc, _ = self._service(turns)
+        svc.tool_handler = lambda name, args: "Opening stremio"
+
+        list(svc.stream_response("open Stremio and search what to watch"))
+
+        stored = svc.history[1]["content"]
+        self.assertNotIn(search_call, stored)
+        self.assertEqual([b.type for b in stored], ["text", "tool_use"])
+
+    def test_the_request_that_runs_the_search_still_carries_it(self):
+        """Only history is filtered. The continuation must still send the
+        search call, or the search never runs."""
+        search_call, _, turns = self._search_and_launch_turns()
+        svc, _ = self._service(turns)
+        svc.tool_handler = lambda name, args: "Opening stremio"
+
+        list(svc.stream_response("open Stremio and search what to watch"))
+
+        continuation = svc.client.messages.calls[1]
+        self.assertIn(search_call, continuation[1]["content"])
+
+    def test_the_turn_after_sends_no_unanswered_web_search(self):
+        _, _, turns = self._search_and_launch_turns()
+        svc, _ = self._service(turns)
+        svc.tool_handler = lambda name, args: "Opening stremio"
+
+        list(svc.stream_response("open Stremio and search what to watch"))
+        list(svc.stream_response("open Star City"))
+
+        next_request = svc.client.messages.calls[2]
+        for message in next_request:
+            if isinstance(message["content"], list):
+                types = [getattr(b, "type", None) or b.get("type")
+                         for b in message["content"]]
+                self.assertNotIn("server_tool_use", types)
+
+    def test_a_search_with_its_result_in_the_same_message_is_kept(self):
+        call = _Block("server_tool_use", name="web_search", input={}, id="srv1")
+        result = _Block("web_search_tool_result", tool_use_id="srv1")
+        launch = _Block("tool_use", name="control_tv",
+                        input={"action": "launch_app", "app_name": "stremio"}, id="t1")
+        content = [call, result, _Block("text", text="Opening it."), launch]
+        svc, _ = self._service([
+            (["Opening it."], content, "tool_use"),
+            (["Done."], [], "end_turn"),
+        ])
+        svc.tool_handler = lambda name, args: "Opening stremio"
+
+        list(svc.stream_response("search and open"))
+
+        self.assertEqual(svc.history[1]["content"], content)
+
+    def test_a_search_result_whose_call_is_elsewhere_is_left_out(self):
+        orphan = _Block("web_search_tool_result", tool_use_id="srv-earlier")
+        launch = _Block("tool_use", name="control_tv",
+                        input={"action": "launch_app", "app_name": "stremio"}, id="t1")
+        svc, _ = self._service([
+            (["ok"], [orphan, _Block("text", text="ok"), launch], "tool_use"),
+            (["Done."], [], "end_turn"),
+        ])
+        svc.tool_handler = lambda name, args: "Opening stremio"
+
+        list(svc.stream_response("open it"))
+
+        self.assertNotIn(orphan, svc.history[1]["content"])
+
+    def test_a_rejected_request_clears_history_instead_of_failing_forever(self):
+        class _BadRequest(Exception):
+            status_code = 400
+
+        svc, _ = self._service([])
+        svc.history = [
+            {"role": "user", "content": "earlier"},
+            {"role": "assistant", "content": "malformed somehow"},
+        ]
+        svc.client.messages.stream = mock.Mock(side_effect=_BadRequest("messages.1: ..."))
+
+        chunks = list(svc.stream_response("open Star City"))
+
+        self.assertIn("trouble thinking", chunks[-1])
+        self.assertEqual(svc.history, [])
+
+    def test_a_network_error_keeps_history(self):
+        svc, _ = self._service([])
+        svc.history = [
+            {"role": "user", "content": "earlier"},
+            {"role": "assistant", "content": "fine"},
+        ]
+        svc.client.messages.stream = mock.Mock(side_effect=ConnectionError("offline"))
+
+        list(svc.stream_response("hello"))
+
+        self.assertEqual(svc.history[0], {"role": "user", "content": "earlier"})
 
     # --- interruption ------------------------------------------------------
 

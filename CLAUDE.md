@@ -2200,6 +2200,17 @@ called and the result comes back, so never describe an outcome without a tool re
 this very turn, and "where is it / what is it doing" is a status call. The "Done. That
 worked out well." signature pattern is now explicitly "after a tool result".
 
+**A web search and a local tool in one response leave the search unanswered.** On
+2026-10-01 "open Stremio and search what I should watch" came back as
+`server_tool_use` (web_search) plus `tool_use` (launch_app), with the search not yet
+run -- the request that answers the tool runs it. Stored verbatim, that message sat
+in history without its `web_search_tool_result`, and every later turn was a 400
+("I had trouble thinking about that") until a restart. `_paired_server_blocks` now
+stores a server tool call only alongside its result in the same message, and drops a
+result whose call is elsewhere; the in-flight request still carries both. As a
+backstop, any 400 from the provider clears history, because the request is mostly
+history and one malformed message would otherwise fail every turn identically.
+
 ### The vacuum's name is config, not a comment
 
 "Where is SirSucksAlot?" was answered with "is that a person or a pet?" because the

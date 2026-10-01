@@ -299,6 +299,39 @@ LOCAL_TOOL_NAMES = {
 }
 
 
+def _paired_server_blocks(content) -> list:
+    """
+    The content of an assistant message as it may be stored in history: every
+    server-side tool call (web search) kept only together with its result.
+
+    When Claude asks for a web search AND a local tool in one response, the
+    response stops at the local tool with the search still unrun:
+    `server_tool_use` is there, `web_search_tool_result` is not. The very next
+    request accepts that, because it is the one that runs the search -- but
+    once the message is in the middle of history, every later request is a 400
+    ("tool use ... found without a corresponding web_search_tool_result"),
+    and she answers "I had trouble thinking about that" to everything until a
+    restart (2026-10-01). The result then arrives in a later message, which on
+    its own is just as invalid, so the rule is symmetric: a call or a result
+    whose partner is not in the same message is left out of history.
+    """
+    calls = {b.id for b in content if b.type == "server_tool_use"}
+    results = {
+        getattr(b, "tool_use_id", None)
+        for b in content
+        if b.type.endswith("_tool_result") and b.type != "tool_result"
+    }
+    kept = []
+    for b in content:
+        if b.type == "server_tool_use" and b.id not in results:
+            continue
+        if (b.type.endswith("_tool_result") and b.type != "tool_result"
+                and getattr(b, "tool_use_id", None) not in calls):
+            continue
+        kept.append(b)
+    return kept
+
+
 class LLMService:
     def __init__(self, config: dict):
         llm_cfg = config["llm"]
@@ -564,6 +597,7 @@ class LLMService:
         # "text" accumulates everything spoken this turn, across tool rounds;
         # "last_text" is only what the final generation said.
         full_response_ref = {"text": "", "last_text": ""}
+        history_reset = False
 
         try:
             if self.provider == "claude":
@@ -589,6 +623,15 @@ class LLMService:
             logger.error(f"LLM error: {e}")
             error_msg = "Sorry, I had trouble thinking about that. Could you try again?"
             full_response = error_msg
+            if getattr(e, "status_code", None) == 400:
+                # The API rejected the request itself, and the request is
+                # mostly history: one malformed message in it fails every
+                # later turn identically until a restart. Start clean instead.
+                # Nothing is stored after the clear -- a history opening on
+                # an assistant turn would be its own malformed request.
+                self.history.clear()
+                history_reset = True
+                logger.warning("Request rejected as malformed; conversation history cleared")
             yield error_msg
 
         # The final assistant message holds only the text of the *last*
@@ -600,7 +643,7 @@ class LLMService:
         # message, and consecutive user turns are merged by the API.
         final_text = full_response_ref["last_text"] if full_response else ""
         final_text = final_text or full_response
-        if final_text:
+        if final_text and not history_reset:
             self.history.append({"role": "assistant", "content": final_text})
 
         elapsed = time.time() - start
@@ -712,12 +755,14 @@ class LLMService:
             # instead of calling ("Sending him to dock now. Done." with no
             # vacuum_dock in the log). Both messages are appended together so
             # a handler that raises leaves no half-round behind.
-            round_messages = [
+            messages.extend([
                 {"role": "assistant", "content": response.content},
                 {"role": "user", "content": tool_results},
-            ]
-            messages.extend(round_messages)
-            self.history.extend(round_messages)
+            ])
+            self.history.extend([
+                {"role": "assistant", "content": _paired_server_blocks(response.content)},
+                {"role": "user", "content": tool_results},
+            ])
 
     def _stream_openai_compatible(self, response_ref: dict) -> Generator[str, None, None]:
         """
