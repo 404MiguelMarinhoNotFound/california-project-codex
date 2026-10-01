@@ -79,6 +79,8 @@ class StremioPlayResult:
     played_source: str | None = None
     requires_confirmation: bool = False
     target_mode: str | None = None
+    # True when the series had no tracked episode and S1E1 was played instead.
+    started_from_first_episode: bool = False
 
     def __bool__(self) -> bool:
         return self.success
@@ -520,7 +522,16 @@ class StremioService:
             season = entry.get("season")
             episode = entry.get("episode")
 
-        return self._play_deep_link(
+        # No tracked episode means he has not started it, and starting it means
+        # episode one. This used to open the series page and press nothing,
+        # which read as "nothing happened" twice on 2026-10-01 (Lanterns,
+        # Brooklyn Nine-Nine) and cost a second request every time.
+        from_first = resolved_type == "series" and not (season and episode)
+        if from_first:
+            log.info("No watch history for %s; starting at S1E1", resolved_title)
+            season, episode = 1, 1
+
+        result = self._play_deep_link(
             imdb_id=imdb_id,
             media_type=resolved_type,
             season=season,
@@ -530,6 +541,8 @@ class StremioService:
             allow_unknown_source=allow_unknown_source,
             remembered_source=remembered_source,
         )
+        result.started_from_first_episode = from_first
+        return result
 
     def _is_resume_sensitive_request(
         self,

@@ -197,7 +197,52 @@ class OrchestratorVpnRoutingTests(unittest.TestCase):
             {},
         )
 
-        self.assertEqual(response, "Opening Shrinking on Stremio.")
+        self.assertIn("nothing is playing", response)
+        self.assertIn("which season and episode", response)
+
+    def test_a_series_page_is_never_reported_like_a_playing_show(self):
+        """2026-10-01: the page came back as "Opening X on Stremio." and she
+        told him Brooklyn Nine-Nine was loading. Nothing ever played."""
+        media_svc = Mock()
+        media_svc.ensure_connected.return_value = True
+        stremio_svc = Mock()
+        stremio_svc.play.return_value = StremioPlayResult(success=True, target_mode="series_detail")
+
+        response = _dispatch_tv(
+            {"action": "stremio_play", "title": "Brooklyn Nine-Nine"},
+            media_svc, stremio_svc, None, {},
+        )
+
+        self.assertIn("nothing is playing", response)
+        self.assertNotIn("is playing on Stremio", response)
+
+    def test_a_confirmed_episode_is_reported_as_playing(self):
+        media_svc = Mock()
+        media_svc.ensure_connected.return_value = True
+        stremio_svc = Mock()
+        stremio_svc.play.return_value = StremioPlayResult(success=True, target_mode="episode")
+
+        response = _dispatch_tv(
+            {"action": "stremio_play", "title": "Lanterns", "season": 1, "episode": 1},
+            media_svc, stremio_svc, None, {},
+        )
+
+        self.assertEqual(response, "Lanterns is playing on Stremio.")
+
+    def test_starting_at_episode_one_says_why(self):
+        media_svc = Mock()
+        media_svc.ensure_connected.return_value = True
+        stremio_svc = Mock()
+        stremio_svc.play.return_value = StremioPlayResult(
+            success=True, target_mode="episode", started_from_first_episode=True)
+
+        for action in ("stremio_play", "stremio_continue"):
+            response = _dispatch_tv(
+                {"action": action, "title": "Brooklyn Nine-Nine"},
+                media_svc, stremio_svc, None, {},
+            )
+            self.assertIn("season 1 episode 1", response, action)
+            self.assertIn("no watch history", response, action)
 
 
 if __name__ == "__main__":

@@ -43,7 +43,7 @@ CONTROL_TV_TOOL = {
             "toggle power, or control the TV in any way. For plain Stremio series "
             "play requests without an explicit season and episode, sync the library "
             "first and resume the latest tracked episode when available. If there is "
-            "no tracked progress, open the series page instead of guessing an episode. "
+            "no tracked progress, it starts at season 1 episode 1 on its own. "
             "If no preferred Stremio source is found, ask before trying the first "
             "unknown source."
         ),

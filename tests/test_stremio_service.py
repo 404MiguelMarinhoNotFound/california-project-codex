@@ -267,7 +267,9 @@ class StremioServiceTests(unittest.TestCase):
             self.assertEqual(deep_link.call_args.kwargs["season"], 2)
             self.assertEqual(deep_link.call_args.kwargs["episode"], 4)
 
-    def test_plain_series_play_falls_back_to_series_detail_when_no_progress_exists(self):
+    def test_plain_series_play_starts_episode_one_when_no_progress_exists(self):
+        """No history means he has not started it. It used to open the series
+        page and press nothing, which read as nothing happening (2026-10-01)."""
         with tempfile.TemporaryDirectory() as tmp:
             watch_state = Path(tmp) / "watch_state.json"
             svc = StremioService(self._config(watch_state))
@@ -282,15 +284,44 @@ class StremioServiceTests(unittest.TestCase):
                         return_value=StremioPlayResult(
                             success=True,
                             played_source="Comet",
-                            target_mode="series_detail",
+                            target_mode="episode",
                         ),
                     ) as deep_link:
                         result = svc.play("Shrinking", media_type="series")
 
             self.assertTrue(result.success)
-            self.assertEqual(result.target_mode, "series_detail")
+            self.assertEqual(deep_link.call_args.kwargs["season"], 1)
+            self.assertEqual(deep_link.call_args.kwargs["episode"], 1)
+            self.assertIs(result.started_from_first_episode, True)
+
+    def test_tracked_progress_is_not_reported_as_starting_fresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            watch_state = Path(tmp) / "watch_state.json"
+            watch_state.write_text(json.dumps({"shrinking": {
+                "title": "Shrinking", "imdb_id": "tt13315786", "type": "series",
+                "season": 2, "episode": 4, "finished_last": False,
+            }}), encoding="utf-8")
+            svc = StremioService(self._config(watch_state))
+
+            with patch.object(svc, "_sync_library_for_resume"):
+                with patch.object(svc, "_play_deep_link",
+                                  return_value=StremioPlayResult(success=True, target_mode="episode")) as deep_link:
+                    result = svc.play("Shrinking")
+
+            self.assertEqual(deep_link.call_args.kwargs["season"], 2)
+            self.assertIs(result.started_from_first_episode, False)
+
+    def test_a_movie_is_never_given_an_episode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = StremioService(self._config(Path(tmp) / "watch_state.json"))
+            with patch.object(svc, "_ensure_fresh_history"):
+                with patch.object(svc, "resolve_imdb_id", return_value=("tt0111161", "movie")):
+                    with patch.object(svc, "_play_deep_link",
+                                      return_value=StremioPlayResult(success=True, target_mode="movie_detail")) as deep_link:
+                        result = svc.play("The Shawshank Redemption", media_type="movie")
+
             self.assertIsNone(deep_link.call_args.kwargs["season"])
-            self.assertIsNone(deep_link.call_args.kwargs["episode"])
+            self.assertIs(result.started_from_first_episode, False)
 
     def test_explicit_episode_bypasses_resume_sync(self):
         with tempfile.TemporaryDirectory() as tmp:

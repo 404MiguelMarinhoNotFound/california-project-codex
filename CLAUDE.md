@@ -1794,7 +1794,7 @@ the openWakeWord models, so a fresh machine needs it again.
 - Playback verification by checking `dumpsys media_session` for `state=3`
 - Remembering the last successful source label for better future source selection
 - Provider fallback order of remembered source, then `comet`, then `mediafusion`, then `torrent` / `torrentio` aliases before asking the user
-- Series-detail fallback when no tracked episode exists instead of forcing season 1 episode 1
+- Season 1 episode 1 when a series has no tracked episode, with a spoken line saying why (see below)
 
 ### Stremio Lookup Order
 
@@ -1803,12 +1803,15 @@ When asked to play or continue a title:
 1. For `stremio_continue` and plain series `stremio_play` requests with no explicit season and episode, sync the Stremio library first
 2. Use the synced `watch_state.json` entry when the title already exists in the library or history
 3. If the title is unknown locally, query TMDB and resolve to IMDb ID
-4. For series with no tracked progress, open the series detail page instead of inventing episode numbers
+4. For series with no tracked progress, play season 1 episode 1 (`started_from_first_episode`
+   on the result), and the tool line tells her to say she started there because he has no
+   watch history for it
 5. Build the Stremio deep link for either an episode target or a detail-page target
 6. Try the remembered source first, then `comet`, then `mediafusion`, then `torrent` / `torrentio`
 7. Launch on Mi Box with ADB, **clearing Stremio's task** (`am start -f 0x10008000`),
    never a force-stop -- see "The ready-list path" below
-8. A series with no tracked episode stops here, on its detail page, with no key pressed
+8. A bare `series_detail` link (only reachable from `_play_deep_link` called directly; `play()`
+   always supplies an episode for a series) stops here, on its detail page, with no key pressed
 9. Wait for the stream list to be on screen (`dumpsys activity top`: a visible
    `stream_card_stub_inflated`, no visible `meta_details_loading_frame`), then press OK
    **once** -- the first card is focused
@@ -3145,7 +3148,13 @@ uv run python -m unittest tests.test_media_service tests.test_stremio_service te
 - Plain show requests should sync first, then use `watch_state.json` as the resume source of truth for Stremio titles
 - TMDB is the fallback resolver for titles outside the local Stremio cache
 - `state=3` in `dumpsys media_session` is the practical playback signal
-- If no resume progress exists for a series, opening the Stremio detail page is better than guessing an episode
+- **No resume progress means he has not started it, so episode one is not a guess.** The
+  detail page looked like the cautious choice and read as "nothing happened": on
+  2026-10-01 both Lanterns and Brooklyn Nine-Nine stopped on their pages, and because the
+  tool answered "Opening X on Stremio." for a page and a playing show alike, she told him
+  Brooklyn Nine-Nine was "loading up" while nothing ever played. `play()` now starts
+  S1E1 and says why; `_stremio_opened_line` gives a page, a playing show and an S1E1 start
+  three different lines
 - Shared ADB helpers with explicit timeouts are more reliable than scattered raw shell calls for UI dumps and screenshot capture
 - Static YouTube playlist mapping is simpler and more reliable than OAuth-heavy integrations
 - **Pressing into a screen you cannot read is a coin flip, and "opened"

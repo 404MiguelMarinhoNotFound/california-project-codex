@@ -149,6 +149,35 @@ def _append_route_warning(message: str, warning_suffix: str | None) -> str:
     return base + warning_suffix
 
 
+def _stremio_opened_line(title: str, result) -> str:
+    """
+    What a successful Stremio launch actually did, in words the model cannot
+    misread. Every success used to come back as "Opening X on Stremio.", the
+    same line for a show that is playing and for a series page with nothing
+    pressed -- and on 2026-10-01 she answered the page with "Brooklyn Nine-Nine
+    is loading up for you" while nothing ever played.
+
+    A series with no watch history now starts at S1E1 instead of stopping on
+    its page, and the line says why, so she tells him rather than leaving him
+    to wonder why it began at the start.
+    """
+    target_mode = result.target_mode
+    if getattr(result, "started_from_first_episode", False) is True:
+        return (
+            f"{title} is playing on Stremio from season 1 episode 1. Tell him you "
+            "started there because he has no watch history for it."
+        )
+    if target_mode == "series_detail":
+        return (
+            f"Opened the {title} page on Stremio, but nothing is playing: there is "
+            "no episode in his watch history to resume. Ask which season and "
+            "episode he wants, or offer season 1 episode 1."
+        )
+    if target_mode in ("episode", "movie_detail"):
+        return f"{title} is playing on Stremio."
+    return f"Opening {title} on Stremio."
+
+
 def _unreachable_line(media_svc) -> str:
     """
     Say WHICH kind of unreachable. These need opposite responses from him.
@@ -593,10 +622,10 @@ def _dispatch_tv(
         if result.requires_confirmation:
             return result.message or AUTOPLAY_FALLBACK_LINE
         if result.success:
-            if result.target_mode == "episode":
+            if result.target_mode == "episode" and getattr(result, "started_from_first_episode", False) is not True:
                 response = f"Continuing {title}."
             else:
-                response = f"Opening {title} on Stremio."
+                response = _stremio_opened_line(title, result)
             _remember_launch(
                 now_playing, "stremio", title,
                 "playing" if result.target_mode == "episode" else "opened",
@@ -625,7 +654,7 @@ def _dispatch_tv(
         if result.requires_confirmation:
             return result.message or AUTOPLAY_FALLBACK_LINE
         if result.success:
-            response = f"Opening {title} on Stremio."
+            response = _stremio_opened_line(title, result)
             _remember_launch(
                 now_playing, "stremio", title,
                 "playing" if result.target_mode == "episode" else "opened",
