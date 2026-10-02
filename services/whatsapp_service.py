@@ -97,6 +97,7 @@ _MSG_GROUP_SHARED = "Two of your groups are called {title}, and I can't tell the
 _MSG_GROUP_GONE = "I couldn't find {title} in WhatsApp just now. It may have been renamed."
 _MSG_GROUP_WRONG_CHAT = "The group didn't open properly, so I didn't send anything."
 _MSG_GROUP_NO_SCHEDULE = "I can only schedule messages to people for now, not groups."
+_MSG_READ_CHAT_FAILED = "I couldn't open that chat just now."
 # A miss against a list re-read this recently is a real miss, not a stale cache.
 _GROUP_REFRESH_COOLDOWN_S = 120.0
 
@@ -1256,6 +1257,55 @@ class WhatsAppService:
                 web.WRONG_CHAT: _MSG_GROUP_WRONG_CHAT,
             }.get(outcome.status, _MSG_UNREACHABLE),
         )
+
+    def read_chat(self, target, count: int = 10):
+        """
+        The last `count` messages of one chat, read or not. `target` is a
+        GroupMatch (a group, by its exact cached title) or a ContactMatch (a
+        person, by number). Returns the driver's ReadResult, or a falsy
+        WhatsAppCommandResult with its spoken line.
+
+        This opens the chat, which marks anything unread there as read on his
+        phone; the driver closes it again afterwards. Playwright only.
+        """
+        if not self.enabled:
+            return WhatsAppCommandResult(False, _MSG_NOT_CONFIGURED)
+        if self.backend != "playwright" or self._driver is None:
+            return WhatsAppCommandResult(False, _MSG_READ_NEEDS_PLAYWRIGHT)
+
+        from services import whatsapp_web as web
+
+        is_group = isinstance(target, GroupMatch)
+        if is_group and target.shared:
+            return WhatsAppCommandResult(
+                False, _MSG_GROUP_SHARED.format(title=speakable_title(target.title))
+            )
+
+        def _work():
+            try:
+                if is_group:
+                    result = self._driver.read_chat(title=target.title, count=count)
+                else:
+                    result = self._driver.read_chat(phone=target.phone, count=count)
+            except Exception:  # noqa: BLE001 - a crashed browser is relaunched next time
+                logger.exception("WhatsApp chat read failed")
+                self._driver.close()
+                return WhatsAppCommandResult(False, _MSG_READ_CHAT_FAILED)
+            if result:
+                return result
+            spoken = speakable_title(target.title) if is_group else ""
+            return WhatsAppCommandResult(
+                False,
+                {
+                    web.NOT_LINKED: _MSG_NEEDS_LINK,
+                    web.INVALID_NUMBER: _MSG_INVALID_NUMBER,
+                    web.GROUP_NOT_FOUND: _MSG_GROUP_GONE.format(title=spoken),
+                    web.GROUP_AMBIGUOUS: _MSG_GROUP_SHARED.format(title=spoken),
+                    web.WRONG_CHAT: "That chat didn't open properly, so I couldn't read it.",
+                }.get(result.status, _MSG_READ_CHAT_FAILED),
+            )
+
+        return self._run(_work)
 
     def find_unread_chat(self, hint: str, chats: list, groups_only: bool = False):
         """

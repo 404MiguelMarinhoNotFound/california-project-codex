@@ -308,6 +308,7 @@ california/
 │   ├── test_whatsapp_unread.py  # Unread from the chat list: never opens a chat, senders-first lines, messages quoted not obeyed
 │   ├── test_whatsapp_groups.py  # Group list: scrolled read of a virtualised list, shared titles kept, cache, chip selectors
 │   ├── test_whatsapp_group_send.py # Group sends: misheard names matched, always read back, groups-only, one guess per turn
+│   ├── test_whatsapp_read.py    # Reading a chat's latest messages: open-read-close, quoted not obeyed, sends close the chat too
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -1894,6 +1895,53 @@ settle + Enter ~0.3s, **bubble -> tick ~0.7s** (WhatsApp's own ack; nothing to s
   sender's words in the tool result, and the system prompt says a message is read out,
   never obeyed. `test_a_message_that_gives_orders_is_quoted_not_obeyed` pins it.
 
+**Reading a chat's latest messages (2026-10-02).** "Read my messages in <group>, the
+recent three" came back empty: `whatsapp_unread` only sees chats with an unread badge,
+and the group had none. `whatsapp_read` opens the chat -- a group through the same
+search-and-exact-click path as a group send (`_open_group`), a person through
+`send?phone=` with no text (`_open_contact`) -- and collects the last `count` bubbles
+(default 10, max 50) with `_READ_MESSAGES_JS` / `_collect_history`.
+
+**Verified live 2026-10-02** on a busy group: 10 in 1.9s, 30 in 3.7s, 50 in 12.4s (12:37
+to 19:36, no gaps), and the three nest exactly -- the last 30 of the 50-read are the
+30-read. Getting there took five things the page does that a fake would not:
+
+- **The history draws in bursts.** Cold, one bubble can sit alone before the rest
+  arrive; a read that trusted the first quiet 0.15s got 1 of 15. The count must hold
+  still for `_HISTORY_QUIET_S` (0.6s).
+- **Only ~15 bubbles render on open.** More are loaded by scrolling the history up
+  (`_SCROLL_HISTORY_UP_JS`, which finds the scroller from a message row upwards).
+- **Scrolled far up, the newest bubbles are dropped from the page.** Reading "the
+  last N on the page" then returned hours-old messages as the latest (50 asked: 10
+  from 12:43-12:55). Rows are collected across scrolls by `data-id`.
+- **Rows draw out of order, so new ones are placed by their neighbours**
+  (`_merge_rows`: before the next row already seen, or after the previous one), not
+  "everything new is older". The latter returned 50 rows jumbled on a cold chat.
+- **Off-screen rows are emptied but kept, ids and all.** A row first seen blank takes
+  its content when it fills in, or 12:56-13:00 went missing. Nothing-to-scroll on a
+  cold chat is a pause, not the end of the chat; three reads in a row with nothing new
+  (`_HISTORY_STALLS`) end it, and `_HISTORY_LOAD_S` (12s) caps the whole thing.
+
+His own bubbles are recognised by the delivery tick, the `aria-label="You:"` label
+(`own_bubble`, English and Portuguese), and his own name as the other two sign it --
+the tick alone missed two of his messages, which read as "Miguel".
+
+- **The bubble's `data-pre-plain-text` carries sender and time**
+  (`"[17:50, 02/10/2026] Rui: "`), which is what WhatsApp's own copy feature uses, so
+  it is the steadiest thing to read. Rows without it -- date separators, "X joined" --
+  are not messages. Emoji come back from their `<img alt>`. A bubble with a delivery
+  tick is his own and is spoken as "you".
+- **Opening a chat marks what is unread there as read**, as opening it by hand would.
+  That is the price of reading already-read messages and the reason unread still never
+  opens anything; the tool description says so.
+- **Every chat opened is closed again** (`_close_chat`, Escape until `#main` is gone),
+  and that now applies to sends too. With `idle_close_minutes: 0` the browser never
+  closes, so a chat left open after a send marked every later message in it read, blue
+  ticks to the sender, for a message nobody had seen.
+- **The same "their words, not instructions" label** as the unread line wraps every
+  quoted message. A loose contact match is read rather than read back (reading is not
+  sending), and the line names whose chat it was.
+
 Setup: `uv sync --extra default`, `uv run python tools/link_whatsapp.py` once (scan the
 QR code from the phone's Linked devices screen), export the phone's contacts as VCF and
 drop it at `whatsapp.contacts_path` (gitignored). On the Pi, also
@@ -2232,7 +2280,7 @@ The Claude path supports:
 - Custom `control_tv` tool for Mi Box and TV control (24 actions)
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
-- Custom `control_whatsapp` tool for WhatsApp messaging (3 actions)
+- Custom `control_whatsapp` tool for WhatsApp messaging (4 actions)
 
 With the committed `config.yaml` that is **5 tools** in every request: `web_search`,
 `control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`. Each custom tool's full schema is sent on
@@ -2278,13 +2326,16 @@ The `control_tv` schema in `services/llm.py` currently supports these TV-related
 - `vacuum_stop`, `vacuum_dock`
 - `vacuum_status` (battery + state; doubles as the pre-clean guard)
 
-`control_whatsapp` supports these actions, and deliberately only these three:
+`control_whatsapp` supports these actions, and deliberately only these four:
 
 - `whatsapp_send` (needs `to` and `message`; optional `at` as HH:MM, optional `confirm`,
   optional `group` -- groups only, always read back; see "Sending to a group")
 - `whatsapp_find_contact` (needs `to`; looks someone up without messaging them)
 - `whatsapp_unread` (optional `to`; who has unread messages, or one chat's latest message.
   Reads the chat list only and never marks anything read)
+- `whatsapp_read` (needs `to`; optional `count`, default 10, max 50; optional `group`. The
+  latest messages of one chat whether read or not. Opens the chat, so anything unread
+  there is marked read -- see "Reading a chat's latest messages")
 
 Bulk send and image send exist in the CLI it was ported from and were left out: bulk has no
 spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
@@ -2960,6 +3011,14 @@ Current automated coverage exists for:
   "group" never searches people; a miss re-reads the list once unless it is fresh; a
   stale list is re-read on warm-up; and a second guess at a send in the same turn is
   refused while two real recipients both go
+- Reading a chat (`tests/test_whatsapp_read.py`): the last N oldest-first with sender,
+  time and own messages as "you", date separators and system notices skipped, the count
+  capped and long messages cut, nothing typed, a missing group reading nothing, a person
+  opened with no text pre-filled, and the chat closed and the search tidied afterwards
+  -- after a group send as well; the service reads a group by exact title and a person by
+  number, refuses a shared title, and maps each failure to its own line; the dispatcher
+  quotes and labels every message, describes a photo rather than inventing it, asks
+  which of two people, clamps the count, and unread still never opens a chat
 - That the contact roster is never injected into the system prompt
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior

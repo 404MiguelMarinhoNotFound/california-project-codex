@@ -120,6 +120,10 @@ SELECTORS: dict[str, list[str]] = {
     # tooltip (live 2026-10-02). The name's emoji are <img>s, so its text is
     # "☭flamingus unanounymous☭" for that title -- compared by words, not exactly.
     "chat_title": ["#main header span[dir='auto']"],
+    # Present only while a chat is open; Escape closes it (verified live 2026-10-02).
+    "chat_open": ["#main"],
+    # The label on his own bubbles, English and Portuguese UI.
+    "own_bubble": ["[aria-label='You:']", "[aria-label='Você:']"],
 }
 
 # Unread-read outcomes.
@@ -158,6 +162,25 @@ class GroupChat:
 class GroupListResult:
     status: str  # READ_OK, NOT_LINKED, TIMEOUT or NO_GROUP_FILTER
     groups: list[GroupChat]
+
+    def __bool__(self) -> bool:
+        return self.status == READ_OK
+
+
+@dataclass
+class ChatMessage:
+    """One message bubble in an open chat, as WhatsApp Web renders it."""
+
+    sender: str  # "" when the bubble carries no sender line
+    text: str  # "" for a photo, voice note or sticker
+    time: str  # "17:50", or "" when unreadable
+    outgoing: bool = False  # his own message
+
+
+@dataclass
+class ReadResult:
+    status: str  # READ_OK, or a SendOutcome status saying why the chat did not open
+    messages: list[ChatMessage]
 
     def __bool__(self) -> bool:
         return self.status == READ_OK
@@ -239,6 +262,50 @@ _SCROLL_LIST_JS = r"""
 }
 """
 
+# Every message row in the open chat: the bubble's meta line, its text with
+# emoji put back from their <img alt>, and whether it is his own. WhatsApp keeps
+# "[17:50, 02/10/2026] Rui: " in data-pre-plain-text on the bubble, which is
+# where the copy-to-clipboard feature gets it from, so it is the most stable
+# place to read a sender and a time. His own bubbles are marked two ways: a
+# delivery tick, and an aria-label "You:" on the bubble (live 2026-10-02). The
+# tick alone missed some of his own messages, which then read as "Miguel".
+_READ_MESSAGES_JS = r"""
+([rowSel, tickSel, youSel]) => [...document.querySelectorAll(rowSel)].map(r => {
+  const pre = r.querySelector("[data-pre-plain-text]");
+  const body = r.querySelector("span.selectable-text, [data-testid='selectable-text']");
+  let text = "";
+  if (body) {
+    const copy = body.cloneNode(true);
+    copy.querySelectorAll("img[alt]").forEach(img => img.replaceWith(img.getAttribute("alt")));
+    text = copy.textContent || "";
+  }
+  const idEl = r.matches("[data-id]") ? r : r.querySelector("[data-id]");
+  return {
+    id: idEl ? idEl.getAttribute("data-id") : "",
+    meta: pre ? pre.getAttribute("data-pre-plain-text") || "" : "",
+    text,
+    outgoing: !!r.querySelector(tickSel) || !!r.querySelector(youSel),
+  };
+})
+"""
+
+# Scroll the open chat's history to its top, which makes WhatsApp load the next
+# older batch. The scroller is found from a message row upwards rather than by a
+# selector of its own: it is the first ancestor that actually scrolls.
+_SCROLL_HISTORY_UP_JS = r"""
+([rowSel]) => {
+  const row = document.querySelector(rowSel);
+  for (let e = row && row.parentElement; e && e !== document.body; e = e.parentElement) {
+    const oy = getComputedStyle(e).overflowY;
+    if ((oy === "auto" || oy === "scroll") && e.scrollHeight > e.clientHeight) {
+      e.scrollTop = 0;
+      return true;
+    }
+  }
+  return false;
+}
+"""
+
 # Bring a row (by its translateY offset) into the middle of the list's view.
 _SCROLL_TO_JS = r"""
 ([listSel, top]) => {
@@ -273,6 +340,20 @@ _OPEN_WAIT_S = 5.0
 # A chat's history renders a beat after it opens; see _enter_and_confirm.
 _HISTORY_SETTLE_S = 0.15
 _HISTORY_WAIT_S = 3.0
+# "[17:50, 02/10/2026] Rui Costa: " -> time, date, sender
+_META = re.compile(r"^\[(?P<time>[^,\]]+),\s*(?P<date>[^\]]*)\]\s*(?P<sender>.*?):?$")
+# A chat's history draws in bursts: right after opening, one bubble can sit
+# alone for a moment before the rest arrive (live 2026-10-02, a cold read got 1
+# of 15). The count must hold still this long before it counts as loaded.
+_HISTORY_QUIET_S = 0.6
+# How long a read may spend scrolling up for older messages. WhatsApp renders
+# only ~15 recent bubbles on open; older ones load as the history is scrolled.
+_HISTORY_LOAD_S = 12.0
+# Reads in a row that bring nothing new before a read settles for what it has.
+_HISTORY_STALLS = 3
+# A read is at most this many messages, each cut to this length: she reads them aloud.
+MAX_READ_MESSAGES = 50
+MAX_MESSAGE_CHARS = 300
 
 _BIDI_MARKS = re.compile("[‪-‮⁦-⁩‎‏]")
 
@@ -627,15 +708,30 @@ class WhatsAppWebDriver:
         failure; every one becomes a SendOutcome.
         """
         page = self.open_page()
+        deadline = time.monotonic() + self.timeout_s
+        try:
+            failed = self._open_contact(page, phone, message, deadline)
+            if failed is not None:
+                return failed
+            return self._enter_and_confirm(page, message, deadline)
+        finally:
+            self._close_chat(page)
+
+    def _open_contact(self, page, phone: str, text: str, deadline: float) -> SendOutcome | None:
+        """
+        Open the chat with `phone`, `text` pre-filled (may be empty). None once
+        it is open; otherwise the outcome that says why not.
+        """
         number = phone.lstrip("+")
-        url = f"{WHATSAPP_URL}send?phone={number}&text={quote(message)}"
+        url = f"{WHATSAPP_URL}send?phone={number}"
+        if text:
+            url += f"&text={quote(text)}"
         page.goto(url, wait_until="domcontentloaded")
 
         # Wait for whichever of the three screens this turns into.
-        deadline = time.monotonic() + self.timeout_s
         while True:
             if _visible(page, "compose"):
-                break
+                return None
             if _visible(page, "qr"):
                 return SendOutcome(NOT_LINKED)
             # The chat list stays on screen behind this dialog, so it must not
@@ -646,7 +742,24 @@ class WhatsAppWebDriver:
                 return SendOutcome(TIMEOUT, "chat never opened")
             time.sleep(0.2)
 
-        return self._enter_and_confirm(page, message, deadline)
+    @staticmethod
+    def _close_chat(page) -> None:
+        """
+        Close whatever chat is open, so nothing that arrives in it later is
+        marked read behind his back. A chat left open in a browser that never
+        closes (idle_close_minutes: 0) reads every new message as it lands,
+        and the sender gets blue ticks for a message he has not seen.
+        """
+        try:
+            for _ in range(2):
+                if not _visible(page, "chat_open"):
+                    return
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
+            if _visible(page, "chat_open"):
+                logger.warning("WhatsApp Web: a chat would not close; new messages there may be marked read")
+        except Exception:  # noqa: BLE001 - tidying must never mask the outcome
+            logger.debug("Closing the WhatsApp chat failed", exc_info=True)
 
     def _enter_and_confirm(self, page, message: str, deadline: float) -> SendOutcome:
         """
@@ -677,14 +790,7 @@ class WhatsAppWebDriver:
         # (live 2026-10-02). For "on my way", sent many times, that is a false
         # "sent". Two equal reads _HISTORY_SETTLE_S apart; capped, because an
         # empty chat is settled at once.
-        before = bubbles.count()
-        settle_until = min(deadline, time.monotonic() + _HISTORY_WAIT_S)
-        while time.monotonic() < settle_until:
-            time.sleep(_HISTORY_SETTLE_S)
-            now = bubbles.count()
-            if now == before:
-                break
-            before = now
+        before = self._settle(bubbles.count, min(deadline, time.monotonic() + _HISTORY_WAIT_S))
 
         # Exactly one Enter, on the element -- see WhatsAppService._press_send
         # for why a second one is harmful (it lands on the record button).
@@ -726,50 +832,171 @@ class WhatsAppWebDriver:
         page = self._page
         deadline = time.monotonic() + self.timeout_s
         try:
-            if not self._click_filter(page, "filter_groups", settle=False):
-                return SendOutcome(TIMEOUT, "no Groups filter")
-            search = _any(page, "search").first
-            args = [", ".join(SELECTORS["chat_row"]), title, _BIDI_MARKS.pattern]
-            opened = False
-            # Twice at most: a click that opened the wrong chat has typed
-            # nothing, so searching again is safe.
-            for attempt in range(2):
-                search.fill("")
-                # The longest emoji-free run of the title: what can be typed,
-                # and still a substring of the title for WhatsApp's search.
-                search.fill(_snippet(title) or title)
-                found = self._settled_count(page, title, min(deadline, time.monotonic() + _SEARCH_WAIT_S))
-                if found == 0 and attempt:
-                    break  # the retry ran out of time: still the wrong-chat outcome
-                if found == 0:
-                    return SendOutcome(GROUP_NOT_FOUND)
-                if found > 1:
-                    return SendOutcome(GROUP_AMBIGUOUS)
-                row = page.evaluate_handle(_FIND_ROW_JS, args).as_element()
-                if row is None:
-                    continue  # the list moved between the read and now
-                row.click(timeout=5000)
-                if self._wait_for_chat(page, title, min(deadline, time.monotonic() + _OPEN_WAIT_S)):
-                    opened = True
-                    break
-                logger.warning(
-                    "Group send: opened %r instead of %r (attempt %d)",
-                    _open_chat_title(page), title, attempt + 1,
-                )
-            if not opened:
-                return SendOutcome(WRONG_CHAT, "the group never opened")
-
+            failed = self._open_group(page, title, deadline)
+            if failed is not None:
+                return failed
             compose = _any(page, "compose").first
             compose.evaluate("e => e.focus()")
             # One line: a newline typed into the compose box would send early.
             page.keyboard.insert_text(" ".join(message.split()))
             return self._enter_and_confirm(page, message, deadline)
         finally:
-            try:
-                _any(page, "search").first.fill("")
-            except Exception:  # noqa: BLE001 - tidying the search box must not mask the outcome
-                pass
-            self._click_filter(page, "filter_all", settle=False)
+            self._close_chat(page)
+            self._tidy_group_search(page)
+
+    def _tidy_group_search(self, page) -> None:
+        try:
+            _any(page, "search").first.fill("")
+        except Exception:  # noqa: BLE001 - tidying the search box must not mask the outcome
+            pass
+        self._click_filter(page, "filter_all", settle=False)
+
+    def _open_group(self, page, title: str, deadline: float) -> SendOutcome | None:
+        """
+        Open the group whose title is exactly `title`. None once it is open and
+        its header says so; otherwise the outcome that says why not. See
+        send_group for why it goes through the search.
+        """
+        if not self._click_filter(page, "filter_groups", settle=False):
+            return SendOutcome(TIMEOUT, "no Groups filter")
+        search = _any(page, "search").first
+        args = [", ".join(SELECTORS["chat_row"]), title, _BIDI_MARKS.pattern]
+        opened = False
+        # Twice at most: a click that opened the wrong chat has typed
+        # nothing, so searching again is safe.
+        for attempt in range(2):
+            search.fill("")
+            # The longest emoji-free run of the title: what can be typed,
+            # and still a substring of the title for WhatsApp's search.
+            search.fill(_snippet(title) or title)
+            found = self._settled_count(page, title, min(deadline, time.monotonic() + _SEARCH_WAIT_S))
+            if found == 0 and attempt:
+                break  # the retry ran out of time: still the wrong-chat outcome
+            if found == 0:
+                return SendOutcome(GROUP_NOT_FOUND)
+            if found > 1:
+                return SendOutcome(GROUP_AMBIGUOUS)
+            row = page.evaluate_handle(_FIND_ROW_JS, args).as_element()
+            if row is None:
+                continue  # the list moved between the read and now
+            row.click(timeout=5000)
+            if self._wait_for_chat(page, title, min(deadline, time.monotonic() + _OPEN_WAIT_S)):
+                opened = True
+                break
+            logger.warning(
+                "Group send: opened %r instead of %r (attempt %d)",
+                _open_chat_title(page), title, attempt + 1,
+            )
+        if not opened:
+            return SendOutcome(WRONG_CHAT, "the group never opened")
+        return None
+
+    # --------------------------------------------------------------- read chat
+
+    def read_chat(self, *, title: str = "", phone: str = "", count: int = 10) -> ReadResult:
+        """
+        The last `count` messages of one chat -- a group by exact title, or a
+        person by number -- read whether or not they are unread.
+
+        Unlike unread_chats this OPENS the chat, which is the only way to see
+        messages already read. Opening it marks anything unread there as read
+        on his phone, exactly as opening it by hand would; it is closed again
+        before returning so nothing arriving later is read behind his back.
+        """
+        state = self.warm()
+        if state == "needs_link":
+            return ReadResult(NOT_LINKED, [])
+        if state != "linked":
+            return ReadResult(TIMEOUT, [])
+        page = self._page
+        deadline = time.monotonic() + self.timeout_s
+        count = max(1, min(int(count), MAX_READ_MESSAGES))
+        try:
+            if title:
+                failed = self._open_group(page, title, deadline)
+            else:
+                failed = self._open_contact(page, phone, "", deadline)
+            if failed is not None:
+                return ReadResult(failed.status, [])
+            raw = self._collect_history(page, count, min(deadline, time.monotonic() + _HISTORY_LOAD_S))
+            messages = [m for m in (_parse_message(r) for r in raw) if m is not None]
+            # The meta line carries his own name on his own bubbles; any bubble
+            # signed with a name his marked bubbles carry is his too.
+            own = {m.sender for m in messages if m.outgoing and m.sender}
+            for m in messages:
+                m.outgoing = m.outgoing or m.sender in own
+            return ReadResult(READ_OK, messages[-count:])
+        finally:
+            self._close_chat(page)
+            if title:
+                self._tidy_group_search(page)
+
+    def _collect_history(self, page, want: int, until: float) -> list[dict]:
+        """
+        Rows of the open chat, oldest first, until at least `want` are messages.
+
+        WhatsApp renders the latest ~15 bubbles on open, loads older ones as the
+        history is scrolled up -- and, scrolled far enough, DROPS the newest from
+        the page. Reading "the last N on the page" after scrolling therefore
+        returned hours-old messages as the latest (live 2026-10-02: 50 asked,
+        got 10 from 12:43-12:55). So rows are collected as they appear, keyed by
+        their data-id, and each new row is placed by its neighbours on the page
+        -- before the next row already seen, or after the previous one. Not
+        "new rows are older, put them in front": a cold chat draws its newest
+        batch in pieces, and that assumption returned 50 rows out of order.
+        """
+        args = [", ".join(SELECTORS[k]) for k in ("outgoing", "tick_sent", "own_bubble")]
+        counter = _any(page, "outgoing").count
+        collected: list[dict] = []
+        seen: set = set()
+
+        def _key(r: dict):
+            return r.get("id") or (r.get("meta"), r.get("text"))
+
+        def _absorb() -> int:
+            return _merge_rows(collected, seen, page.evaluate(_READ_MESSAGES_JS, args), _key)
+
+        def _messages() -> int:
+            return sum(1 for r in collected if r.get("meta"))
+
+        self._settle_quiet(counter, until)
+        _absorb()
+        stalls = 0
+        while _messages() < want and time.monotonic() < until and stalls < _HISTORY_STALLS:
+            # Nothing to scroll is NOT "the whole chat is on screen": a cold chat
+            # can show one bubble with the rest still drawing, and stopping there
+            # returned 1 message of 50 (live 2026-10-02). It is a pause like any
+            # other, and only repeated pauses with nothing new end the read.
+            page.evaluate(_SCROLL_HISTORY_UP_JS, [args[0]])
+            self._settle_quiet(counter, until)
+            stalls = 0 if _absorb() else stalls + 1
+        return collected
+
+    @staticmethod
+    def _settle_quiet(counter, until: float) -> int:
+        """The count once it has held still for _HISTORY_QUIET_S (or at `until`)."""
+        last = counter()
+        still_since = time.monotonic()
+        while time.monotonic() < until:
+            time.sleep(_HISTORY_SETTLE_S)
+            now = counter()
+            if now != last:
+                last, still_since = now, time.monotonic()
+            elif time.monotonic() - still_since >= _HISTORY_QUIET_S:
+                break
+        return last
+
+    @staticmethod
+    def _settle(counter, until: float) -> int:
+        """The count once two reads _HISTORY_SETTLE_S apart agree (or `until`)."""
+        before = counter()
+        while time.monotonic() < until:
+            time.sleep(_HISTORY_SETTLE_S)
+            now = counter()
+            if now == before:
+                break
+            before = now
+        return before
 
     def _settled_count(self, page, title: str, until: float) -> int:
         """
@@ -797,6 +1024,66 @@ class WhatsAppWebDriver:
                 return True
             time.sleep(0.1)
         return False
+
+
+def _merge_rows(collected: list, seen: set, read: list, key) -> int:
+    """
+    Fold one read of the page (rows in page order) into `collected`, keeping
+    page order: each unseen row goes before the next seen row of this read, or
+    after the previous one, or at the end. Returns how many rows were new.
+    """
+    added = 0
+    for i, row in enumerate(read):
+        k = key(row)
+        if k in seen:
+            # WhatsApp empties rows outside the visible area but keeps them, id
+            # and all; one first seen blank must take its content when it fills
+            # in, or the message is lost (live 2026-10-02: 12:56-13:00 dropped).
+            if row.get("meta"):
+                for j, old in enumerate(collected):
+                    if key(old) == k and not old.get("meta"):
+                        collected[j] = row
+                        break
+            continue
+        if not row.get("id") and not row.get("meta") and not row.get("text"):
+            continue  # a blank row with no id cannot be placed or recognised later
+        if not row.get("id") and any(
+            x.get("meta") == row.get("meta") and x.get("text") == row.get("text") for x in collected
+        ):
+            continue  # the same message seen earlier under its id
+        after = next((key(x) for x in read[i + 1:] if key(x) in seen), None)
+        before = next((key(x) for x in reversed(read[:i]) if key(x) in seen), None)
+        keys = [key(x) for x in collected]
+        if after is not None:
+            collected.insert(keys.index(after), row)
+        elif before is not None:
+            collected.insert(keys.index(before) + 1, row)
+        else:
+            collected.append(row)
+        seen.add(k)
+        added += 1
+    return added
+
+
+def _parse_message(row: dict) -> ChatMessage | None:
+    """
+    A rendered row as a ChatMessage, or None for what is not a message someone
+    wrote: date separators ("TODAY") and system notices ("X joined") carry no
+    meta line.
+    """
+    meta = (row.get("meta") or "").strip()
+    if not meta:
+        return None
+    m = _META.match(meta)
+    text = _BIDI_MARKS.sub("", row.get("text") or "").strip()
+    if len(text) > MAX_MESSAGE_CHARS:
+        text = text[:MAX_MESSAGE_CHARS].rstrip() + "..."
+    return ChatMessage(
+        sender=m.group("sender").strip() if m else "",
+        text=text,
+        time=m.group("time").strip() if m else "",
+        outgoing=bool(row.get("outgoing")),
+    )
 
 
 def default_channel() -> str:

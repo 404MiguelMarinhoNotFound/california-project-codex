@@ -242,7 +242,10 @@ CONTROL_WHATSAPP_TOOL = {
         "set confirm true once he has said yes to that read-back, never on a first "
         "attempt. Optionally pass `at` as HH:MM to schedule it. whatsapp_unread with "
         "no `to` lists who has unread messages; with `to` it gives that person's "
-        "latest message. When he says it is a group, set `group` true: then only his "
+        "latest message, and never marks anything read. whatsapp_read with `to` reads "
+        "the last few messages of that chat (`count`, default 10, max 50) even if already read; "
+        "it opens the chat, so anything unread there is marked read. "
+        "When he says it is a group, set `group` true: then only his "
         "groups are searched, never people, and a group send is always read back "
         "first. The tool matches misheard names itself, so make ONE call with the "
         "name as heard; never split one name into several calls or try other "
@@ -253,8 +256,11 @@ CONTROL_WHATSAPP_TOOL = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["whatsapp_send", "whatsapp_find_contact", "whatsapp_unread"],
-                "description": "Send a message, look a contact up, or check what is unread."
+                "enum": ["whatsapp_send", "whatsapp_find_contact", "whatsapp_unread", "whatsapp_read"],
+                "description": (
+                    "Send a message, look a contact up, check what is unread, or read "
+                    "a chat's latest messages."
+                )
             },
             "to": {
                 "type": "string",
@@ -265,7 +271,10 @@ CONTROL_WHATSAPP_TOOL = {
             },
             "message": {
                 "type": "string",
-                "description": "The message body, in his words. Required for whatsapp_send."
+                "description": (
+                    "The message body: his exact words, or one you wrote when he asked "
+                    "you to write it. Required for whatsapp_send."
+                )
             },
             "at": {
                 "type": "string",
@@ -281,6 +290,10 @@ CONTROL_WHATSAPP_TOOL = {
             "group": {
                 "type": "boolean",
                 "description": "True when he means a WhatsApp group rather than a person."
+            },
+            "count": {
+                "type": "integer",
+                "description": "For whatsapp_read: how many of the latest messages, 1-50. Default 10."
             }
         },
         "required": ["action"]
