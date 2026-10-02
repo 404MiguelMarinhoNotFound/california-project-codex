@@ -72,4 +72,7 @@ def config_for_tests(**overrides) -> dict:
     # that file exists must never decide what a test asserts. A test that
     # exercises the file sets its own path.
     config.setdefault("whatsapp", {})["aliases_path"] = "/nonexistent/whatsapp_aliases.yaml"
+    # Same for the cached group list -- and more so: list_groups() WRITES it,
+    # so a test left on the real path would overwrite his cache with fakes.
+    config["whatsapp"]["groups_path"] = "/nonexistent/whatsapp_groups.json"
     return deep_merge(config, overrides)

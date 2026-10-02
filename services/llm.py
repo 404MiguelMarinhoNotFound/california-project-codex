@@ -242,7 +242,11 @@ CONTROL_WHATSAPP_TOOL = {
         "set confirm true once he has said yes to that read-back, never on a first "
         "attempt. Optionally pass `at` as HH:MM to schedule it. whatsapp_unread with "
         "no `to` lists who has unread messages; with `to` it gives that person's "
-        "latest message. Not for the TV, the lights or the vacuum."
+        "latest message. When he says it is a group, set `group` true: then only his "
+        "groups are searched, never people, and a group send is always read back "
+        "first. The tool matches misheard names itself, so make ONE call with the "
+        "name as heard; never split one name into several calls or try other "
+        "spellings. Not for the TV, the lights or the vacuum."
     ),
     "input_schema": {
         "type": "object",
@@ -273,6 +277,10 @@ CONTROL_WHATSAPP_TOOL = {
                     "Only true when Master Miguel has just confirmed a recipient the "
                     "tool read back to him. Never true on a first attempt."
                 )
+            },
+            "group": {
+                "type": "boolean",
+                "description": "True when he means a WhatsApp group rather than a person."
             }
         },
         "required": ["action"]
@@ -520,7 +528,8 @@ class LLMService:
         line = (
             "\nWhatsApp contacts are looked up when you call the tool, so they are"
             " not listed here. Pass the name exactly as Master Miguel said it and"
-            " let the tool find them, never guess at a fuller name."
+            " let the tool find them, never guess at a fuller name. His groups are"
+            " searched the same way when you set group true."
         )
         if self.whatsapp_aliases:
             names = ", ".join(self.whatsapp_aliases)

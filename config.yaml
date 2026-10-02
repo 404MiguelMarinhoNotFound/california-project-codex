@@ -933,7 +933,11 @@ whatsapp:
   # browser_channel: "msedge"        # default: msedge on Windows, bundled chromium elsewhere
   headless: true                     # no window at all
   keep_warm: true                    # open WhatsApp Web at boot so the first send skips the launch
-  idle_close_minutes: 30             # close the browser after this long unused; 0 = never
+  # Close the browser after this long unused; 0 = never. 0 since 2026-10-02:
+  # a relaunched browser's first send waits up to ~18s for WhatsApp to connect
+  # (measured), against ~2s with it kept open, for ~200-300MB of RAM. On a
+  # memory-tight Pi, set a window instead (e.g. 240).
+  idle_close_minutes: 0
   send_timeout_ms: 30000             # chat open + sent tick must happen inside this
   # --- keyboard backend ---
   firefox_path: 'C:\Program Files\Mozilla Firefox\firefox.exe'
@@ -946,6 +950,17 @@ whatsapp:
   # An exact nickname wins even over a tie in the book; a full contact name
   # still wins over a loose nickname match. See WhatsAppService.resolve_contact.
   aliases_path: "whatsapp_aliases.yaml"
+  # Every group's title, read off WhatsApp Web's chat list (Groups filter,
+  # scrolled to the end) by tools/list_whatsapp_groups.py. Gitignored: group
+  # titles say who he spends time with. The title is the only handle on a
+  # group -- the page shows no group id -- so rerun the tool after a rename.
+  groups_path: "whatsapp_groups.json"
+  # The group list is re-read at boot (with the keep_warm warm-up) and then on
+  # this interval, like stremio.library_sync_interval_minutes; 0 = boot only.
+  # Each re-read takes ~20s on the WhatsApp worker, and a send that arrives
+  # meanwhile waits behind it. A group send that matches nothing also re-reads
+  # the list once, so a group made today is found without waiting a day.
+  groups_refresh_interval_minutes: 1440
   aliases: {}
     # the landlord: "Joao Silva"
     # mum: {contact: "Maria Silva", prefer: "+351"}

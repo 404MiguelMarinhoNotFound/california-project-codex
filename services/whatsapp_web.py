@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
+from services.whatsapp_groups import words
+
 logger = logging.getLogger(__name__)
 
 WHATSAPP_URL = "https://web.whatsapp.com/"
@@ -85,12 +87,39 @@ SELECTORS: dict[str, list[str]] = {
     # "1 unread message" / "3 unread messages" (observed live 2026-09-23).
     "unread_badge": ["span[aria-label*='unread message']"],
     "muted": ["[aria-label*='muted' i]", "[data-icon*='muted']"],
-    # The chat-list filter chips: <button role=tab id=...> with aria-selected.
-    # Clicking one opens no chat, so nothing is marked read. The ids are
-    # language-independent, unlike the labels.
+    # The chat-list filter chips: <button role=tab> with aria-selected.
+    # Clicking one opens no chat, so nothing is marked read.
+    #
+    # Until 2026-10-02 these keyed on ids (#unread-filter, #group-filter). That
+    # day the live page renamed them to positional `label_item_1`/`_3` -- only
+    # #all-filter survived -- and unread quietly degraded to the ~20 rendered
+    # "All" rows with no group detection. Positional ids are worse than labels,
+    # so the label text is the fallback (English and Portuguese UI). Playwright's
+    # :has-text is a case-insensitive substring, and "Groups\n2" (with its
+    # unread badge) still matches.
     "filter_all": ["button#all-filter"],
-    "filter_unread": ["button#unread-filter"],
-    "filter_groups": ["button#group-filter"],
+    "filter_unread": [
+        "button#unread-filter",
+        "button[role='tab']:has-text(\"Unread\")",
+        "button[role='tab']:has-text(\"Não lidas\")",
+    ],
+    "filter_groups": [
+        "button#group-filter",
+        "button[role='tab']:has-text(\"Groups\")",
+        "button[role='tab']:has-text(\"Grupos\")",
+    ],
+    # The scrollable chat list. It is virtualised: only ~20 rows exist in the
+    # DOM at a time, so reading every chat means scrolling it.
+    "chat_list": ["#pane-side"],
+    # The chat-list search box. Under the Groups chip it reads "Search group
+    # chats" and searches group titles only (observed live 2026-10-02).
+    "search": ["#side input[role='textbox']", "#side div[contenteditable='true'][role='textbox']"],
+    # The open chat's name in its header -- checked before a group send, so a
+    # click that opened the wrong chat never gets a message typed into it. NOT
+    # `span[title]`: in a group header that is the "click here for group info"
+    # tooltip (live 2026-10-02). The name's emoji are <img>s, so its text is
+    # "☭flamingus unanounymous☭" for that title -- compared by words, not exactly.
+    "chat_title": ["#main header span[dir='auto']"],
 }
 
 # Unread-read outcomes.
@@ -117,8 +146,37 @@ class UnreadResult:
         return self.status == READ_OK
 
 
+@dataclass
+class GroupChat:
+    """One group, as the chat list shows it. The title is its only handle."""
+
+    name: str
+    muted: bool = False
+
+
+@dataclass
+class GroupListResult:
+    status: str  # READ_OK, NOT_LINKED, TIMEOUT or NO_GROUP_FILTER
+    groups: list[GroupChat]
+
+    def __bool__(self) -> bool:
+        return self.status == READ_OK
+
+
+# The "Groups" chip is the only thing that says a chat is a group -- nothing in
+# a row marks one -- so without it there is no list to give.
+NO_GROUP_FILTER = "no_group_filter"
+
 # Runs in the page. Reads each chat row's name, preview, badge and muted marker.
 # Selectors come in as arguments so SELECTORS stays the one table to update.
+#
+# `index` is the row's position in the WHOLE list, not in the ~20 rendered
+# rows; it is what lets a scrolled read keep two chats with the same title
+# apart. It comes from the wrapper the virtual list positions each row with,
+# `transform: translateY(380px)` over `height: 76px` = row 5. NOT from
+# data-testid="list-item-N": that is the recycled DOM slot, 0-19 at every
+# scroll position (measured live 2026-10-02, and keying on it stopped a
+# 216-group read at 20). null when no positioned wrapper is found.
 _READ_ROWS_JS = r"""
 ([rowSel, badgeSel, mutedSel]) => [...document.querySelectorAll(rowSel)].map(r => {
   const titled = [...r.querySelectorAll("span[title]")].map(s => s.getAttribute("title") || "");
@@ -128,15 +186,93 @@ _READ_ROWS_JS = r"""
     const m = (badge.getAttribute("aria-label") || "").match(/\d+/);
     count = m ? parseInt(m[0], 10) : null;
   }
+  let idx = NaN, top = null;
+  for (let e = r, i = 0; e && i < 5 && Number.isNaN(idx); e = e.parentElement, i++) {
+    const m = (e.style && e.style.transform || "").match(/translateY\((-?[\d.]+)px\)/);
+    if (m) {
+      const y = parseFloat(m[1]);
+      const h = parseFloat(e.style.height) || e.offsetHeight;
+      idx = h > 0 ? Math.round(y / h) : y;
+      top = y;
+    }
+  }
   return {
     name: titled[0] || "",
     preview: titled[1] || "",
     unread: !!badge,
     count,
     muted: !!r.querySelector(mutedSel),
+    index: Number.isNaN(idx) ? null : idx,
+    top,
   };
 })
 """
+
+# The one rendered chat row whose title is exactly `title`, as an element, or
+# null when there is not exactly one. The caller clicks THAT element with a
+# real Playwright click:
+# - a synthetic mousedown/mouseup/click dispatched in the page opened nothing
+#   (live 2026-10-02), while a pointer click opens the chat in ~0.2s. The
+#   role=dialog layer that defeats pointer clicks on the chips spares the rows;
+# - an element, not a position: the search re-sorts the list under the click.
+#   Clicking row N of a list read a moment earlier opened a different group
+#   (live 2026-10-02, "Test group" sat near the top of the unfiltered list).
+_FIND_ROW_JS = r"""
+([rowSel, title, marks]) => {
+  const strip = s => (s || "").replace(new RegExp(marks, "g"), "").trim();
+  const rows = [...document.querySelectorAll(rowSel)].filter(r => {
+    const t = r.querySelector("span[title]");
+    return t && strip(t.getAttribute("title")) === title;
+  });
+  return rows.length === 1 ? rows[0] : null;
+}
+"""
+
+# Scroll the chat list by `fraction` of its visible height (0 = to the top) and
+# report where it ended up, so the caller knows when it has reached the bottom.
+_SCROLL_LIST_JS = r"""
+([listSel, fraction]) => {
+  const p = document.querySelector(listSel);
+  if (!p) return null;
+  p.scrollTop = fraction > 0 ? p.scrollTop + p.clientHeight * fraction : 0;
+  return {top: p.scrollTop, height: p.scrollHeight, client: p.clientHeight};
+}
+"""
+
+# Bring a row (by its translateY offset) into the middle of the list's view.
+_SCROLL_TO_JS = r"""
+([listSel, top]) => {
+  const p = document.querySelector(listSel);
+  if (p) p.scrollTop = Math.max(0, top - p.clientHeight / 2);
+}
+"""
+
+# A list of 216 groups took ~40 steps live (2026-10-02); this only bounds a
+# list that never reports a bottom.
+_MAX_SCROLL_STEPS = 400
+# How far each step scrolls (a fraction of the visible height) and how long the
+# rows get to re-render. Measured on 218 groups, 2026-10-02: 0.4s / 0.8 took
+# 18.9s, 0.15s / 0.9 took 7.4s. Never above 1.0: rows past the rendered window
+# would be skipped, which only the overscan was hiding at 1.5.
+_SCROLL_FRACTION = 0.9
+_SCROLL_SETTLE_S = 0.15
+# What WhatsApp shows in a group row before the group's name has loaded. At the
+# faster settle one row read "Group" and showed its real name 0.3s later (live
+# 2026-10-02); such rows are revisited until the real name shows.
+_PLACEHOLDER_TITLES = frozenset({"Group", "Grupo"})
+_PLACEHOLDER_TRIES = 4
+_PLACEHOLDER_WAIT_S = 0.3
+# How long a group search may take to show the title before it counts as gone.
+_SEARCH_WAIT_S = 6.0
+# The search re-renders a beat after typing; rows count as settled once two
+# reads this far apart agree.
+_SEARCH_SETTLE_S = 0.15
+# How long a clicked group may take to show its header before it counts as the
+# wrong chat (and is retried once).
+_OPEN_WAIT_S = 5.0
+# A chat's history renders a beat after it opens; see _enter_and_confirm.
+_HISTORY_SETTLE_S = 0.15
+_HISTORY_WAIT_S = 3.0
 
 _BIDI_MARKS = re.compile("[‪-‮⁦-⁩‎‏]")
 
@@ -146,6 +282,9 @@ UNCONFIRMED = "unconfirmed"        # bubble appeared, tick never did (still queu
 NOT_LINKED = "not_linked"          # QR code instead of the chat: run the link tool
 INVALID_NUMBER = "invalid_number"  # WhatsApp's own "not on WhatsApp" dialog
 TIMEOUT = "timeout"                # nothing recognisable within the budget
+GROUP_NOT_FOUND = "group_not_found"  # no group with exactly that title (renamed, or left)
+GROUP_AMBIGUOUS = "group_ambiguous"  # two groups with exactly that title: cannot tell which
+WRONG_CHAT = "wrong_chat"          # the chat that opened is not the one clicked; nothing typed
 
 
 # Anything WhatsApp may render as an image instead of text: astral-plane
@@ -163,6 +302,15 @@ def _visible(page, key: str) -> bool:
         return _any(page, key).first.is_visible()
     except Exception:  # noqa: BLE001 - a detached/navigating page reads as "not yet"
         return False
+
+
+def _open_chat_title(page) -> str:
+    """The name in the open chat's header, or "" when there is none to read."""
+    try:
+        text = _any(page, "chat_title").first.inner_text() or ""
+    except Exception:  # noqa: BLE001 - no chat open yet reads as "not this one"
+        return ""
+    return _BIDI_MARKS.sub("", text).strip()
 
 
 def _snippet(message: str) -> str:
@@ -295,7 +443,7 @@ class WhatsAppWebDriver:
 
     # --------------------------------------------------------------------- read
 
-    def unread_chats(self) -> UnreadResult:
+    def unread_chats(self, known_groups=()) -> UnreadResult:
         """
         What is unread, read off the chat LIST. Never opens a chat.
 
@@ -306,9 +454,11 @@ class WhatsAppWebDriver:
         per chat is visible, truncated -- the caller says so.
 
         Groups are identified through the "Groups" filter chip because nothing
-        in a row reliably marks one. The "Unread" chip lists every unread chat,
-        not just the ~20 rows the virtualised "All" list has rendered. The list
-        is put back on "All" afterwards.
+        in a row reliably marks one. Only the rows that chip renders without
+        scrolling are read here (a full scroll is ~18s), so `known_groups` --
+        the cached list_groups() titles -- covers the rest. The "Unread" chip's
+        list is scrolled to the end, so every unread chat is read, not just the
+        first ~20. The list is put back on "All" afterwards.
         """
         state = self.warm()
         if state == "needs_link":
@@ -316,8 +466,9 @@ class WhatsAppWebDriver:
         if state != "linked":
             return UnreadResult(TIMEOUT, [])
         page = self._page
-        group_names = {c["name"] for c in (self._rows_under(page, "filter_groups") or [])}
-        rows = self._rows_under(page, "filter_unread")
+        group_names = set(known_groups)
+        group_names |= {c["name"] for c in (self._rows_under(page, "filter_groups") or [])}
+        rows = self._all_rows_under(page, "filter_unread")
         if rows is None:
             # No filter chips (older UI or a redesign): fall back to the rows
             # the "All" list has rendered, which still carry their badges.
@@ -341,7 +492,7 @@ class WhatsAppWebDriver:
         args = [", ".join(SELECTORS[k]) for k in ("chat_row", "unread_badge", "muted")]
         return page.evaluate(_READ_ROWS_JS, args)
 
-    def _click_filter(self, page, key: str) -> bool:
+    def _click_filter(self, page, key: str, settle: bool = True) -> bool:
         chip = _any(page, key).first
         try:
             if not chip.is_visible():
@@ -359,14 +510,113 @@ class WhatsAppWebDriver:
                 time.sleep(0.1)
         except Exception:  # noqa: BLE001 - a missing chip is a fallback, not a failure
             return False
-        time.sleep(0.5)  # the rows re-render a beat after the chip flips
+        if settle:
+            # The rows re-render a beat after the chip flips. A caller that
+            # polls the rows itself (a group send) passes settle=False: this
+            # fixed half-second was ~1s of every send, measured 2026-10-02.
+            time.sleep(0.5)
         return True
 
     def _rows_under(self, page, key: str) -> list[dict] | None:
-        """Rows shown under one filter chip, or None when the chip is not there."""
+        """Rows RENDERED under one filter chip (~20), or None when the chip is not there."""
         if not self._click_filter(page, key):
             return None
         return self._read_rows(page)
+
+    def _all_rows_under(self, page, key: str) -> list[dict] | None:
+        """Every row under one filter chip, scrolled for, or None when the chip is not there."""
+        if not self._click_filter(page, key):
+            return None
+        return self._collect_rows(page)
+
+    def _scroll_list(self, page, fraction: float) -> dict | None:
+        return page.evaluate(_SCROLL_LIST_JS, [", ".join(SELECTORS["chat_list"]), fraction])
+
+    def _collect_rows(self, page) -> list[dict]:
+        """
+        Every row of the current (virtualised) list, by scrolling it to the end.
+
+        Rows are keyed by their position in the whole list when the markup
+        gives one, so two chats with the same title stay two rows; by title
+        otherwise. A row seen again keeps its LATEST name, since names load
+        after rows do. Done when the list reports its bottom and a further read
+        adds nothing; then any row still showing the "Group" placeholder is
+        scrolled back to and re-read. The list is left at the top.
+        """
+        seen: dict = {}
+
+        def _absorb() -> bool:
+            added = False
+            for r in self._read_rows(page):
+                if not r.get("name"):
+                    continue
+                key = r["index"] if r.get("index") is not None else r["name"]
+                if key not in seen:
+                    added = True
+                    seen[key] = r
+                elif r.get("index") is not None and seen[key]["name"] != r["name"]:
+                    seen[key] = r  # the real name arrived after the placeholder
+            return added
+
+        pos = self._scroll_list(page, 0)
+        time.sleep(_SCROLL_SETTLE_S)
+        _absorb()
+        for _ in range(_MAX_SCROLL_STEPS):
+            at_bottom = pos is None or pos["top"] + pos["client"] >= pos["height"] - 2
+            pos = self._scroll_list(page, _SCROLL_FRACTION)
+            time.sleep(_SCROLL_SETTLE_S)
+            if not _absorb() and at_bottom:
+                break
+        else:
+            logger.warning("Chat list never reported its bottom; read %d rows", len(seen))
+        self._revisit_placeholders(page, seen, _absorb)
+        self._scroll_list(page, 0)
+        rows = list(seen.values())
+        if all(r.get("index") is not None for r in rows):
+            rows.sort(key=lambda r: r["index"])
+        return rows
+
+    def _revisit_placeholders(self, page, seen: dict, absorb) -> None:
+        """Scroll back to rows still named like a placeholder until they load."""
+        for _ in range(_PLACEHOLDER_TRIES):
+            pending = [r for r in seen.values() if r["name"] in _PLACEHOLDER_TITLES and r.get("top") is not None]
+            if not pending:
+                return
+            for r in pending:
+                page.evaluate(_SCROLL_TO_JS, [", ".join(SELECTORS["chat_list"]), r["top"]])
+                time.sleep(_PLACEHOLDER_WAIT_S)
+                absorb()
+        still = [r["index"] for r in seen.values() if r["name"] in _PLACEHOLDER_TITLES]
+        if still:
+            logger.info("Group rows %s still read as a placeholder; kept as they are", still)
+
+    def list_groups(self) -> GroupListResult:
+        """
+        Every group this account is in, read off the chat list. Opens no chat.
+
+        The "Groups" chip filters the list to groups and the list is scrolled to
+        the end. The title is the only handle on a group: the page carries no
+        group id (no @g.us anywhere in the list, checked live 2026-10-02), so a
+        renamed group is found again only by reading the list again. Two
+        groups can share a title, and both are returned.
+        """
+        state = self.warm()
+        if state == "needs_link":
+            return GroupListResult(NOT_LINKED, [])
+        if state != "linked":
+            return GroupListResult(TIMEOUT, [])
+        page = self._page
+        try:
+            rows = self._all_rows_under(page, "filter_groups")
+        finally:
+            self._click_filter(page, "filter_all")
+        if rows is None:
+            return GroupListResult(NO_GROUP_FILTER, [])
+        groups = [
+            GroupChat(name=_BIDI_MARKS.sub("", r["name"]).strip(), muted=bool(r["muted"]))
+            for r in rows
+        ]
+        return GroupListResult(READ_OK, [g for g in groups if g.name])
 
     # --------------------------------------------------------------------- send
 
@@ -396,6 +646,13 @@ class WhatsAppWebDriver:
                 return SendOutcome(TIMEOUT, "chat never opened")
             time.sleep(0.2)
 
+        return self._enter_and_confirm(page, message, deadline)
+
+    def _enter_and_confirm(self, page, message: str, deadline: float) -> SendOutcome:
+        """
+        The text is in the compose box, or about to be: press Enter once and
+        wait for the bubble and its tick. Shared by `send` and `send_group`.
+        """
         compose = _any(page, "compose").first
         snippet = _snippet(message)
 
@@ -414,7 +671,20 @@ class WhatsAppWebDriver:
 
         rows = _any(page, "outgoing")
         bubbles = rows.filter(has_text=snippet) if snippet else rows
+        # Count only once the chat's history has finished rendering. Counted
+        # while it was still loading, an OLDER copy of the same text arriving
+        # read as the new bubble: 0 -> 2 on a repeated "latency benchmark 2"
+        # (live 2026-10-02). For "on my way", sent many times, that is a false
+        # "sent". Two equal reads _HISTORY_SETTLE_S apart; capped, because an
+        # empty chat is settled at once.
         before = bubbles.count()
+        settle_until = min(deadline, time.monotonic() + _HISTORY_WAIT_S)
+        while time.monotonic() < settle_until:
+            time.sleep(_HISTORY_SETTLE_S)
+            now = bubbles.count()
+            if now == before:
+                break
+            before = now
 
         # Exactly one Enter, on the element -- see WhatsAppService._press_send
         # for why a second one is harmful (it lands on the record button).
@@ -432,6 +702,101 @@ class WhatsAppWebDriver:
                 return SendOutcome(UNCONFIRMED)
             time.sleep(0.2)
         return SendOutcome(SENT)
+
+    def send_group(self, title: str, message: str) -> SendOutcome:
+        """
+        Send `message` to the group whose title is exactly `title`.
+
+        There is no link that opens a group (no id is exposed; see
+        list_groups), so this goes the way a person would: Groups chip, type
+        the title into the search -- which that chip scopes to groups -- and
+        click the one row whose title matches EXACTLY. Zero rows or two rows
+        with that title are refused before anything is clicked. After the
+        click the open chat's header must carry the same title, or nothing is
+        typed. Then the same one-Enter, wait-for-the-tick tail as `send`.
+
+        Opening the group marks it read on his phone. That is what sending
+        into a chat by hand does too.
+        """
+        state = self.warm()
+        if state == "needs_link":
+            return SendOutcome(NOT_LINKED)
+        if state != "linked":
+            return SendOutcome(TIMEOUT, "WhatsApp Web never loaded")
+        page = self._page
+        deadline = time.monotonic() + self.timeout_s
+        try:
+            if not self._click_filter(page, "filter_groups", settle=False):
+                return SendOutcome(TIMEOUT, "no Groups filter")
+            search = _any(page, "search").first
+            args = [", ".join(SELECTORS["chat_row"]), title, _BIDI_MARKS.pattern]
+            opened = False
+            # Twice at most: a click that opened the wrong chat has typed
+            # nothing, so searching again is safe.
+            for attempt in range(2):
+                search.fill("")
+                # The longest emoji-free run of the title: what can be typed,
+                # and still a substring of the title for WhatsApp's search.
+                search.fill(_snippet(title) or title)
+                found = self._settled_count(page, title, min(deadline, time.monotonic() + _SEARCH_WAIT_S))
+                if found == 0 and attempt:
+                    break  # the retry ran out of time: still the wrong-chat outcome
+                if found == 0:
+                    return SendOutcome(GROUP_NOT_FOUND)
+                if found > 1:
+                    return SendOutcome(GROUP_AMBIGUOUS)
+                row = page.evaluate_handle(_FIND_ROW_JS, args).as_element()
+                if row is None:
+                    continue  # the list moved between the read and now
+                row.click(timeout=5000)
+                if self._wait_for_chat(page, title, min(deadline, time.monotonic() + _OPEN_WAIT_S)):
+                    opened = True
+                    break
+                logger.warning(
+                    "Group send: opened %r instead of %r (attempt %d)",
+                    _open_chat_title(page), title, attempt + 1,
+                )
+            if not opened:
+                return SendOutcome(WRONG_CHAT, "the group never opened")
+
+            compose = _any(page, "compose").first
+            compose.evaluate("e => e.focus()")
+            # One line: a newline typed into the compose box would send early.
+            page.keyboard.insert_text(" ".join(message.split()))
+            return self._enter_and_confirm(page, message, deadline)
+        finally:
+            try:
+                _any(page, "search").first.fill("")
+            except Exception:  # noqa: BLE001 - tidying the search box must not mask the outcome
+                pass
+            self._click_filter(page, "filter_all", settle=False)
+
+    def _settled_count(self, page, title: str, until: float) -> int:
+        """
+        How many rows carry exactly `title`, read once the search has settled:
+        two reads `_SEARCH_SETTLE_S` apart that agree and contain the title.
+        Agreement alone is not enough -- the unfiltered list is stable too.
+        """
+        previous = None
+        while time.monotonic() < until:
+            rows = [_BIDI_MARKS.sub("", r["name"]).strip() for r in self._read_rows(page)]
+            if rows == previous and title in rows:
+                return rows.count(title)
+            previous = rows
+            time.sleep(_SEARCH_SETTLE_S)
+        return 0
+
+    @staticmethod
+    def _wait_for_chat(page, title: str, until: float) -> bool:
+        """
+        Whether the open chat becomes `title` before `until`. Compared by
+        words: the header renders the title's emoji as images.
+        """
+        while time.monotonic() < until:
+            if _visible(page, "compose") and words(_open_chat_title(page)) == words(title):
+                return True
+            time.sleep(0.1)
+        return False
 
 
 def default_channel() -> str:

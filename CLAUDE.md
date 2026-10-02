@@ -242,6 +242,7 @@ california/
 │   ├── youtube_playlist_resolver.py # Matches voice playlist names and picks one saved ID at random
 │   ├── whatsapp_service.py      # WhatsApp: VCF contacts, confirm-before-send, one worker thread, backend switch
 │   ├── whatsapp_web.py          # Playwright driver for WhatsApp Web: selectors table, send + sent-tick confirm
+│   ├── whatsapp_groups.py       # Forgiving spoken-name -> group-title matcher (emoji-blind, sound-alike words)
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
@@ -262,6 +263,7 @@ california/
 │   ├── probe_deebot_rooms.py       # Live room id -> name; prints the deebot.rooms block; --check flags drift
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
+│   ├── list_whatsapp_groups.py     # Read every WhatsApp group off the chat list and refresh the cache
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
@@ -304,6 +306,8 @@ california/
 │   ├── test_orchestrator_whatsapp.py # control_whatsapp dispatch: spoken lines, the read-back guard, the interim line
 │   ├── test_whatsapp_web.py     # Playwright driver on a fake page, outcome lines, one-thread worker, no-browser guard
 │   ├── test_whatsapp_unread.py  # Unread from the chat list: never opens a chat, senders-first lines, messages quoted not obeyed
+│   ├── test_whatsapp_groups.py  # Group list: scrolled read of a virtualised list, shared titles kept, cache, chip selectors
+│   ├── test_whatsapp_group_send.py # Group sends: misheard names matched, always read back, groups-only, one guess per turn
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -314,6 +318,7 @@ california/
 ├── .deebot_device_id            # Generated locally, the Ecovacs device id that got verified
 ├── contacts.vcf                 # Local only: the phone's contacts export (WhatsApp)
 ├── whatsapp_aliases.yaml        # Local only: WhatsApp nickname -> contact map
+├── whatsapp_groups.json         # Local only: cached WhatsApp group titles (list_groups)
 ├── .whatsapp_profile/           # Local only: the linked WhatsApp Web browser session
 └── .deebot_credentials.json     # Generated locally, live Ecovacs session token (~7 day life)
 ```
@@ -1759,13 +1764,131 @@ line says so. Opening a chat to read it in full is deliberately not an action.
   gives that chat's latest message. `find_unread_chat` resolves the name exactly like a
   send (aliases, then the book, then the chat titles), so a nickname like "my mum" works.
 - **Muted chats are left out and counted; groups are listed apart**, identified through
-  the "Groups" filter chip because nothing in a row marks a group. The "Unread" chip
-  lists every unread chat, not just the ~20 rows the virtualised list has rendered, and
-  the list is put back on "All" afterwards.
-- **The chips need a DOM click.** They are `button#all-filter` / `#unread-filter` /
-  `#group-filter` with `aria-selected`. A Playwright pointer click waited out its whole
-  30s actionability timeout on each (97s for one read) because of the role=dialog layer
-  WhatsApp keeps in the page; `evaluate("b => b.click()")` takes 8.9s cold, 1.9s warm.
+  the "Groups" filter chip because nothing in a row marks a group, plus the cached group
+  list (below) for groups the chip has not rendered. The list under the "Unread" chip is
+  scrolled to the end, and put back on "All" afterwards.
+- **The chips need a DOM click.** They are `button[role=tab]` with `aria-selected`. A
+  Playwright pointer click waited out its whole 30s actionability timeout on each (97s for
+  one read) because of the role=dialog layer WhatsApp keeps in the page;
+  `evaluate("b => b.click()")` takes 8.9s cold, 1.9s warm.
+- **The chips are found by their label, not their id (2026-10-02).** `#unread-filter` and
+  `#group-filter` were renamed to positional `label_item_1` / `label_item_3` (only
+  `#all-filter` survived), and unread quietly degraded to the ~20 rendered "All" rows with
+  no group detection. The old ids stay first in `SELECTORS`; the fallback is
+  `:has-text("Unread"/"Groups")` plus the Portuguese labels. Never key on `label_item_N`:
+  it is a position in a list of chips the user can add to.
+
+**Listing groups (2026-10-02).** `WhatsAppWebDriver.list_groups()` selects the Groups chip
+and scrolls the chat list to the end; `WhatsAppService.list_groups()` caches the titles to
+`whatsapp.groups_path` (`whatsapp_groups.json`, gitignored: group titles say who he spends
+time with) and the next service reads that cache without a browser. Refresh it with
+`uv run python tools/list_whatsapp_groups.py` -- **with California stopped**, since her
+browser holds the profile. Measured: 218 groups (27 muted) in **7.5s** of scrolling
+(was 18.9s before the 2026-10-02 tuning below).
+
+**Sending to a group (2026-10-02).** Group titles in this section and in the tests are
+invented stand-ins with the same shape as the real ones (the repository is public, and
+real titles say who he spends time with). Prompted by a live miss: asked to message the group
+"🦩‍🔥☭flamingus unanounymous☭🦩‍🔥", Whisper and the model produced two sends, to
+"Flamingist" and to "Anonymous group"; both searched the contact book only (15ms each,
+no browser) and missed.
+
+- **Saying "group" means groups only.** The tool takes a `group` flag, and the word
+  itself in `to` ("group", "grupo", "gc") also counts (`_wants_group`). Then the
+  contact book is never consulted, and a person is never messaged.
+- **Group names are matched forgivingly** (`services/whatsapp_groups.py`), because
+  titles are decorated and misspelt and Whisper mishears them again. Emoji, symbols,
+  accents and the filler words "group/grupo/chat/the" are dropped; each spoken word is
+  scored against its best title word by spelling and by a rough sound key
+  ("anonymous" and "unanounymous" share one), plus the whole name run together.
+  Tuned on the real 217 titles: every live mishearing above lands on the right group;
+  "anos rita wine" and "porto" ask which of two; gibberish finds nothing (the floor
+  is 0.70 -- at 0.62 "xyz nonsense" matched three titles).
+- **Every group send is read back first**, even an exact match: the matcher is fuzzy by
+  design and a wrong guess reaches everyone in the group. It reuses the contact
+  confirmation token, keyed `group:<exact title>` + the exact message.
+- **Sending opens the group the way a person would.** No link opens a group, so
+  `WhatsAppWebDriver.send_group` selects the Groups chip, types the title's longest
+  emoji-free run into the (now groups-only) search, refuses zero or two rows with that
+  exact title, clicks the one, checks the open chat's header says that title, and only
+  then types and presses Enter once. Opening the group marks it read on his phone.
+  **Verified live 2026-10-02**: "Flamingist anonymous" -> read-back in 0.06s -> confirmed
+  send with the sent tick in 10.2s from a cold browser. Two things the first live run
+  got wrong, both caught by the header check (nothing was typed):
+  - **Rows need a real Playwright click.** A synthetic mousedown/mouseup/click in the
+    page opened nothing; `locator.nth(i).click()` opens the chat in ~0.2s. The
+    role=dialog layer that defeats pointer clicks on the filter chips does not cover
+    the rows, so `_FIND_ROW_JS` only finds the row and Playwright clicks it.
+  - **The header's `span[title]` is "click here for group info"**, not the name. The
+    name is `#main header span[dir='auto']`, and its emoji are `<img>`s, so it reads
+    "☭flamingus unanounymous☭"; it is compared to the title with `words()`.
+
+**Group send latency, benchmarked 2026-10-02** against a throwaway "Test group"
+(scratch harness wrapping the driver's own methods, ~15 real sends):
+
+| path | before | after |
+|---|---|---|
+| warm send (browser open, connected) | 2.2-2.9s | **1.7-2.0s** |
+| group-list refresh, 218 groups | 18.9s | **7.5s**, identical list |
+| cold send, browser just launched | 7-27s | unchanged: see below |
+| cold, but 20s+ after the page loaded | -- | 2.1-2.9s |
+| miss -> re-read -> read-back (cold browser) | -- | 13.5s, "Let me check" at 0.03s |
+
+Inside a warm send: Groups chip ~0.15s, search settle + click + header ~0.5s, history
+settle + Enter ~0.3s, **bubble -> tick ~0.7s** (WhatsApp's own ack; nothing to shave).
+
+- **A cold browser's first send waits up to ~18s for the tick.** The chat list renders
+  well before WhatsApp Web is connected: the bubble appears at once and sits on the
+  clock. Measured 18.3s, 18.1s, 18.4s on fresh launches, and 0.3-0.9s once the page had
+  20s+ to settle. Not a driver bug and not fixable from the driver -- it is the price
+  of `idle_close_minutes` closing the browser, which is why the shipped config sets it
+  to **0 (never close)** since 2026-10-02 -- ~200-300MB of RAM for ~2s sends throughout;
+  a memory-tight Pi should use a window instead. The boot warm-up + refresh hides it for
+  the first send after a restart.
+- **The search re-sorts the list under a click.** Reading row N and clicking row N a
+  moment later opened a different group ("Test group" was near the top of the
+  unfiltered list). Now: wait until two reads 0.15s apart agree and contain the title,
+  then click the *element* (`page.evaluate_handle(_FIND_ROW_JS)`), not a position; one
+  retry if the header still disagrees. The header check had already kept anything from
+  being typed into the wrong chat.
+- **History renders after the chat opens.** "Before Enter" was counted while it was
+  still loading, so an older copy of the same text arriving read as the new bubble
+  (0 -> 2). For a repeated "on my way" that is a false "sent". The count now waits for
+  two equal reads (`_HISTORY_SETTLE_S`), capped at 3s.
+- **The fixed 0.5s after each chip click** is skipped in a group send (`settle=False`),
+  since the rows are polled anyway. ~1s per send.
+- **Faster scrolling exposed a placeholder.** At 0.15s settle one row read "Group" and
+  became the real name 0.3s later: WhatsApp shows "Group" until a group's name loads. Rows
+  seen again now keep their latest name, and any row still reading "Group"/"Grupo" at
+  the end is scrolled back to and re-read (`_revisit_placeholders`). `_SCROLL_FRACTION`
+  stays <= 1.0: a 1.5-screen step also found all 218, but only because of the overscan.
+- **The list refreshes itself, the way the Stremio library does.** Once at boot (the
+  `keep_warm` warm-up re-reads it once linked) and then every
+  `groups_refresh_interval_minutes` (1440, daily) from `Orchestrator._whatsapp_groups_loop`,
+  stopped by the same `_background_stop` as `_stremio_sync_loop`. The timed refresh is
+  **queued** on the WhatsApp worker (`refresh_groups_in_background`), never run through
+  `_run`: `_run` marks the service busy, and a send arriving during a ~20s refresh would
+  be refused as "still sending". Queued, it waits its turn. On top of that, a group send
+  that matches nothing re-reads the list once, live and announced ("Let me check your
+  WhatsApp groups"), unless it was read in the last two minutes.
+- **One unresolved send per turn** (`Orchestrator._guard_whatsapp_send`). Once a send
+  in a turn has come back without sending, a second send in the same turn is refused,
+  so the model cannot try a second spelling as a second message. A send that went
+  through does not block another: "tell mum and dad" is two real recipients.
+- **Scheduled group sends are refused** for now, rather than half-built.
+
+- **The list is virtualised: ~20 rows exist in the DOM at a time.** Reading it means
+  scrolling `#pane-side` and collecting (`_collect_rows`), until the list reports its
+  bottom and a further read adds nothing. `unread_chats` uses the same loop.
+- **A row's position comes from its wrapper's `translateY`, never `data-testid`.**
+  `list-item-N` is the recycled DOM slot, 0-19 at every scroll position; keying on it
+  stopped a 216-group read at 20. `translateY(380px)` over `height: 76px` is row 5.
+  Position is the key so two groups with the same title stay two (the real account has
+  one such pair); title is the fallback key when no wrapper is found.
+- **The title is the only handle.** No `@g.us` id anywhere in the list, no `data-id`. A
+  renamed group is found again only by listing again.
+- **The Groups chip scopes search.** With it selected the search box reads "Search group
+  chats", so a group send can search by an exact cached title without matching a person.
 - **Other people's words are data.** This is the first path where someone other than
   Master Miguel puts text in front of the model. The quoted preview is labelled as the
   sender's words in the tool result, and the system prompt says a message is read out,
@@ -2157,7 +2280,8 @@ The `control_tv` schema in `services/llm.py` currently supports these TV-related
 
 `control_whatsapp` supports these actions, and deliberately only these three:
 
-- `whatsapp_send` (needs `to` and `message`; optional `at` as HH:MM, optional `confirm`)
+- `whatsapp_send` (needs `to` and `message`; optional `at` as HH:MM, optional `confirm`,
+  optional `group` -- groups only, always read back; see "Sending to a group")
 - `whatsapp_find_contact` (needs `to`; looks someone up without messaging them)
 - `whatsapp_unread` (optional `to`; who has unread messages, or one chat's latest message.
   Reads the chat list only and never marks anything read)
@@ -2820,6 +2944,22 @@ Current automated coverage exists for:
   carried, direction marks stripped, no chat ever opened, the list put back on All; lines
   list senders without text, quote one chat's latest message labelled as the sender's
   words, and a message that gives orders is read, never acted on
+- Groups (`tests/test_whatsapp_groups.py`, against a fake virtualised list that renders
+  only a window of rows): every group read past the first render, two groups sharing a
+  title both kept, muted carried and direction marks stripped, no chat opened, the list
+  put back on All at the top, no Groups chip as its own outcome, a list that never ends
+  bounded; the cache round-trips, a failed read leaves it alone, each failure has its own
+  line, the long time budget, unread told the cached groups, the fixture never pointing at
+  the real cache; and the chip selectors carry English and Portuguese labels and no
+  positional `label_item_N` id
+- Group sends (`tests/test_whatsapp_group_send.py`): the live mishearings resolve to the
+  right title against a real-shaped list, near ties ask, noise finds nothing, emoji never
+  spoken; the driver searches the speakable part, clicks only an exact single title, and
+  types nothing when the title is missing, shared, or the wrong chat opened; every group
+  send is read back (confirm on a first attempt too, and only for that message); saying
+  "group" never searches people; a miss re-reads the list once unless it is fresh; a
+  stale list is re-read on warm-up; and a second guess at a send in the same turn is
+  refused while two real recipients both go
 - That the contact roster is never injected into the system prompt
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
