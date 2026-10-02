@@ -53,6 +53,7 @@ shared services/name_matcher like the light rooms do.
 from __future__ import annotations
 
 import difflib
+import json
 import logging
 import os
 import queue
@@ -65,10 +66,12 @@ import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 from services.name_matcher import match_name, normalize_text
+from services.whatsapp_groups import GroupMatch, match_group, speakable_title
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +92,19 @@ _MSG_UNCONFIRMED = (
 
 _MSG_READ_NEEDS_PLAYWRIGHT = "I can only check unread WhatsApps with the Playwright setup."
 _MSG_READ_FAILED = "I couldn't check WhatsApp just now."
+_MSG_NO_GROUP_FILTER = "I couldn't find the Groups filter on WhatsApp Web, so I can't list groups."
+_MSG_GROUP_SHARED = "Two of your groups are called {title}, and I can't tell them apart from here."
+_MSG_GROUP_GONE = "I couldn't find {title} in WhatsApp just now. It may have been renamed."
+_MSG_GROUP_WRONG_CHAT = "The group didn't open properly, so I didn't send anything."
+_MSG_GROUP_NO_SCHEDULE = "I can only schedule messages to people for now, not groups."
+_MSG_READ_CHAT_FAILED = "I couldn't open that chat just now."
+# A miss against a list re-read this recently is a real miss, not a stale cache.
+_GROUP_REFRESH_COOLDOWN_S = 120.0
+
+# Reading every group means scrolling the whole list: 216 groups took ~18s
+# live (2026-10-02), on top of a possible cold launch. The send budget is too
+# short for that.
+_GROUP_LIST_TIMEOUT_S = 180.0
 
 _BACKENDS = ("playwright", "keyboard")
 # A Playwright send has no fixed wait to schedule around; this is only the
@@ -418,6 +434,13 @@ class WhatsAppService:
             os.getenv("FIREFOX_PATH") or str(cfg.get("firefox_path") or "").strip() or _DEFAULT_FIREFOX
         )
         self.contacts_path = Path(str(cfg.get("contacts_path") or "contacts.vcf"))
+        self.groups_path = Path(str(cfg.get("groups_path") or "whatsapp_groups.json"))
+        # The orchestrator re-reads the group list on this interval, the way it
+        # re-syncs the Stremio library. 0 = only at boot.
+        self.groups_refresh_interval_minutes = max(
+            0, _as_int(cfg.get("groups_refresh_interval_minutes"), 1440)
+        )
+        self._groups_refreshed_at: float | None = None
 
         self.backend = str(cfg.get("backend") or "keyboard").strip().lower()
         if self.backend not in _BACKENDS:
@@ -455,6 +478,9 @@ class WhatsAppService:
 
         self.contacts: list[Contact] = []
         self._load_contacts()
+        # Group titles from the last list_groups(), read from the cache file.
+        # Nothing here touches a browser; the list is refreshed on request.
+        self.groups: list[dict] = self._load_groups()
 
         self.available = self._probe_platform()
 
@@ -493,6 +519,10 @@ class WhatsAppService:
         boot, and a unit test that only constructs the service must never start
         a browser. Non-blocking -- the warm-up is a job on the worker thread,
         and a send that arrives meanwhile simply queues behind it.
+
+        It is also the boot refresh of the group list: the warm-up re-reads it
+        once linked. keep_warm off means "no browser at boot", and that covers
+        the refresh too; the daily refresh and a send's miss still re-read it.
         """
         if not (self.enabled and self._driver is not None and self.keep_warm):
             return
@@ -511,9 +541,30 @@ class WhatsAppService:
                 )
             else:
                 logger.info("WhatsApp Web warm: %s", state)
+                # The boot refresh of the group list, while nobody is waiting on
+                # it. Same worker, so a send that arrives meanwhile waits for it.
+                if state == "linked":
+                    self._refresh_groups()
             return state
 
         self._submit(_warm)
+
+    def refresh_groups_in_background(self):
+        """
+        Queue a group-list re-read on the worker and return at once.
+
+        For the boot-time and daily refreshes. It is queued with _submit, NOT
+        run through _run: _run marks the service busy, and a send arriving
+        during a ~20s refresh would then be refused with "still sending the
+        last message". Queued, the send simply waits its turn behind it.
+        Returns the Future, or None when there is no browser to read with.
+        """
+        if not self.enabled or self.backend != "playwright" or self._driver is None:
+            return None
+        with self._lock:
+            if self._closed:
+                return None
+        return self._submit(self._refresh_groups)
 
     # ------------------------------------------------------------ self-disable
 
@@ -817,7 +868,7 @@ class WhatsAppService:
             except BaseException as exc:  # noqa: BLE001 - handed to the caller in _run
                 future.set_exception(exc)
 
-    def _run(self, work):
+    def _run(self, work, timeout_s: float | None = None):
         """
         Run one blocking send on a worker thread with a timeout.
 
@@ -849,9 +900,9 @@ class WhatsAppService:
 
         future = self._submit(_work)
         try:
-            return future.result(timeout=self._wait_timeout_s)
+            return future.result(timeout=timeout_s or self._wait_timeout_s)
         except FutureTimeoutError:
-            logger.warning("WhatsApp send timed out after %.0fs", self._wait_timeout_s)
+            logger.warning("WhatsApp send timed out after %.0fs", timeout_s or self._wait_timeout_s)
             return WhatsAppCommandResult(False, _MSG_UNREACHABLE)
         except Exception:  # noqa: BLE001 - never let a browser error reach the orchestrator
             logger.exception("WhatsApp send failed")
@@ -1050,7 +1101,7 @@ class WhatsAppService:
 
         def _work():
             try:
-                result = self._driver.unread_chats()
+                result = self._driver.unread_chats(known_groups=self.group_names())
             except Exception:  # noqa: BLE001 - a crashed browser is relaunched next time
                 logger.exception("WhatsApp unread read failed")
                 self._driver.close()
@@ -1063,7 +1114,200 @@ class WhatsAppService:
 
         return self._run(_work)
 
-    def find_unread_chat(self, hint: str, chats: list):
+    # ------------------------------------------------------------------- groups
+
+    def _load_groups(self) -> list[dict]:
+        """The cached group list, or [] when there is none or it is unreadable."""
+        if not self.groups_path.is_file():
+            return []
+        try:
+            data = json.loads(self.groups_path.read_text(encoding="utf-8"))
+            try:
+                self._groups_refreshed_at = datetime.fromisoformat(data["refreshed_at"]).timestamp()
+            except (KeyError, TypeError, ValueError):
+                self._groups_refreshed_at = None
+            return [g for g in data.get("groups", []) if isinstance(g, dict) and g.get("name")]
+        except (OSError, ValueError, AttributeError):
+            logger.warning("Could not read %s, ignoring the cached group list", self.groups_path)
+            return []
+
+    def _save_groups(self, groups: list[dict]) -> None:
+        """Write the cache whole, via a temp file, so a crash never leaves half a list."""
+        payload = {
+            "version": 1,
+            "refreshed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "groups": groups,
+        }
+        tmp = self.groups_path.with_name(self.groups_path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self.groups_path)
+
+    def group_names(self) -> list[str]:
+        return [g["name"] for g in self.groups]
+
+    def list_groups(self):
+        """
+        Read every group off WhatsApp Web, cache it, and return the driver's
+        GroupListResult; a falsy WhatsAppCommandResult (with its spoken line) on
+        any failure. Opens no chat. A failed read leaves the old cache alone.
+
+        The cache (`whatsapp.groups_path`) is gitignored like contacts.vcf: the
+        repository is public and group titles say who he spends time with.
+        """
+        if not self.enabled:
+            return WhatsAppCommandResult(False, _MSG_NOT_CONFIGURED)
+        if self.backend != "playwright" or self._driver is None:
+            return WhatsAppCommandResult(False, _MSG_READ_NEEDS_PLAYWRIGHT)
+
+        return self._run(self._refresh_groups, timeout_s=_GROUP_LIST_TIMEOUT_S)
+
+    def _refresh_groups(self):
+        """Read the group list off WhatsApp Web and cache it. Runs on the worker."""
+        from services import whatsapp_web as web
+
+        t0 = time.monotonic()
+        try:
+            result = self._driver.list_groups()
+        except Exception:  # noqa: BLE001 - a crashed browser is relaunched next time
+            logger.exception("WhatsApp group list failed")
+            self._driver.close()
+            return WhatsAppCommandResult(False, _MSG_READ_FAILED)
+        if result.status == web.NOT_LINKED:
+            return WhatsAppCommandResult(False, _MSG_NEEDS_LINK)
+        if result.status == web.NO_GROUP_FILTER:
+            return WhatsAppCommandResult(False, _MSG_NO_GROUP_FILTER)
+        if not result:
+            return WhatsAppCommandResult(False, _MSG_READ_FAILED)
+        groups = [{"name": g.name, "muted": g.muted} for g in result.groups]
+        try:
+            self._save_groups(groups)
+        except OSError:
+            logger.exception("Could not write %s; keeping the list in memory only", self.groups_path)
+        self.groups = groups
+        self._groups_refreshed_at = time.time()
+        logger.info("WhatsApp: %d group(s) listed in %.1fs", len(groups), time.monotonic() - t0)
+        return result
+
+    def groups_age_s(self) -> float | None:
+        """Seconds since the group list was read, or None if it never was."""
+        if self._groups_refreshed_at is None:
+            return None
+        return max(0.0, time.time() - self._groups_refreshed_at)
+
+    def can_refresh_groups(self) -> bool:
+        """Whether a miss is worth a live re-read: Playwright, and not re-read moments ago."""
+        if not self.enabled or self.backend != "playwright" or self._driver is None:
+            return False
+        age = self.groups_age_s()
+        return age is None or age > _GROUP_REFRESH_COOLDOWN_S
+
+    def resolve_group(self, hint: str) -> GroupMatch:
+        """A spoken group name against the cached titles. Never touches the browser."""
+        return match_group(hint, self.group_names())
+
+    def send_group(self, match: GroupMatch, message: str, confirm: bool = False) -> WhatsAppCommandResult:
+        """
+        Send to a group -- always after a read-back.
+
+        Unlike a contact, no group match is ever certain enough to send on its
+        own: the matcher is fuzzy by design (it has to survive Whisper), and a
+        wrong guess lands in front of everyone in the group. So the first call
+        arms the same one-shot confirmation a fuzzy contact gets, keyed to the
+        exact title and message, and only a later confirmed call sends.
+        """
+        if not self.enabled:
+            return WhatsAppCommandResult(False, _MSG_NOT_CONFIGURED)
+        if self.backend != "playwright" or self._driver is None:
+            return WhatsAppCommandResult(False, _MSG_READ_NEEDS_PLAYWRIGHT)
+        if not match or not message:
+            return WhatsAppCommandResult(False, _MSG_UNREACHABLE)
+        spoken = speakable_title(match.title)
+        if match.shared:
+            return WhatsAppCommandResult(False, _MSG_GROUP_SHARED.format(title=spoken))
+
+        key = "group:" + match.title
+        if not (confirm and self._confirmed(key, message)):
+            self._arm_confirmation(key, message)
+            return WhatsAppCommandResult(
+                False, f"That's the group {spoken}. Say send it and I will."
+            )
+        return self._run(lambda: self._send_group_now(match.title, message))
+
+    def _send_group_now(self, title: str, message: str) -> WhatsAppCommandResult:
+        from services import whatsapp_web as web
+
+        spoken = speakable_title(title)
+        try:
+            outcome = self._driver.send_group(title, message)
+        except Exception:  # noqa: BLE001 - a crashed browser is relaunched by the next send
+            logger.exception("WhatsApp Web send to group %r failed", title)
+            self._driver.close()
+            return WhatsAppCommandResult(False, _MSG_UNREACHABLE)
+        if outcome.status == web.SENT:
+            logger.info("WhatsApp message sent to group %r (tick seen)", title)
+            return WhatsAppCommandResult(True)
+        logger.warning("WhatsApp send to group %r: %s %s", title, outcome.status, outcome.detail)
+        return WhatsAppCommandResult(
+            False,
+            {
+                web.NOT_LINKED: _MSG_NEEDS_LINK,
+                web.UNCONFIRMED: _MSG_UNCONFIRMED,
+                web.GROUP_NOT_FOUND: _MSG_GROUP_GONE.format(title=spoken),
+                web.GROUP_AMBIGUOUS: _MSG_GROUP_SHARED.format(title=spoken),
+                web.WRONG_CHAT: _MSG_GROUP_WRONG_CHAT,
+            }.get(outcome.status, _MSG_UNREACHABLE),
+        )
+
+    def read_chat(self, target, count: int = 10):
+        """
+        The last `count` messages of one chat, read or not. `target` is a
+        GroupMatch (a group, by its exact cached title) or a ContactMatch (a
+        person, by number). Returns the driver's ReadResult, or a falsy
+        WhatsAppCommandResult with its spoken line.
+
+        This opens the chat, which marks anything unread there as read on his
+        phone; the driver closes it again afterwards. Playwright only.
+        """
+        if not self.enabled:
+            return WhatsAppCommandResult(False, _MSG_NOT_CONFIGURED)
+        if self.backend != "playwright" or self._driver is None:
+            return WhatsAppCommandResult(False, _MSG_READ_NEEDS_PLAYWRIGHT)
+
+        from services import whatsapp_web as web
+
+        is_group = isinstance(target, GroupMatch)
+        if is_group and target.shared:
+            return WhatsAppCommandResult(
+                False, _MSG_GROUP_SHARED.format(title=speakable_title(target.title))
+            )
+
+        def _work():
+            try:
+                if is_group:
+                    result = self._driver.read_chat(title=target.title, count=count)
+                else:
+                    result = self._driver.read_chat(phone=target.phone, count=count)
+            except Exception:  # noqa: BLE001 - a crashed browser is relaunched next time
+                logger.exception("WhatsApp chat read failed")
+                self._driver.close()
+                return WhatsAppCommandResult(False, _MSG_READ_CHAT_FAILED)
+            if result:
+                return result
+            spoken = speakable_title(target.title) if is_group else ""
+            return WhatsAppCommandResult(
+                False,
+                {
+                    web.NOT_LINKED: _MSG_NEEDS_LINK,
+                    web.INVALID_NUMBER: _MSG_INVALID_NUMBER,
+                    web.GROUP_NOT_FOUND: _MSG_GROUP_GONE.format(title=spoken),
+                    web.GROUP_AMBIGUOUS: _MSG_GROUP_SHARED.format(title=spoken),
+                    web.WRONG_CHAT: "That chat didn't open properly, so I couldn't read it.",
+                }.get(result.status, _MSG_READ_CHAT_FAILED),
+            )
+
+        return self._run(_work)
+
+    def find_unread_chat(self, hint: str, chats: list, groups_only: bool = False):
         """
         The unread chat he asked about, or None.
 
@@ -1071,9 +1315,17 @@ class WhatsAppService:
         send applies first -- "mum" is the alias, the alias is a
         contact name, the contact name is the chat title. Only then a direct
         match on the titles, which covers groups and unsaved numbers.
+
+        `groups_only` (he said "group") skips people entirely and matches the
+        unread groups' titles the forgiving way a group send does.
         """
         if not hint or not chats:
             return None
+        if groups_only:
+            groups = [c for c in chats if c.is_group]
+            found = match_group(hint, [c.name for c in groups])
+            title = found.title or (found.candidates[0] if found.candidates else "")
+            return next((c for c in groups if c.name == title), None) if title else None
         by_title = {c.name.lower(): c for c in chats}
         match = self.resolve_contact(hint)
         if match.key and match.key.lower() in by_title:

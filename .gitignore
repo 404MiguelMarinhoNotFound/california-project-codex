@@ -46,5 +46,10 @@ contacts.vcf
 # friends are, and the repository is public -- local-only like contacts.vcf.
 whatsapp_aliases.yaml
 
+# WhatsApp group titles (whatsapp.groups_path), cached by list_groups(). Who he
+# spends time with -- local-only for the same reason as the aliases.
+whatsapp_groups.json
+whatsapp_groups.json.tmp
+
 # Runtime logs (config logging.dir). Transcripts and replies, local only.
 logs/

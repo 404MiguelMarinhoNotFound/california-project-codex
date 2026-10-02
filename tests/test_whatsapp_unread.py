@@ -69,6 +69,8 @@ class _ChipPage:
         return _Chip(self, _CHIP_BY_SELECTOR[selector])
 
     def evaluate(self, script, args=None):
+        if script is web._SCROLL_LIST_JS:
+            return {"top": 0, "height": 0, "client": 0}  # everything fits: no scrolling
         return self.views.get(self.active, [])
 
     def goto(self, url, **_):
