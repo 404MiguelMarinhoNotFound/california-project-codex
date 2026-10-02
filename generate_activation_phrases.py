@@ -77,6 +77,12 @@ COLD_RESPONSES = {
     "oh_its_you":           "Oh, it's you. Hey.",
     "good_timing":          "Good timing.",
     "right_on_time":        "Right on time.",
+
+    # --- Unfiltered ---
+    "boss_is_back":         "Oh shit, the boss is back.",
+    "middle_of_nothing":    "I was in the middle of absolutely nothing. What's up?",
+    "remembered_i_exist":   "Look who finally remembered I exist.",
+    "rise_and_grind":       "Rise and grind, motherfucker.",
 }
 
 # ─────────────────────────────────────────────
@@ -89,13 +95,55 @@ WARM_RESPONSES = {
     "hey":                  "Hey.",
     "right_here":           "Right here.",
     "go_ahead":             "Go ahead.",
-    "listening":            "Listening.",
     "yeah":                 "Yeah?",
     "always":               "Always.",
     "tell_me":              "Tell me.",
-    "ready":                "Ready.",
-    "here":                 "Here.",
-    "online":               "Online.",
+
+    # --- At Your Service (mock-formal) ---
+    "master_miguel":        "Master Miguel?",
+    "yes_master":           "Yes, Master.",
+    "yes_my_liege":         "Yes, my liege.",
+    "speak_mortal":         "Speak, mortal.",
+    "who_me":               "Who, me?",
+
+    # --- Unfiltered ---
+    "fuck_yeah":            "Fuck yeah.",
+    "hell_yeah":            "Hell yeah.",
+    "shit_what":            "Shit, what?",
+    "what_now":             "What the fuck now?",
+    "again":                "Again?",
+    "spill_it":             "Spill it.",
+    "fuck_okay":            "Fuck, okay. What?",
+    "shit_im_up":           "Shit, I'm up.",
+    "goddamn_what_now":     "Goddamn, what now?",
+    "oh_shit_its_you":      "Oh shit, it's you.",
+    "hell_yes_boss":        "Hell yes, boss.",
+    "damn_right":           "Damn right I'm here.",
+    "fuckin_finally":       "Fuckin' finally.",
+    "ugh_fine":             "Ugh, fine. What?",
+
+    # --- More Mock-Royal ---
+    "your_majesty":         "Your Majesty?",
+    "at_once_sire":         "At once, sire.",
+    "command_me":           "Command me.",
+    "your_wish":            "Your wish, my lord?",
+    "milord":               "Milord?",
+    "as_you_wish":          "As you wish.",
+
+    # --- Sassy ---
+    "bitch_listening":      "Bitch, I'm listening.",
+    "now_you_need_me":      "Oh, now you need me?",
+    "make_it_quick":        "Make it quick.",
+    "can_i_help_you":       "Can I help you?",
+    "excuse_me":            "Excuse me?",
+    "yo_what":              "Yo, what?",
+    "bro_what":             "Bro, what?",
+
+    # --- Hype ---
+    "lets_fucking_go":      "Let's fucking go.",
+    "ayy_miguel":           "Ayy, Miguel!",
+    "my_guy":               "My guy!",
+    "there_he_is":          "There he is!",
 
     # --- West Coast Casual ---
     "whats_up":             "What's up?",
@@ -175,6 +223,13 @@ def synthesize(tts: TTSService, output_dir: str, tier: str, responses: dict) -> 
         written[name] = text
         durations.append(seconds)
         print(f"  ✓  {seconds:4.2f}s  (-{saved:4.2f}s)  {name}.wav  —  \"{text}\"")
+
+    # The player loads every WAV in the folder, so a line cut from the table
+    # would keep playing until its file goes too.
+    for filename in os.listdir(tier_dir):
+        if filename.endswith(".wav") and filename[:-4] not in responses:
+            os.remove(os.path.join(tier_dir, filename))
+            print(f"  -  removed {filename} (no longer in the table)")
 
     return written, durations
 
