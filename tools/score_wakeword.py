@@ -52,10 +52,23 @@ recorded herself. Then:
 gives false fires per hour at each threshold, next to recall from --dir. That
 pair is what a threshold should be chosen from.
 
-Gotcha when building a negatives corpus: openWakeWord zeroes its first five
-predictions after a reset, so any clip shorter than about 0.5s scores 0.0 no
-matter what is in it, and would silently understate the false-positive rate.
-The 2s clips written by wake_word.capture are safely clear of this.
+Only the *_no_speech.wav captures are negatives. The *_ok.wav ones are wakes
+that led to a real command, so their 2s pre-roll holds the wake word itself;
+--negatives skips them rather than counting a correct wake as a false fire.
+
+Every file is scored inside a bed of background audio (2s before, 1s after),
+never bare. This is load-bearing, and until 2026-09-23 it was missing. The
+classifier decides from ~1.3s of embeddings and openWakeWord refills its
+feature buffer from the global numpy RNG on reset, so a 0.7s held-out take fed
+straight after a reset was scored mostly against that filler, and the loop also
+dropped the last partial 1280-sample chunk, which is where the word ends. The
+same 40 holdouts that measured 18% EN / 21% PT that way fire 82% / 78% inside a
+bed of room-level noise. Live, the mic never stops, so the bed is what matches
+what she actually hears. --bed points it at a real room-tone WAV instead of
+Gaussian noise; --no-pad reproduces the old numbers for comparison.
+
+Scores are deterministic per file: the global RNG (openWakeWord's reset) and
+the dither RNG are both seeded from the file name before scoring.
 """
 
 import argparse
@@ -63,6 +76,7 @@ import os
 import sys
 import time
 import wave
+import zlib
 from collections import deque
 from pathlib import Path
 
@@ -75,6 +89,80 @@ from core.audio_pipeline import AudioPipeline  # noqa: E402
 from core.wake_word import WakeWordDetector  # noqa: E402
 
 WINDOW_SECONDS = 2.0
+SAMPLE_RATE = 16000
+NATIVE_FRAME = 1280  # 80ms, openWakeWord's native step
+
+# The measured median noise floor of training/recordings, RMS on int16.
+DEFAULT_BED_RMS = 36.0
+
+
+class Bed:
+    """
+    What a file is surrounded with before it is scored.
+
+    A bare clip scored after a reset measures the reset, not the model: see the
+    module docstring. The bed gives the model the continuous audio it always has
+    live, and a tail so the word's last syllable is actually scored.
+    """
+
+    def __init__(
+        self,
+        rms: float = DEFAULT_BED_RMS,
+        tone: np.ndarray | None = None,
+        pre_s: float = 2.0,
+        post_s: float = 1.0,
+        enabled: bool = True,
+    ):
+        self.rms = rms
+        self.tone = tone if tone is not None and len(tone) else None
+        self.pre_s = pre_s
+        self.post_s = post_s
+        self.enabled = enabled
+
+    @property
+    def offset_s(self) -> float:
+        """Where the original file starts inside the padded audio."""
+        return self.pre_s if self.enabled else 0.0
+
+    def surround(self, audio: np.ndarray, seed: int) -> np.ndarray:
+        audio = audio.astype(np.int16)
+        if not self.enabled:
+            return audio
+        rng = np.random.default_rng(seed)
+        pre = self._fill(int(SAMPLE_RATE * self.pre_s), rng)
+        post = self._fill(int(SAMPLE_RATE * self.post_s), rng)
+        return np.concatenate([pre, audio, post])
+
+    def _fill(self, n: int, rng: np.random.Generator) -> np.ndarray:
+        if self.tone is not None:
+            start = int(rng.integers(0, len(self.tone)))
+            return np.resize(np.roll(self.tone, -start), n).astype(np.int16)
+        noise = rng.normal(0.0, self.rms, n)
+        return np.clip(noise, -32768, 32767).astype(np.int16)
+
+
+# Set once from the command line in main(). Every scoring function reads it,
+# so recall, negatives and the sweep are always measured the same way.
+BED = Bed()
+
+
+def file_seed(path: str) -> int:
+    """Stable per file and independent of scoring order."""
+    return zlib.crc32(Path(path).name.encode("utf-8"))
+
+
+def _begin(detector, seed: int) -> None:
+    """Reset the detector into a reproducible state for one file."""
+    np.random.seed(seed)  # openWakeWord's reset() draws from the global RNG
+    detector._dither_rng = np.random.default_rng(seed)
+    detector.reset()
+    detector._last_activation_time = 0.0
+
+
+def _frame_score(detector, frame: np.ndarray) -> float:
+    return float(
+        list(detector._oww_model.predict(detector._apply_dither(frame)).values())[0]
+    )
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -108,31 +196,26 @@ def save_clip(out_dir: str, ring: deque, sample_rate: int, score: float) -> str:
 
 def run_wav(detector, path: str, floor: float) -> None:
     with wave.open(path, "rb") as wf:
-        if wf.getframerate() != 16000 or wf.getnchannels() != 1:
+        if wf.getframerate() != SAMPLE_RATE or wf.getnchannels() != 1:
             print(
                 f"warning: expected 16kHz mono, got {wf.getframerate()}Hz "
                 f"{wf.getnchannels()}ch - scores may be meaningless"
             )
-        raw = wf.readframes(wf.getnframes())
-    audio = np.frombuffer(raw, dtype=np.int16)
+    seed = file_seed(path)
+    audio = BED.surround(read_wav(path), seed)
+    _begin(detector, seed)
 
-    chunk = 1280  # 80ms, openWakeWord's native step
+    # Times are relative to the file, so frames in the leading bed print negative.
     peak, peak_at = 0.0, 0.0
-    for start in range(0, len(audio) - chunk + 1, chunk):
-        score = float(
-            list(
-                detector._oww_model.predict(
-                    detector._apply_dither(audio[start : start + chunk])
-                ).values()
-            )[0]
-        )
-        t = start / 16000
+    for start in range(0, len(audio) - NATIVE_FRAME + 1, NATIVE_FRAME):
+        score = _frame_score(detector, audio[start : start + NATIVE_FRAME])
+        t = start / SAMPLE_RATE - BED.offset_s
         if score >= floor:
             print(f"  [{t:6.2f}s] {score:.4f}")
         if score > peak:
             peak, peak_at = score, t
 
-    detector._oww_model.reset()
+    detector.reset()
     print(f"\npeak {peak:.4f} at {peak_at:.2f}s   (threshold is {detector.threshold})")
     print("verdict:", verdict(peak, detector.threshold))
 
@@ -145,21 +228,15 @@ def read_wav(path: str) -> np.ndarray:
 
 
 def score_wav(detector, path: str) -> float:
-    """Peak score over a WAV file. Returns 0.0 for unreadable or empty audio."""
-    audio = read_wav(path)
+    """Peak score over a WAV file, inside the bed. 0.0 for unreadable or empty audio."""
+    seed = file_seed(path)
+    audio = BED.surround(read_wav(path), seed)
+    _begin(detector, seed)
 
-    chunk = 1280
     peak = 0.0
-    for start in range(0, len(audio) - chunk + 1, chunk):
-        score = float(
-            list(
-                detector._oww_model.predict(
-                    detector._apply_dither(audio[start : start + chunk])
-                ).values()
-            )[0]
-        )
-        peak = max(peak, score)
-    detector._oww_model.reset()
+    for start in range(0, len(audio) - NATIVE_FRAME + 1, NATIVE_FRAME):
+        peak = max(peak, _frame_score(detector, audio[start : start + NATIVE_FRAME]))
+    detector.reset()
     return peak
 
 
@@ -172,9 +249,9 @@ def fires_framed(detector, path: str, chunk_samples: int = 640) -> bool:
     model see it"; this answers "would she wake up", and since the 1280-frame
     fix those are different questions.
     """
-    audio = read_wav(path)
-    detector.reset()
-    detector._last_activation_time = 0.0
+    seed = file_seed(path)
+    audio = BED.surround(read_wav(path), seed)
+    _begin(detector, seed)
     for start in range(0, len(audio) - chunk_samples + 1, chunk_samples):
         if detector.process_audio(audio[start : start + chunk_samples]):
             detector.reset()
@@ -183,21 +260,27 @@ def fires_framed(detector, path: str, chunk_samples: int = 640) -> bool:
     return False
 
 
-def score_dir(detector, directory: str) -> list[tuple[Path, float, float]]:
+def score_dir(
+    detector, directory: str, exclude: tuple[str, ...] = ()
+) -> list[tuple[Path, float, float]]:
     """
     (path, peak score, duration in seconds) for every WAV in a directory.
 
     Shared by the recall (--dir) and false-positive (--negatives) modes so both
-    are measured the same way.
+    are measured the same way. Durations are of the file, not the bed. Files
+    whose names end with anything in `exclude` are skipped.
     """
-    paths = sorted(Path(directory).glob("*.wav"))
+    paths = [
+        p for p in sorted(Path(directory).glob("*.wav"))
+        if not p.name.endswith(exclude)
+    ]
     if not paths:
         raise SystemExit(f"no .wav files in {directory}")
 
     rows = []
     for path in paths:
         peak = score_wav(detector, str(path))
-        rows.append((path, peak, len(read_wav(str(path))) / 16000))
+        rows.append((path, peak, len(read_wav(str(path))) / SAMPLE_RATE))
     return rows
 
 
@@ -245,10 +328,13 @@ def run_negatives(detector, directory: str, framed: bool = False) -> list[tuple[
     Point this at debug/activations (see wake_word.capture in config.yaml):
     every *_no_speech.wav there is a wake that nobody spoke into, which is the
     definition of a false fire. Anything else with no wake word in it works too.
+    *_ok.wav captures are skipped: their pre-roll holds a real wake word.
     """
-    rows = score_dir(detector, directory)
+    skipped = len(list(Path(directory).glob("*_ok.wav")))
+    if skipped:
+        print(f"  skipping {skipped} *_ok.wav capture(s): they contain the wake word\n")
+    rows = score_dir(detector, directory, exclude=("_ok.wav",))
 
-    short = [p.name for p, _, dur in rows if dur < 0.5]
     fired_rows = []
     for path, peak, dur in rows:
         hit = fires_framed(detector, str(path)) if framed else peak >= detector.threshold
@@ -270,12 +356,6 @@ def run_negatives(detector, directory: str, framed: bool = False) -> list[tuple[
         print(f"  a threshold of {clean:.2f} would silence every one of these")
     else:
         print("  no threshold silences all of these - these need to be training negatives")
-    if short:
-        print(
-            f"  warning: {len(short)} clip(s) under 0.5s always score 0.0 "
-            "(openWakeWord zeroes its first 5 predictions after a reset) - "
-            f"ignore them: {', '.join(short[:5])}"
-        )
     return rows
 
 
@@ -423,7 +503,32 @@ def main() -> None:
         help="decide with the live detector (threshold + consecutive_frames + "
              "debounce) instead of peak model score - what she actually does",
     )
+    parser.add_argument(
+        "--bed",
+        metavar="WAV",
+        help="surround each file with this room-tone recording instead of "
+             "Gaussian noise (16kHz mono)",
+    )
+    parser.add_argument(
+        "--bed-rms",
+        type=float,
+        default=DEFAULT_BED_RMS,
+        help=f"RMS of the Gaussian bed when --bed is not given (default {DEFAULT_BED_RMS:g})",
+    )
+    parser.add_argument(
+        "--no-pad",
+        action="store_true",
+        help="score files bare, as this tool did before 2026-09-23; only for "
+             "comparing against old numbers, it badly understates recall",
+    )
     args = parser.parse_args()
+
+    global BED
+    BED = Bed(
+        rms=args.bed_rms,
+        tone=read_wav(args.bed) if args.bed else None,
+        enabled=not args.no_pad,
+    )
 
     config = load_config(args.config)
     if args.model:
