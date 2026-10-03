@@ -416,6 +416,11 @@ stremio:
   # 2026-09-25: list 2.2-2.7s after a clear-task link (warm), player 1.8s after
   # OK, playing ~7s after OK on a torrent stream.
   stream_list_timeout_ms: 20000
+  # H8: work out the launch (library sync, watch-state lookup, TMDB fallback,
+  # deep link) on a thread while the room is still waking, instead of after
+  # it. None of it needs the box; from deep standby the wake is ~35s, so the
+  # whole prepare is hidden. false = the old order (wake, then prepare).
+  prepare_during_wake: true
   player_start_timeout_ms: 6000
   # Comet over Real-Debrid is the first stream addon on the account since
   # 2026-10-01, and a debrid stream starts in seconds. 45s was sized for plain

@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -51,6 +52,27 @@ _CLEAR_TASK_FLAGS = "0x10008000"
 _VISIBLE_VIEW_RE = re.compile(r"\{[0-9a-f]+ V\S* .*app:id/(\w+)\}")
 
 
+# watch_state.json is read-modify-written by the background library sync and,
+# since prepare() runs on its own thread during a wake, by a play request at the
+# same moment. One lock for every writer; re-entrant because sync_library is
+# also called from inside prepare().
+_WATCH_STATE_LOCK = threading.RLock()
+
+
+@dataclass
+class StremioPlan:
+    """Everything a launch needs, worked out without touching the box."""
+
+    imdb_id: str
+    media_type: str
+    season: int | None
+    episode: int | None
+    title_key: str
+    title_label: str
+    remembered_source: str | None
+    started_from_first_episode: bool
+
+
 class _StreamListFailed(Exception):
     """Stremio showed its error frame instead of a stream list."""
 
@@ -97,6 +119,8 @@ class StremioService:
         self.email = os.getenv("STREMIO_EMAIL") or stremio_cfg.get("email")
         self.password = os.getenv("STREMIO_PASSWORD") or stremio_cfg.get("password")
         self.autoplay_delay_ms = int(stremio_cfg.get("autoplay_delay_ms", 2500))
+        # H8: _dispatch_tv runs prepare() on a thread while the room wakes.
+        self.prepare_during_wake = stremio_cfg.get("prepare_during_wake", False) is True
         # The ready-list path (_play_when_ready). Measured 2026-09-25, cold after
         # the force-stop: stream list visible ~8s after the deep link, player
         # views 1.8s after OK, state=3 5.8s after OK on a torrent stream.
@@ -214,8 +238,6 @@ class StremioService:
         if not self._auth_key:
             self._auth_key = self._authenticate()
 
-        previous_state = self._load_watch_state()
-
         resp = requests.post(
             "https://api.strem.io/api/datastoreGet",
             json={
@@ -229,6 +251,11 @@ class StremioService:
         resp.raise_for_status()
 
         items = resp.json().get("result", [])
+        with _WATCH_STATE_LOCK:
+            return self._merge_library(items)
+
+    def _merge_library(self, items: list) -> bool:
+        previous_state = self._load_watch_state()
         state = {}
         synced_previous_keys = set()
         history_updated_at = self._now_iso()
@@ -325,7 +352,11 @@ class StremioService:
             return {}
 
     def _write_watch_state(self, state: dict):
-        self.watch_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        # Whole-file replace, so a reader on another thread never sees half a file.
+        with _WATCH_STATE_LOCK:
+            tmp = self.watch_state_path.with_name(self.watch_state_path.name + ".tmp")
+            tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            os.replace(tmp, self.watch_state_path)
 
     def _find_existing_entry(self, state: dict, title: str, imdb_id: str) -> tuple[str | None, dict]:
         title_key = (title or "").strip().lower()
@@ -505,6 +536,23 @@ class StremioService:
         episode: int | None = None,
         allow_unknown_source: bool = False,
     ) -> StremioPlayResult:
+        plan = self.prepare(title, media_type=media_type, season=season, episode=episode)
+        return self.launch(plan, allow_unknown_source=allow_unknown_source)
+
+    def prepare(
+        self,
+        title: str,
+        media_type: str | None = None,
+        season: int | None = None,
+        episode: int | None = None,
+    ) -> StremioPlan:
+        """
+        Work out what to launch -- sync, lookup, TMDB, episode -- without the box.
+
+        Raises exactly what play() raised before its launch, so a caller's
+        "I couldn't find X" handling is unchanged. Network and local files only:
+        that is what lets it run while a deep-standby wake is still going.
+        """
         resume_sensitive = self._is_resume_sensitive_request(media_type, season, episode)
         if resume_sensitive:
             self._sync_library_for_resume(title)
@@ -533,17 +581,30 @@ class StremioService:
             log.info("No watch history for %s; starting at S1E1", resolved_title)
             season, episode = 1, 1
 
-        result = self._play_deep_link(
+        phase_marks.mark("stremio_prepared")
+        return StremioPlan(
             imdb_id=imdb_id,
             media_type=resolved_type,
             season=season,
             episode=episode,
             title_key=title_key or resolved_title.lower(),
             title_label=resolved_title,
-            allow_unknown_source=allow_unknown_source,
             remembered_source=remembered_source,
+            started_from_first_episode=from_first,
         )
-        result.started_from_first_episode = from_first
+
+    def launch(self, plan: StremioPlan, allow_unknown_source: bool = False) -> StremioPlayResult:
+        result = self._play_deep_link(
+            imdb_id=plan.imdb_id,
+            media_type=plan.media_type,
+            season=plan.season,
+            episode=plan.episode,
+            title_key=plan.title_key,
+            title_label=plan.title_label,
+            allow_unknown_source=allow_unknown_source,
+            remembered_source=plan.remembered_source,
+        )
+        result.started_from_first_episode = plan.started_from_first_episode
         return result
 
     def _is_resume_sensitive_request(
@@ -1114,7 +1175,10 @@ class StremioService:
     ):
         if not source_label:
             return
+        with _WATCH_STATE_LOCK:
+            self._remember_source_locked(title_key, title_label, imdb_id, media_type, source_label)
 
+    def _remember_source_locked(self, title_key, title_label, imdb_id, media_type, source_label):
         state = self._load_watch_state()
         existing_key = title_key if title_key in state else None
         if not existing_key:
