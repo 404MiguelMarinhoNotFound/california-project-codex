@@ -59,6 +59,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from services import phase_marks
 from services.device_finder import (
     DeviceFinder,
     arp_table_candidates,
@@ -259,6 +260,7 @@ class CecWaker:
                     sock.close()
                 except OSError as exc:
                     log.debug("WoL to %s:%s failed: %s", target, port, exc)
+        phase_marks.mark("wol_sent")
 
     def power_on_tv(self, timeout_s: float | None = None) -> bool:
         """

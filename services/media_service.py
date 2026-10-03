@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
+from services import phase_marks
 from services.cec_wake import CecWaker, WakeResult
 from services.device_finder import (
     DeviceFinder,
@@ -1663,6 +1664,8 @@ class MediaService:
         # Its own wake announced it, but on the rescue path the TV was elsewhere a
         # moment ago; make sure the picture is the box's.
         selected = self.ensure_active_source()
+        if selected is True:
+            phase_marks.mark("tv_showing_box")
         confirmed = True if selected is True else (False if selected is False else None)
         self.last_wake_result = WakeResult(True, result.detail, tv_confirmed=confirmed)
         return True
@@ -1714,6 +1717,7 @@ class MediaService:
             # never be worse than the old behaviour, which accepted the
             # connection by itself.
             if self.ensure_connected() and self.is_boot_completed() is not False:
+                phase_marks.mark("box_ready")
                 return True
             if time.monotonic() >= deadline:
                 return False

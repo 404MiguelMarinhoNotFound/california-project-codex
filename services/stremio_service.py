@@ -11,6 +11,8 @@ from pathlib import Path
 
 import requests
 
+from services import phase_marks
+
 log = logging.getLogger(__name__)
 
 AUTOPLAY_FALLBACK_LINE = "Stremio's open but it didn't start on its own. Just hit OK on the remote."
@@ -610,6 +612,7 @@ class StremioService:
         # which recreates the screen in the running process: right episode both
         # ways (S1E1 -> S01E01 files, S2E9 -> S02 packs), list in 2.2-2.7s.
         self._launch_uri(uri)
+        phase_marks.mark("deeplink_fired")
         if not self._wait_for_stremio_foreground():
             log.warning("Stremio did not become foreground within wait window")
 
@@ -793,10 +796,12 @@ class StremioService:
         except _StreamListFailed:
             log.warning("Stremio showed its error frame instead of streams")
             return None, False
+        phase_marks.mark("stream_list_visible")
 
         source = self._first_card_label()
         log.info("Stream list ready; first card: %s", source or "unreadable")
         self._keyevent(23)
+        phase_marks.mark("ok_pressed")
 
         def player_opened():
             views = self._stremio_views() or set()
@@ -805,8 +810,10 @@ class StremioService:
         if not self._poll(player_opened, self.player_start_timeout_s):
             log.warning("OK went in on the stream list but no player opened")
             return None, True
+        phase_marks.mark("player_up")
 
         if self._poll(lambda: self._stremio_playback_state() == 3, self.playback_timeout_s, 0.5):
+            phase_marks.mark("playing")
             log.info("Playing from %s", source or "an unread source")
             return StremioPlayResult(success=True, played_source=source, target_mode=target_mode), True
 
