@@ -1897,10 +1897,36 @@ settle + Enter ~0.3s, **bubble -> tick ~0.7s** (WhatsApp's own ack; nothing to s
 
 **Reading a chat's latest messages (2026-10-02).** "Read my messages in <group>, the
 recent three" came back empty: `whatsapp_unread` only sees chats with an unread badge,
-and the group had none. `whatsapp_read` opens the chat -- a group through the same
-search-and-exact-click path as a group send (`_open_group`), a person through
-`send?phone=` with no text (`_open_contact`) -- and collects the last `count` bubbles
-(default 10, max 50) with `_READ_MESSAGES_JS` / `_collect_history`.
+and the group had none. `whatsapp_read` opens the chat from the chat list -- a group
+under the Groups chip (`_open_group`), a person under All by the name the phone saved
+them as (`_open_person`; first exact row wins, since All also lists message hits), both
+through `_open_by_title`'s search-and-exact-click -- and collects the last `count`
+bubbles (default 10, max 50) with `_READ_MESSAGES_JS` / `_collect_history`.
+
+Three more things the live log taught on 2026-10-03:
+
+- **The model does not always set `group` when reading.** "Read autismus" went to
+  the contact book and came back "Tia Rosa or Mateus?". `_dispatch_whatsapp` now asks
+  the group list whenever a name is no *certain* contact: a group title scoring
+  >= `_GROUP_FALLBACK_SCORE` (0.8) wins. The contact lookup is done once and reused,
+  and a bare Mock service never triggers it (`isinstance(..., GroupMatch)`).
+- **A person's chat is NOT opened through `send?phone=` for a read.** That link
+  reloads the whole of WhatsApp Web (~13s) and opens the chat with no history at all.
+  Sends still use it -- they only need the compose box.
+- **A multi-word name is checked word by word.** "Tomas Silvah" -- Whisper's
+  "Tomass Silva" -- went, certain, to a contact saved as just "Tomas", because
+  `score_contacts` scores a contact name that *starts* the spoken one at 90 and never
+  weighed the surname (Tomass Silva: 32.6). `_prefer_whole_name` asks the group
+  matcher's word-and-sound scorer for a second opinion (Tomass Silva 0.90, Tomas
+  0.69): a different contact at >= 0.8 and 0.1 clear wins, as a LOOSE match so a send
+  is read back; two close ones are a question. Swept over the real book: every one of
+  294 multi-word names still resolves to itself (the two that do not, did not before).
+- **A chat can genuinely be empty on the laptop.** Tomas's chat showed only
+  WhatsApp's encryption notice: a linked device holds what synced at link time plus
+  what has arrived since. The read line says so rather than a bare "no messages" --
+  but check the name resolved to the right person first; that is what was wrong here.
+- Right after California's own browser closes, the first reads from another process
+  gave up at 30s and then worked; give the profile a few seconds before testing.
 
 **Verified live 2026-10-02** on a busy group: 10 in 1.9s, 30 in 3.7s, 50 in 12.4s (12:37
 to 19:36, no gaps), and the three nest exactly -- the last 30 of the 50-read are the

@@ -241,13 +241,13 @@ _READ_ROWS_JS = r"""
 #   Clicking row N of a list read a moment earlier opened a different group
 #   (live 2026-10-02, "Test group" sat near the top of the unfiltered list).
 _FIND_ROW_JS = r"""
-([rowSel, title, marks]) => {
+([rowSel, title, marks, first]) => {
   const strip = s => (s || "").replace(new RegExp(marks, "g"), "").trim();
   const rows = [...document.querySelectorAll(rowSel)].filter(r => {
     const t = r.querySelector("span[title]");
     return t && strip(t.getAttribute("title")) === title;
   });
-  return rows.length === 1 ? rows[0] : null;
+  return rows.length === 1 || (first && rows.length) ? rows[0] : null;
 }
 """
 
@@ -857,10 +857,26 @@ class WhatsAppWebDriver:
         its header says so; otherwise the outcome that says why not. See
         send_group for why it goes through the search.
         """
-        if not self._click_filter(page, "filter_groups", settle=False):
-            return SendOutcome(TIMEOUT, "no Groups filter")
+        return self._open_by_title(page, title, deadline, chip="filter_groups")
+
+    def _open_person(self, page, name: str, deadline: float) -> SendOutcome | None:
+        """
+        Open his chat with the contact saved as `name`, from the chat list.
+
+        Not through `send?phone=`: that link reloads the whole of WhatsApp Web
+        (~13s), and a freshly loaded page shows a chat it was linked to with NO
+        history -- one bare notice row, zero messages (live 2026-10-03, "read my
+        chat with <a contact>" came back empty). A chat opened from the list has its
+        history. Under the All chip the search also lists message hits, which
+        can carry the same title; the first exact row is the chat itself.
+        """
+        return self._open_by_title(page, name, deadline, chip="filter_all", first=True)
+
+    def _open_by_title(self, page, title: str, deadline: float, chip: str, first: bool = False) -> SendOutcome | None:
+        if not self._click_filter(page, chip, settle=False):
+            return SendOutcome(TIMEOUT, f"no {chip} chip")
         search = _any(page, "search").first
-        args = [", ".join(SELECTORS["chat_row"]), title, _BIDI_MARKS.pattern]
+        args = [", ".join(SELECTORS["chat_row"]), title, _BIDI_MARKS.pattern, first]
         opened = False
         # Twice at most: a click that opened the wrong chat has typed
         # nothing, so searching again is safe.
@@ -874,7 +890,7 @@ class WhatsAppWebDriver:
                 break  # the retry ran out of time: still the wrong-chat outcome
             if found == 0:
                 return SendOutcome(GROUP_NOT_FOUND)
-            if found > 1:
+            if found > 1 and not first:
                 return SendOutcome(GROUP_AMBIGUOUS)
             row = page.evaluate_handle(_FIND_ROW_JS, args).as_element()
             if row is None:
@@ -884,7 +900,7 @@ class WhatsAppWebDriver:
                 opened = True
                 break
             logger.warning(
-                "Group send: opened %r instead of %r (attempt %d)",
+                "WhatsApp: opened %r instead of %r (attempt %d)",
                 _open_chat_title(page), title, attempt + 1,
             )
         if not opened:
@@ -893,7 +909,7 @@ class WhatsAppWebDriver:
 
     # --------------------------------------------------------------- read chat
 
-    def read_chat(self, *, title: str = "", phone: str = "", count: int = 10) -> ReadResult:
+    def read_chat(self, *, title: str = "", name: str = "", phone: str = "", count: int = 10) -> ReadResult:
         """
         The last `count` messages of one chat -- a group by exact title, or a
         person by number -- read whether or not they are unread.
@@ -914,6 +930,8 @@ class WhatsAppWebDriver:
         try:
             if title:
                 failed = self._open_group(page, title, deadline)
+            elif name:
+                failed = self._open_person(page, name, deadline)
             else:
                 failed = self._open_contact(page, phone, "", deadline)
             if failed is not None:
@@ -928,7 +946,7 @@ class WhatsAppWebDriver:
             return ReadResult(READ_OK, messages[-count:])
         finally:
             self._close_chat(page)
-            if title:
+            if title or name:
                 self._tidy_group_search(page)
 
     def _collect_history(self, page, want: int, until: float) -> list[dict]:
