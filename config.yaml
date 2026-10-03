@@ -421,6 +421,12 @@ stremio:
   # it. None of it needs the box; from deep standby the wake is ~35s, so the
   # whole prepare is hidden. false = the old order (wake, then prepare).
   prepare_during_wake: true
+  # H9: skip the separate wait for Stremio to be foreground (the stream-list
+  # poll already waits for its list), and cap the one uiautomator dump before
+  # the OK, which only feeds the log and the remembered source and is skipped
+  # outright when a source is remembered. Old: false / media.ui_dump_timeout_ms.
+  skip_foreground_wait: true
+  first_card_dump_timeout_ms: 2000
   player_start_timeout_ms: 6000
   # Comet over Real-Debrid is the first stream addon on the account since
   # 2026-10-01, and a debrid stream starts in seconds. 45s was sized for plain

@@ -370,6 +370,15 @@ class MediaServiceYouTubeTests(unittest.TestCase):
 
         self.assertEqual(adb.call_args_list[0].kwargs.get("timeout_s"), svc.ui_dump_timeout_s)
 
+    def test_dump_ui_hierarchy_honours_a_caller_cap(self):
+        """H9: the pre-OK dump is capped, and one failed try is the end of it."""
+        svc = MediaService(self.config)
+        with patch.object(svc, "ensure_connected", return_value=True):
+            with patch.object(svc, "_adb", return_value=(False, "timeout")) as adb:
+                self.assertEqual(svc.dump_ui_hierarchy(timeout_s=2.0, retries=1), "")
+        self.assertEqual(adb.call_count, 1)
+        self.assertEqual(adb.call_args_list[0].kwargs.get("timeout_s"), 2.0)
+
     def test_detect_youtube_profile_picker_curly_apostrophe(self):
         svc = MediaService(self.config)
         xml = '<hierarchy><node text="Who\u2019s watching?" bounds="[0,0][100,100]" /></hierarchy>'

@@ -934,24 +934,27 @@ class MediaService:
             log.warning("Activity start failed for %s: %s", component, output)
         return success, output
 
-    def dump_ui_hierarchy(self) -> str:
+    def dump_ui_hierarchy(self, timeout_s: float | None = None, retries: int | None = None) -> str:
+        """`timeout_s` / `retries` cap one call; the defaults are media.ui_dump_*."""
         if not self.ensure_connected():
             return ""
         remote_path = "/sdcard/window_dump.xml"
-        for attempt in range(1, self.ui_dump_retry_count + 1):
+        timeout_s = self.ui_dump_timeout_s if timeout_s is None else timeout_s
+        retries = self.ui_dump_retry_count if retries is None else max(1, retries)
+        for attempt in range(1, retries + 1):
             ok, dump_output = self._adb(
                 f"shell uiautomator dump --compressed {remote_path}",
-                timeout_s=self.ui_dump_timeout_s,
+                timeout_s=timeout_s,
             )
             if ok and dump_output and "error:" not in dump_output.lower():
                 break
             log.warning(
                 "UI dump attempt %d/%d failed: %s",
                 attempt,
-                self.ui_dump_retry_count,
+                retries,
                 dump_output or "no output",
             )
-            if attempt < self.ui_dump_retry_count and self.ui_dump_retry_delay_s > 0:
+            if attempt < retries and self.ui_dump_retry_delay_s > 0:
                 time.sleep(self.ui_dump_retry_delay_s)
         else:
             log.warning("UI dump never succeeded, returning empty XML instead of stale dump")

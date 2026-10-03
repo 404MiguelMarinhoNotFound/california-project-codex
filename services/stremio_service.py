@@ -121,6 +121,14 @@ class StremioService:
         self.autoplay_delay_ms = int(stremio_cfg.get("autoplay_delay_ms", 2500))
         # H8: _dispatch_tv runs prepare() on a thread while the room wakes.
         self.prepare_during_wake = stremio_cfg.get("prepare_during_wake", False) is True
+        # H9: list_ready already waits for Stremio's stream list, so the separate
+        # wait for Stremio to be foreground is redundant; and the one uiautomator
+        # dump before the OK is capped (it only feeds the log and the remembered
+        # source). Defaults = the old behaviour.
+        self.skip_foreground_wait = stremio_cfg.get("skip_foreground_wait", False) is True
+        ui_dump_ms = int((config.get("media", {}) or {}).get("ui_dump_timeout_ms", 6000))
+        self.first_card_dump_timeout_s = max(
+            1, int(stremio_cfg.get("first_card_dump_timeout_ms", ui_dump_ms))) / 1000
         # The ready-list path (_play_when_ready). Measured 2026-09-25, cold after
         # the force-stop: stream list visible ~8s after the deep link, player
         # views 1.8s after OK, state=3 5.8s after OK on a torrent stream.
@@ -674,7 +682,7 @@ class StremioService:
         # ways (S1E1 -> S01E01 files, S2E9 -> S02 packs), list in 2.2-2.7s.
         self._launch_uri(uri)
         phase_marks.mark("deeplink_fired")
-        if not self._wait_for_stremio_foreground():
+        if not self.skip_foreground_wait and not self._wait_for_stremio_foreground():
             log.warning("Stremio did not become foreground within wait window")
 
         # A series with no tracked episode opens its detail page and stops there:
@@ -683,7 +691,8 @@ class StremioService:
         if target_mode == "series_detail":
             return StremioPlayResult(success=True, played_source=None, target_mode=target_mode)
 
-        result, pressed = self._play_when_ready(target_mode, title_label or title_key)
+        result, pressed = self._play_when_ready(target_mode, title_label or title_key,
+                                                remembered_source=remembered_source)
         if result is not None:
             if result.success:
                 self._remember_successful_source(
@@ -828,7 +837,8 @@ class StremioService:
                 return False
             time.sleep(interval_s)
 
-    def _play_when_ready(self, target_mode: str, title: str | None) -> tuple[StremioPlayResult | None, bool]:
+    def _play_when_ready(self, target_mode: str, title: str | None,
+                         remembered_source: str | None = None) -> tuple[StremioPlayResult | None, bool]:
         """
         Wait for the stream list, press OK once, confirm the player, wait for play.
 
@@ -859,8 +869,11 @@ class StremioService:
             return None, False
         phase_marks.mark("stream_list_visible")
 
-        source = self._first_card_label()
-        log.info("Stream list ready; first card: %s", source or "unreadable")
+        # A remembered source makes the dump redundant: it only ever fed the log
+        # and that memory, and it holds the OK back ~1-2s (up to its timeout).
+        source = remembered_source or self._first_card_label()
+        log.info("Stream list ready; first card: %s%s", source or "unreadable",
+                 " (remembered, not read)" if remembered_source else "")
         self._keyevent(23)
         phase_marks.mark("ok_pressed")
 
@@ -900,7 +913,8 @@ class StremioService:
         is None, never a reason to skip the OK.
         """
         try:
-            candidates = self._extract_candidates_from_ui_xml(self._dump_ui_hierarchy())
+            candidates = self._extract_candidates_from_ui_xml(
+                self._dump_ui_hierarchy(timeout_s=self.first_card_dump_timeout_s, retries=1))
         except Exception:
             log.debug("Could not read the stream list before OK", exc_info=True)
             return None
@@ -1059,9 +1073,11 @@ class StremioService:
         xml_text = self._dump_ui_hierarchy()
         return self._extract_candidates_from_ui_xml(xml_text)
 
-    def _dump_ui_hierarchy(self) -> str:
+    def _dump_ui_hierarchy(self, timeout_s: float | None = None, retries: int | None = None) -> str:
         if self.media_service is not None:
-            return self.media_service.dump_ui_hierarchy()
+            if timeout_s is None and retries is None:
+                return self.media_service.dump_ui_hierarchy()
+            return self.media_service.dump_ui_hierarchy(timeout_s=timeout_s, retries=retries)
         self._run_shell(f"uiautomator dump --compressed {UI_DUMP_REMOTE_PATH}")
         _, output = self._run_shell(f"cat {UI_DUMP_REMOTE_PATH}")
         return output or ""
