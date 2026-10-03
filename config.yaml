@@ -671,6 +671,11 @@ media:
     # sys.boot_completed and returns as soon as Android says it is up, so a
     # fast boot no longer costs the whole budget.
     settle_ms: 45000
+    # H6: when the box misses one ADB ping (off the LAN), Wake-on-LAN the TV
+    # before the reachability scan and the UPnP probes, ~2-4s of checks the
+    # code audit found in front of the wake packet (2026-10-02). WoL is a
+    # no-op on a TV that is already on. false = the old order.
+    prewake_wol: true
     # Then, if the box still is not up, the Source-menu rescue gets this long.
     # 7.9s measured from a lit TV (2026-09-25).
     rescue_settle_ms: 20000

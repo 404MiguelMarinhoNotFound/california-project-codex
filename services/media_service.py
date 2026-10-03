@@ -461,6 +461,9 @@ class MediaService:
         # it is still on the LAN (shallow standby). From deep standby turn_on
         # goes through the television over CEC. See services/cec_wake.py.
         wake_cfg = media_cfg.get("cec_wake", {}) or {}
+        # H6 (2026-10-02 optimization): Wake-on-LAN before the reachability
+        # checks when one ping says the box is off the LAN. Off = today's order.
+        self.prewake_wol = wake_cfg.get("prewake_wol", False) is True
         self.wake_settle_s = max(0, int(wake_cfg.get("settle_ms", 25000))) / 1000
         self.wake_poll_interval_s = max(0.1, int(wake_cfg.get("poll_interval_ms", 2000)) / 1000)
         self.mibox_hdmi_port = int(wake_cfg.get("mibox_hdmi_port", 2))
@@ -1237,6 +1240,31 @@ class MediaService:
             return None
         return _parse_wakefulness(output)
 
+    def prewake(self) -> bool | None:
+        """
+        Start the television booting before anything slower runs.
+
+        True: the box answered one ping. False: it did not, and Wake-on-LAN has
+        gone to the TV (when the waker is available). None: prewake is off, and
+        nothing was sent or asked -- today's behaviour exactly.
+
+        One `adb shell echo ping` is ~0.2s against a transport that is gone.
+        is_awake() would go on to reconnect, port-probe and rescan the /24
+        (~2.5s), and the deep path then probes UPnP before its own WoL: seconds
+        during which a television that has to boot for ~37s was not booting.
+        WoL is a no-op on a TV that is already on. No rediscovery here, and no
+        cooldown is touched: that is is_awake()'s job, straight after.
+        """
+        if not self.prewake_wol:
+            return None
+        ok, _ = self._adb("shell echo ping")
+        if ok:
+            return True
+        if self.cec_waker.available is True:
+            log.info("Box does not answer; Wake-on-LAN to the TV before the reachability checks")
+            self.cec_waker.send_wol()
+        return False
+
     def turn_on(self) -> bool:
         """
         Get the box awake and the television on and showing it.
@@ -1250,6 +1278,7 @@ class MediaService:
         self.last_wake_result = None
         self.last_input_result = None
         self._finish_pending_standby()
+        self.prewake()
         state = self.is_awake()
         if state is None:
             return self._wake_and_wait()  # Deep standby: only the TV can reach it.

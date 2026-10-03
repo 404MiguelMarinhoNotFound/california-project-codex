@@ -262,6 +262,10 @@ class CecWaker:
                     log.debug("WoL to %s:%s failed: %s", target, port, exc)
         phase_marks.mark("wol_sent")
 
+    def send_wol(self) -> None:
+        """One Wake-on-LAN burst, nothing else: no probe, no wait. A no-op on a TV that is on."""
+        self._send_wol()
+
     def power_on_tv(self, timeout_s: float | None = None) -> bool:
         """
         Wake-on-LAN the TV and wait for it to answer. Needs no token.

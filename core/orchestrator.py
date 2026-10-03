@@ -368,8 +368,16 @@ def _ensure_playable(media_svc, say_now=None) -> str:
     remote_line = ("The box is awake but I can't get the TV onto its input. "
                    "Switch to it with the remote and I'll take it from there.")
 
+    # A box that misses one ping is off the LAN: the TV gets its Wake-on-LAN
+    # now, she says so now, and the awake-box branch below is skipped -- its
+    # is_awake() would rediscover for ~2.5s just to learn the same thing.
+    # turn_on() does that one rediscovery itself. `is False`, because a bare
+    # Mock's prewake() returns a Mock and must keep today's order.
+    prewake = getattr(media_svc, "prewake", None)
+    off_lan = prewake is not None and prewake() is False
+
     # Identity checks throughout: a bare Mock's attributes are truthy.
-    if media_svc.is_awake() is True:
+    if not off_lan and media_svc.is_awake() is True:
         # The TV's UPnP port is the live power reading; the CEC tail can be hours
         # stale, and after tv_only_standby a dark set under an awake box is the
         # normal state. Identity checks: a bare Mock's `available` is truthy.
