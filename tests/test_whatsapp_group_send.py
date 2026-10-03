@@ -216,7 +216,8 @@ class _GroupPage:
     def evaluate_handle(self, script, args=None):
         assert script is web._FIND_ROW_JS
         hits = [i for i, t in enumerate(self._visible_rows()) if t == args[1]]
-        return _Handle(self, hits[0] if len(hits) == 1 else None)
+        first = len(args) > 3 and args[3]
+        return _Handle(self, hits[0] if len(hits) == 1 or (first and hits) else None)
         raise AssertionError("unexpected script")
 
 
