@@ -28,8 +28,9 @@ from services.media_service import MediaService
 from services.light_shadow import LightShadow
 from services.now_playing import NowPlaying
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
+from services.whatsapp_groups import GroupMatch
 from services.whatsapp_groups import speakable_title as speakable_group_title
-from services.whatsapp_service import WhatsAppService
+from services.whatsapp_service import WhatsAppService, looks_like_phone
 from services.surfshark_service import SurfsharkService
 from services.tv_volume import TvVolume
 from services.youtube_playlist_resolver import resolve_playlist_choice
@@ -1260,7 +1261,14 @@ def _whatsapp_read_line(result, where: str) -> str:
         return getattr(result, "message", "") or "I couldn't open that chat just now."
     messages = list(result.messages)
     if not messages:
-        return f"There are no messages I can read in {where}."
+        # Live 2026-10-03: a chat with a real person showed only WhatsApp's
+        # encryption notice. A linked laptop holds what the phone synced when it
+        # was linked plus what arrived since; an older chat has nothing there.
+        return (
+            f"WhatsApp on the laptop has no messages in {where}. It only has what "
+            "synced from his phone when it was linked plus anything since, so "
+            "older messages are only on his phone."
+        )
     parts = []
     for m in messages:
         who = "you" if m.outgoing else (m.sender or "someone")
@@ -1277,6 +1285,11 @@ def _whatsapp_read_line(result, where: str) -> str:
 
 # "the hiking group", "grupo da praia", "the gc": he means a group, not a person.
 _GROUP_WORD = re.compile(r"\b(groups?|grupos?|gc|group ?chat)\b", re.IGNORECASE)
+
+
+# A group title at least this close to the spoken name wins over a contact
+# match that is not certain. Real mishearings of group names score 0.79+.
+_GROUP_FALLBACK_SCORE = 0.8
 
 
 def _wants_group(params: dict, hint: str) -> bool:
@@ -1377,13 +1390,27 @@ def _dispatch_whatsapp(params: dict, whatsapp_svc, say_now=None) -> str:
     if hint and _wants_group(params, hint):
         return _dispatch_whatsapp_group(action, hint, params, whatsapp_svc, say_now)
 
+    # The model does not always set `group` (2026-10-03: two reads of a group by
+    # name went to the contact book and came back "Tia Rosa or Mateus?" and
+    # "nobody called that"). So a name that is no certain contact but a strong
+    # group title is the group. A group send is read back first anyway, so a
+    # wrong guess here costs a question, never a message.
+    person = None
+    if hint and action in ("whatsapp_send", "whatsapp_read", "whatsapp_find_contact") and not looks_like_phone(hint):
+        person = whatsapp_svc.resolve_contact(hint)
+        if not getattr(person, "certain", False):
+            group = whatsapp_svc.resolve_group(hint)
+            # isinstance, not truthiness: a bare Mock service answers anything.
+            if isinstance(group, GroupMatch) and group and group.score >= _GROUP_FALLBACK_SCORE:
+                return _dispatch_whatsapp_group(action, hint, params, whatsapp_svc, say_now)
+
     if action == "whatsapp_unread":
         return _whatsapp_unread_line(whatsapp_svc, hint)
 
     if not hint:
         return "Whose chat should I read?" if action == "whatsapp_read" else "Who should I message?"
 
-    match = whatsapp_svc.resolve_contact(hint)
+    match = person if person is not None else whatsapp_svc.resolve_contact(hint)
 
     if action == "whatsapp_read":
         if match.candidates:

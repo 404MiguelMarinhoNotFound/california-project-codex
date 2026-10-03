@@ -72,6 +72,8 @@ from urllib.parse import quote
 
 from services.name_matcher import match_name, normalize_text
 from services.whatsapp_groups import GroupMatch, match_group, speakable_title
+from services.whatsapp_groups import score as words_score
+from services.whatsapp_groups import words as spoken_words
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +124,12 @@ _DEFAULT_COUNTRY = "351"  # Portugal, matches most numbers in this book
 # first-name token. Below it ("ana" found inside "Joana", or a difflib ratio)
 # the recipient is read back first.
 _CERTAIN_SCORE = 80.0
+
+# _prefer_whole_name: the word scorer's pick must reach this, beat the contact
+# scorer's pick by this margin, and be this far clear of its own runner-up.
+_WHOLE_NAME_MIN = 0.8
+_WHOLE_NAME_MARGIN = 0.1
+_WHOLE_NAME_TIE = 0.05
 
 # How close the runner-up has to be before a match counts as ambiguous.
 _AMBIGUOUS_MARGIN = 5.0
@@ -701,7 +709,7 @@ class WhatsAppService:
             # He said the digits, so there is nothing for him to confirm.
             return ContactMatch(key=phone, phone=phone, certain=True)
 
-        book = self._classify(score_contacts(cleaned, self.contacts))
+        book = self._prefer_whole_name(cleaned, self._classify(score_contacts(cleaned, self.contacts)))
 
         # Aliases go through the shared matcher, whose substring tier is right
         # for six light rooms and dangerous here: with an `ana` alias for one
@@ -730,6 +738,42 @@ class WhatsAppService:
                         return hit
 
         return book
+
+    def _prefer_whole_name(self, spoken: str, book: ContactMatch) -> ContactMatch:
+        """
+        A second opinion on a spoken name of two or more words.
+
+        score_contacts rates "the contact's name starts the spoken name" as
+        near-certain, so "Tomas Silvah" -- Whisper's "Tomass Silva" -- went,
+        certain, to a contact saved as just "Tomas" (90), with "Tomass Silva"
+        at 32.6 (live 2026-10-03). The surname was never weighed. The word and
+        sound scorer the group names use weighs every spoken word against its
+        best word in the name, by spelling and by sound, and puts Tomass Silva
+        at 0.90 against Tomas's 0.69.
+
+        When that scorer clearly prefers a different contact, it wins -- as a
+        LOOSE match, so a send is read back before anything goes. Two of its
+        contacts close together are a question, not a pick.
+        """
+        q = spoken_words(spoken)
+        if len(q) < 2 or not self.contacts:
+            return book
+        ranked = sorted(
+            ((words_score(q, spoken_words(c.name)), c) for c in self.contacts if c.phone),
+            key=lambda pair: -pair[0],
+        )
+        if not ranked:
+            return book
+        best_score, best = ranked[0]
+        if best_score < _WHOLE_NAME_MIN or best.name == book.key:
+            return book
+        current = words_score(q, spoken_words(book.key)) if book.key else 0.0
+        if best_score - current < _WHOLE_NAME_MARGIN:
+            return book
+        if len(ranked) > 1 and ranked[1][0] >= best_score - _WHOLE_NAME_TIE:
+            return ContactMatch(candidates=[best.name, ranked[1][1].name])
+        logger.info("WhatsApp: %r reads as %r on every word, not %r", spoken, best.name, book.key)
+        return ContactMatch(key=best.name, phone=best.phone, certain=False)
 
     def _alias_match(self, alias: str) -> ContactMatch | None:
         """The contact an alias points at, or None (logged) when it points nowhere."""
@@ -1286,7 +1330,9 @@ class WhatsAppService:
                 if is_group:
                     result = self._driver.read_chat(title=target.title, count=count)
                 else:
-                    result = self._driver.read_chat(phone=target.phone, count=count)
+                    # By the name his phone saved them under: the chat list's
+                    # title. The phone link opens a chat with no history.
+                    result = self._driver.read_chat(name=target.key, count=count)
             except Exception:  # noqa: BLE001 - a crashed browser is relaunched next time
                 logger.exception("WhatsApp chat read failed")
                 self._driver.close()
@@ -1294,12 +1340,16 @@ class WhatsAppService:
             if result:
                 return result
             spoken = speakable_title(target.title) if is_group else ""
+            not_found = (
+                _MSG_GROUP_GONE.format(title=spoken) if is_group
+                else f"I couldn't find a chat with {target.key} on WhatsApp."
+            )
             return WhatsAppCommandResult(
                 False,
                 {
                     web.NOT_LINKED: _MSG_NEEDS_LINK,
                     web.INVALID_NUMBER: _MSG_INVALID_NUMBER,
-                    web.GROUP_NOT_FOUND: _MSG_GROUP_GONE.format(title=spoken),
+                    web.GROUP_NOT_FOUND: not_found,
                     web.GROUP_AMBIGUOUS: _MSG_GROUP_SHARED.format(title=spoken),
                     web.WRONG_CHAT: "That chat didn't open properly, so I couldn't read it.",
                 }.get(result.status, _MSG_READ_CHAT_FAILED),

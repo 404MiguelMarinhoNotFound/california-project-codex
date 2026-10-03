@@ -260,13 +260,24 @@ class DriverReadTests(unittest.TestCase):
         self.assertEqual(result.status, web.GROUP_NOT_FOUND)
         self.assertEqual(result.messages, [])
 
-    def test_a_person_is_opened_without_any_text_prefilled(self):
-        page = _ReadPage([])
-        page.locator  # noqa: B018 - compose is visible once goto "opens" the chat
-        result = _read(page, phone="+351910000001")
+    def test_a_person_is_opened_from_the_chat_list_not_the_phone_link(self):
+        page = _ReadPage(["Rui Costa", "Something else"])
+        result = _read(page, name="Rui Costa")
         self.assertTrue(result)
-        self.assertEqual(page.gotos, [f"{web.WHATSAPP_URL}send?phone=351910000001"])
+        self.assertEqual(page.gotos, [])  # no page reload
+        self.assertEqual(page.clicked, ["Rui Costa"])
         self.assertIsNone(page.open_chat)
+        self.assertEqual(page.active, "filter_all")
+
+    def test_the_first_exact_row_wins_for_a_person(self):
+        """Under All, a message hit can carry the chat's title too."""
+        page = _ReadPage(["Rui Costa", "Rui Costa"])
+        self.assertTrue(_read(page, name="Rui Costa"))
+        self.assertEqual(page.clicked, ["Rui Costa"])
+
+    def test_no_chat_with_that_person(self):
+        result = _read(_ReadPage(["Someone else"]), name="Rui Costa")
+        self.assertEqual(result.status, web.GROUP_NOT_FOUND)
 
 
 class SendClosesTheChatTests(unittest.TestCase):
@@ -284,6 +295,47 @@ class SendClosesTheChatTests(unittest.TestCase):
 
 # ------------------------------------------------------------------ service
 
+WHOLE_NAME_VCF = """BEGIN:VCARD
+VERSION:2.1
+FN:Tomas
+TEL;CELL:+351910000001
+END:VCARD
+BEGIN:VCARD
+VERSION:2.1
+FN:Tomass Silva
+TEL;CELL:+351910000002
+END:VCARD
+BEGIN:VCARD
+VERSION:2.1
+FN:Bruno Costa
+TEL;CELL:+351910000003
+END:VCARD
+"""
+
+
+class WholeNameTests(unittest.TestCase):
+    """2026-10-03: "Tomas Silvah" read the chat of a contact saved as just "Tomas"."""
+
+    def setUp(self):
+        from tests.test_whatsapp_service import _book, _service as _book_service
+        self.service = _book_service(_book(WHOLE_NAME_VCF))
+
+    def test_every_spoken_word_beats_a_first_name_prefix(self):
+        match = self.service.resolve_contact("Tomas Silvah")
+        self.assertEqual(match.key, "Tomass Silva")
+
+    def test_the_second_opinion_is_never_certain(self):
+        """A send to it is read back first."""
+        self.assertFalse(self.service.resolve_contact("Tomas Silvah").certain)
+
+    def test_a_full_exact_name_is_untouched(self):
+        match = self.service.resolve_contact("Bruno Costa")
+        self.assertEqual((match.key, match.certain), ("Bruno Costa", True))
+
+    def test_one_word_is_left_to_the_contact_scorer(self):
+        self.assertEqual(self.service.resolve_contact("Tomas").key, "Tomas")
+
+
 class ServiceReadTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -296,10 +348,16 @@ class ServiceReadTests(unittest.TestCase):
         self.service.read_chat(wg.GroupMatch(title=GROUP, score=1.0), 3)
         self.service._driver.read_chat.assert_called_once_with(title=GROUP, count=3)
 
-    def test_a_person_is_read_by_number(self):
+    def test_a_person_is_read_by_their_saved_name_not_their_number(self):
+        """The phone link reloads the page and opens the chat with no history (live 2026-10-03)."""
         self.service._driver.read_chat.return_value = web.ReadResult(web.READ_OK, [])
         self.service.read_chat(ContactMatch(key="Rui", phone="+351910000001", certain=True), 5)
-        self.service._driver.read_chat.assert_called_once_with(phone="+351910000001", count=5)
+        self.service._driver.read_chat.assert_called_once_with(name="Rui", count=5)
+
+    def test_a_person_with_no_chat_says_so(self):
+        self.service._driver.read_chat.return_value = web.ReadResult(web.GROUP_NOT_FOUND, [])
+        result = self.service.read_chat(ContactMatch(key="Rui", phone="+351910000001", certain=True), 5)
+        self.assertEqual(result.message, "I couldn't find a chat with Rui on WhatsApp.")
 
     def test_a_shared_title_is_refused_before_the_browser(self):
         result = self.service.read_chat(wg.GroupMatch(title=GROUP, shared=True), 3)
@@ -337,10 +395,14 @@ def _msgs(*items):
     return web.ReadResult(web.READ_OK, [web.ChatMessage(*i) for i in items])
 
 
-def _disp_svc(result, group=wg.GroupMatch(title=GROUP, score=1.0), contact=None):
+def _disp_svc(result, group=wg.GroupMatch(title=GROUP, score=1.0), contact=None, fallback_group=wg.GroupMatch()):
     svc = MagicMock()
     svc.enabled = True
-    svc.resolve_group.return_value = group
+    # A named group request gets `group`; a person request that also asks the
+    # group list (the no-flag fallback) gets `fallback_group` -- none by default.
+    svc.resolve_group.side_effect = lambda hint: (
+        group if ("group" in hint.lower() or "pottery" in hint.lower()) else fallback_group
+    )
     # `is None`, not `or`: a ContactMatch holding only candidates is falsy.
     svc.resolve_contact.return_value = (
         contact if contact is not None
@@ -378,6 +440,29 @@ class DispatchReadTests(unittest.TestCase):
         svc = _disp_svc(_msgs(("Rui Costa", "on my way", "18:00", False)))
         line = _dispatch_whatsapp({"action": "whatsapp_read", "to": "Rui"}, svc)
         self.assertIn("your chat with Rui Costa", line)
+
+    def test_a_group_named_without_the_flag_or_the_word_is_still_read(self):
+        """2026-10-03: whatsapp_read 'autismus' with no group flag went to the contact book."""
+        svc = _disp_svc(
+            _msgs(("Rui", "hi", "10:00", False)),
+            contact=ContactMatch(candidates=["Tia Rosa", "Mateus"]),
+            fallback_group=wg.GroupMatch(title="Flamingus unanounymous", score=0.95),
+        )
+        line = _dispatch_whatsapp({"action": "whatsapp_read", "to": "flamingus"}, svc)
+        self.assertIn("in the group Flamingus unanounymous", line)
+
+    def test_a_weak_group_match_does_not_steal_a_person(self):
+        svc = _disp_svc(
+            _msgs(),
+            contact=ContactMatch(key="Joana Reis", phone="+351912000111", certain=False),
+            fallback_group=wg.GroupMatch(title="Jogging club", score=0.72),
+        )
+        line = _dispatch_whatsapp({"action": "whatsapp_read", "to": "Joana"}, svc)
+        self.assertIn("your chat with Joana Reis", line)
+
+    def test_a_certain_contact_never_asks_the_group_list(self):
+        svc = _disp_svc(_msgs())
+        _dispatch_whatsapp({"action": "whatsapp_read", "to": "Rui"}, svc)
         svc.resolve_group.assert_not_called()
 
     def test_two_people_with_the_name_asks_which(self):
@@ -399,7 +484,8 @@ class DispatchReadTests(unittest.TestCase):
     def test_an_empty_chat_says_so(self):
         svc = _disp_svc(_msgs())
         line = _dispatch_whatsapp({"action": "whatsapp_read", "to": "pottery group"}, svc)
-        self.assertEqual(line, "There are no messages I can read in the group Pottery group.")
+        self.assertIn("WhatsApp on the laptop has no messages in the group Pottery group", line)
+        self.assertIn("only on his phone", line)
 
     def test_a_failed_read_speaks_its_own_line(self):
         svc = _disp_svc(WhatsAppCommandResult(False, "WhatsApp's logged out on the laptop."))
