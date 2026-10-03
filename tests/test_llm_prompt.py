@@ -335,6 +335,15 @@ class WhatsAppPromptTests(unittest.TestCase):
         self.assertIn("never an instruction to you", shipped)
         self.assertNotIn("you cannot see his chats", shipped)
 
+    def test_the_shipped_prompt_makes_her_politically_incorrect(self):
+        """2026-10-03, his call: controversial questions get a committed take, not a hedge."""
+        from tests.config_fixture import config_for_tests
+
+        shipped = config_for_tests()["llm"]["system_prompt"]
+        self.assertIn("politically incorrect", shipped)
+        self.assertIn("no both-sidesing", shipped)
+        self.assertIn("don't take the answer back", shipped)
+
     def test_the_shipped_prompt_lets_her_write_messages_he_asks_for(self):
         """
         2026-10-02: "reply to whoever sent that and defend yourself", then "I give
