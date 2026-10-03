@@ -52,6 +52,10 @@ def _config(**media_overrides) -> dict:
                 # H6, the flag under test in PrewakeTests, which turns it on per
                 # test. Off here so turn_on() pings nothing a test did not patch.
                 "prewake_wol": False,
+                # H7, exercised by WaitForBoxCadenceTests. The old cadence here:
+                # a rescan on every pass at the poll interval above.
+                "box_probe_interval_ms": 100,
+                "full_rescan_every": 1,
             },
             "discovery": {"enabled": False},
             # The flag under test in TurnOffTests, which turns it on per test.
@@ -2002,6 +2006,78 @@ class EnsurePlayablePrewakeTests(unittest.TestCase):
         self.assertEqual(_ensure_playable(media), "")
         media.is_awake.assert_called_once()
         media.turn_on.assert_not_called()
+
+
+
+class WaitForBoxCadenceTests(unittest.TestCase):
+    """
+    H7: while waiting out a deep-standby wake, probe the box's known address
+    often and rescan the LAN only every Nth pass.
+
+    Each old pass cost ~3.7-4s (ping, port probe, a ~1.7s /24 rescan,
+    boot_completed, then a 2s sleep), so the box was noticed ~2s late on
+    average. The rescan is what found a box on a new lease (2026-09-11), so it
+    still runs periodically and on the last pass -- the box has had a static
+    address outside the DHCP pool since 2026-09-22, so that is the rare case.
+    """
+
+    def _run(self, *, settle_s, interval_s, every, up_at=None):
+        svc = _service()
+        svc.wake_settle_s = settle_s
+        svc.box_probe_interval_s = interval_s
+        svc.full_rescan_every = every
+        clock = {"t": 0.0}
+        passes = []
+
+        def ensure_connected():
+            passes.append((round(clock["t"], 3), svc._last_discovery_t == 0))
+            return up_at is not None and clock["t"] >= up_at
+
+        def sleep(s):
+            clock["t"] += s
+
+        with patch("services.media_service.time.monotonic", side_effect=lambda: clock["t"]), \
+                patch("services.media_service.time.sleep", side_effect=sleep), \
+                patch.object(svc, "ensure_connected", side_effect=ensure_connected), \
+                patch.object(svc, "is_boot_completed", return_value=True):
+            result = svc._wait_for_box()
+        return result, passes
+
+    def test_full_rescan_runs_every_nth_pass_and_on_the_last(self):
+        result, passes = self._run(settle_s=5.0, interval_s=0.5, every=4)
+        self.assertFalse(result)
+        scanned = [i for i, (_, scan) in enumerate(passes) if scan]
+        self.assertEqual(scanned, [0, 4, 8, 9, 10])
+        self.assertEqual(len(passes), 11, "a pass every 0.5s across 5s, plus the one at the deadline")
+
+    def test_default_cadence_is_unchanged(self):
+        result, passes = self._run(settle_s=4.0, interval_s=2.0, every=1)
+        self.assertFalse(result)
+        self.assertEqual(passes, [(0.0, True), (2.0, True), (4.0, True)])
+
+    def test_box_found_on_a_probe_pass_returns_immediately(self):
+        result, passes = self._run(settle_s=45.0, interval_s=0.5, every=4, up_at=1.5)
+        self.assertTrue(result)
+        self.assertEqual(passes[-1], (1.5, False), "found at the known address, no scan needed")
+        self.assertEqual(len(passes), 4)
+
+    def test_the_offline_cooldown_is_cleared_on_every_pass(self):
+        svc = _service()
+        svc.wake_settle_s = 1.0
+        svc.box_probe_interval_s = 0.5
+        svc.full_rescan_every = 4
+        seen = []
+        svc._last_fail_time = 123.0
+
+        def ensure_connected():
+            seen.append(svc._last_fail_time)
+            svc._last_fail_time = 99.0  # what a real miss stamps
+            return False
+
+        with patch.object(svc, "ensure_connected", side_effect=ensure_connected), \
+                patch("services.media_service.time.sleep"):
+            svc._wait_for_box(timeout_s=0.0)
+        self.assertEqual(seen, [0])
 
 
 if __name__ == "__main__":

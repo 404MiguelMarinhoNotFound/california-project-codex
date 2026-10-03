@@ -680,6 +680,14 @@ media:
     # 7.9s measured from a lit TV (2026-09-25).
     rescue_settle_ms: 20000
     poll_interval_ms: 2000
+    # H7: while waiting out a deep-standby wake, port-probe the box's known
+    # (static, 192.168.1.200) address this often, and rescan the whole LAN only
+    # every Nth pass and on the last one. Each old pass rescanned and cost
+    # ~3.7-4s, so the box was noticed ~2s late on average (code audit
+    # 2026-10-02). Old cadence: box_probe_interval_ms = poll_interval_ms,
+    # full_rescan_every = 1.
+    box_probe_interval_ms: 500
+    full_rescan_every: 4
     # Mi Box is at CEC physical address 0x2000 == HDMI 2; HDMI 1 is a tuner
     # (CEC logical address 3). KEY_HDMI cycles only inputs with a live signal,
     # so it cannot select a sleeping box -- inputs are selected through the

@@ -466,6 +466,11 @@ class MediaService:
         self.prewake_wol = wake_cfg.get("prewake_wol", False) is True
         self.wake_settle_s = max(0, int(wake_cfg.get("settle_ms", 25000))) / 1000
         self.wake_poll_interval_s = max(0.1, int(wake_cfg.get("poll_interval_ms", 2000)) / 1000)
+        # H7: _wait_for_box probes the known address this often and rescans the
+        # LAN only every Nth pass (and on the last). Defaults = the old cadence.
+        self.box_probe_interval_s = max(
+            0.1, int(wake_cfg.get("box_probe_interval_ms", self.wake_poll_interval_s * 1000)) / 1000)
+        self.full_rescan_every = max(1, int(wake_cfg.get("full_rescan_every", 1)))
         self.mibox_hdmi_port = int(wake_cfg.get("mibox_hdmi_port", 2))
         # Fast path budgets: the box half and the TV half each get
         # fast_wake_timeout, then the CEC bus gets tv_confirm_timeout to say the
@@ -1728,15 +1733,29 @@ class MediaService:
         # allowed after the timeout. The scan costs ~1.7s against a 2s poll
         # interval -- cheaper than a single wasted poll, and it ends the wait the
         # moment the box is up anywhere on the LAN.
+        #
+        # Rescanning on EVERY pass was then cut back (2026-10-02, H7): each pass
+        # cost ~3.7-4s (ping, port probe, ~1.7s rescan, boot_completed, 2s
+        # sleep), so the box was noticed ~2s late on average. The box has a
+        # static address outside the DHCP pool since 2026-09-22, so a pass now
+        # port-probes the known address every box_probe_interval and rescans
+        # only every full_rescan_every-th pass and on the last one -- a moved
+        # box is still found, a few passes later instead of on the next.
         deadline = time.monotonic() + (self.wake_settle_s if timeout_s is None else timeout_s)
+        attempt = 0
         while True:
             # ensure_connected() stamps _last_fail_time on every miss and then
-            # refuses to retry for _OFFLINE_COOLDOWN, and _rediscover_and_connect
-            # refuses to rescan for rescan_cooldown_s. Both are correct for normal
-            # operation and wrong here, where we are deliberately waiting out a
-            # boot, so clear both before each pass.
+            # refuses to retry for _OFFLINE_COOLDOWN: correct in normal
+            # operation, wrong while deliberately waiting out a boot, so it is
+            # cleared before every pass. _rediscover_and_connect refuses to
+            # rescan for rescan_cooldown_s; that stamp is what paces the scans.
             self._last_fail_time = 0
-            self._last_discovery_t = 0
+            last_pass = time.monotonic() + self.box_probe_interval_s >= deadline
+            if attempt % self.full_rescan_every == 0 or last_pass:
+                self._last_discovery_t = 0
+            else:
+                self._last_discovery_t = time.monotonic()
+            attempt += 1
             # Reachable is not the same as ready. adbd answers early in boot,
             # so returning here on connection alone hands back a box that
             # cannot launch anything yet -- and settle_ms exists as a fixed
@@ -1750,7 +1769,7 @@ class MediaService:
                 return True
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(self.wake_poll_interval_s)
+            time.sleep(self.box_probe_interval_s)
 
     def is_active_source(self) -> bool | None:
         """
