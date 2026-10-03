@@ -164,6 +164,35 @@ class RunRecordedTests(unittest.TestCase):
         self.assertEqual(record["outcome"], "failed")
 
 
+class BoxHealthTests(unittest.TestCase):
+    """
+    The box's own load decides the numbers: Button Mapper leaks media players
+    until every ADB call times out (2026-09-25, and again 2026-10-03 mid-bench).
+    Each record carries the count read before the run, so a leak is visible.
+    """
+
+    def test_media_player_clients_are_counted(self):
+        svc = Mock()
+        svc._adb.return_value = (True, " Client\n  pid(13125), connId(6)\n Client\n  pid(13125), connId(7)\n")
+        self.assertEqual(bench.box_health(svc), {"media_player_clients": 2})
+
+    def test_an_unreadable_box_reports_none_not_zero(self):
+        svc = Mock()
+        svc._adb.return_value = (False, "error: closed")
+        self.assertEqual(bench.box_health(svc), {"media_player_clients": None})
+
+    def test_the_record_carries_the_health_it_was_given(self):
+        box = _FakeBox()
+        svc = _svc(box)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(bench, "PortObserver", _NoObserver), \
+                    patch.object(bench, "_tv_ip", return_value=""), \
+                    patch.object(bench, "_git_sha", return_value="abc1234"):
+                record = bench.run_recorded(svc, "S1", "base", 1, lambda: True, Path(tmp) / "r.jsonl",
+                                            health={"media_player_clients": 0})
+        self.assertEqual(record["box_health"], {"media_player_clients": 0})
+
+
 class DeepStandbyStartTests(unittest.TestCase):
     def test_deep_standby_refuses_without_an_on_reading(self):
         svc = _svc(_FakeBox())
