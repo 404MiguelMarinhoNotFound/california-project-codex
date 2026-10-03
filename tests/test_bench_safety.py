@@ -132,6 +132,33 @@ class RunRecordedTests(unittest.TestCase):
         self.assertEqual(saved["outcome"], "interrupted")
         self.assertIsNone(saved["total_ms"])
 
+    def test_settings_captured_before_deep_standby_are_the_ones_restored(self):
+        """
+        A deep-standby run starts with the box off the LAN, so capturing at the
+        start of the run reads nothing and the restore silently does nothing
+        (first live baseline, 2026-10-03). The caller captures while the box is
+        awake and hands that in.
+        """
+        box = _FakeBox()
+        svc = _svc(box)
+        before = bench.capture_settings(svc)
+        box.reachable = False  # deep standby: nothing answers at the start
+
+        def action():
+            box.reachable = True  # the wake brought it back...
+            box.settings["hdmi_control_enabled"] = "0"  # ...and something changed this
+            return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(bench, "PortObserver", _NoObserver), \
+                    patch.object(bench, "_tv_ip", return_value=""), \
+                    patch.object(bench, "_git_sha", return_value="abc1234"):
+                record = bench.run_recorded(svc, "S1", "baseline", 1, action,
+                                            Path(tmp) / "r.jsonl", before=before)
+        self.assertEqual(record["settings_before"], before)
+        self.assertEqual(box.settings["hdmi_control_enabled"], "1")
+        self.assertTrue(record["settings_restored"])
+
     def test_a_failed_action_is_recorded_as_failed(self):
         _, _, record = self._run(lambda: False)
         self.assertEqual(record["outcome"], "failed")

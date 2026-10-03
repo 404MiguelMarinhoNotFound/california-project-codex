@@ -216,13 +216,18 @@ class PortObserver(threading.Thread):
 
 
 def run_recorded(svc: MediaService, scenario: str, spike: str, run: int,
-                 action: Callable[[], object], out: Path) -> dict:
+                 action: Callable[[], object], out: Path,
+                 before: dict[str, str] | None = None) -> dict:
     """
     Time one action and append its record to `out`. Settings are captured before
     and restored in a finally -- on failure, on an exception, on Ctrl-C -- and
     the record says whether the restore verified.
+
+    A deep-standby run starts with the box off the LAN, where a capture reads
+    nothing; the caller captures while it is still awake and passes `before`.
     """
-    before = capture_settings(svc)
+    if before is None:
+        before = capture_settings(svc)
     record = {"scenario": scenario, "spike": spike, "git_sha": _git_sha(), "run": run,
               "phases": {}, "total_ms": None, "outcome": "error",
               "settings_before": before, "settings_restored": False}
@@ -499,19 +504,25 @@ def _start_clean(svc: MediaService) -> None:
     svc._last_discovery_t = 0
 
 
-def _prepare_start(svc: MediaService, args) -> bool:
+def _prepare_start(svc: MediaService, args) -> dict[str, str] | None:
+    """Set up the run's start state; the settings captured while the box was awake, or None."""
     if args.from_deep:
-        return _bring_room_up(svc) and put_room_in_deep_standby(svc, args.idle)
+        if not _bring_room_up(svc):
+            return None
+        before = capture_settings(svc)
+        return before if put_room_in_deep_standby(svc, args.idle) else None
+    before = capture_settings(svc) if svc.is_awake() is not None else {}
     if getattr(args, "from_off", False):
         if not _bring_room_up(svc):
-            return False
+            return None
+        before = capture_settings(svc)
         svc.stop()  # untimed: nothing left playing behind a dark set
         svc.go_home()
         print(f"Putting the room away (tv_only_standby={svc.tv_only_standby})...", flush=True)
         print("  turn_off() ->", svc.turn_off(), flush=True)
         print(f"  waiting {args.settle:.0f}s so the room is properly away...", flush=True)
         time.sleep(args.settle)
-    return True
+    return before
 
 
 def _stremio_once(svc: MediaService, stremio, args) -> bool:
@@ -576,12 +587,13 @@ def cmd_stremio(svc: MediaService, args) -> int:
     scenario = "S2-deep" if args.from_deep else ("S2-shallow" if args.from_off else "S2")
     out = _results_path(args, scenario)
     for run in range(1, args.runs + 1):
-        if not _prepare_start(svc, args):
+        before = _prepare_start(svc, args)
+        if before is None:
             print("Could not set up the start state; stopping the series.")
             return 1
         _start_clean(svc)
         record = run_recorded(svc, scenario, args.spike, run,
-                              lambda: _stremio_once(svc, stremio, args), out)
+                              lambda: _stremio_once(svc, stremio, args), out, before=before or None)
         if record["outcome"] != "ok" and args.from_deep and svc.is_awake() is None:
             print("STOP: the box is not back after a full wake attempt. Not retrying.")
             return 1
@@ -650,8 +662,10 @@ def _wake_recorded(svc: MediaService, args) -> int:
     scenario = "S1" if args.from_deep else "wake"
     out = _results_path(args, scenario)
     for run in range(1, args.runs + 1):
+        before = None
         if args.from_deep:
-            if not _prepare_start(svc, args):
+            before = _prepare_start(svc, args)
+            if before is None:
                 print("Could not set up the start state; stopping the series.")
                 return 1
         elif run > 1 or args.sleep_first:
@@ -659,7 +673,7 @@ def _wake_recorded(svc: MediaService, args) -> int:
             time.sleep(args.between_minutes * 60)
         print(f"[run {run}] room before: {_room(svc)}")
         _start_clean(svc)
-        record = run_recorded(svc, scenario, args.spike, run, svc.turn_on, out)
+        record = run_recorded(svc, scenario, args.spike, run, svc.turn_on, out, before=before)
         print(f"[run {run}] last_wake_result={svc.last_wake_result}")
         if record["outcome"] != "ok" and args.from_deep:
             print("STOP: turn_on() did not bring the box back. Not retrying.")
