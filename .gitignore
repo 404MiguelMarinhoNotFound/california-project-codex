@@ -53,3 +53,7 @@ whatsapp_groups.json.tmp
 
 # Runtime logs (config logging.dir). Transcripts and replies, local only.
 logs/
+
+# Bench runs (tools/bench_tv_power.py --json). Local measurements of this
+# room, not source; the conclusions go into CLAUDE.md instead.
+bench/
