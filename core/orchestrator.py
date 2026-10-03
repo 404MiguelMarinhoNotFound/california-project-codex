@@ -368,8 +368,16 @@ def _ensure_playable(media_svc, say_now=None) -> str:
     remote_line = ("The box is awake but I can't get the TV onto its input. "
                    "Switch to it with the remote and I'll take it from there.")
 
+    # A box that misses one ping is off the LAN: the TV gets its Wake-on-LAN
+    # now, she says so now, and the awake-box branch below is skipped -- its
+    # is_awake() would rediscover for ~2.5s just to learn the same thing.
+    # turn_on() does that one rediscovery itself. `is False`, because a bare
+    # Mock's prewake() returns a Mock and must keep today's order.
+    prewake = getattr(media_svc, "prewake", None)
+    off_lan = prewake is not None and prewake() is False
+
     # Identity checks throughout: a bare Mock's attributes are truthy.
-    if media_svc.is_awake() is True:
+    if not off_lan and media_svc.is_awake() is True:
         # The TV's UPnP port is the live power reading; the CEC tail can be hours
         # stale, and after tv_only_standby a dark set under an awake box is the
         # normal state. Identity checks: a bare Mock's `available` is truthy.
@@ -446,6 +454,39 @@ def _dispatch_tv_volume(action: str, params: dict, tv_volume) -> str:
     return off_line
 
 
+class _Prepared:
+    """A StremioService.prepare() running on its own thread; result() joins it."""
+
+    def __init__(self, fn):
+        self._plan = None
+        self._error = None
+        self._thread = threading.Thread(target=self._run, args=(fn,), daemon=True,
+                                        name="stremio-prepare")
+        self._thread.start()
+
+    def _run(self, fn):
+        try:
+            self._plan = fn()
+        except Exception as exc:  # spoken as "I couldn't find X" by the caller
+            self._error = exc
+
+    def result(self):
+        # No timeout: every network call inside prepare() carries its own.
+        self._thread.join()
+        if self._error is not None:
+            raise self._error
+        return self._plan
+
+
+def _prepare_in_background(stremio_svc, action: str, params: dict) -> _Prepared:
+    title = (params.get("title") or "").strip()
+    if action == "stremio_continue":
+        return _Prepared(lambda: stremio_svc.prepare(title, media_type="series"))
+    return _Prepared(lambda: stremio_svc.prepare(
+        title, media_type=params.get("media_type"),
+        season=params.get("season"), episode=params.get("episode")))
+
+
 def _dispatch_tv(
     params: dict,
     media_svc,
@@ -484,6 +525,16 @@ def _dispatch_tv(
         "launch_app", "youtube_playlist", "youtube_search",
         "stremio_play", "stremio_continue",
     }
+
+    # H8: work out the Stremio launch (sync, lookup, TMDB) while the room wakes.
+    # It needs no box, and the wake is ~35s from deep standby. isinstance, not
+    # truthiness: the dispatch tests pass bare Mocks and keep today's play().
+    prepared = None
+    if (action in ("stremio_play", "stremio_continue")
+            and isinstance(stremio_svc, StremioService)
+            and stremio_svc.prepare_during_wake is True
+            and (params.get("title") or "").strip()):
+        prepared = _prepare_in_background(stremio_svc, action, params)
 
     if action in needs_screen:
         problem = _ensure_playable(media_svc, say_now)
@@ -614,11 +665,16 @@ def _dispatch_tv(
         if not title:
             return "Tell me what show you want to continue."
         try:
-            result = stremio_svc.play(
-                title=title,
-                media_type="series",
-                allow_unknown_source=bool(params.get("allow_unknown_source", False)),
-            )
+            if prepared is not None:
+                result = stremio_svc.launch(
+                    prepared.result(),
+                    allow_unknown_source=bool(params.get("allow_unknown_source", False)))
+            else:
+                result = stremio_svc.play(
+                    title=title,
+                    media_type="series",
+                    allow_unknown_source=bool(params.get("allow_unknown_source", False)),
+                )
         except Exception as exc:
             logger.warning("Stremio continue failed: %s", exc)
             return f"I couldn't find {title} in Stremio or TMDB."
@@ -643,13 +699,18 @@ def _dispatch_tv(
         if not title:
             return "Tell me what you want to play on Stremio."
         try:
-            result = stremio_svc.play(
-                title=title,
-                media_type=params.get("media_type"),
-                season=params.get("season"),
-                episode=params.get("episode"),
-                allow_unknown_source=bool(params.get("allow_unknown_source", False)),
-            )
+            if prepared is not None:
+                result = stremio_svc.launch(
+                    prepared.result(),
+                    allow_unknown_source=bool(params.get("allow_unknown_source", False)))
+            else:
+                result = stremio_svc.play(
+                    title=title,
+                    media_type=params.get("media_type"),
+                    season=params.get("season"),
+                    episode=params.get("episode"),
+                    allow_unknown_source=bool(params.get("allow_unknown_source", False)),
+                )
         except Exception as exc:
             logger.warning("Stremio play failed: %s", exc)
             return f"I couldn't find {title} in Stremio or TMDB."

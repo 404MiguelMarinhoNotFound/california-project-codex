@@ -2129,7 +2129,15 @@ YouTube support is intentionally simple and predictable:
 Cold-start behavior:
 
 - If YouTube is already foreground, California does not relaunch it before opening the requested playlist or search
-- If YouTube is not foreground, California warm-launches YouTube first, waits briefly, presses OK once for the profile picker, then opens the target URL
+- If YouTube is not foreground, California warm-launches YouTube first, waits briefly, presses OK only if the focused activity looks like a picker, then opens the target URL
+- **The activity name cannot see the "Who's watching" picker (2026-10-03).** It runs inside the same
+  `MainActivity` as the home screen, so `_detect_youtube_profile_picker_fast` says "no picker" while it is
+  on screen, and the link sent into it is ignored (stamp never moves; reported as "hit play on the remote").
+  The check now runs on **every** cold launch (the old once-per-session `_youtube_profile_cleared` cache is
+  gone), and `youtube_play_video` backs it with the session stamp: after a cold launch, if nothing played
+  within `media.youtube_picker_probe_ms` (3s), press OK once and resend the link (the resend restarts the
+  video, so an OK that landed in a player cannot leave it paused). Never on a warm launch, and never on an
+  unreadable session. Playlists and results pages have no stamp oracle, so they still rely on the activity guess
 
 ### "Search for X and play it": the results page never plays
 

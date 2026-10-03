@@ -49,6 +49,13 @@ def _config(**media_overrides) -> dict:
                 "tv_confirm_timeout_ms": 100,
                 "tv_confirm_poll_ms": 100,
                 "otp_grace_ms": 0,
+                # H6, the flag under test in PrewakeTests, which turns it on per
+                # test. Off here so turn_on() pings nothing a test did not patch.
+                "prewake_wol": False,
+                # H7, exercised by WaitForBoxCadenceTests. The old cadence here:
+                # a rescan on every pass at the poll interval above.
+                "box_probe_interval_ms": 100,
+                "full_rescan_every": 1,
             },
             "discovery": {"enabled": False},
             # The flag under test in TurnOffTests, which turns it on per test.
@@ -1909,6 +1916,169 @@ class WaitForBootTests(unittest.TestCase):
             with patch.object(svc, "ensure_connected", return_value=True):
                 with patch.object(svc, "is_boot_completed", return_value=True):
                     self.assertTrue(svc._wait_for_box())
+
+
+class PrewakeTests(unittest.TestCase):
+    """
+    H6: when the box is off the LAN, Wake-on-LAN the TV before anything else.
+
+    The code audit (2026-10-02) found ~2-4s spent before the wake packet went
+    out: is_awake() rediscovering the box (ping, port probe, /24 scan) and
+    tv_power() probing UPnP three times. A box that does not answer one ping is
+    almost certainly in deep standby, and WoL is a no-op on a TV that is
+    already on, so the packet can go first and the TV boots during the checks.
+    """
+
+    def _svc(self, *, ping_ok, enabled=True):
+        svc = _service()
+        svc.prewake_wol = enabled
+        svc._adb = Mock(return_value=(ping_ok, "ping" if ping_ok else "error: closed"))
+        svc._finder = Mock()
+        return svc
+
+    def test_unreachable_box_sends_wol_before_anything_else(self):
+        svc = self._svc(ping_ok=False)
+        self.assertIs(svc.prewake(), False)
+        svc.cec_waker.send_wol.assert_called_once()
+        svc._finder.resolve.assert_not_called()
+        self.assertEqual(svc._adb.call_count, 1)
+
+    def test_reachable_box_sends_no_early_wol(self):
+        svc = self._svc(ping_ok=True)
+        self.assertIs(svc.prewake(), True)
+        svc.cec_waker.send_wol.assert_not_called()
+
+    def test_reachable_box_keeps_its_turn_on_branch(self):
+        """Awake under a lit TV showing it: still 'already on', no packet sent."""
+        svc = self._svc(ping_ok=True)
+        with patch.object(svc, "is_awake", return_value=True), \
+                patch.object(svc, "hdmi_state", return_value=_on()):
+            self.assertTrue(svc.turn_on())
+        self.assertEqual(svc.last_wake_result.detail, "already on")
+        svc.cec_waker.send_wol.assert_not_called()
+
+    def test_prewake_off_sends_nothing_and_pings_nothing(self):
+        svc = self._svc(ping_ok=False, enabled=False)
+        self.assertIsNone(svc.prewake())
+        svc.cec_waker.send_wol.assert_not_called()
+        svc._adb.assert_not_called()
+
+    def test_unavailable_waker_sends_nothing(self):
+        svc = self._svc(ping_ok=False)
+        svc.cec_waker.available = False
+        self.assertIs(svc.prewake(), False)
+        svc.cec_waker.send_wol.assert_not_called()
+
+    def test_turn_on_sends_wol_before_the_reachability_check(self):
+        svc = self._svc(ping_ok=False)
+        order = []
+        svc.cec_waker.send_wol.side_effect = lambda: order.append("wol")
+        with patch.object(svc, "is_awake", side_effect=lambda: order.append("is_awake")), \
+                patch.object(svc, "_wake_and_wait", return_value=True):
+            self.assertTrue(svc.turn_on())
+        self.assertEqual(order[:2], ["wol", "is_awake"])
+
+
+class EnsurePlayablePrewakeTests(unittest.TestCase):
+    def _media(self, prewake):
+        media = Mock()
+        media.prewake.return_value = prewake
+        media.is_awake.return_value = True
+        media.hdmi_state.return_value = HdmiState(True, "on")
+        media.ensure_active_source.return_value = True
+        media.cec_waker.available = False
+        media.turn_on.return_value = True
+        media.ensure_connected.return_value = True
+        media.last_wake_result = WakeResult(True, "woke", tv_confirmed=True)
+        return media
+
+    def test_ensure_playable_speaks_before_turn_on_when_prewake_misses(self):
+        media = self._media(prewake=False)
+        order = []
+        media.turn_on.side_effect = lambda: order.append("turn_on") or True
+        self.assertEqual(_ensure_playable(media, say_now=lambda line: order.append("say")), "")
+        self.assertEqual(order, ["say", "turn_on"])
+        media.is_awake.assert_not_called()
+
+    def test_bare_mock_media_keeps_the_old_order(self):
+        """A plain Mock's prewake() returns a Mock, not False: today's path."""
+        media = self._media(prewake=Mock())
+        self.assertEqual(_ensure_playable(media), "")
+        media.is_awake.assert_called_once()
+        media.turn_on.assert_not_called()
+
+
+
+class WaitForBoxCadenceTests(unittest.TestCase):
+    """
+    H7: while waiting out a deep-standby wake, probe the box's known address
+    often and rescan the LAN only every Nth pass.
+
+    Each old pass cost ~3.7-4s (ping, port probe, a ~1.7s /24 rescan,
+    boot_completed, then a 2s sleep), so the box was noticed ~2s late on
+    average. The rescan is what found a box on a new lease (2026-09-11), so it
+    still runs periodically and on the last pass -- the box has had a static
+    address outside the DHCP pool since 2026-09-22, so that is the rare case.
+    """
+
+    def _run(self, *, settle_s, interval_s, every, up_at=None):
+        svc = _service()
+        svc.wake_settle_s = settle_s
+        svc.box_probe_interval_s = interval_s
+        svc.full_rescan_every = every
+        clock = {"t": 0.0}
+        passes = []
+
+        def ensure_connected():
+            passes.append((round(clock["t"], 3), svc._last_discovery_t == 0))
+            return up_at is not None and clock["t"] >= up_at
+
+        def sleep(s):
+            clock["t"] += s
+
+        with patch("services.media_service.time.monotonic", side_effect=lambda: clock["t"]), \
+                patch("services.media_service.time.sleep", side_effect=sleep), \
+                patch.object(svc, "ensure_connected", side_effect=ensure_connected), \
+                patch.object(svc, "is_boot_completed", return_value=True):
+            result = svc._wait_for_box()
+        return result, passes
+
+    def test_full_rescan_runs_every_nth_pass_and_on_the_last(self):
+        result, passes = self._run(settle_s=5.0, interval_s=0.5, every=4)
+        self.assertFalse(result)
+        scanned = [i for i, (_, scan) in enumerate(passes) if scan]
+        self.assertEqual(scanned, [0, 4, 8, 9, 10])
+        self.assertEqual(len(passes), 11, "a pass every 0.5s across 5s, plus the one at the deadline")
+
+    def test_default_cadence_is_unchanged(self):
+        result, passes = self._run(settle_s=4.0, interval_s=2.0, every=1)
+        self.assertFalse(result)
+        self.assertEqual(passes, [(0.0, True), (2.0, True), (4.0, True)])
+
+    def test_box_found_on_a_probe_pass_returns_immediately(self):
+        result, passes = self._run(settle_s=45.0, interval_s=0.5, every=4, up_at=1.5)
+        self.assertTrue(result)
+        self.assertEqual(passes[-1], (1.5, False), "found at the known address, no scan needed")
+        self.assertEqual(len(passes), 4)
+
+    def test_the_offline_cooldown_is_cleared_on_every_pass(self):
+        svc = _service()
+        svc.wake_settle_s = 1.0
+        svc.box_probe_interval_s = 0.5
+        svc.full_rescan_every = 4
+        seen = []
+        svc._last_fail_time = 123.0
+
+        def ensure_connected():
+            seen.append(svc._last_fail_time)
+            svc._last_fail_time = 99.0  # what a real miss stamps
+            return False
+
+        with patch.object(svc, "ensure_connected", side_effect=ensure_connected), \
+                patch("services.media_service.time.sleep"):
+            svc._wait_for_box(timeout_s=0.0)
+        self.assertEqual(seen, [0])
+
 
 if __name__ == "__main__":
     unittest.main()

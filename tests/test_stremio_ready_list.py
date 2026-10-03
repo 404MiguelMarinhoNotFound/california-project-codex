@@ -148,7 +148,7 @@ class PlayWhenReadyTests(unittest.TestCase):
         svc = _service(box)
         order = []
         svc.media_service.dump_ui_hierarchy = Mock(
-            side_effect=lambda: order.append("dump") or STREAM_CARDS_XML)
+            side_effect=lambda **kw: order.append("dump") or STREAM_CARDS_XML)
         svc._keyevent = Mock(side_effect=lambda k: order.append("ok"))
 
         result, _ = svc._play_when_ready("episode", "Lanterns")
@@ -166,6 +166,30 @@ class PlayWhenReadyTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertIsNone(result.played_source)
         self.assertEqual(box.keys, [23])
+
+    # --- H9: less waiting before the one OK ---------------------------------
+
+    def test_remembered_source_skips_the_dump(self, _sleep):
+        """The dump only feeds the log and the remembered source; a known one makes it redundant."""
+        box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
+        svc = _service(box)
+        svc.media_service.dump_ui_hierarchy = Mock(return_value=STREAM_CARDS_XML)
+
+        result, _ = svc._play_when_ready("episode", "Fallout", remembered_source="Comet")
+
+        svc.media_service.dump_ui_hierarchy.assert_not_called()
+        self.assertEqual(result.played_source, "Comet")
+        self.assertEqual(box.keys, [23])
+
+    def test_first_card_dump_is_capped(self, _sleep):
+        box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
+        svc = _service(box)
+        svc.first_card_dump_timeout_s = 2.0
+        svc.media_service.dump_ui_hierarchy = Mock(return_value=STREAM_CARDS_XML)
+
+        svc._play_when_ready("episode", "Lanterns")
+
+        svc.media_service.dump_ui_hierarchy.assert_called_once_with(timeout_s=2.0, retries=1)
 
 
 @patch("services.stremio_service.time.sleep")
@@ -192,6 +216,35 @@ class PlayDeepLinkTests(unittest.TestCase):
         self.assertEqual(len(launch), 1)
         self.assertIn("-f 0x10008000", launch[0])
         self.assertIn("tt12637874:2:9", launch[0])
+
+    def test_no_foreground_wait_when_skipped(self, _sleep):
+        """list_ready already returns False until Stremio's stream list is on screen."""
+        box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
+        svc = _service(box)
+        svc.skip_foreground_wait = True
+        svc._wait_for_stremio_foreground = Mock(return_value=True)
+        result = svc._play_deep_link("tt12637874", "series", season=2, episode=9, title_label="Fallout")
+        self.assertTrue(result.success)
+        svc._wait_for_stremio_foreground.assert_not_called()
+        launch = [c[0][0] for c in svc._run_shell.call_args_list if c[0][0].startswith("am start")]
+        self.assertEqual(len(launch), 1)
+
+    def test_foreground_wait_kept_when_not_skipped(self, _sleep):
+        box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
+        svc = _service(box)
+        svc.skip_foreground_wait = False
+        svc._wait_for_stremio_foreground = Mock(return_value=True)
+        svc._play_deep_link("tt12637874", "series", season=2, episode=9, title_label="Fallout")
+        svc._wait_for_stremio_foreground.assert_called_once()
+
+    def test_the_remembered_source_reaches_the_ready_list(self, _sleep):
+        box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
+        svc = self._svc(box)
+        svc.media_service.dump_ui_hierarchy = Mock(return_value=STREAM_CARDS_XML)
+        result = svc._play_deep_link("tt12637874", "series", season=2, episode=9,
+                                     title_label="Fallout", remembered_source="Comet")
+        self.assertEqual(result.played_source, "Comet")
+        svc.media_service.dump_ui_hierarchy.assert_not_called()
 
     def test_no_second_ok_after_the_first_opened_nothing(self, _sleep):
         box = _Box([STREAM_LIST], [""])

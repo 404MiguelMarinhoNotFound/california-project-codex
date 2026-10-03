@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
+from services import phase_marks
 from services.cec_wake import CecWaker, WakeResult
 from services.device_finder import (
     DeviceFinder,
@@ -452,6 +453,8 @@ class MediaService:
         self.youtube_search_autoplay = bool(media_cfg.get("youtube_search_autoplay", True))
         self.youtube_search_resolve_timeout_s = max(1, int(media_cfg.get("youtube_search_resolve_timeout_ms", 5000))) / 1000
         self.youtube_search_verify_s = max(0, int(media_cfg.get("youtube_search_verify_ms", 6000))) / 1000
+        # How long a cold-launched video gets to start before the profile picker is assumed.
+        self.youtube_picker_probe_s = max(0, int(media_cfg.get("youtube_picker_probe_ms", 3000))) / 1000
         self.ui_dump_retry_count = max(1, int(media_cfg.get("ui_dump_retry_count", 2)))
         self.ui_dump_retry_delay_s = max(0, int(media_cfg.get("ui_dump_retry_delay_ms", 700)) / 1000)
         self.ui_dump_timeout_s = max(1, int(media_cfg.get("ui_dump_timeout_ms", 6000))) / 1000
@@ -460,8 +463,16 @@ class MediaService:
         # it is still on the LAN (shallow standby). From deep standby turn_on
         # goes through the television over CEC. See services/cec_wake.py.
         wake_cfg = media_cfg.get("cec_wake", {}) or {}
+        # H6 (2026-10-02 optimization): Wake-on-LAN before the reachability
+        # checks when one ping says the box is off the LAN. Off = today's order.
+        self.prewake_wol = wake_cfg.get("prewake_wol", False) is True
         self.wake_settle_s = max(0, int(wake_cfg.get("settle_ms", 25000))) / 1000
         self.wake_poll_interval_s = max(0.1, int(wake_cfg.get("poll_interval_ms", 2000)) / 1000)
+        # H7: _wait_for_box probes the known address this often and rescans the
+        # LAN only every Nth pass (and on the last). Defaults = the old cadence.
+        self.box_probe_interval_s = max(
+            0.1, int(wake_cfg.get("box_probe_interval_ms", self.wake_poll_interval_s * 1000)) / 1000)
+        self.full_rescan_every = max(1, int(wake_cfg.get("full_rescan_every", 1)))
         self.mibox_hdmi_port = int(wake_cfg.get("mibox_hdmi_port", 2))
         # Fast path budgets: the box half and the TV half each get
         # fast_wake_timeout, then the CEC bus gets tv_confirm_timeout to say the
@@ -542,8 +553,9 @@ class MediaService:
         self._connected = False
         self._last_fail_time: float = 0  # monotonic timestamp of last failed reconnect
 
-        # Cleared once per YouTube cold start; see _prepare_youtube_launch.
-        self._youtube_profile_cleared: bool = False
+        # True when the last _prepare_youtube_launch started YouTube from
+        # scratch, i.e. the "Who's watching" picker may be up. See youtube_play_video.
+        self._youtube_cold_launch: bool = False
 
     @property
     def target(self) -> str:
@@ -663,7 +675,6 @@ class MediaService:
         if not success:
             self._last_fail_time = time.monotonic()
         else:
-            self._youtube_profile_cleared = False
             self.unreachable_reason = ""
         log.info(f"ADB connect -> '{output}' (success={success})")
         return success
@@ -888,10 +899,7 @@ class MediaService:
         if not package or not self.ensure_connected():
             return False
         log.info("Force-stopping %s (%s)", app_name, package)
-        ok = self._adb(f"shell am force-stop {package}")[0]
-        if ok and (app_name or "").strip().lower() == "youtube":
-            self._youtube_profile_cleared = False
-        return ok
+        return self._adb(f"shell am force-stop {package}")[0]
 
     def start_activity(
         self,
@@ -925,24 +933,27 @@ class MediaService:
             log.warning("Activity start failed for %s: %s", component, output)
         return success, output
 
-    def dump_ui_hierarchy(self) -> str:
+    def dump_ui_hierarchy(self, timeout_s: float | None = None, retries: int | None = None) -> str:
+        """`timeout_s` / `retries` cap one call; the defaults are media.ui_dump_*."""
         if not self.ensure_connected():
             return ""
         remote_path = "/sdcard/window_dump.xml"
-        for attempt in range(1, self.ui_dump_retry_count + 1):
+        timeout_s = self.ui_dump_timeout_s if timeout_s is None else timeout_s
+        retries = self.ui_dump_retry_count if retries is None else max(1, retries)
+        for attempt in range(1, retries + 1):
             ok, dump_output = self._adb(
                 f"shell uiautomator dump --compressed {remote_path}",
-                timeout_s=self.ui_dump_timeout_s,
+                timeout_s=timeout_s,
             )
             if ok and dump_output and "error:" not in dump_output.lower():
                 break
             log.warning(
                 "UI dump attempt %d/%d failed: %s",
                 attempt,
-                self.ui_dump_retry_count,
+                retries,
                 dump_output or "no output",
             )
-            if attempt < self.ui_dump_retry_count and self.ui_dump_retry_delay_s > 0:
+            if attempt < retries and self.ui_dump_retry_delay_s > 0:
                 time.sleep(self.ui_dump_retry_delay_s)
         else:
             log.warning("UI dump never succeeded, returning empty XML instead of stale dump")
@@ -1075,6 +1086,7 @@ class MediaService:
         t_start = time.monotonic()
 
         if self._youtube_is_foreground():
+            self._youtube_cold_launch = False
             log.info("[timing] _prepare_youtube_launch: already foreground, skipped in %.3fs", time.monotonic() - t_start)
             return True
 
@@ -1083,13 +1095,19 @@ class MediaService:
         log.info("[timing] _prepare_youtube_launch: launch_app took %.3fs ok=%s", time.monotonic() - t_launch, ok)
         if not ok:
             return False
+        self._youtube_cold_launch = True
 
         if self.youtube_warm_launch_delay_s > 0:
             t_warm = time.monotonic()
             time.sleep(self.youtube_warm_launch_delay_s)
             log.info("[timing] _prepare_youtube_launch: warm_delay took %.3fs", time.monotonic() - t_warm)
 
-        if self.youtube_profile_select_on_cold_start and not self._youtube_profile_cleared:
+        # Checked on EVERY cold launch, never cached for the session: the picker
+        # comes back whenever YouTube has been away. The activity name cannot see
+        # it (the picker runs inside the same MainActivity as the home screen), so
+        # a "no" here is only a guess; youtube_play_video backs it with the
+        # session stamp.
+        if self.youtube_profile_select_on_cold_start:
             t_detect = time.monotonic()
             should_press, detection_source = self._detect_youtube_profile_picker_fast()
             log.info(
@@ -1100,13 +1118,11 @@ class MediaService:
             )
             if should_press:
                 self.keyevent("DPAD_CENTER")
+                self._youtube_cold_launch = False  # already cleared; no second press
                 if self.youtube_profile_select_delay_s > 0:
                     t_profile = time.monotonic()
                     time.sleep(self.youtube_profile_select_delay_s)
                     log.info("[timing] _prepare_youtube_launch: profile_select_delay took %.3fs", time.monotonic() - t_profile)
-            self._youtube_profile_cleared = True
-        elif self._youtube_profile_cleared:
-            log.info("[timing] _prepare_youtube_launch: profile_detect skipped (cleared earlier this session)")
 
         log.info("[timing] _prepare_youtube_launch: total %.3fs", time.monotonic() - t_start)
         return True
@@ -1154,7 +1170,9 @@ class MediaService:
             return False, None
         return True, _session_for(_parse_media_sessions(output), self._youtube_package())
 
-    def _wait_for_new_youtube_playback(self, before: MediaSession | None) -> tuple[bool | None, str | None]:
+    def _wait_for_new_youtube_playback(
+        self, before: MediaSession | None, window_s: float | None = None
+    ) -> tuple[bool | None, str | None]:
         """
         Poll the session until a playback newer than `before` shows up.
 
@@ -1163,7 +1181,8 @@ class MediaService:
         two later. A new stamp is enough to believe the launch landed, but the
         title is worth a short wait, so keep polling for it inside the grace.
         """
-        deadline = time.monotonic() + self.youtube_search_verify_s
+        window = self.youtube_search_verify_s if window_s is None else window_s
+        deadline = time.monotonic() + window
         readable = False
         started: MediaSession | None = None
         while True:
@@ -1207,6 +1226,29 @@ class MediaService:
         _, before = self._youtube_session()
         if not self.youtube_watch(video_id):
             return YoutubePlayback(opened=False, started=False, title=None)
+        if not self._youtube_cold_launch:
+            started, title = self._wait_for_new_youtube_playback(before)
+            return YoutubePlayback(opened=True, started=started, title=title)
+
+        # YouTube was started from scratch for this link. If nothing played
+        # within the probe window, the "Who's watching" picker is almost
+        # certainly up (seen live 2026-10-03: the link was ignored and the
+        # stamp never moved), and nothing else can detect it -- see
+        # _detect_youtube_profile_picker_fast. One OK clears it, then the link
+        # is sent again. The re-send also restarts the video from zero with a
+        # fresh stamp, so an OK that landed in a player cannot leave it paused.
+        self._youtube_cold_launch = False
+        started, title = self._wait_for_new_youtube_playback(
+            before, min(self.youtube_search_verify_s, self.youtube_picker_probe_s)
+        )
+        if started is not False:
+            return YoutubePlayback(opened=True, started=started, title=title)
+        log.info("YouTube cold launch did not start playback; pressing OK once for the profile picker")
+        self.keyevent("DPAD_CENTER")
+        if self.youtube_profile_select_delay_s > 0:
+            time.sleep(self.youtube_profile_select_delay_s)
+        if not self.youtube_watch(video_id):
+            return YoutubePlayback(opened=True, started=False, title=None)
         started, title = self._wait_for_new_youtube_playback(before)
         return YoutubePlayback(opened=True, started=started, title=title)
 
@@ -1236,6 +1278,31 @@ class MediaService:
             return None
         return _parse_wakefulness(output)
 
+    def prewake(self) -> bool | None:
+        """
+        Start the television booting before anything slower runs.
+
+        True: the box answered one ping. False: it did not, and Wake-on-LAN has
+        gone to the TV (when the waker is available). None: prewake is off, and
+        nothing was sent or asked -- today's behaviour exactly.
+
+        One `adb shell echo ping` is ~0.2s against a transport that is gone.
+        is_awake() would go on to reconnect, port-probe and rescan the /24
+        (~2.5s), and the deep path then probes UPnP before its own WoL: seconds
+        during which a television that has to boot for ~37s was not booting.
+        WoL is a no-op on a TV that is already on. No rediscovery here, and no
+        cooldown is touched: that is is_awake()'s job, straight after.
+        """
+        if not self.prewake_wol:
+            return None
+        ok, _ = self._adb("shell echo ping")
+        if ok:
+            return True
+        if self.cec_waker.available is True:
+            log.info("Box does not answer; Wake-on-LAN to the TV before the reachability checks")
+            self.cec_waker.send_wol()
+        return False
+
     def turn_on(self) -> bool:
         """
         Get the box awake and the television on and showing it.
@@ -1249,6 +1316,7 @@ class MediaService:
         self.last_wake_result = None
         self.last_input_result = None
         self._finish_pending_standby()
+        self.prewake()
         state = self.is_awake()
         if state is None:
             return self._wake_and_wait()  # Deep standby: only the TV can reach it.
@@ -1663,6 +1731,8 @@ class MediaService:
         # Its own wake announced it, but on the rescue path the TV was elsewhere a
         # moment ago; make sure the picture is the box's.
         selected = self.ensure_active_source()
+        if selected is True:
+            phase_marks.mark("tv_showing_box")
         confirmed = True if selected is True else (False if selected is False else None)
         self.last_wake_result = WakeResult(True, result.detail, tv_confirmed=confirmed)
         return True
@@ -1696,15 +1766,29 @@ class MediaService:
         # allowed after the timeout. The scan costs ~1.7s against a 2s poll
         # interval -- cheaper than a single wasted poll, and it ends the wait the
         # moment the box is up anywhere on the LAN.
+        #
+        # Rescanning on EVERY pass was then cut back (2026-10-02, H7): each pass
+        # cost ~3.7-4s (ping, port probe, ~1.7s rescan, boot_completed, 2s
+        # sleep), so the box was noticed ~2s late on average. The box has a
+        # static address outside the DHCP pool since 2026-09-22, so a pass now
+        # port-probes the known address every box_probe_interval and rescans
+        # only every full_rescan_every-th pass and on the last one -- a moved
+        # box is still found, a few passes later instead of on the next.
         deadline = time.monotonic() + (self.wake_settle_s if timeout_s is None else timeout_s)
+        attempt = 0
         while True:
             # ensure_connected() stamps _last_fail_time on every miss and then
-            # refuses to retry for _OFFLINE_COOLDOWN, and _rediscover_and_connect
-            # refuses to rescan for rescan_cooldown_s. Both are correct for normal
-            # operation and wrong here, where we are deliberately waiting out a
-            # boot, so clear both before each pass.
+            # refuses to retry for _OFFLINE_COOLDOWN: correct in normal
+            # operation, wrong while deliberately waiting out a boot, so it is
+            # cleared before every pass. _rediscover_and_connect refuses to
+            # rescan for rescan_cooldown_s; that stamp is what paces the scans.
             self._last_fail_time = 0
-            self._last_discovery_t = 0
+            last_pass = time.monotonic() + self.box_probe_interval_s >= deadline
+            if attempt % self.full_rescan_every == 0 or last_pass:
+                self._last_discovery_t = 0
+            else:
+                self._last_discovery_t = time.monotonic()
+            attempt += 1
             # Reachable is not the same as ready. adbd answers early in boot,
             # so returning here on connection alone hands back a box that
             # cannot launch anything yet -- and settle_ms exists as a fixed
@@ -1714,10 +1798,11 @@ class MediaService:
             # never be worse than the old behaviour, which accepted the
             # connection by itself.
             if self.ensure_connected() and self.is_boot_completed() is not False:
+                phase_marks.mark("box_ready")
                 return True
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(self.wake_poll_interval_s)
+            time.sleep(self.box_probe_interval_s)
 
     def is_active_source(self) -> bool | None:
         """
