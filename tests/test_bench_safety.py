@@ -155,6 +155,28 @@ class DeepStandbyStartTests(unittest.TestCase):
             self.assertTrue(bench.put_room_in_deep_standby(svc, idle_s=0))
         svc.cec_waker._send_keys.assert_called_once_with(["KEY_POWER"])
 
+    def test_the_tv_address_is_resolved_before_the_key(self):
+        """_send_keys builds its websocket from _tv_ip; unresolved, it fails as
+        'Can't build URL with port but without host' (first live baseline run)."""
+        svc = _svc(_FakeBox())
+        svc.is_awake.return_value = True
+        svc.hdmi_state.return_value = HdmiState(True, "on", "x")
+        order = []
+        svc.cec_waker.resolve_tv_ip.side_effect = lambda *a, **kw: order.append("resolve") or "192.168.1.201"  # config-literal: stub
+        svc.cec_waker._send_keys.side_effect = lambda keys: order.append("key") or WakeResult(True, "sent")
+        with patch.object(bench, "port_open", return_value=False), patch.object(bench.time, "sleep"):
+            self.assertTrue(bench.put_room_in_deep_standby(svc, idle_s=0))
+        self.assertEqual(order, ["resolve", "key"])
+
+    def test_an_unresolvable_tv_sends_no_key(self):
+        svc = _svc(_FakeBox())
+        svc.is_awake.return_value = True
+        svc.hdmi_state.return_value = HdmiState(True, "on", "x")
+        svc.cec_waker.resolve_tv_ip.return_value = ""
+        with patch.object(bench, "port_open", return_value=False), patch.object(bench.time, "sleep"):
+            self.assertFalse(bench.put_room_in_deep_standby(svc, idle_s=0))
+        svc.cec_waker._send_keys.assert_not_called()
+
     def test_bench_never_sends_keycode_power(self):
         box = _FakeBox()
         svc = _svc(box)

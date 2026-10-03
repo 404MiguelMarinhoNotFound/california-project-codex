@@ -270,6 +270,11 @@ def put_room_in_deep_standby(svc: MediaService, idle_s: float) -> bool:
         print("Deep-standby start: the bus does not say the TV is on, so a toggle could turn it ON.")
         return False
     svc._finish_pending_standby()
+    # _send_keys builds its websocket from the resolved address; without this
+    # it fails as "Can't build URL with port but without host".
+    if not svc.cec_waker.resolve_tv_ip():
+        print("Deep-standby start: the TV is not reachable over REST, so no key can go.")
+        return False
     if not svc.cec_waker._send_keys(["KEY_POWER"]):
         print("Deep-standby start: the TV did not take KEY_POWER.")
         return False
