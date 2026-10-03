@@ -295,6 +295,56 @@ class PlayVideoTests(unittest.TestCase):
         watch.assert_not_called()
         adb.assert_not_called()
 
+    def _run_cold(self, dumps):
+        """Like _run, but the launch counts as a cold start; records keys and re-sends."""
+        outputs = iter(dumps)
+        self.keys = []
+
+        def adb(command, *args, **kwargs):
+            if "dumpsys media_session" in command:
+                return True, next(outputs, dumps[-1])
+            self.keys.append(command)
+            return True, "ok"
+
+        def watch(_id):
+            self.svc._youtube_cold_launch = self.cold
+            self.cold = False  # the second send finds YouTube in the foreground
+            return True
+
+        self.cold = True
+        with patch.object(self.svc, "ensure_connected", return_value=True):
+            with patch.object(self.svc, "youtube_watch", side_effect=watch) as w:
+                with patch.object(self.svc, "_adb", side_effect=adb):
+                    with patch("services.media_service.time.sleep"):
+                        result = self.svc.youtube_play_video("ntst90rCiGM")
+        return result, w
+
+    def test_a_cold_launch_that_never_starts_gets_one_ok_and_a_resend(self):
+        # The picker case: the link is ignored, the stamp does not move.
+        self.svc.youtube_picker_probe_s = 0
+        playback, watch = self._run_cold([STALE, STALE, PLAYING])
+        self.assertEqual(sum("DPAD_CENTER" in k for k in self.keys), 1)
+        self.assertEqual(watch.call_count, 2)
+        self.assertTrue(playback.started)
+
+    def test_a_cold_launch_that_starts_presses_nothing(self):
+        self.svc.youtube_picker_probe_s = 0
+        playback, watch = self._run_cold([STALE, PLAYING])
+        self.assertEqual(self.keys, [])
+        self.assertEqual(watch.call_count, 1)
+        self.assertTrue(playback.started)
+
+    def test_an_unreadable_session_never_triggers_the_picker_press(self):
+        self.svc.youtube_picker_probe_s = 0
+        playback, _ = self._run_cold([None, None])
+        self.assertEqual(self.keys, [])
+        self.assertIsNone(playback.started)
+
+    def test_a_warm_launch_that_does_not_start_is_never_pressed(self):
+        # YouTube already in the foreground: an OK could pause a player.
+        playback, _ = self._run([STALE, STALE])
+        self.assertFalse(playback.started)
+
     def test_no_key_is_ever_pressed(self):
         # The DPAD approach this replaced pressed OK into whatever the top
         # result was, and a second OK in the player is play/pause.

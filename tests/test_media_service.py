@@ -324,39 +324,33 @@ class MediaServiceYouTubeTests(unittest.TestCase):
         self.assertTrue(should_press)
         self.assertTrue(source.startswith("focus_other:"))
 
-    def test_youtube_second_launch_skips_profile_detection(self):
+    def test_every_cold_launch_checks_for_the_profile_picker(self):
+        # Not cached for the session: the picker returns whenever YouTube has
+        # been away, so a second cold launch must look again.
         svc = MediaService(self.config)
         main_focus = "com.google.android.youtube.tv/com.google.android.apps.youtube.tv.activity.ShellActivity"
-        # First launch: not foreground, triggers detection + sets the session flag
-        with patch.object(svc, "ensure_connected", return_value=True):
-            with patch.object(svc, "get_current_app", return_value="stremio"):
-                with patch.object(svc, "launch_app", return_value=(True, "Opening youtube")):
-                    with patch("services.media_service.time.sleep"):
-                        with patch.object(svc, "get_current_focus", return_value=main_focus) as focus:
-                            with patch.object(svc, "_adb", return_value=(True, "ok")):
-                                svc.youtube_playlist("PL_FIRST")
-                                self.assertTrue(svc._youtube_profile_cleared)
-                                first_focus_calls = focus.call_count
+        for playlist in ("PL_FIRST", "PL_SECOND"):
+            with patch.object(svc, "ensure_connected", return_value=True):
+                with patch.object(svc, "get_current_app", return_value="stremio"):
+                    with patch.object(svc, "launch_app", return_value=(True, "Opening youtube")):
+                        with patch("services.media_service.time.sleep"):
+                            with patch.object(svc, "get_current_focus", return_value=main_focus) as focus:
+                                with patch.object(svc, "_adb", return_value=(True, "ok")):
+                                    svc.youtube_playlist(playlist)
+                                    self.assertEqual(focus.call_count, 1)
+                                    self.assertTrue(svc._youtube_cold_launch)
 
-        # Second launch: still not foreground (simulates backgrounding). Detection must NOT run again.
-        with patch.object(svc, "ensure_connected", return_value=True):
-            with patch.object(svc, "get_current_app", return_value="stremio"):
-                with patch.object(svc, "launch_app", return_value=(True, "Opening youtube")):
-                    with patch("services.media_service.time.sleep"):
-                        with patch.object(svc, "get_current_focus", return_value=main_focus) as focus:
-                            with patch.object(svc, "_adb", return_value=(True, "ok")) as adb:
-                                svc.youtube_playlist("PL_SECOND")
-                                self.assertEqual(focus.call_count, 0)  # fast path skipped
-                                self.assertEqual(adb.call_count, 1)     # only the deep-link am start
-                                self.assertIn("PL_SECOND", adb.call_args_list[0][0][0])
-
-    def test_force_stop_youtube_resets_profile_cache(self):
+    def test_a_pressed_picker_is_not_pressed_again_by_the_stamp_fallback(self):
         svc = MediaService(self.config)
-        svc._youtube_profile_cleared = True
+        picker = "com.google.android.youtube.tv/com.google.android.apps.youtube.tv.profile.ProfileSwitcherActivity"
         with patch.object(svc, "ensure_connected", return_value=True):
-            with patch.object(svc, "_adb", return_value=(True, "ok")):
-                svc.force_stop_app("youtube")
-        self.assertFalse(svc._youtube_profile_cleared)
+            with patch.object(svc, "get_current_app", return_value="stremio"):
+                with patch.object(svc, "launch_app", return_value=(True, "Opening youtube")):
+                    with patch("services.media_service.time.sleep"):
+                        with patch.object(svc, "get_current_focus", return_value=picker):
+                            with patch.object(svc, "_adb", return_value=(True, "ok")):
+                                svc.youtube_playlist("PL_X")
+        self.assertFalse(svc._youtube_cold_launch)
 
     def test_dump_ui_hierarchy_uses_ui_dump_timeout(self):
         svc = MediaService(self.config)

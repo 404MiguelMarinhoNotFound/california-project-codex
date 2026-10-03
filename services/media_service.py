@@ -453,6 +453,8 @@ class MediaService:
         self.youtube_search_autoplay = bool(media_cfg.get("youtube_search_autoplay", True))
         self.youtube_search_resolve_timeout_s = max(1, int(media_cfg.get("youtube_search_resolve_timeout_ms", 5000))) / 1000
         self.youtube_search_verify_s = max(0, int(media_cfg.get("youtube_search_verify_ms", 6000))) / 1000
+        # How long a cold-launched video gets to start before the profile picker is assumed.
+        self.youtube_picker_probe_s = max(0, int(media_cfg.get("youtube_picker_probe_ms", 3000))) / 1000
         self.ui_dump_retry_count = max(1, int(media_cfg.get("ui_dump_retry_count", 2)))
         self.ui_dump_retry_delay_s = max(0, int(media_cfg.get("ui_dump_retry_delay_ms", 700)) / 1000)
         self.ui_dump_timeout_s = max(1, int(media_cfg.get("ui_dump_timeout_ms", 6000))) / 1000
@@ -551,8 +553,9 @@ class MediaService:
         self._connected = False
         self._last_fail_time: float = 0  # monotonic timestamp of last failed reconnect
 
-        # Cleared once per YouTube cold start; see _prepare_youtube_launch.
-        self._youtube_profile_cleared: bool = False
+        # True when the last _prepare_youtube_launch started YouTube from
+        # scratch, i.e. the "Who's watching" picker may be up. See youtube_play_video.
+        self._youtube_cold_launch: bool = False
 
     @property
     def target(self) -> str:
@@ -672,7 +675,6 @@ class MediaService:
         if not success:
             self._last_fail_time = time.monotonic()
         else:
-            self._youtube_profile_cleared = False
             self.unreachable_reason = ""
         log.info(f"ADB connect -> '{output}' (success={success})")
         return success
@@ -897,10 +899,7 @@ class MediaService:
         if not package or not self.ensure_connected():
             return False
         log.info("Force-stopping %s (%s)", app_name, package)
-        ok = self._adb(f"shell am force-stop {package}")[0]
-        if ok and (app_name or "").strip().lower() == "youtube":
-            self._youtube_profile_cleared = False
-        return ok
+        return self._adb(f"shell am force-stop {package}")[0]
 
     def start_activity(
         self,
@@ -1087,6 +1086,7 @@ class MediaService:
         t_start = time.monotonic()
 
         if self._youtube_is_foreground():
+            self._youtube_cold_launch = False
             log.info("[timing] _prepare_youtube_launch: already foreground, skipped in %.3fs", time.monotonic() - t_start)
             return True
 
@@ -1095,13 +1095,19 @@ class MediaService:
         log.info("[timing] _prepare_youtube_launch: launch_app took %.3fs ok=%s", time.monotonic() - t_launch, ok)
         if not ok:
             return False
+        self._youtube_cold_launch = True
 
         if self.youtube_warm_launch_delay_s > 0:
             t_warm = time.monotonic()
             time.sleep(self.youtube_warm_launch_delay_s)
             log.info("[timing] _prepare_youtube_launch: warm_delay took %.3fs", time.monotonic() - t_warm)
 
-        if self.youtube_profile_select_on_cold_start and not self._youtube_profile_cleared:
+        # Checked on EVERY cold launch, never cached for the session: the picker
+        # comes back whenever YouTube has been away. The activity name cannot see
+        # it (the picker runs inside the same MainActivity as the home screen), so
+        # a "no" here is only a guess; youtube_play_video backs it with the
+        # session stamp.
+        if self.youtube_profile_select_on_cold_start:
             t_detect = time.monotonic()
             should_press, detection_source = self._detect_youtube_profile_picker_fast()
             log.info(
@@ -1112,13 +1118,11 @@ class MediaService:
             )
             if should_press:
                 self.keyevent("DPAD_CENTER")
+                self._youtube_cold_launch = False  # already cleared; no second press
                 if self.youtube_profile_select_delay_s > 0:
                     t_profile = time.monotonic()
                     time.sleep(self.youtube_profile_select_delay_s)
                     log.info("[timing] _prepare_youtube_launch: profile_select_delay took %.3fs", time.monotonic() - t_profile)
-            self._youtube_profile_cleared = True
-        elif self._youtube_profile_cleared:
-            log.info("[timing] _prepare_youtube_launch: profile_detect skipped (cleared earlier this session)")
 
         log.info("[timing] _prepare_youtube_launch: total %.3fs", time.monotonic() - t_start)
         return True
@@ -1166,7 +1170,9 @@ class MediaService:
             return False, None
         return True, _session_for(_parse_media_sessions(output), self._youtube_package())
 
-    def _wait_for_new_youtube_playback(self, before: MediaSession | None) -> tuple[bool | None, str | None]:
+    def _wait_for_new_youtube_playback(
+        self, before: MediaSession | None, window_s: float | None = None
+    ) -> tuple[bool | None, str | None]:
         """
         Poll the session until a playback newer than `before` shows up.
 
@@ -1175,7 +1181,8 @@ class MediaService:
         two later. A new stamp is enough to believe the launch landed, but the
         title is worth a short wait, so keep polling for it inside the grace.
         """
-        deadline = time.monotonic() + self.youtube_search_verify_s
+        window = self.youtube_search_verify_s if window_s is None else window_s
+        deadline = time.monotonic() + window
         readable = False
         started: MediaSession | None = None
         while True:
@@ -1219,6 +1226,29 @@ class MediaService:
         _, before = self._youtube_session()
         if not self.youtube_watch(video_id):
             return YoutubePlayback(opened=False, started=False, title=None)
+        if not self._youtube_cold_launch:
+            started, title = self._wait_for_new_youtube_playback(before)
+            return YoutubePlayback(opened=True, started=started, title=title)
+
+        # YouTube was started from scratch for this link. If nothing played
+        # within the probe window, the "Who's watching" picker is almost
+        # certainly up (seen live 2026-10-03: the link was ignored and the
+        # stamp never moved), and nothing else can detect it -- see
+        # _detect_youtube_profile_picker_fast. One OK clears it, then the link
+        # is sent again. The re-send also restarts the video from zero with a
+        # fresh stamp, so an OK that landed in a player cannot leave it paused.
+        self._youtube_cold_launch = False
+        started, title = self._wait_for_new_youtube_playback(
+            before, min(self.youtube_search_verify_s, self.youtube_picker_probe_s)
+        )
+        if started is not False:
+            return YoutubePlayback(opened=True, started=started, title=title)
+        log.info("YouTube cold launch did not start playback; pressing OK once for the profile picker")
+        self.keyevent("DPAD_CENTER")
+        if self.youtube_profile_select_delay_s > 0:
+            time.sleep(self.youtube_profile_select_delay_s)
+        if not self.youtube_watch(video_id):
+            return YoutubePlayback(opened=True, started=False, title=None)
         started, title = self._wait_for_new_youtube_playback(before)
         return YoutubePlayback(opened=True, started=started, title=title)
 

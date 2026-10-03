@@ -34,8 +34,8 @@ wake_word:
   #    0.25 |    40%   51%     264.0        |    43%   55%       0.0
   #    0.45 |    35%   41%     144.0        |    32%   41%       0.0
   #    0.55 |    32%   34%      72.0        |    29%   36%       0.0
-  #    0.70 |    26%   29%       0.0        |    21%   29%       0.0
-  #    0.81 |    19%   25%       0.0        |    16%   20%       0.0   <- here
+  #    0.70 |    26%   29%       0.0        |    21%   29%       0.0   <- here
+  #    0.81 |    19%   25%       0.0        |    16%   20%       0.0   <- until 2026-10-03
   #    0.90 |    15%   16%       0.0        |    10%    8%       0.0
   #
   # Read the left column before touching this number: undithered, lowering the
@@ -56,7 +56,7 @@ wake_word:
   # feature buffer from the GLOBAL numpy RNG, so a single pass over a directory is
   # not repeatable. Seed numpy and average several runs, or two honest measurements
   # of the same thing will disagree by a couple of files.
-  threshold: 0.81
+  threshold: 0.7
   sensitivity: 0.6          # Porcupine-specific alias, unused on this backend
   # Native openWakeWord frames (1280 samples / 80ms each) that must clear the
   # threshold back to back. 2 = 160ms of sustained detection.
@@ -109,7 +109,7 @@ wake_word:
   #
   # Wake path only - Whisper still gets clean audio, and wake_word.capture still
   # records raw. Set to 0 to disable exactly and revert to the old behaviour.
-  dither_rms: 10
+  dither_rms: 7           # was 10 until 2026-10-03 (lowered for recall; only 0 and 10-40 were measured)
 
   # Record what she heard around each activation, so false positives stop being
   # anecdotes. Clips are labelled by outcome: *_no_speech.wav and *_short.wav are
@@ -792,6 +792,7 @@ media:
   youtube_warm_launch_delay_ms: 1500     # On cross-app launches, open YouTube first and wait before the deep link
   youtube_profile_select_on_cold_start: true  # Press OK once to clear the YouTube profile picker after warm launch
   youtube_profile_select_delay_ms: 1200  # Wait after the profile OK before opening playlist/search URLs
+  youtube_picker_probe_ms: 3000          # Cold-launched video that has not started by now: assume the profile picker, press OK once, resend
   # "Search YouTube for X and play it". The results deep link stops at the
   # results page and never plays on its own (measured 2026-09-14: 20s on the
   # page, session untouched), and pressing into it blind is a coin flip: the

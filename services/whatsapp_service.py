@@ -1273,7 +1273,10 @@ class WhatsAppService:
         if not (confirm and self._confirmed(key, message)):
             self._arm_confirmation(key, message)
             return WhatsAppCommandResult(
-                False, f"That's the group {spoken}. Say send it and I will."
+                False,
+                f"NOT SENT YET. The group is {spoken}. Read the message back to Master Miguel "
+                f"and ask if you should send it, then wait for his yes. Never say it went out "
+                f"until a later call returns that it was sent. Message: {message}",
             )
         return self._run(lambda: self._send_group_now(match.title, message))
 
