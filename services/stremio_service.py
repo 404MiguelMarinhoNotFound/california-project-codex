@@ -17,6 +17,9 @@ from services import phase_marks
 log = logging.getLogger(__name__)
 
 AUTOPLAY_FALLBACK_LINE = "Stremio's open but it didn't start on its own. Just hit OK on the remote."
+STREMIO_DID_NOT_OPEN_LINE = (
+    "Stremio didn't come up on the TV, it might be updating. Try me again in a minute."
+)
 UNKNOWN_SOURCE_CONFIRMATION_TEMPLATE = (
     "I couldn't find Comet, MediaFusion, or Torrent for {title}. Want me to try the first available source?"
 )
@@ -703,6 +706,24 @@ class StremioService:
                     source_label=result.played_source,
                 )
             return result
+        if not pressed and self._stremio_absent():
+            # Stremio is not on screen at all, so an OK below would land in
+            # whatever is. Seen 2026-10-04: the Play Store updated Stremio 7s
+            # before the link, the launcher's app picker sat on top for the whole
+            # wait, the blind OK resumed YouTube, and its state=3 was reported as
+            # Fallout playing. Relaunch once; still absent means say so.
+            log.warning("Stremio is not on screen after the link; launching it once more")
+            self._launch_uri(uri)
+            result, pressed = self._play_when_ready(target_mode, title_label or title_key,
+                                                    remembered_source=remembered_source)
+            if result is not None:
+                return result
+            if not pressed and self._stremio_absent():
+                return StremioPlayResult(
+                    success=False,
+                    message=STREMIO_DID_NOT_OPEN_LINE,
+                    target_mode=target_mode,
+                )
         if not pressed:
             log.info("Stream list never became ready; falling back to the OK-and-scan path")
             time.sleep(self.autoplay_delay_ms / 1000)
@@ -812,6 +833,15 @@ class StremioService:
             if match:
                 visible.add(match.group(1))
         return visible
+
+    def _stremio_absent(self) -> bool:
+        """True only when `dumpsys activity top` was read and Stremio is not in it.
+
+        An unreadable dump is "cannot tell", never "absent": the OK-and-scan
+        fallback stays available for it, as before.
+        """
+        ok, output = self._run_shell("dumpsys activity top")
+        return bool(ok and output) and "com.stremio.one" not in output
 
     def _stremio_playback_state(self) -> int | None:
         """
@@ -1221,8 +1251,10 @@ class StremioService:
         self._write_watch_state(state)
 
     def _is_playing(self) -> bool:
-        _, output = self._run_shell("dumpsys media_session")
-        return "state=3" in (output or "").lower()
+        # Stremio's own session only. A flat "state=3" anywhere in the dump let
+        # YouTube's session confirm a Stremio launch that never happened
+        # (2026-10-04).
+        return self._stremio_playback_state() == 3
 
     @property
     def adb_target(self) -> str:
