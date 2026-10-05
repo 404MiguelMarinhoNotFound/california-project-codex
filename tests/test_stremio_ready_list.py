@@ -274,6 +274,29 @@ class PlayDeepLinkTests(unittest.TestCase):
         old_path.assert_called_once()
         self.assertTrue(result.success)
 
+    def test_stremio_never_on_screen_relaunches_once_and_presses_nothing(self, _sleep):
+        """
+        2026-10-04: the Play Store updated Stremio seconds before the link, the
+        launcher's app picker stayed on top, a blind OK resumed YouTube and its
+        state=3 was reported as Fallout playing.
+        """
+        launcher = "TASK 10050:com.google.android.apps.tv.launcherx id=1\n"
+        youtube = _session("com.google.android.youtube.tv", 3)
+        box = _Box([launcher], [youtube])
+        svc = self._svc(box)
+        svc.stream_list_timeout_s = 0.01
+        result = svc._play_deep_link("tt12637874", "series", season=2, episode=11, title_label="Fallout")
+        self.assertFalse(result.success)
+        self.assertIn("didn't come up", result.message)
+        self.assertEqual(svc._launch_uri.call_count, 2)
+        self.assertEqual(box.keys, [], "no key into a screen that is not Stremio")
+
+    def test_another_apps_session_is_not_stremio_playing(self, _sleep):
+        svc = _service(_Box([""], [_session("com.google.android.youtube.tv", 3)]))
+        self.assertFalse(svc._is_playing())
+        svc = _service(_Box([""], [_session(state=3)]))
+        self.assertTrue(svc._is_playing())
+
 
 if __name__ == "__main__":
     unittest.main()
