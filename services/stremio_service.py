@@ -899,11 +899,18 @@ class StremioService:
             return None, False
         phase_marks.mark("stream_list_visible")
 
-        # A remembered source makes the dump redundant: it only ever fed the log
-        # and that memory, and it holds the OK back ~1-2s (up to its timeout).
-        source = remembered_source or self._first_card_label()
-        log.info("Stream list ready; first card: %s%s", source or "unreadable",
-                 " (remembered, not read)" if remembered_source else "")
+        # H9 (skip_foreground_wait): with a source remembered the dump is
+        # skipped -- it only ever fed the log and that memory, and it holds the
+        # OK back ~1-2s, 36.6s once on a loaded box. The card is then UNREAD,
+        # so it is reported as unknown rather than as the memory: reporting it
+        # wrote the memory straight back on every play, and a stale source
+        # could never correct itself. Without a memory the read is capped.
+        if self.skip_foreground_wait and remembered_source:
+            source = None
+            log.info("Stream list ready; first card not read (remembered: %s)", remembered_source)
+        else:
+            source = self._first_card_label(capped=self.skip_foreground_wait)
+            log.info("Stream list ready; first card: %s", source or "unreadable")
         self._keyevent(23)
         phase_marks.mark("ok_pressed")
 
@@ -931,7 +938,7 @@ class StremioService:
             target_mode=target_mode,
         ), True
 
-    def _first_card_label(self) -> str | None:
+    def _first_card_label(self, capped: bool = False) -> str | None:
         """
         The source label of the first stream card, read before the one OK.
 
@@ -943,8 +950,9 @@ class StremioService:
         is None, never a reason to skip the OK.
         """
         try:
-            candidates = self._extract_candidates_from_ui_xml(
-                self._dump_ui_hierarchy(timeout_s=self.first_card_dump_timeout_s, retries=1))
+            xml = (self._dump_ui_hierarchy(timeout_s=self.first_card_dump_timeout_s, retries=1)
+                   if capped else self._dump_ui_hierarchy())
+            candidates = self._extract_candidates_from_ui_xml(xml)
         except Exception:
             log.debug("Could not read the stream list before OK", exc_info=True)
             return None

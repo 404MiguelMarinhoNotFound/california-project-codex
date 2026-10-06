@@ -3166,7 +3166,9 @@ Current automated coverage exists for:
   overlapping the wake (a barrier test), a prepare error spoken after the wake with
   nothing launched, a failed wake never launching; `watch_state.json` writes locked
   and atomic (mutation-checked); the pre-OK dump skipped with a remembered source
-  and capped otherwise
+  and capped otherwise, an unread card reported as unknown (never as the memory,
+  which would re-confirm a stale source forever), and a failed ping with port
+  5555 open read as "on the LAN" (a dropped adb transport), not as deep standby
 - The bench runner: CEC settings restored on failure and on Ctrl-C, captured while
   the box is awake for a deep-standby run, the TV address resolved before the one
   `KEY_POWER`, no `KEYCODE_POWER` anywhere, one `_dispatch_tv` per S2 run
