@@ -546,24 +546,26 @@ def _prepare_start(svc: MediaService, args) -> tuple[dict[str, str], dict] | Non
 
 
 def _stremio_once(svc: MediaService, stremio, args) -> bool:
-    from core.orchestrator import _dispatch_tv, _ensure_playable  # noqa: PLC0415
+    """
+    One "put on <title>", exactly as the orchestrator does it: a single
+    _dispatch_tv call, which wakes the room itself through _ensure_playable.
+
+    The first version called _ensure_playable here and _dispatch_tv after it,
+    so the room was already awake when _dispatch_tv started the prepare thread
+    and stremio.prepare_during_wake could not overlap anything (2026-10-03).
+    Where the wake ends comes from the phase marks (box_ready, tv_showing_box),
+    not from a split in this function.
+    """
+    from core.orchestrator import _dispatch_tv  # noqa: PLC0415
 
     print("Room at the start:", _room(svc), flush=True)
     t0 = time.monotonic()
     spoken = []
-
-    line = _ensure_playable(svc, say_now=spoken.append)
-    t_wake = time.monotonic() - t0
-    print(f"  {_stamp(t0)} _ensure_playable -> {line!r}", flush=True)
-    if spoken:
-        print(f"  (she would have said: {spoken[0]!r} at ~0.0s)", flush=True)
-    if line:
-        print(f"RESULT: the room never became playable after {t_wake:.1f}s.")
-        return False
-
     reply = _dispatch_tv({"action": "stremio_play", "title": args.title}, svc,
-                         stremio, None, {}, None, None)
+                         stremio, None, {}, None, spoken.append)
     t_launch = time.monotonic() - t0
+    if spoken:
+        print(f"  (she would have said: {spoken[0]!r} first)", flush=True)
     print(f"  {_stamp(t0)} stremio_play -> {reply!r}", flush=True)
 
     # Playing is what the box says, never what the launch returned.
@@ -577,10 +579,9 @@ def _stremio_once(svc: MediaService, stremio, args) -> bool:
             break
         time.sleep(1)
 
-    print(f"  wake the room      {t_wake:6.1f}s")
-    print(f"  stremio launch     {t_launch - t_wake:6.1f}s  (cumulative {t_launch:.1f}s)")
+    print(f"  wake + launch      {t_launch:6.1f}s")
     if playing_at is None:
-        print(f"  playing            never within {args.watch:.0f}s of the start")
+        print(f"  playing            never within {args.watch:.0f}s of the launch returning")
         return False
     print(f"  TOTAL to playing   {playing_at:6.1f}s")
     return True

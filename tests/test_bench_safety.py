@@ -257,5 +257,26 @@ class OverrideTests(unittest.TestCase):
         self.assertEqual(config["media"]["cec_wake"]["poll_interval_ms"], 2000, "input not mutated")
 
 
+
+class StremioRunTests(unittest.TestCase):
+    """
+    The S2 action must be what the orchestrator does: one _dispatch_tv call,
+    which wakes the room itself. The first bench called _ensure_playable first,
+    so the room was already awake when _dispatch_tv started H8's prepare thread
+    and the H8 runs measured nothing (2026-10-03).
+    """
+
+    def test_the_run_dispatches_once_and_never_wakes_the_room_itself(self):
+        svc = Mock()
+        svc.is_awake.return_value = True
+        svc.room_status.return_value = Mock(playing=True, title="Fallout")
+        args = Mock(title="Fallout", watch=1)
+        with patch("core.orchestrator._ensure_playable") as ensure,                 patch("core.orchestrator._dispatch_tv", return_value="Fallout is playing on Stremio.") as dispatch:
+            self.assertTrue(bench._stremio_once(svc, Mock(), args))
+        ensure.assert_not_called()
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[0], {"action": "stremio_play", "title": "Fallout"})
+
+
 if __name__ == "__main__":
     unittest.main()

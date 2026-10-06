@@ -170,20 +170,41 @@ class PlayWhenReadyTests(unittest.TestCase):
     # --- H9: less waiting before the one OK ---------------------------------
 
     def test_remembered_source_skips_the_dump(self, _sleep):
-        """The dump only feeds the log and the remembered source; a known one makes it redundant."""
+        """
+        The dump only feeds the log and the remembered source, so a known one
+        skips it -- but an unread card is not reported as the remembered one.
+        Reporting it would write the memory straight back on every play, so a
+        stale "torrentio" from before Comet came first could never correct
+        itself (final review, 2026-10-06).
+        """
         box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
         svc = _service(box)
+        svc.skip_foreground_wait = True
         svc.media_service.dump_ui_hierarchy = Mock(return_value=STREAM_CARDS_XML)
 
-        result, _ = svc._play_when_ready("episode", "Fallout", remembered_source="Comet")
+        result, _ = svc._play_when_ready("episode", "Fallout", remembered_source="torrentio")
 
         svc.media_service.dump_ui_hierarchy.assert_not_called()
-        self.assertEqual(result.played_source, "Comet")
+        self.assertTrue(result.success)
+        self.assertIsNone(result.played_source)
         self.assertEqual(box.keys, [23])
+
+    def test_flag_off_reads_the_card_even_with_a_memory(self, _sleep):
+        """skip_foreground_wait false is the old path exactly: always read, uncapped."""
+        box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
+        svc = _service(box)
+        svc.skip_foreground_wait = False
+        svc.media_service.dump_ui_hierarchy = Mock(return_value=STREAM_CARDS_XML)
+
+        result, _ = svc._play_when_ready("episode", "Fallout", remembered_source="torrentio")
+
+        svc.media_service.dump_ui_hierarchy.assert_called_once_with()
+        self.assertEqual(result.played_source, "Comet")
 
     def test_first_card_dump_is_capped(self, _sleep):
         box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
         svc = _service(box)
+        svc.skip_foreground_wait = True
         svc.first_card_dump_timeout_s = 2.0
         svc.media_service.dump_ui_hierarchy = Mock(return_value=STREAM_CARDS_XML)
 
@@ -240,11 +261,15 @@ class PlayDeepLinkTests(unittest.TestCase):
     def test_the_remembered_source_reaches_the_ready_list(self, _sleep):
         box = _Box([STREAM_LIST, PLAYER], ["", _session(state=3)])
         svc = self._svc(box)
+        svc.skip_foreground_wait = True
         svc.media_service.dump_ui_hierarchy = Mock(return_value=STREAM_CARDS_XML)
-        result = svc._play_deep_link("tt12637874", "series", season=2, episode=9,
-                                     title_label="Fallout", remembered_source="Comet")
-        self.assertEqual(result.played_source, "Comet")
+        with patch.object(svc, "_remember_successful_source") as remember:
+            result = svc._play_deep_link("tt12637874", "series", season=2, episode=9,
+                                         title_label="Fallout", remembered_source="Comet")
+        self.assertTrue(result.success)
         svc.media_service.dump_ui_hierarchy.assert_not_called()
+        self.assertIsNone(remember.call_args.kwargs["source_label"],
+                          "an unread source must not be written back as observed")
 
     def test_no_second_ok_after_the_first_opened_nothing(self, _sleep):
         box = _Box([STREAM_LIST], [""])

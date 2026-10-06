@@ -420,11 +420,19 @@ stremio:
   # deep link) on a thread while the room is still waking, instead of after
   # it. None of it needs the box; from deep standby the wake is ~35s, so the
   # whole prepare is hidden. false = the old order (wake, then prepare).
-  prepare_during_wake: true
+  # OFF until measured: the 2026-10-03 bench woke the room itself before
+  # dispatching, so the H8 runs never overlapped anything (fixed since in
+  # tools/bench_tv_power.py). On a clean box prepare costs ~2.5s after the
+  # wake, so that is the most this can save. Re-run S2-deep base vs H8.
+  prepare_during_wake: false
   # H9: skip the separate wait for Stremio to be foreground (the stream-list
   # poll already waits for its list), and cap the one uiautomator dump before
   # the OK, which only feeds the log and the remembered source and is skipped
   # outright when a source is remembered. Old: false / media.ui_dump_timeout_ms.
+  # Measured 2026-10-03: ~1s on a healthy box (stream list -> OK is ~1.1s
+  # either way), not a win by the bench rule. Kept on for the tail: with
+  # Button Mapper's leak the uncapped dump timed out twice and held the OK
+  # back 36.6s on a stream list that was already up.
   skip_foreground_wait: true
   first_card_dump_timeout_ms: 2000
   player_start_timeout_ms: 6000
@@ -686,6 +694,8 @@ media:
     # before the reachability scan and the UPnP probes, ~2-4s of checks the
     # code audit found in front of the wake packet (2026-10-02). WoL is a
     # no-op on a TV that is already on. false = the old order.
+    # Measured 2026-10-03, clean box, interleaved: WoL leaves at 0.1s instead
+    # of 2.9s; deep wake 32.6s median vs 33.0s (best 30.2s). Kept.
     prewake_wol: true
     # Then, if the box still is not up, the Source-menu rescue gets this long.
     # 7.9s measured from a lit TV (2026-09-25).
@@ -697,8 +707,11 @@ media:
     # ~3.7-4s, so the box was noticed ~2s late on average (code audit
     # 2026-10-02). Old cadence: box_probe_interval_ms = poll_interval_ms,
     # full_rescan_every = 1.
-    box_probe_interval_ms: 500
-    full_rescan_every: 4
+    # Measured 2026-10-03, clean box, interleaved: 33.6/33.7/34.7s against
+    # 33.0/33.0/33.2s -- no gain, slightly slower. The box's resume, not the
+    # poll, decides when it appears. Back to the old cadence; set 500/4 to retry.
+    box_probe_interval_ms: 2000
+    full_rescan_every: 1
     # Mi Box is at CEC physical address 0x2000 == HDMI 2; HDMI 1 is a tuner
     # (CEC logical address 3). KEY_HDMI cycles only inputs with a live signal,
     # so it cannot select a sleeping box -- inputs are selected through the

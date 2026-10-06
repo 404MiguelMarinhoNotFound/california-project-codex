@@ -1929,10 +1929,14 @@ class PrewakeTests(unittest.TestCase):
     already on, so the packet can go first and the TV boots during the checks.
     """
 
-    def _svc(self, *, ping_ok, enabled=True):
+    def _svc(self, *, ping_ok, enabled=True, port_up=False):
         svc = _service()
         svc.prewake_wol = enabled
         svc._adb = Mock(return_value=(ping_ok, "ping" if ping_ok else "error: closed"))
+        # The 0.3s gate behind a failed ping; never a real socket from a test.
+        patcher = patch("services.media_service.port_open", return_value=port_up)
+        self.port_open = patcher.start()
+        self.addCleanup(patcher.stop)
         svc._finder = Mock()
         return svc
 
@@ -1956,6 +1960,18 @@ class PrewakeTests(unittest.TestCase):
             self.assertTrue(svc.turn_on())
         self.assertEqual(svc.last_wake_result.detail, "already on")
         svc.cec_waker.send_wol.assert_not_called()
+
+    def test_a_dropped_adb_transport_is_not_off_the_lan(self):
+        """
+        The ping fails in 0.21s whenever adb has no open transport -- after a
+        laptop resume or an adb-server restart -- with the box wide awake. Port
+        5555 answering means it is on the LAN: no WoL, and no "waking
+        everything up" for a room that is already on (final review, 2026-10-06).
+        """
+        svc = self._svc(ping_ok=False, port_up=True)
+        self.assertIs(svc.prewake(), True)
+        svc.cec_waker.send_wol.assert_not_called()
+        self.port_open.assert_called_once_with(svc.ip, svc.port, svc.port_probe_timeout_s)
 
     def test_prewake_off_sends_nothing_and_pings_nothing(self):
         svc = self._svc(ping_ok=False, enabled=False)

@@ -223,6 +223,7 @@ california/
 │   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
 │   ├── cec_wake.py              # Wake the box via the TV over HDMI-CEC; ADB cannot turn it on
 │   ├── device_finder.py         # Shared find-by-MAC / verify-by-identity / cache-the-IP ladder
+│   ├── phase_marks.py           # Bench timeline marks from inside the wake/play paths; a no-op unless recording
 │   ├── llm.py                   # Multi-provider LLM streaming + tool calling
 │   ├── deebot_service.py        # Deebot N8+ vacuum: REST-only, auth-first, cached-id-then-live rooms
 │   ├── deebot_session.py        # Ecovacs login: persisted token + device id, Gmail-read verification
@@ -265,6 +266,7 @@ california/
 │   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
 │   ├── list_whatsapp_groups.py     # Read every WhatsApp group off the chat list and refresh the cache
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
+│   ├── bench_report.py             # Per-phase medians of recorded bench runs, and the spike-vs-base win rule
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
 │   ├── probe_stremio_sync.py       # Refreshes and inspects Stremio watch-state cache
@@ -284,6 +286,10 @@ california/
 │   ├── test_tapo_tpap.py        # SPAKE2+ handshake against a fake bulb, the encrypted channel, protocol routing
 │   ├── test_device_discovery.py # DeviceFinder ladder, cache, ARP parsing; no-network guard
 │   ├── test_media_power.py      # turn_on/turn_off: fast path, CEC-bus confirm, deep-standby fallback, no blind KEYCODE_POWER
+│   ├── test_phase_marks.py      # Bench marks: first occurrence wins, any thread, no-op outside a recording
+│   ├── test_bench_report.py     # Bench summary: absent phases are not zero, the win rule needs more than the spread
+│   ├── test_bench_safety.py     # Bench runner: CEC settings restored on any exit, no KEYCODE_POWER, one dispatch per run
+│   ├── test_stremio_prepare.py  # prepare()/launch() split, prepare overlapping the wake, watch_state.json lock
 │   ├── test_media_service.py    # YouTube / ADB unit tests
 │   ├── test_mic_drain.py        # Stale mic-buffer draining after playback
 │   ├── test_speaker_session.py  # Per-turn OutputStream: block writes, stop-within-a-block, reopen after abort, tail on close
@@ -976,9 +982,16 @@ worst case if a timer exists is the ~35s deep-standby wake, not a failure.
 
 This replaced catching the box inside the ~3-5s before
 adbd suspended, with One Touch Play suppressed across the window. And
-`persist.sys.hdmi.keep_awake`, named above as the gate, is not: in Android 11 it
-only picks a wakelock (`HdmiCecLocalDevicePlayback`) and is not consulted on
-the `<Standby>` path.
+`persist.sys.hdmi.keep_awake`, named above as the gate, is not the gate, but
+"not consulted" was wrong too (corrected 2026-10-03). In AOSP 11 every standby
+path ends in `HdmiControlService.standby()`, which refuses while
+`canGoToStandby()` is false -- for a playback device, while it holds its
+keep-awake wakelock, which it takes as active source **only if this property is
+true**. **On this box it reads `false`** (`tools/bench_tv_power.py
+standby-probe`, 2026-10-03), so the wakelock is never held and the Samsung
+remote's `<Standby>` sleeps the box whether or not it is the active source.
+Claiming the active source first cannot help, and the property is not
+shell-writable. `hdmi_control_enabled` stays the only gate.
 
 - **CEC must come back on.** Left off, the Xiaomi remote cannot turn the TV on:
   a box wake announces `<Text View On>` over CEC. The tail runs on a thread so
@@ -1023,6 +1036,49 @@ to 2.5s. That hidden second is also where most of the old 6s "pair" went.
 Deep standby cannot beat ~37s from the software side: that is the Samsung's CEC
 start after a cold power-on, and resending keys every 4s did not bring the wake
 forward. A box that never went deep is the only faster route without root.
+
+#### The wake/play optimization bench (2026-10-03)
+
+Spec and plan: `docs/superpowers/specs/2026-10-02-tv-wake-optimization-design.md`,
+`docs/superpowers/plans/2026-10-02-tv-wake-optimization.md`. Four code changes
+were each put behind a flag whose old value reproduces the old behaviour, then
+measured on the real room against a base with every flag old, **interleaved**
+(base and each change once per round, three rounds) so drift lands on both
+sides. Win rule: the change's median must beat the base median by more than the
+base's own min-max spread.
+
+| change | flag | clean runs, base vs change | shipped |
+|---|---|---|---|
+| H6 WoL before the reachability scan | `cec_wake.prewake_wol` | deep wake 33.0/33.0/33.2s vs 32.6/30.2/33.2s; WoL at 0.1s instead of 2.9s | **on** (a win, ~0.4s median) |
+| H7 probe the known IP, rescan every Nth pass | `cec_wake.box_probe_interval_ms`, `full_rescan_every` | 33.0/33.0/33.2s vs 33.6/33.7/34.7s | **off** (2000 / 1) |
+| H8 prepare Stremio during the wake | `stremio.prepare_during_wake` | **not measured**: the bench woke the room itself first (fixed since) | **off** until re-run |
+| H9 no foreground wait, capped pre-OK dump | `stremio.skip_foreground_wait`, `first_card_dump_timeout_ms` | dark room -> playing 23.2/32.5s vs 21.3/20.4s; list -> OK ~1.1s both | **on** for the tail (below) |
+
+**What decided the numbers was the box, not the code.** Button Mapper's media
+player leak (see "The ready-list path") was back mid-bench: every ADB call
+slowed, a `uiautomator dump` timed out twice and held the one OK back **36.6s**
+over a stream list that was already up, and S2 runs went from ~50s to 64-95s.
+The first baseline and spike series were all contaminated and thrown away. It
+regrew from 1 to 8 players **inside one long play run**. Button Mapper was
+replaced on 2026-10-06; H9 stays on because it is exactly that 36.6s it caps.
+
+**Where the time goes now, clean box, medians:** deep wake ~33s, of which our
+code is ~1s -- WoL, then the Samsung boots, its CEC wakes the box at ~30-32s,
+`boot_completed` within a second. Dark room -> playing ~50s: box ready 33s,
+prepare + deep link 36s, stream list 38s, OK 39s, playing ~49s (~10s is the
+torrent buffering). From California's own `turn_off` it is ~20-25s.
+
+**H10 (does an active-source box survive the Samsung remote?) is closed** by the
+`keep_awake=false` read above; nobody had to press the remote.
+
+The bench itself: `--json` records one line per run to `bench/results/` (gitignored)
+with phase marks from inside the code (`services/phase_marks.py`, a no-op unless
+recording), first-open times of TV :8001/:9197 and box :5555 from outside, the
+box's media-player count, and the CEC settings captured while the box was awake
+and restored in a `finally`. `--from-deep` reproduces the Samsung-remote state
+unattended (KEY_POWER behind an "on" reading, CEC left on, wait for 5555 to
+close); `--set dotted.key=value` overrides config per run;
+`tools/bench_report.py` prints per-phase medians and the win-rule verdicts.
 
 **The power actions are deliberately absent from `_dispatch_tv`'s `requires_tv`
 set.** That gate returns `"TV is off or unreachable right now"` when
@@ -2069,6 +2125,15 @@ show on screen. Now **20.0s** from an idle room to confirmed playing, one key:
   clear it**: `persist.adb.tcp.port` is empty, so ADB over Wi-Fi may not come back.
   4K HEVC playback itself also loads the box to ~250%, which slows every ADB call
   made during it.
+  **Button Mapper is gone since 2026-10-06.** The leak came back mid-bench on
+  2026-10-03 (1 -> 8 players inside one long play run, 14 at its worst, ~34
+  CPU-hours on media.extractor) and needed the restart twice in one day.
+  There is no root-free way to remap the remote without an accessibility
+  service, so its one job -- the Netflix key opening Stremio -- moved to
+  **tvQuickActions** (`dev.vodik7.tvquickactions.free`, accessibility service
+  `dev.vodik7.tvquickactions.KeyAccessibilityService`), 0 players afterwards.
+  Whether the leak was Button Mapper's alone is a day-or-two question:
+  `adb shell "dumpsys media.player | grep -c 'pid('"` should stay at 0-1.
 - The library sync before a resume is **0.16s** and was left alone.
 
 ### Watch-State Cache
@@ -3095,6 +3160,18 @@ Current automated coverage exists for:
   one block, a stop staying in force until `reset_playback`, an aborted stream
   being closed and replaced rather than restarted, the silent tail on close, a
   rate change reopening, and a failed open falling back to `sd.play`
+- The wake/play optimization flags: Wake-on-LAN before rediscovery only when one
+  ping misses (and nothing at all, not even the ping, with the flag off); the
+  `_wait_for_box` cadence rescanning on every Nth pass and the last; `prepare()`
+  overlapping the wake (a barrier test), a prepare error spoken after the wake with
+  nothing launched, a failed wake never launching; `watch_state.json` writes locked
+  and atomic (mutation-checked); the pre-OK dump skipped with a remembered source
+  and capped otherwise, an unread card reported as unknown (never as the memory,
+  which would re-confirm a stale source forever), and a failed ping with port
+  5555 open read as "on the LAN" (a dropped adb transport), not as deep standby
+- The bench runner: CEC settings restored on failure and on Ctrl-C, captured while
+  the box is awake for a deep-standby run, the TV address resolved before the one
+  `KEY_POWER`, no `KEYCODE_POWER` anywhere, one `_dispatch_tv` per S2 run
 - Barge-in: the wake word mid-reply stops her, closes the LLM stream, drains
   both queues and returns `True`; a hit while she is saying "California" is
   ignored; the listener scores at `barge_in_threshold`; a listener error does
@@ -3134,6 +3211,13 @@ uv run python tools/bench_tv_power.py tv-standby --key KEY_POWER      # one powe
 uv run python tools/bench_tv_power.py otp                 # box asleep-but-reachable: does its own wake bring the TV on?
 uv run python tools/bench_tv_power.py soak --minutes 60   # how long after turn_off does the box stay on the LAN?
 uv run python tools/bench_tv_power.py wake --runs 3 --via-turn-on
+
+# Recorded runs (see "The wake/play optimization bench"). --from-deep cycles the
+# room unattended; nothing else may drive the box meanwhile, California included.
+uv run python tools/bench_tv_power.py wake --via-turn-on --from-deep --runs 3 --spike base
+uv run python tools/bench_tv_power.py --set stremio.prepare_during_wake=true stremio --from-deep --runs 3 --spike H8
+uv run python tools/bench_tv_power.py standby-probe        # keep_awake + active source, read-only with --watch 1
+uv run python tools/bench_report.py bench/results/*.jsonl --baseline base
 ```
 
 `bench_tv_power.py` loads `.env` like `main.py` (Stremio and TMDB credentials);
@@ -3555,6 +3639,21 @@ just the commits.
   race and shipped on. "On" 42s -> ~5s. A daemon restore thread left the real
   box with CEC off once; it is non-daemon now. Root research is in
   `research/` (not yet acted on).
+
+- **"Run optimization benchmarks on the Mi Box boot times" (2026-10-02/06,
+  branch `feat/wake-optimization`, merged as PR #44; follow-up
+  `chore/wake-followup`).** Brainstormed to a spec and plan, three read-only
+  research subagents (Samsung settings, AOSP 11 HDMI-CEC, a code audit of every
+  fixed wait), then a recorded bench and four flag-gated changes. Findings: the
+  Samsung UE49M5505 has no user-menu warm standby or Anynet+ device-off option
+  (a service-menu "Instant On" was the only lead, left untried); `keep_awake` is
+  `false` on this box, closing the Samsung-remote question; the code changes are
+  worth about a second at most against a ~33s wake set by the TV's CEC start.
+  The real lever was the box: Button Mapper's leak contaminated the first two
+  series, was cleared twice, and Master Miguel replaced it with tvQuickActions.
+  The merged PR shipped every flag on; the follow-up set them to what was
+  measured (H6 on, H7 off, H8 off until measured, H9 on for the tail) and fixed
+  the bench so H8 can be measured.
 
 -----
 

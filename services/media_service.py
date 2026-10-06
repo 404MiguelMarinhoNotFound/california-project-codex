@@ -1282,8 +1282,9 @@ class MediaService:
         """
         Start the television booting before anything slower runs.
 
-        True: the box answered one ping. False: it did not, and Wake-on-LAN has
-        gone to the TV (when the waker is available). None: prewake is off, and
+        True: the box is on the LAN (it answered one ping, or its ADB port is
+        open). False: neither, and Wake-on-LAN has gone to the TV (when the
+        waker is available). None: prewake is off, and
         nothing was sent or asked -- today's behaviour exactly.
 
         One `adb shell echo ping` is ~0.2s against a transport that is gone.
@@ -1297,6 +1298,11 @@ class MediaService:
             return None
         ok, _ = self._adb("shell echo ping")
         if ok:
+            return True
+        # A failed ping is also what a dropped adb transport looks like (laptop
+        # resume, adb-server restart) with the box wide awake. The 0.3s port
+        # gate tells the two apart without the 21s `adb connect`.
+        if port_open(self.ip, self.port, self.port_probe_timeout_s):
             return True
         if self.cec_waker.available is True:
             log.info("Box does not answer; Wake-on-LAN to the TV before the reachability checks")
