@@ -34,6 +34,8 @@ import tempfile
 logger = logging.getLogger(__name__)
 
 _PS_TIMEOUT_S = 25
+# Consecutive "End button gone" readings before a call counts as hung up.
+_GONE_READINGS = 2
 
 # Default audio endpoint get/set (IMMDeviceEnumerator / IPolicyConfig). The
 # vtable order is what matters; unused slots are placeholders.
@@ -241,6 +243,7 @@ class PhoneLinkDialer:
         if not number:
             return "BAD_NUMBER"
         self._saw_call = False
+        self._gone = 0
         status = _run_ps(_DIAL.replace("__NUMBER__", number))
         if status == "DIALED":
             self._saw_call = True
@@ -259,12 +262,18 @@ class PhoneLinkDialer:
         status = _run_ps(_IN_CALL, timeout_s=10)
         if status == "YES":
             self._saw_call = True
+            self._gone = 0
             return True
         # The button lives inside the main window (no separate call window,
         # recorded live 2026-10-07). Once it has been seen in THIS call, its
         # disappearance is a real hang-up; before that it proves nothing.
+        # One missed reading is not enough: a UIA walk can miss the button
+        # while Phone Link redraws, and a single miss used to end the call
+        # mid-sentence. `_GONE_READINGS` misses in a row (~4-6s) are.
         if status == "NO" and getattr(self, "_saw_call", False):
-            return False
+            self._gone = getattr(self, "_gone", 0) + 1
+            logger.info("Phone Link: End button gone (%d/%d)", self._gone, _GONE_READINGS)
+            return False if self._gone >= _GONE_READINGS else None
         return None
 
     def hang_up(self) -> str:

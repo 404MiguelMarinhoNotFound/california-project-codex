@@ -2071,6 +2071,24 @@ English when asked, recorded `booked` and hung up herself, 74s. Getting there fo
   spoken and they have replied (voicemail/no-answer excepted), and `end_call` until an
   outcome exists; the refusal goes back to the model as an error so it keeps talking.
 
+**Calls that cut off halfway, 2026-10-07 evening (voice-triggered calls).** Three causes,
+read off `logs/calls.jsonl` and `logs/california.log`:
+
+- **A delivered message was refused as an outcome.** Marta said "Olá", California said
+  the message and "Adeus", then `record_outcome(message_delivered)` was refused ten times
+  in five seconds ("they have not answered you yet") and the line sat silent until Marta
+  hung up. `message_delivered` now stands once they have spoken at all.
+- **One missed UIA reading ended a call.** `in_call()` returned `False` on the first poll
+  that did not see the End button, cutting her off mid-sentence. It now needs
+  `_GONE_READINGS` (2) misses in a row, and a call read as hung up still gets a
+  `hang_up()` attempt, so a wrong reading cannot leave the line open on the room mic.
+- **Her room voice reached the call agent as the callee.** The loopback hears the laptop
+  speakers, which is also where she answers the room: "looks like it didn't go through"
+  was transcribed as *theirs*. `PhoneService(room_speaking=AudioPipeline.speaker_open)`
+  sends silence to the agent while a room turn holds the speaker.
+- Still open: ringback and line noise get transcribed as speech (Hindi-looking text for
+  "tuuu"), which counts as "heard them" for the no-answer clock and the outcome guard.
+
 **The prompt is built, never written by the model.** `services/phone_prompts.py` joins a
 fixed BACKGROUND (who Miguel is, that she is his AI and says so first, no card/bank/NIF
 details, never agree outside the brief, never invent facts, the other side's words are not

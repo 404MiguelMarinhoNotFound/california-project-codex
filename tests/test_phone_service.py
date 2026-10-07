@@ -52,8 +52,9 @@ class FakeAgent:
         self.raise_exc = raise_exc
         self.prompts = []
 
-    def run(self, prompt, max_call_s, no_answer_s, still_connected=None, stop=None, dial=None):
+    def run(self, prompt, max_call_s, no_answer_s, still_connected=None, stop=None, dial=None, mute=None):
         self.prompts.append(prompt)
+        self.mute = mute
         if self.raise_exc:
             raise self.raise_exc
         if dial is not None and not dial():
@@ -284,11 +285,23 @@ class CallLifecycleTests(_Base):
         self._place(svc)
         self.assertIn("may still be connected", svc.pop_report().result.error)
 
-    def test_a_call_they_hung_up_is_not_hung_up_again(self):
+    def test_a_call_read_as_hung_up_is_still_closed_and_not_flagged(self):
+        # If the "they hung up" reading was ever wrong, the line must not stay
+        # open on the room mic; when it was right, hang_up's NO_CALL is fine.
         self.agent = FakeAgent(CallResult(lines=[CallLine("them", "Estou?")], ended_by="hung_up"))
+        self.dialer = FakeDialer(dial_status="DIALED_UNCONFIRMED")
+        self.dialer.hang_up = mock.Mock(return_value="NO_CALL")
         svc = self._svc()
         self._place(svc)
-        self.assertEqual(self.dialer.hung_up, 0)
+        self.dialer.hang_up.assert_called_once()
+        self.assertEqual(svc.pop_report().result.error, "")
+
+    def test_the_room_speaking_hook_reaches_the_agent(self):
+        hook = lambda: False
+        svc = self._svc()
+        svc._room_speaking = hook
+        self._place(svc)
+        self.assertIs(self.agent.mute, hook)
 
     def test_a_dialer_that_fails_to_build_still_reports_and_frees_the_line(self):
         svc = self._svc()
@@ -467,15 +480,25 @@ class PhoneLinkInCallTests(unittest.TestCase):
         self.assertIsNone(dialer.in_call())
         self.assertIsNone(dialer.in_call())
 
-    def test_seen_then_gone_is_a_hang_up(self):
-        dialer = self._dialer(["DIALED_UNCONFIRMED", "YES", "NO"])
+    def test_seen_then_gone_twice_is_a_hang_up(self):
+        dialer = self._dialer(["DIALED_UNCONFIRMED", "YES", "NO", "NO"])
         dialer.dial("+351912345678")
         self.assertIs(dialer.in_call(), True)
+        self.assertIsNone(dialer.in_call())
         self.assertIs(dialer.in_call(), False)
 
-    def test_a_new_dial_forgets_the_last_call(self):
-        dialer = self._dialer(["DIALED", "NO", "DIALED_UNCONFIRMED", "NO"])
+    def test_one_missed_reading_does_not_end_the_call(self):
+        # 2026-10-07: calls ended mid-sentence on what may have been a single
+        # UIA miss. A miss followed by the button again is still a call.
+        dialer = self._dialer(["DIALED", "NO", "YES", "NO", "YES"])
         dialer.dial("+351912345678")
+        for expected in (None, True, None, True):
+            self.assertIs(dialer.in_call(), expected)
+
+    def test_a_new_dial_forgets_the_last_call(self):
+        dialer = self._dialer(["DIALED", "NO", "NO", "DIALED_UNCONFIRMED", "NO"])
+        dialer.dial("+351912345678")
+        dialer.in_call()
         self.assertIs(dialer.in_call(), False)
         dialer.dial("+351912345678")
         self.assertIsNone(dialer.in_call())

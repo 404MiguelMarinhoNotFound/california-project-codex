@@ -127,6 +127,7 @@ class PhoneService:
         dialer=None,
         agent_factory: Callable | None = None,
         mic_route_factory: Callable | None = None,
+        room_speaking: Callable[[], bool] | None = None,
     ):
         cfg = config.get("phone", {}) or {}
         self.owner = str(cfg.get("owner_name") or "Miguel")
@@ -161,6 +162,7 @@ class PhoneService:
         self._dialer = dialer
         self._agent_factory = agent_factory
         self._mic_route_factory = mic_route_factory
+        self._room_speaking = room_speaking
 
         self._lock = threading.Lock()
         self._pending: tuple[str, str, float] | None = None
@@ -413,17 +415,26 @@ class PhoneService:
                     still_connected=dialer.in_call,
                     stop=self._stop,
                     dial=dial,
+                    mute=self._room_speaking,
                 )
                 if result.ended_by == "dial_failed":
                     result.error = _DIAL_FAILURES.get(dial_status[-1] if dial_status else "", _DIAL_FAILURES[""])
-                elif dial_status and result.ended_by != "hung_up":
+                elif dial_status:
                     # Always try, still inside the mic route: a call whose End
                     # button was never seen (DIALED_UNCONFIRMED) reads None, not
                     # True, and skipping it would leave the line open on the
-                    # room mic once the route is undone.
-                    # NO_CALL is only reassuring once the call was seen on screen.
+                    # room mic once the route is undone. After "hung_up" too:
+                    # if that reading was ever wrong, this closes the line.
+                    # NO_CALL is only reassuring once the call was seen on
+                    # screen, which "hung_up" (seen, then gone) implies.
                     hung = dialer.hang_up()
-                    unseen = dial_status[-1] == "DIALED_UNCONFIRMED" and hung != "ENDED"
+                    unseen = (
+                        dial_status[-1] == "DIALED_UNCONFIRMED"
+                        and result.ended_by != "hung_up"
+                        and hung != "ENDED"
+                    )
+                    if hung == "ENDED" and result.ended_by == "hung_up":
+                        logger.warning("Call read as hung up was still live; ended it now")
                     if unseen or hung not in ("ENDED", "NO_CALL"):
                         result.error = result.error or (
                             "I couldn't confirm the call hung up. Check the phone, it may still be connected."

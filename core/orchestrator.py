@@ -1673,9 +1673,13 @@ class Orchestrator:
         self.whatsapp_service.start()
 
         # Phone calls. Names resolve through the WhatsApp contact book (its
-        # resolver only reads the VCF and aliases, never the browser).
+        # resolver only reads the VCF and aliases, never the browser). The call
+        # agent hears the laptop speakers, which is also where she talks to the
+        # room, so its ears are muted while a room turn holds the speaker.
         self.phone_service = PhoneService(
-            config, resolve_contact=getattr(self.whatsapp_service, "resolve_contact", None)
+            config,
+            resolve_contact=getattr(self.whatsapp_service, "resolve_contact", None),
+            room_speaking=getattr(self.audio, "speaker_open", None),
         )
 
         if media_enabled:

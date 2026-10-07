@@ -98,7 +98,7 @@ class FakeCapture:
         self.stopped = False
 
     def start(self, on_block):
-        on_block(b"\x00\x00" * 160)
+        on_block(b"\x01\x00" * 160)  # not silence, so muting is visible
 
     def stop(self):
         self.stopped = True
@@ -226,6 +226,45 @@ class PrematureEndTests(_Base):
         ])
         result = self.agent(session).run("p", max_call_s=30, no_answer_s=30)
         self.assertEqual((result.ended_by, result.outcome["status"]), ("end_call", "voicemail"))
+
+
+    def test_a_message_said_after_they_picked_up_counts_as_delivered(self):
+        # 2026-10-07 21:15: "Olá" -> her message + "Adeus" -> record_outcome
+        # refused ten times for want of a reply, dead air until they hung up.
+        session = FakeSession([
+            [heard("Olá.")], [said("Olá, aqui é a California. O Miguel pediu para dizer que a ama. Adeus.")],
+            [tool("record_outcome", status="message_delivered", summary="told her")], [tool("end_call")],
+        ])
+        result = self.agent(session).run("p", max_call_s=30, no_answer_s=30)
+        self.assertEqual((result.ended_by, result.outcome["status"]), ("end_call", "message_delivered"))
+
+    def test_a_booking_still_needs_their_reply(self):
+        session = FakeSession([
+            [heard("Estou?")], [said("Queria uma mesa.")],
+            [tool("record_outcome", status="booked", summary="x")],
+        ])
+        result = self.agent(session).run("p", max_call_s=0.1, no_answer_s=30)
+        self.assertIsNone(result.outcome)
+
+
+class MuteTests(_Base):
+    def test_room_speech_reaches_the_agent_as_silence(self):
+        sent = []
+
+        class Recording(FakeSession):
+            async def send_realtime_input(self, audio=None, **kw):
+                sent.append(audio.data)
+
+        self.agent(Recording(wrap_up())).run("p", max_call_s=30, no_answer_s=30, mute=lambda: True)
+        self.assertTrue(sent)
+        self.assertTrue(all(not any(block) for block in sent))
+
+    def test_a_raising_mute_hook_does_not_silence_the_call(self):
+        def boom():
+            raise RuntimeError("audio gone")
+
+        result = self.agent(FakeSession(wrap_up())).run("p", max_call_s=30, no_answer_s=30, mute=boom)
+        self.assertEqual(result.ended_by, "end_call")
 
 
 class EndingTests(_Base):

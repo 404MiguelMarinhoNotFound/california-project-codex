@@ -133,6 +133,12 @@ def _outcome_too_early(result: "CallResult", status: str) -> str:
         return "Too early: you have not spoken yet. Greet them and have the conversation first."
     if status in _UNANSWERED_STATUSES:
         return ""
+    if status == "message_delivered" and result.heard_them:
+        # They picked up ("Olá") and she said the message: that IS delivered.
+        # Demanding a reply after it left her in dead air after her goodbye,
+        # refused ten times in five seconds, until the callee hung up
+        # (2026-10-07, 21:15).
+        return ""
     first = next(i for i, l in enumerate(result.lines) if l.who == "california" and l.text.strip())
     replied = any(l.who == "them" and l.text.strip() for l in result.lines[first + 1:])
     if not replied:
@@ -305,6 +311,7 @@ class GeminiLiveAgent:
         still_connected: Callable[[], bool | None] | None = None,
         stop: threading.Event | None = None,
         dial: Callable[[], bool] | None = None,
+        mute: Callable[[], bool] | None = None,
     ) -> CallResult:
         """
         Blocking: one call, start to finish. Never raises.
@@ -312,11 +319,16 @@ class GeminiLiveAgent:
         `dial` runs once the session is connected and the loopback is
         listening, so a callee who answers on the first ring is not talking
         into nothing. It returns False when the call did not go out.
+
+        `mute` is True while California is talking to the room: the loopback
+        hears the laptop speakers, so without it her room voice reaches the
+        call agent as if the callee said it (seen 2026-10-07: "looks like it
+        didn't go through" transcribed as theirs). Muted blocks go as silence.
         """
         result = CallResult()
         started = time.monotonic()
         try:
-            asyncio.run(self._run(prompt, max_call_s, no_answer_s, still_connected, stop or threading.Event(), dial, result))
+            asyncio.run(self._run(prompt, max_call_s, no_answer_s, still_connected, stop or threading.Event(), dial, result, mute))
         except Exception as exc:  # the call must always come back with a result
             logger.exception("Call agent failed")
             result.ended_by = result.ended_by or "error"
@@ -324,7 +336,7 @@ class GeminiLiveAgent:
         result.duration_s = round(time.monotonic() - started, 1)
         return result
 
-    async def _run(self, prompt, max_call_s, no_answer_s, still_connected, stop, dial, result: CallResult) -> None:
+    async def _run(self, prompt, max_call_s, no_answer_s, still_connected, stop, dial, result: CallResult, mute=None) -> None:
         loop = asyncio.get_running_loop()
         audio_in: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
         finished = asyncio.Event()
@@ -336,6 +348,13 @@ class GeminiLiveAgent:
             finished.set()
 
         def on_block(pcm: bytes) -> None:
+            try:
+                muted = mute is not None and mute() is True
+            except Exception:
+                muted = False  # never let it kill the capture thread
+            if muted:
+                pcm = bytes(len(pcm))
+
             def put():
                 if audio_in.full():
                     audio_in.get_nowait()  # stale audio is worthless; keep it live
