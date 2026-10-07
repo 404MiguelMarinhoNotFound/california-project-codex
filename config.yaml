@@ -998,3 +998,54 @@ whatsapp:
   aliases: {}
     # the landlord: "Joao Silva"
     # mum: {contact: "Maria Silva", prefer: "+351"}
+
+# ============================================================
+# PHONE CALLS (control_phone) -- from Master Miguel's own number
+# ============================================================
+# California places the call through Phone Link (Bluetooth hands-free to his
+# Android) and a Gemini Live session holds the conversation in Portuguese.
+# Her voice reaches the call through VB-CABLE: the default Windows mic is
+# switched to the cable for the length of the call and restored after, and the
+# other side is heard through a loopback of the laptop speakers. See
+# CLAUDE.md "PhoneService". Needs Gemini credentials (see backend) and
+# `uv sync --extra default` (the phone extra). Windows only.
+phone:
+  enabled: true
+  owner_name: "Miguel"
+  # Read out if they ask for a contact number. Empty = "the number I'm calling from".
+  callback_number: ""
+  # Where the call agent runs. "vertex" bills the Google Cloud project, so the
+  # project's credits apply. "ai_studio" bills AI Studio's own prepaid balance,
+  # which is separate (it answered "prepayment credits are depleted" on
+  # 2026-10-06 while the Cloud credits were untouched).
+  backend: "vertex"
+  vertex:
+    # The Google Cloud project id (not the name). Can also come from
+    # GOOGLE_CLOUD_PROJECT. Credentials: GOOGLE_APPLICATION_CREDENTIALS (a
+    # service account key file) in .env, or VERTEX_API_KEY for express mode.
+    project: "project-65ef5b79-5402-4096-a93"
+    location: "us-central1"
+    model: "gemini-live-2.5-flash-native-audio"
+  # backend: ai_studio only. The cheapest Live model there: the same audio
+  # price as gemini-3.8-live ($3 in / $12 out per 1M tokens) and lower text
+  # prices. ~$0.03-0.05 for a three-minute call.
+  model: "gemini-2.5-flash-native-audio-latest"
+  voice: "Aoede"
+  # Empty lets the native-audio model pick the language from the prompt and
+  # the other side (it speaks Portuguese, and English if they do).
+  language_code: ""
+  max_call_s: 300           # hard cap per call
+  no_answer_s: 45           # nobody spoke this long after dialling -> hang up
+  # Gemini's end-of-turn silence. Restaurants read times and numbers out with
+  # pauses; under ~500ms she starts talking over them.
+  silence_duration_ms: 700
+  confirm_timeout_ms: 120000
+  default_country: "351"
+  allowed_country_codes: ["351"]
+  # Where her voice goes (an output device name prefix), and the Windows
+  # recording endpoint Phone Link must use as its microphone.
+  cable_output_device: "CABLE Input"
+  cable_mic_endpoint: "CABLE Output (VB-Audio Virtual Cable)"
+  # One line per call: outcome and, unless logging.include_transcripts is
+  # false, both sides of the conversation.
+  log_path: "logs/calls.jsonl"

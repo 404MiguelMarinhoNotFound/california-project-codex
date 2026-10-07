@@ -309,6 +309,61 @@ CONTROL_WHATSAPP_TOOL_OPENAI = {
     }
 }
 
+CONTROL_PHONE_TOOL = {
+    "name": "control_phone",
+    "description": (
+        "Places a real phone call from Master Miguel's own mobile number and has "
+        "the conversation for him, in Portuguese, then reports back. phone_call "
+        "takes a brief: `to` (who, as he said it). People are looked up in his "
+        "contacts by `to`, so pass no number for a person. For a business "
+        "(restaurant, clinic, shop), web search its number first, near Carcavelos "
+        "unless he names a place, and pass it as `number`. `kind`: book_table, "
+        "book_appointment (clinic, hairdresser, garage), ask_question, "
+        "deliver_message, personal (a friend or family: invite, make plans), "
+        "general. `goal`, `details` (day, time, party size, the name to book under, "
+        "the exact question or message), `may_agree` (sensible defaults: about 30 "
+        "min either side of the time, inside or terrace) and `must_not` (always a "
+        "deposit or card details). Ask him only for what the call cannot do "
+        "without, like the day, the time or how many; never invent it. The first "
+        "phone_call always comes back with a read-back and does NOT call: say it "
+        "to him and only repeat the same call with confirm true once he says go. "
+        "The call then runs in the background; say you are calling and that you "
+        "will tell him how it went. The result arrives later as a [Phone call "
+        "report] message. phone_status says whether a call is going on."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["phone_call", "phone_status"]},
+            "to": {"type": "string", "description": "Who to call: a contact name as spoken, a business name, or a number."},
+            "number": {"type": "string", "description": "The phone number, when known. Digits, optional +."},
+            "kind": {
+                "type": "string",
+                "enum": ["book_table", "book_appointment", "ask_question", "deliver_message", "personal", "general"],
+                "description": "The kind of call.",
+            },
+            "goal": {"type": "string", "description": "What the call must get done, in one sentence."},
+            "details": {"type": "string", "description": "The facts the call needs."},
+            "may_agree": {"type": "string", "description": "What she may accept on his behalf, e.g. any time 19:30-21:00, inside or terrace."},
+            "must_not": {"type": "string", "description": "What she must never accept, e.g. a deposit, another day."},
+            "confirm": {
+                "type": "boolean",
+                "description": "Only true when Master Miguel has just said go to the read-back. Never true on a first attempt.",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+CONTROL_PHONE_TOOL_OPENAI = {
+    "type": "function",
+    "function": {
+        "name": CONTROL_PHONE_TOOL["name"],
+        "description": CONTROL_PHONE_TOOL["description"],
+        "parameters": CONTROL_PHONE_TOOL["input_schema"],
+    }
+}
+
 # Tools this project dispatches locally via tool_handler. Claude's built-in
 # web_search also arrives as a tool_use block but is executed server-side, so
 # the dispatch loop must check membership here rather than block.type alone.
@@ -317,6 +372,7 @@ LOCAL_TOOL_NAMES = {
     CONTROL_LIGHTS_TOOL["name"],
     CONTROL_VACUUM_TOOL["name"],
     CONTROL_WHATSAPP_TOOL["name"],
+    CONTROL_PHONE_TOOL["name"],
 }
 
 
@@ -406,6 +462,11 @@ class LLMService:
             for key, value in load_alias_config(whatsapp_cfg).items()
             if str(key).strip() and str(value or "").strip()
         ]
+
+        # Phone calls (control_phone). Gated on config like the others; the
+        # service self-disables without its key or Phone Link and then answers
+        # "aren't set up" rather than disappearing from the model.
+        self.phone_enabled = bool((config.get("phone", {}) or {}).get("enabled", False))
 
         # Saved YouTube playlist categories, injected for the same reason as the
         # lights: "what playlists do you know" is an inventory question, and the
@@ -710,6 +771,13 @@ class LLMService:
                 "description": CONTROL_WHATSAPP_TOOL["description"],
                 "input_schema": CONTROL_WHATSAPP_TOOL["input_schema"],
             })
+        if self.phone_enabled:
+            tools.append({
+                "type": "custom",
+                "name": CONTROL_PHONE_TOOL["name"],
+                "description": CONTROL_PHONE_TOOL["description"],
+                "input_schema": CONTROL_PHONE_TOOL["input_schema"],
+            })
 
         messages = list(self.history)
 
@@ -805,6 +873,8 @@ class LLMService:
             tools_arg.append(CONTROL_VACUUM_TOOL_OPENAI)
         if self.whatsapp_enabled:
             tools_arg.append(CONTROL_WHATSAPP_TOOL_OPENAI)
+        if self.phone_enabled:
+            tools_arg.append(CONTROL_PHONE_TOOL_OPENAI)
 
         while True:
             create_kwargs = dict(
