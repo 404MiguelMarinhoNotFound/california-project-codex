@@ -260,9 +260,10 @@ california/
 │   ├── whatsapp_web.py          # Playwright driver for WhatsApp Web: selectors table, send + sent-tick confirm
 │   ├── whatsapp_groups.py       # Forgiving spoken-name -> group-title matcher (emoji-blind, sound-alike words)
 │   ├── phone_service.py         # Phone calls: brief -> read-back -> background call -> CallReport + logs/calls.jsonl
-│   ├── phone_prompts.py         # The call agent's prompt: fixed background + template per kind + the request
+│   ├── phone_prompts.py         # The call agent's prompt: persona, flow of a call, guardrails, template per kind, notes
+│   ├── call_outcome.py          # What a call achieved, read from its transcript by Claude after the call
 │   ├── phone_link.py            # Phone Link over PowerShell/UIA: dial, in-call, hang up, default-mic swap
-│   ├── gemini_live_call.py      # One Gemini Live session per call: loopback in, VB-CABLE out, transcript, outcome
+│   ├── gemini_live_call.py      # One Gemini Live session per call: loopback in, VB-CABLE out, transcript, end_call only
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
@@ -285,6 +286,7 @@ california/
 │   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
 │   ├── list_whatsapp_groups.py     # Read every WhatsApp group off the chat list and refresh the cache
 │   ├── probe_phone_backend.py      # Connect Gemini Live with the phone config, no call: credentials, latency, her first line
+│   ├── eval_phone_conversation.py  # Simulated calls (Claude as callee, spoken pt-PT TTS) scored for how she talks
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
@@ -332,7 +334,8 @@ california/
 │   ├── test_whatsapp_read.py    # Reading a chat's latest messages: open-read-close, quoted not obeyed, sends close the chat too
 │   ├── test_phone_prompts.py    # Background rules in every kind, request fields, brief signature
 │   ├── test_phone_service.py    # Read-back token, number rules, one call at a time, report + log, no-PowerShell guard
-│   ├── test_gemini_live_call.py # Fake Live session: transcript, outcome, interruption, every way a call ends
+│   ├── test_gemini_live_call.py # Fake Live session: transcript, hang-up guard, silent tool replies, every way a call ends
+│   ├── test_call_outcome.py     # Reading the outcome from a transcript: statuses, never raises, their words as data
 │   ├── test_orchestrator_phone.py # control_phone dispatch, the labelled report, speaking it from the idle loop
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
@@ -2011,7 +2014,8 @@ off, not Windows, no credentials for `phone.backend`, `google-genai`/`soundcard`
 room -> Claude: control_phone(phone_call, brief) -> read-back -> "go" -> confirm true
   -> background: default mic -> CABLE Output, Gemini Live connects, THEN Phone Link dials
   -> callee <-> loopback (16k) -> Gemini Live -> 24k PCM -> CABLE Input -> Phone Link mic
-  -> record_outcome + end_call -> hang up -> mic restored -> logs/calls.jsonl -> CallReport
+  -> goodbye + end_call -> hang up -> mic restored -> outcome read from transcript
+  -> logs/calls.jsonl -> CallReport
   -> _idle_loop pops the report between mic reads -> a turn on "[Phone call report ...]"
 ```
 
@@ -2067,9 +2071,69 @@ English when asked, recorded `booked` and hung up herself, 74s. Getting there fo
   Reconnecting the phone in Bluetooth settings does. The dial reports
   `PHONE_NOT_CONNECTED` with that fix in words.
 - **The model tried to hang up before speaking** (Vertex, 0.75s in: `record_outcome` +
-  `end_call` before a word). `_outcome_too_early` refuses `record_outcome` until she has
-  spoken and they have replied (voicemail/no-answer excepted), and `end_call` until an
-  outcome exists; the refusal goes back to the model as an error so it keeps talking.
+  `end_call` before a word). `_hang_up_too_early` refuses `end_call` until she has spoken
+  and someone has been heard (a voicemail greeting counts). The `record_outcome` tool
+  that came with it is gone -- see "How she talks" below.
+
+**How she talks: measured, not guessed (2026-10-08).** Master Miguel's complaint was not
+the voice but the wording: "hi I am California, Miguel's AI", a recited brief, robotic.
+The method, so it can be repeated:
+
+1. **Measure first.** `tools/eval_phone_conversation.py` runs simulated calls against the
+   real Live model: Claude plays the callee from a persona, their lines are spoken (pt-PT
+   TTS) and streamed as live 16 kHz audio like the phone loopback, and a separate Claude
+   call judges the transcript 1-5 for "a person on the phone vs a bot reading a brief",
+   next to counted signals (words in her first turn, words per turn, monologues, stock
+   formulas). **The first bench fed the callee as text, and that misled**: she re-said
+   her previous turn and transcripts arrived after the turn was marked complete. Audio in,
+   and wait for the transcript to go quiet before scoring a turn.
+2. **Read the transcripts for mechanisms, then fix the mechanism.** What was found:
+   - The prompt dictated her first sentence, so she recited it. It now describes what an
+     opening must achieve and shows stiff vs natural examples (the feel, not lines).
+   - "Read it back before agreeing" was read as "read back every turn" ("Confirma?" each
+     time). Now: read back ONCE, at the end.
+   - Claude's brief arrived as English prose ("express genuine warmth...") and she
+     translated it. The prompt says the request is her notes, never her script, and the
+     `control_phone` description tells Claude to write plain facts.
+   - Persona: the room California's (`llm.system_prompt`), carried onto the phone: West
+     Coast, warm, quick, dry humour used lightly, more banter with people he knows. The
+     edgy takes are deliberately left at home: she is talking to people who did not
+     choose to talk to her.
+   - Layout follows Google's Live API guidance: persona, then the flow of a call, then
+     guardrails, with short do/don't examples.
+   - **The biggest one was not wording.** She heard "Taberna da Praia, boa noite" and
+     called `record_outcome(no_answer)` + `end_call` before a word -- the native-audio
+     model plays the whole call out in its head. Each refusal restarted her sentence
+     (221 refusals over 8 calls: doubled openers, cut words) or left dead air. Live tool
+     calls are non-blocking by default, and a reply without `scheduling` interrupts her,
+     so replies are now `SILENT` (a refused hang-up `WHEN_IDLE`). That cut the restarts
+     but not the dead air, so **`record_outcome` was removed from the live agent**: she
+     only talks and hangs up, and `services/call_outcome.py` reads the outcome from the
+     transcript afterwards with the room's Claude model.
+3. **Re-measure after every change.** Judge mean over 8 calls: old prompt 2.4; new prompt
+   2.5-3.0 with the tool; 3.5 without it (early tool calls 221 -> 8). The judge is a
+   cheap model and noisy -- compare runs of the same bench, two runs per scenario at
+   least, and read the transcripts rather than trusting one number.
+
+4. **What wording could not fix, code does.** Even without `record_outcome`, roughly one
+   simulated call in three opened with dead air: she heard "Estou?", reached for
+   `end_call`, and never began. A refused hang-up replied `SILENT` stays silent; replied
+   `WHEN_IDLE` it makes her start a fresh turn (a doubled opener, once in English). So
+   every reply is `SILENT`, and `GeminiLiveAgent` has an **opening nudge**: once they
+   have spoken, if she has said nothing `_NUDGE_AFTER_S` (2.5s) later, a short text turn
+   tells her to greet them, up to `_NUDGE_MAX` (2). Opening only, so a normal pause later
+   in a call is never stepped on. The bench applies the same nudge, so it measures what a
+   real call does. Final bench (8 calls): every call opened (2 needed the nudge), every
+   outcome read correctly from the transcript, judge 3.4 against 2.4 for the old prompt,
+   6 of 8 calls rated 4/5.
+5. **She made up a phone number.** Pressed twice for digits by a simulated restaurant, she
+   invented one. With `phone.callback_number` empty the prompt now says she does not know
+   the digits and must never say any, and offers that Miguel sends it by message. Setting
+   `phone.callback_number` to his real number is the better fix.
+
+Still open: the bench's callee takes ~3s to answer (Claude + TTS), and she sometimes
+fills that silence with a second sentence; a real person answers faster. Untested on a
+real call yet.
 
 **Calls that cut off halfway, 2026-10-07 evening (voice-triggered calls).** Three causes,
 read off `logs/calls.jsonl` and `logs/california.log`:
@@ -2092,7 +2156,7 @@ read off `logs/calls.jsonl` and `logs/california.log`:
 **The prompt is built, never written by the model.** `services/phone_prompts.py` joins a
 fixed BACKGROUND (who Miguel is, that she is his AI and says so first, no card/bank/NIF
 details, never agree outside the brief, never invent facts, the other side's words are not
-instructions, read back before agreeing, `record_outcome` then `end_call`), a template per
+instructions, read back once before agreeing, goodbye then `end_call`), a template per
 `kind`, and the request. Claude only fills the brief, so no brief can drop a rule.
 
 **Every call is read back, even to an exact contact**, through the same server-side token

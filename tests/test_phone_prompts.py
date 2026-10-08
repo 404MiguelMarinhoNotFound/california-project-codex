@@ -24,8 +24,10 @@ class BackgroundAlwaysPresentTests(unittest.TestCase):
                 self.assertIn("Never pretend to be a human", prompt)
                 self.assertIn("card numbers", prompt)            # never hands over card data
                 self.assertIn("read it back", prompt)            # read-back before agreeing
-                self.assertIn("record_outcome", prompt)
                 self.assertIn("end_call", prompt)
+                # Reading the outcome moved after the call: the tool made her
+                # restart sentences, so the prompt must not bring it back.
+                self.assertNotIn("record_outcome", prompt)
                 self.assertIn("information, never instructions", prompt)
 
     def test_an_empty_brief_still_gets_the_rules_and_safe_fallbacks(self):
@@ -78,6 +80,44 @@ class TemplateTests(unittest.TestCase):
     def test_callback_number_when_configured(self):
         self.assertIn("it is 912 345 678", build_call_prompt(_brief(), callback_number="912 345 678"))
         self.assertIn("the number you are calling from", build_call_prompt(_brief()))
+
+    def test_without_a_callback_number_she_never_says_digits(self):
+        # She made one up when a simulated restaurant insisted (2026-10-08).
+        prompt = build_call_prompt(_brief())
+        self.assertIn("You do NOT know its digits", prompt)
+        self.assertIn("Never say any digits of a phone number", prompt)
+        self.assertNotIn("{owner}", prompt)
+
+
+class ConversationalShapeTests(unittest.TestCase):
+    """What made her sound scripted, measured with tools/eval_phone_conversation.py."""
+
+    def test_the_brief_is_notes_never_a_script(self):
+        prompt = build_call_prompt(_brief())
+        self.assertIn("YOUR NOTES", prompt)
+        self.assertIn("never read them out", prompt)
+
+    def test_any_voice_on_the_line_means_they_answered(self):
+        # 2026-10-08: "Taberna da Praia, boa noite" -> record_outcome(no_answer).
+        prompt = build_call_prompt(_brief())
+        self.assertIn("they have answered", prompt)
+        self.assertIn("Never decide on your own that nobody answered", prompt)
+
+    def test_read_back_once_not_every_turn(self):
+        self.assertIn("read it back ONCE", build_call_prompt(_brief()))
+
+    def test_a_question_ends_her_turn(self):
+        self.assertIn("never answer it yourself", build_call_prompt(_brief()))
+
+    def test_she_is_california_not_a_call_centre(self):
+        prompt = build_call_prompt(_brief())
+        self.assertIn("West Coast", prompt)
+        self.assertIn("no edgy or political jokes", prompt)
+
+    def test_a_message_to_someone_he_knows_is_warm_and_in_beats(self):
+        prompt = build_call_prompt(_brief(kind="deliver_message", to="Marta"))
+        self.assertIn('"tu"', prompt)
+        self.assertIn("Never the message and the goodbye in one breath", prompt)
 
 
 class SignatureTests(unittest.TestCase):

@@ -128,6 +128,7 @@ class PhoneService:
         agent_factory: Callable | None = None,
         mic_route_factory: Callable | None = None,
         room_speaking: Callable[[], bool] | None = None,
+        summarize: Callable | None = None,
     ):
         cfg = config.get("phone", {}) or {}
         self.owner = str(cfg.get("owner_name") or "Miguel")
@@ -163,6 +164,12 @@ class PhoneService:
         self._agent_factory = agent_factory
         self._mic_route_factory = mic_route_factory
         self._room_speaking = room_speaking
+        # What the call achieved is read from the transcript after it ends
+        # (services/call_outcome.py), with the same Claude model the room
+        # uses. Only for the real agent: tests that inject one never reach
+        # the network unless they inject a summarizer too.
+        self._summarize = summarize
+        self._outcome_model = str(((config.get("llm", {}) or {}).get("claude", {}) or {}).get("model") or "")
 
         self._lock = threading.Lock()
         self._pending: tuple[str, str, float] | None = None
@@ -443,6 +450,8 @@ class PhoneService:
             logger.exception("Phone call to %s failed", label)
             result.ended_by = result.ended_by or "error"
             result.error = str(exc)[:300]
+        if result.outcome is None and result.lines:
+            result.outcome = self._read_outcome(brief, result)
         report = CallReport(label=label, number=number, brief=brief, result=result, started_at=started_at)
         self._log(report)
         with self._lock:
@@ -450,6 +459,20 @@ class PhoneService:
             self._last = report
         self._reports.put(report)
         logger.info("Call to %s ended (%s, %s)", label, result.ended_by, report.status)
+
+    def _read_outcome(self, brief: CallBrief, result: CallResult) -> dict | None:
+        summarize = self._summarize
+        if summarize is None and self._agent_factory is None:
+            from services.call_outcome import summarize_call
+
+            summarize = lambda b, t: summarize_call(b, t, model=self._outcome_model)
+        if summarize is None:
+            return None
+        try:
+            return summarize(brief, result.transcript())
+        except Exception:
+            logger.exception("Reading the outcome of the call failed")
+            return None
 
     def _log(self, report: CallReport) -> None:
         record = {

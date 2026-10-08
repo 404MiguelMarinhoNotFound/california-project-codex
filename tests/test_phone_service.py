@@ -230,6 +230,38 @@ class NumberTests(_Base):
                 self.assertEqual(result.message, "I won't call that number myself.")
 
 
+class OutcomeAfterTheCallTests(_Base):
+    """The live agent no longer reports an outcome; it is read from the transcript."""
+
+    def _talked(self):
+        return FakeAgent(CallResult(lines=[CallLine("them", "Estou?"), CallLine("california", "Olá!")],
+                                    ended_by="end_call"))
+
+    def test_the_transcript_is_read_when_the_agent_reported_nothing(self):
+        self.agent = self._talked()
+        svc = self._svc()
+        svc._summarize = mock.Mock(return_value={"status": "booked", "details": "Fri", "summary": "Booked."})
+        self._place(svc)
+        report = svc.pop_report()
+        self.assertEqual(report.status, "booked")
+        brief, transcript = svc._summarize.call_args.args
+        self.assertIn("Them: Estou?", transcript)
+
+    def test_a_failing_reader_leaves_the_outcome_unknown(self):
+        self.agent = self._talked()
+        svc = self._svc()
+        svc._summarize = mock.Mock(side_effect=RuntimeError("down"))
+        self._place(svc)
+        self.assertEqual(svc.pop_report().status, "unknown")
+
+    def test_tests_with_an_injected_agent_never_reach_claude(self):
+        self.agent = self._talked()
+        svc = self._svc()
+        with mock.patch("services.call_outcome.summarize_call", side_effect=AssertionError("network")):
+            self._place(svc)
+        self.assertEqual(svc.pop_report().status, "unknown")
+
+
 class CallLifecycleTests(_Base):
     def test_one_call_at_a_time(self):
         svc = self._svc()

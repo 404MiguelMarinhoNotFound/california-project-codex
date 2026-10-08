@@ -43,6 +43,19 @@ _WATCH_INTERVAL_S = 2.0
 _GOODBYE_DRAIN_S = 8.0
 # Minimum wait after end_call before trusting speaker.idle().
 _GOODBYE_GRACE_S = 0.8
+# The opening nudge. Measured 2026-10-08 on simulated calls: in roughly one
+# call in three the native-audio model heard "Estou?" and never began -- it
+# reaches for end_call instead, and however the refusal is delivered it either
+# stays silent (SILENT) or repeats its opener (WHEN_IDLE). Prompt wording did
+# not fix it, so this does: if they have spoken and she has not said a word
+# this long after their last words, she is told to speak. Opening only, so a
+# normal pause later in the call is never stepped on. Up to _NUDGE_MAX times.
+_NUDGE_AFTER_S = 2.5
+_NUDGE_MAX = 2
+_NUDGE_TEXT = (
+    "[The call has been answered and they are waiting for you. Greet them and "
+    "say why you are calling, now, in their language.]"
+)
 
 OUTCOME_STATUSES = [
     "booked",
@@ -56,32 +69,24 @@ OUTCOME_STATUSES = [
     "failed",
 ]
 
+# The live agent has ONE tool: hang up. It used to have record_outcome too, and
+# that tool was the single biggest cause of her sounding broken. Measured with
+# tools/eval_phone_conversation.py on 2026-10-08: the native-audio model calls
+# record_outcome + end_call the instant it hears "Taberna da Praia, boa noite",
+# before a word of its own -- it plays the whole call out in its head. Refusing
+# those calls made her restart her sentence (221 refusals over 8 calls) or go
+# silent; replying SILENTLY cut the restarts but not the dead air. With the
+# tool removed: 8 early refusals instead of 221, every call ran to a natural
+# end, and the transcript judge went from 2.4 (old prompt) to 3.5. What the
+# call achieved is now read from the transcript AFTER the call, by
+# services/call_outcome.py, which is a text task and does not need the voice.
 TOOL_DECLARATIONS = [
     {
-        "name": "record_outcome",
-        "description": (
-            "Record what this call achieved. Call it once, before saying goodbye, "
-            "with what was actually agreed or learned."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "status": {"type": "STRING", "enum": OUTCOME_STATUSES},
-                "details": {
-                    "type": "STRING",
-                    "description": "The facts: day, time, number of people, name, price, the answer to the question.",
-                },
-                "summary": {
-                    "type": "STRING",
-                    "description": "One sentence in English for Miguel saying how the call went.",
-                },
-            },
-            "required": ["status", "summary"],
-        },
-    },
-    {
         "name": "end_call",
-        "description": "Hang up. Call it right after your goodbye.",
+        "description": (
+            "Hang up. Only after you have said goodbye out loud and they have said "
+            "goodbye too (on voicemail: after your message)."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {"reason": {"type": "STRING"}},
@@ -114,36 +119,38 @@ class CallResult:
         return text if len(text) <= max_chars else "...\n" + text[-max_chars:]
 
 
-# Outcomes that legitimately happen with nobody replying to her.
-_UNANSWERED_STATUSES = {"voicemail", "no_answer", "failed"}
-
-
-def _outcome_too_early(result: "CallResult", status: str) -> str:
+def _hang_up_too_early(result: "CallResult") -> str:
     """
-    Why record_outcome must be refused right now, or "" if it may stand.
+    Why end_call must be refused right now, or "" if she may hang up.
 
     Found live 2026-10-07 on Vertex: given the callee's "Estou?", the model
-    called record_outcome AND end_call 0.75s in, before saying a word, and
-    only then started its greeting. On a real call that hangs up on the
-    restaurant. The prompt already says otherwise; this is the guarantee. A
-    refused call goes back to the model as an error, so it carries on talking.
+    hung up 0.75s in, before saying a word. So she must have spoken, and
+    someone must have been heard -- their "Estou?" or a voicemail greeting
+    both count, so a left message can still end the call. Whether the call
+    was answered by nobody at all is the watchdog's job (`no_answer_s`), never
+    the model's.
     """
-    she_spoke = any(l.who == "california" and l.text.strip() for l in result.lines)
-    if not she_spoke:
+    if not any(l.who == "california" and l.text.strip() for l in result.lines):
         return "Too early: you have not spoken yet. Greet them and have the conversation first."
-    if status in _UNANSWERED_STATUSES:
-        return ""
-    if status == "message_delivered" and result.heard_them:
-        # They picked up ("Olá") and she said the message: that IS delivered.
-        # Demanding a reply after it left her in dead air after her goodbye,
-        # refused ten times in five seconds, until the callee hung up
-        # (2026-10-07, 21:15).
-        return ""
-    first = next(i for i, l in enumerate(result.lines) if l.who == "california" and l.text.strip())
-    replied = any(l.who == "them" and l.text.strip() for l in result.lines[first + 1:])
-    if not replied:
-        return "Too early: they have not answered you yet. Wait for their reply."
+    if not result.heard_them:
+        return "Too early: nobody has spoken on the line yet. Wait for them."
     return ""
+
+
+# How a tool reply is delivered. Live API tool calls are non-blocking by
+# default (Google's async function calling docs), and a reply with no
+# `scheduling` is handled the old way, which interrupts her: measured on
+# 2026-10-08, 8 simulated calls produced 221 refused record_outcome calls, and
+# each refusal made her restart her sentence ("...É possível?Boa noite! Fala a
+# Califórnia..."). SILENT lets her keep talking and use the reply later.
+# Every reply is SILENT, refused hang-ups included: a refusal only ever happens
+# at the start of a call, and WHEN_IDLE made the model start a fresh turn when
+# she paused -- a doubled opener, once in English ("Let me check").
+_SILENT = "SILENT"
+
+
+def _reply(call, response: dict, scheduling: str) -> dict:
+    return {"id": call.id, "name": call.name, "response": response, "scheduling": scheduling}
 
 
 # ----------------------------------------------------------------- audio I/O
@@ -365,6 +372,8 @@ class GeminiLiveAgent:
         def add_line(who: str, text: str) -> None:
             if not text:
                 return
+            if who == "them":
+                clock["them_at"] = time.monotonic()
             if result.lines and result.lines[-1].who == who:
                 result.lines[-1].text += text
             else:
@@ -418,7 +427,28 @@ class GeminiLiveAgent:
                             if connected is False:
                                 finish("hung_up")
 
-                tasks = [asyncio.create_task(t()) for t in (send_audio, receive, watch)]
+                async def opening_nudge():
+                    # See _NUDGE_AFTER_S.
+                    nudges = 0
+                    while not finished.is_set() and nudges < _NUDGE_MAX:
+                        await asyncio.sleep(0.25)
+                        if any(l.who == "california" and l.text.strip() for l in result.lines):
+                            return
+                        them_at = clock.get("them_at")
+                        if them_at is None or time.monotonic() - them_at < _NUDGE_AFTER_S:
+                            continue
+                        nudges += 1
+                        logger.info("Call agent: they spoke and she has not; nudge %d", nudges)
+                        try:
+                            await session.send_client_content(
+                                turns={"role": "user", "parts": [{"text": _NUDGE_TEXT}]}, turn_complete=True
+                            )
+                        except Exception as exc:  # a failed nudge must never end the call
+                            logger.warning("Call agent: nudge failed (%s)", exc)
+                            return
+                        clock["them_at"] = time.monotonic()  # give her the full wait again
+
+                tasks = [asyncio.create_task(t()) for t in (send_audio, receive, watch, opening_nudge)]
 
                 def task_died(task: asyncio.Task) -> None:
                     # A dropped Live session kills receive/send with an
@@ -470,32 +500,16 @@ class GeminiLiveAgent:
         responses = []
         end = False
         for call in calls:
-            args = dict(getattr(call, "args", None) or {})
-            if call.name == "record_outcome":
-                status = str(args.get("status") or "")
-                status = status if status in OUTCOME_STATUSES else "failed"
-                too_early = _outcome_too_early(result, status)
+            if call.name == "end_call":
+                too_early = _hang_up_too_early(result)
                 if too_early:
-                    logger.info("Call agent: record_outcome(%s) refused, %s", status, too_early)
-                    responses.append({"id": call.id, "name": call.name, "response": {"error": too_early}})
-                    continue
-                result.outcome = {
-                    "status": status,
-                    "details": str(args.get("details") or ""),
-                    "summary": str(args.get("summary") or ""),
-                }
-                responses.append({"id": call.id, "name": call.name, "response": {"ok": True}})
-            elif call.name == "end_call":
-                if result.outcome is None:
-                    logger.info("Call agent: end_call refused, no outcome recorded")
-                    responses.append({"id": call.id, "name": call.name, "response": {
-                        "error": "Not yet: the call has no outcome. Keep talking to them; call "
-                                 "record_outcome once something is agreed or learned, then end_call."}})
+                    logger.info("Call agent: end_call refused, %s", too_early)
+                    responses.append(_reply(call, {"error": too_early}, _SILENT))
                     continue
                 end = True
-                responses.append({"id": call.id, "name": call.name, "response": {"ok": True}})
+                responses.append(_reply(call, {"ok": True}, _SILENT))
             else:
-                responses.append({"id": call.id, "name": call.name, "response": {"error": "unknown tool"}})
+                responses.append(_reply(call, {"error": "unknown tool"}, _SILENT))
         await session.send_tool_response(function_responses=responses)
         if end:
             finish("end_call")

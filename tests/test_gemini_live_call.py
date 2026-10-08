@@ -41,11 +41,11 @@ def tool(name, **args):
 
 
 def wrap_up():
-    """A realistic close: she spoke, they answered, outcome, then hang up."""
+    """A realistic close: she spoke, they answered, she said goodbye and hung up."""
     return [
         [said("Boa noite, fala a California.")],
         [heard("Sim, diga.")],
-        [tool("record_outcome", status="answered", summary="ok")],
+        [said(" Obrigada, boa noite!")],
         [tool("end_call")],
     ]
 
@@ -57,12 +57,16 @@ class FakeSession:
         self.batches = list(batches)
         self.sent_audio = 0
         self.tool_responses = []
+        self.nudges = []
 
     async def send_realtime_input(self, audio=None, **kw):
         self.sent_audio += 1
 
     async def send_tool_response(self, function_responses):
         self.tool_responses.append(function_responses)
+
+    async def send_client_content(self, turns=None, turn_complete=False):
+        self.nudges.append(turns["parts"][0]["text"])
 
     async def receive(self):
         if not self.batches:
@@ -126,7 +130,7 @@ class FakeSpeaker:
 
 class _Base(unittest.TestCase):
     def setUp(self):
-        for name, value in (("_WATCH_INTERVAL_S", 0.02), ("_GOODBYE_GRACE_S", 0.05)):
+        for name, value in (("_WATCH_INTERVAL_S", 0.02), ("_GOODBYE_GRACE_S", 0.05), ("_NUDGE_AFTER_S", 0.3)):
             patcher = mock.patch.object(glc, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -149,20 +153,18 @@ class ConversationTests(_Base):
             [heard("Estou"), heard("?")],
             [said("Boa noite, aqui é a California, "), said("assistente do Miguel."), audio(b"pcm1")],
             [heard("Só temos às nove e meia.")],
-            [tool("record_outcome", status="alternative_agreed", details="sexta 21:30, 4", summary="Got 21:30 on Friday.")],
             [tool("end_call", reason="done")],
         ])
         result = self.agent(session).run("prompt", max_call_s=30, no_answer_s=30)
         self.assertEqual(result.ended_by, "end_call")
-        self.assertEqual(result.outcome["status"], "alternative_agreed")
-        self.assertEqual(result.outcome["summary"], "Got 21:30 on Friday.")
+        self.assertIsNone(result.outcome)  # read from the transcript after the call
         self.assertEqual([(l.who, l.text) for l in result.lines], [
             ("them", "Estou?"),
             ("california", "Boa noite, aqui é a California, assistente do Miguel."),
             ("them", "Só temos às nove e meia."),
         ])
         self.assertEqual(self.speaker.written, [b"pcm1"])
-        self.assertEqual(len(self.session.tool_responses), 2)
+        self.assertEqual(len(self.session.tool_responses), 1)
         self.assertTrue(self.capture.stopped and self.speaker.stopped)
 
     def test_interruption_drops_queued_audio(self):
@@ -170,81 +172,116 @@ class ConversationTests(_Base):
         self.agent(session).run("p", max_call_s=30, no_answer_s=30)
         self.assertEqual(self.speaker.flushes, 1)
 
-    def test_an_invented_status_is_recorded_as_failed(self):
-        session = FakeSession([[said("Olá.")], [heard("Sim?")], [tool("record_outcome", status="sold_the_car", summary="x")], [tool("end_call")]])
-        result = self.agent(session).run("p", max_call_s=30, no_answer_s=30)
-        self.assertEqual(result.outcome["status"], "failed")
-
     def test_unknown_tool_is_answered_not_ignored(self):
-        session = FakeSession([[tool("transfer_money", amount=5)], *wrap_up()])
-        self.agent(session).run("p", max_call_s=30, no_answer_s=30)
-        self.assertEqual(self.session.tool_responses[0][0]["response"], {"error": "unknown tool"})
+        # record_outcome included: a model that remembers it gets an error, not a hang.
+        for name in ("transfer_money", "record_outcome"):
+            with self.subTest(name=name):
+                session = FakeSession([[tool(name, amount=5)], *wrap_up()])
+                self.agent(session).run("p", max_call_s=30, no_answer_s=30)
+                self.assertEqual(self.session.tool_responses[0][0]["response"], {"error": "unknown tool"})
 
-    def test_config_carries_prompt_voice_and_tools(self):
+    def test_config_carries_prompt_voice_and_only_the_hang_up_tool(self):
         self.agent(FakeSession(wrap_up())).run("THE PROMPT", max_call_s=30, no_answer_s=30)
         config = self.client.config
         self.assertEqual(config.system_instruction, "THE PROMPT")
         self.assertEqual(config.speech_config.voice_config.prebuilt_voice_config.voice_name, "Aoede")
         names = [f.name for f in config.tools[0].function_declarations]
-        self.assertEqual(names, ["record_outcome", "end_call"])
+        # record_outcome was removed on purpose: see TOOL_DECLARATIONS.
+        self.assertEqual(names, ["end_call"])
         self.assertEqual(config.realtime_input_config.automatic_activity_detection.silence_duration_ms, 700)
 
 
-class PrematureEndTests(_Base):
-    """Seen live on Vertex: record_outcome + end_call 0.75s in, before a word was said."""
+class ToolReplySchedulingTests(_Base):
+    """A tool reply must not interrupt her: refusals restarted her sentence (221 in 8 calls)."""
 
-    def test_outcome_and_hang_up_before_she_speaks_are_refused(self):
+    def test_every_reply_is_silent_refused_hang_ups_included(self):
         session = FakeSession([
             [heard("Estou?")],
-            [tool("record_outcome", status="booked", summary="booked")],
+            [tool("end_call")],                    # too early -> SILENT
+            [tool("transfer_money")],              # unknown -> SILENT
+            [said("Olá, fala a California.")], [heard("Diga.")],
+            [tool("end_call")],                    # allowed -> SILENT
+        ])
+        self.agent(session).run("p", max_call_s=30, no_answer_s=30)
+        schedules = [r[0]["scheduling"] for r in self.session.tool_responses]
+        self.assertEqual(schedules, ["SILENT", "SILENT", "SILENT"])
+
+    def test_the_sdk_accepts_the_reply_shape(self):
+        from google.genai import types
+
+        from services.gemini_live_call import _reply
+
+        reply = _reply(NS(id="1", name="end_call"), {"ok": True}, "WHEN_IDLE")
+        self.assertEqual(types.FunctionResponse(**reply).scheduling.value, "WHEN_IDLE")
+
+
+class OpeningNudgeTests(_Base):
+    """One call in three, she heard "Estou?" and never began (2026-10-08)."""
+
+    def test_she_is_nudged_when_they_spoke_and_she_did_not(self):
+        session = FakeSession([[heard("Estou?")]])
+        self.agent(session).run("p", max_call_s=1.5, no_answer_s=30)
+        self.assertEqual(len(self.session.nudges), glc._NUDGE_MAX)
+        self.assertIn("answered", self.session.nudges[0])
+
+    def test_no_nudge_once_she_has_spoken(self):
+        session = FakeSession([[heard("Estou?")], [said("Boa noite!")]])
+        self.agent(session).run("p", max_call_s=1.0, no_answer_s=30)
+        self.assertEqual(self.session.nudges, [])
+
+    def test_no_nudge_before_anyone_speaks(self):
+        self.agent(FakeSession([])).run("p", max_call_s=1.0, no_answer_s=30)
+        self.assertEqual(self.session.nudges, [])
+
+    def test_a_failing_nudge_does_not_end_the_call(self):
+        class Broken(FakeSession):
+            async def send_client_content(self, **kw):
+                raise RuntimeError("nope")
+
+        result = self.agent(Broken([[heard("Estou?")]])).run("p", max_call_s=1.0, no_answer_s=30)
+        self.assertEqual(result.ended_by, "max_duration")
+
+
+class PrematureEndTests(_Base):
+    """Seen live on Vertex: a hang-up 0.75s in, before a word was said."""
+
+    def test_hang_up_before_she_speaks_is_refused(self):
+        session = FakeSession([
+            [heard("Estou?")],
             [tool("end_call")],
             [said("Boa noite, fala a California, assistente do Miguel.")],
             [heard("Diga.")],
-            [tool("record_outcome", status="answered", summary="talked")],
             [tool("end_call")],
         ])
         result = self.agent(session).run("p", max_call_s=30, no_answer_s=30)
         self.assertEqual(result.ended_by, "end_call")
-        self.assertEqual(result.outcome["status"], "answered")
-        early = self.session.tool_responses[0][0]["response"]
-        self.assertIn("not spoken yet", early["error"])
-        self.assertIn("no outcome", self.session.tool_responses[1][0]["response"]["error"])
+        self.assertIn("not spoken yet", self.session.tool_responses[0][0]["response"]["error"])
 
-    def test_outcome_waits_for_their_reply(self):
-        session = FakeSession([
-            [heard("Estou?")], [said("Olá, fala a California.")],
-            [tool("record_outcome", status="booked", summary="x")],
-        ])
+    def test_hang_up_before_anyone_is_heard_is_refused(self):
+        session = FakeSession([[said("Olá?")], [tool("end_call")]])
         result = self.agent(session).run("p", max_call_s=0.1, no_answer_s=30)
-        self.assertIsNone(result.outcome)
-        self.assertIn("not answered you yet", self.session.tool_responses[0][0]["response"]["error"])
+        self.assertEqual(result.ended_by, "max_duration")
+        self.assertIn("nobody has spoken", self.session.tool_responses[0][0]["response"]["error"])
 
-    def test_voicemail_needs_no_reply(self):
+    def test_voicemail_can_be_left_and_hung_up(self):
+        # A recorded greeting counts as heard: a message left on voicemail ends the call.
         session = FakeSession([
             [heard("Deixe a sua mensagem.")], [said("Olá, fala a California, o Miguel liga depois.")],
-            [tool("record_outcome", status="voicemail", summary="left a message")], [tool("end_call")],
+            [tool("end_call")],
         ])
         result = self.agent(session).run("p", max_call_s=30, no_answer_s=30)
-        self.assertEqual((result.ended_by, result.outcome["status"]), ("end_call", "voicemail"))
+        self.assertEqual(result.ended_by, "end_call")
 
-
-    def test_a_message_said_after_they_picked_up_counts_as_delivered(self):
-        # 2026-10-07 21:15: "Olá" -> her message + "Adeus" -> record_outcome
-        # refused ten times for want of a reply, dead air until they hung up.
+    def test_a_message_said_after_they_picked_up_can_end_the_call(self):
+        # 2026-10-07 21:15: "Olá" -> her message + "Adeus" -> refused ten times
+        # for want of a reply, dead air until they hung up.
         session = FakeSession([
             [heard("Olá.")], [said("Olá, aqui é a California. O Miguel pediu para dizer que a ama. Adeus.")],
-            [tool("record_outcome", status="message_delivered", summary="told her")], [tool("end_call")],
+            [tool("end_call")],
         ])
         result = self.agent(session).run("p", max_call_s=30, no_answer_s=30)
-        self.assertEqual((result.ended_by, result.outcome["status"]), ("end_call", "message_delivered"))
+        self.assertEqual(result.ended_by, "end_call")
 
-    def test_a_booking_still_needs_their_reply(self):
-        session = FakeSession([
-            [heard("Estou?")], [said("Queria uma mesa.")],
-            [tool("record_outcome", status="booked", summary="x")],
-        ])
-        result = self.agent(session).run("p", max_call_s=0.1, no_answer_s=30)
-        self.assertIsNone(result.outcome)
 
 
 class MuteTests(_Base):
