@@ -193,6 +193,53 @@ Start-Sleep -Milliseconds 800
 if (EndButton) { 'STILL_IN_CALL' } else { 'ENDED' }
 """
 
+# --- Find my phone ----------------------------------------------------------
+# The left pane's "Play sound" button (AutomationId RingMyPhoneIndicatorToggleButton,
+# read off the live window 2026-10-08) rings the phone for ~20 seconds at full
+# volume, even on silent. It is a toggle: ToggleState On while it rings. Like
+# the Call button it ignores a synthetic click, so it takes the same
+# focus-and-Enter, and the toggle state is what proves the press landed. If
+# Phone Link is closed it is launched first (its package family name is fixed).
+_PLAY_SOUND = _UIA_KEYS + r"""
+function Ringing($b) { try { return ($b.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'On') } catch { return $false } }
+$win = MainWindow
+if (-not $win) {
+  Start-Process 'shell:AppsFolder\Microsoft.YourPhone_8wekyb3d8bbwe!App'
+  $deadline = (Get-Date).AddSeconds(15)
+  do { Start-Sleep -Milliseconds 500; $win = MainWindow } until ($win -or (Get-Date) -gt $deadline)
+}
+if (-not $win) { 'NO_WINDOW'; exit 0 }
+$deadline = (Get-Date).AddSeconds(8); $btn = $null
+do { $btn = ById $win 'RingMyPhoneIndicatorToggleButton'; if (-not $btn) { Start-Sleep -Milliseconds 400 } } until ($btn -or (Get-Date) -gt $deadline)
+if (-not $btn) { 'NO_BUTTON'; exit 0 }
+if (Ringing $btn) { 'ALREADY_PLAYING'; exit 0 }
+if (-not $btn.Current.IsEnabled) { 'DISABLED'; exit 0 }
+# The toggle only opens a confirmation flyout ("The sound will play for 20
+# seconds...") whose own "Play sound" button, a plain button with no
+# AutomationId, does the ringing. Found live 2026-10-08: pressing the toggle
+# alone leaves the flyout up and the phone silent. A flyout already open from
+# an earlier try is reused rather than toggled shut.
+function Flyout($w) {
+  foreach ($b in $w.FindAll($T::Descendants, (New-Object System.Windows.Automation.PropertyCondition($A::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)))) {
+    if ($b.Current.Name -match '^(Play sound|Reproduzir som)$' -and $b.Current.AutomationId -eq '') { return $b }
+  }
+  return $null
+}
+$confirm = Flyout $win
+if (-not $confirm) {
+  $pressed = PressEnterOn $win $btn 'RingMyPhoneIndicatorToggleButton'
+  if ($pressed -ne 'SENT') { $pressed; exit 0 }
+  $deadline = (Get-Date).AddSeconds(4)
+  do { Start-Sleep -Milliseconds 250; $confirm = Flyout $win } until ($confirm -or (Get-Date) -gt $deadline)
+}
+if (-not $confirm) { 'NO_CONFIRM'; exit 0 }
+$pressed = PressEnterOn $win $confirm ''
+if ($pressed -ne 'SENT') { $pressed; exit 0 }
+$deadline = (Get-Date).AddSeconds(5)
+do { Start-Sleep -Milliseconds 300; if (Ringing $btn) { 'PLAYING'; exit 0 } } until ((Get-Date) -gt $deadline)
+'NOT_STARTED'
+"""
+
 # --- The calling link -------------------------------------------------------
 # Phone Link's Bluetooth calling link drops on its own (three times in two
 # days). The Calls pane then shows DialerPaneErrorTitle ("We weren't able to
@@ -396,6 +443,16 @@ class PhoneLinkDialer:
             logger.info("Phone Link: End button gone (%d/%d)", self._gone, _GONE_READINGS)
             return False if self._gone >= _GONE_READINGS else None
         return None
+
+    def play_sound(self) -> str:
+        """
+        Ring the phone through Phone Link's "Play sound" (about 20s). Returns
+        PLAYING or ALREADY_PLAYING, or why not: NO_WINDOW, NO_BUTTON, DISABLED,
+        NO_CONFIRM, NOT_FOREGROUND, NOT_FOCUSED, NOT_STARTED, or "" when PowerShell failed.
+        """
+        status = _run_ps(_PLAY_SOUND, timeout_s=45)
+        logger.info("Phone Link play sound -> %s", status or "<no output>")
+        return status
 
     def hang_up(self) -> str:
         status = _run_ps(_HANG_UP)

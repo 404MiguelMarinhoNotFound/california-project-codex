@@ -509,6 +509,72 @@ class BackendCredentialTests(unittest.TestCase):
         self.assertIn("unknown phone.backend", why)
 
 
+class FindPhoneTests(_Base):
+    """phone_find: ring the phone through Phone Link's Play sound, never during a call."""
+
+    def _find(self, status, **kw):
+        self.dialer.play_sound = mock.Mock(return_value=status)
+        return self._svc(**kw).find_phone()
+
+    def test_playing_is_success_and_needs_no_read_back(self):
+        result = self._find("PLAYING")
+        self.assertTrue(result)
+        self.assertIn("ringing", result.message)
+        self.dialer.play_sound.assert_called_once_with()
+        self.assertEqual(self.dialer.dialed, [])
+
+    def test_already_playing_is_success_and_does_not_press_again(self):
+        result = self._find("ALREADY_PLAYING")
+        self.assertTrue(result)
+        self.assertIn("already", result.message)
+
+    def test_each_failure_has_its_own_line(self):
+        lines = set()
+        for status in ("NO_WINDOW", "NO_BUTTON", "DISABLED", "NO_CONFIRM", "NOT_STARTED", "NOT_FOREGROUND", "NOT_FOCUSED"):
+            with self.subTest(status=status):
+                result = self._find(status)
+                self.assertFalse(result)
+                lines.add(result.message)
+        self.assertEqual(len(lines), 7)
+
+    def test_no_output_from_powershell_is_a_failure_not_a_success(self):
+        result = self._find("")
+        self.assertFalse(result)
+        self.assertIn("couldn't ring", result.message)
+
+    def test_a_dialer_that_raises_is_a_failure(self):
+        self.dialer.play_sound = mock.Mock(side_effect=OSError("boom"))
+        self.assertFalse(self._svc().find_phone())
+
+    def test_not_while_on_a_call(self):
+        svc = self._svc()
+        self.dialer.play_sound = mock.Mock(return_value="PLAYING")
+        svc._active = {"label": "X", "number": "+351912345678", "since": 0.0}
+        result = svc.find_phone()
+        self.assertFalse(result)
+        self.assertIn("already on a call", result.message)
+        self.dialer.play_sound.assert_not_called()
+
+    def test_disabled_service_presses_nothing(self):
+        svc = self._svc()
+        svc.enabled = False
+        self.dialer.play_sound = mock.Mock(return_value="PLAYING")
+        self.assertFalse(svc.find_phone())
+        self.dialer.play_sound.assert_not_called()
+
+
+class PhoneLinkPlaySoundTests(unittest.TestCase):
+    def test_play_sound_returns_the_scripts_status_and_targets_the_toggle(self):
+        from services import phone_link
+
+        with mock.patch.object(phone_link, "_run_ps", return_value="PLAYING") as run:
+            self.assertEqual(phone_link.PhoneLinkDialer().play_sound(), "PLAYING")
+        script = run.call_args.args[0]
+        self.assertIn("RingMyPhoneIndicatorToggleButton", script)
+        # The key is only sent through the verified-foreground helper.
+        self.assertIn("PressEnterOn", script)
+
+
 class NoRealPhoneTests(unittest.TestCase):
     """Constructing the shipped service must never shell out (dial, mic swap)."""
 

@@ -2323,6 +2323,27 @@ list endpoint on Vertex rejects API keys outright ("API keys are not supported b
 API"), so it is no test of whether a key works -- a real request is. Voice `Aoede`; `language_code` is left
 empty so the native-audio model follows the prompt (Portuguese, English if they do).
 
+**Find my phone: `phone_find` (2026-10-08).** "Where is my phone?" presses Phone Link's
+**Play sound** (AutomationId `RingMyPhoneIndicatorToggleButton` in the left pane, a toggle
+that rings the phone ~20s even on silent) through `PhoneLinkDialer.play_sound` ->
+`PhoneService.find_phone`. It is an action on `control_phone`, so no new tool schema, and it
+needs no read-back: ringing a phone is harmless and repeatable. Same rules as the dial:
+focus the button through UIA, then a real key through `PressEnterOn` (foreground and focus
+verified before any key); Phone Link is launched by its AUMID when closed; refused during a
+call, because it shares the window. Each outcome has its own spoken line (`_FIND_LINES`):
+`PLAYING`, `ALREADY_PLAYING`, `NO_WINDOW`, `NO_BUTTON`, `DISABLED` (greyed out = phone not
+reachable), `NO_CONFIRM`, `NOT_STARTED`, `NOT_FOREGROUND`, `NOT_FOCUSED`.
+
+**It is two presses, and the first one alone looks like a failure.** The toggle only opens a
+confirmation flyout ("The sound will play for 20 seconds..."); the flyout's own **Play sound**
+button (a plain `Button` named exactly "Play sound", no AutomationId, and focus lands on it)
+does the ringing. Until that was found, four live runs pressed the toggle, saw it stay `Off`
+and reported `NOT_STARTED` over a silent phone, and a hand click "also failed" only because
+the flyout was never confirmed. The script presses the toggle, waits for the flyout, presses
+its button, and takes `ToggleState` going `On` as proof (it returns to `Off` after 20s, seen
+live). An already-open flyout is reused, not toggled shut. Verified live 2026-10-08:
+`PLAYING` in 1.5s. `TogglePattern.Toggle` is ignored, like Invoke on the Call button.
+
 **Not built yet, on purpose:** asking Miguel mid-call (`ask_miguel`; he may not be in the
 room, so it needs WhatsApp), and the Pi. On the Pi the transport becomes PipeWire's
 Bluetooth telephony (`org.pipewire.Telephony`, `Dial`), behind the same agent.
@@ -2677,7 +2698,7 @@ The Claude path supports:
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 - Custom `control_whatsapp` tool for WhatsApp messaging (4 actions)
-- Custom `control_phone` tool for phone calls from his own number (3 actions)
+- Custom `control_phone` tool for phone calls from his own number and finding his phone (4 actions)
 
 With the committed `config.yaml` that is **6 tools** in every request: `web_search`,
 `control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`, `control_phone`. Each custom tool's full schema is sent on
@@ -2738,7 +2759,7 @@ Bulk send and image send exist in the CLI it was ported from and were left out: 
 spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
 capability with no voice phrasing.
 
-`control_phone` supports three actions:
+`control_phone` supports four actions:
 
 - `phone_call` with a brief: `to`, optional `number`, `kind` (`book_table`, `book_appointment`,
   `ask_question`, `deliver_message`, `personal`, `general`), `goal`, `details`, `may_agree`,
@@ -2747,6 +2768,7 @@ capability with no voice phrasing.
 - `phone_status`: on a call or not, and the last call's line (when, who, result, how long)
 - `phone_log`: the last calls from `logs/calls.jsonl`, newest first (`count`, default 5,
   max 20). Reads the file, so it survives restarts and reads lines from before `meta` existed
+- `phone_find`: rings his phone ~20s through Phone Link's Play sound; no read-back (see "Find my phone")
 
 When tools are active:
 
