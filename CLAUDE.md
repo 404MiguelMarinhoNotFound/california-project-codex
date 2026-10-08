@@ -2282,6 +2282,29 @@ max-duration clocks start at the dial. A call ends on `end_call` (her goodbye is
 to finish playing), the End button seen and then gone (`hung_up`), the Live session dropping (`error`), `no_answer_s` with nothing
 heard, `max_call_s`, or shutdown. Whatever happens, a `CallReport` is queued and logged.
 
+**What comes back after a call (2026-10-08).** Master Miguel asked for "the call log, all
+relevant metadata, how long it took". Three layers, one source:
+
+- `GeminiLiveAgent` fills `CallResult.stats` while the call runs: `connect_s`, `dial_s`,
+  `answered_at_s` (dial -> first words heard), `first_spoke_at_s`, `talk_window_s`,
+  `interruptions`, `nudges`, `refused_hang_ups`, `unknown_tools`, and her ears
+  (`loopback_source`, `loopback_peak`, `heard_nothing`). Every `CallLine` carries `at`,
+  seconds after the dial, so the transcript is timestamped. A stage that did not happen is
+  absent, never zero -- the `turns.jsonl` rule.
+- `PhoneService` adds what only it knows: `call_id`, `started_at`/`ended_at`,
+  `number_source`, Phone Link's `dial_status` and `hang_up_status`, backend, model, voice.
+  `CallReport.metadata()` derives the rest once: `ring_s`, `talk_s` (talk window minus
+  ring), turns and words per side, and `ended_how` in words.
+- `call_record()` is the one shape of a call: `logs/calls.jsonl` writes it (brief, outcome,
+  `meta`, timed transcript), and `phone_log` / `phone_status` read it back through
+  `call_log_line()`. The `ts` key stays first and keeps its old name for older readers.
+
+The spoken report (`_phone_report_message`) gets the readable part: number and where it
+came from, how it ended, a timing line ("started 11:26, rang 4s before they answered,
+talked 2m10s, 2m23s in all"), turns and interruptions, the outcome, and the transcript with
+`[m:ss]` stamps. Routine internals (nudges, an unconfirmed dial) stay in the log; only a
+real problem is spoken (an error, or `heard_nothing`).
+
 **The report is a turn, not an injection.** `LLMService.history` has no lock and no
 outside writer, so `_idle_loop` (main thread, between mic reads) runs
 `_deliver_phone_report`: same speaker session, barge-in chaining and mic drain as a wake
@@ -2654,7 +2677,7 @@ The Claude path supports:
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 - Custom `control_whatsapp` tool for WhatsApp messaging (4 actions)
-- Custom `control_phone` tool for phone calls from his own number (2 actions)
+- Custom `control_phone` tool for phone calls from his own number (3 actions)
 
 With the committed `config.yaml` that is **6 tools** in every request: `web_search`,
 `control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`, `control_phone`. Each custom tool's full schema is sent on
@@ -2715,13 +2738,15 @@ Bulk send and image send exist in the CLI it was ported from and were left out: 
 spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
 capability with no voice phrasing.
 
-`control_phone` supports two actions:
+`control_phone` supports three actions:
 
 - `phone_call` with a brief: `to`, optional `number`, `kind` (`book_table`, `book_appointment`,
   `ask_question`, `deliver_message`, `personal`, `general`), `goal`, `details`, `may_agree`,
   `must_not`, and `confirm`.
   The first call always reads back; see "PhoneService"
-- `phone_status`: on a call or not, and the last call's summary
+- `phone_status`: on a call or not, and the last call's line (when, who, result, how long)
+- `phone_log`: the last calls from `logs/calls.jsonl`, newest first (`count`, default 5,
+  max 20). Reads the file, so it survives restarts and reads lines from before `meta` existed
 
 When tools are active:
 

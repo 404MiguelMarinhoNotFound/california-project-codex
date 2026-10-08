@@ -215,6 +215,34 @@ class ToolReplySchedulingTests(_Base):
         self.assertEqual(types.FunctionResponse(**reply).scheduling.value, "WHEN_IDLE")
 
 
+class CallStatsTests(_Base):
+    """What the session records for the call log."""
+
+    def test_a_call_records_its_timings_and_counts(self):
+        session = FakeSession([
+            [heard("Estou?")], [tool("end_call")],          # refused: she has not spoken
+            [said("Olá!"), interrupted()], [heard("Diga.")],
+            [said(" Adeus!")], [tool("end_call")],
+        ])
+        result = self.agent(session).run("p", max_call_s=30, no_answer_s=30, dial=lambda: True)
+        stats = result.stats
+        for key in ("connect_s", "dial_s", "answered_at_s", "first_spoke_at_s", "talk_window_s"):
+            self.assertIn(key, stats)
+        self.assertEqual((stats["interruptions"], stats["refused_hang_ups"]), (1, 1))
+        self.assertTrue(all(l.at is not None and l.at >= 0 for l in result.lines))
+        self.assertLessEqual(stats["answered_at_s"], stats["first_spoke_at_s"])
+
+    def test_a_failed_dial_records_no_talk_window(self):
+        result = self.agent().run("p", max_call_s=30, no_answer_s=30, dial=lambda: False)
+        self.assertIn("dial_s", result.stats)
+        self.assertNotIn("talk_window_s", result.stats)
+
+    def test_the_timed_transcript(self):
+        result = glc.CallResult(lines=[glc.CallLine("them", "Estou?", 4.2), glc.CallLine("california", "Olá", 65.0)])
+        self.assertEqual(result.transcript(times=True), "[0:04] Them: Estou?\n[1:05] California: Olá")
+        self.assertEqual(result.transcript(), "Them: Estou?\nCalifornia: Olá")
+
+
 class HangUpCrossCheckTests(_Base):
     def test_a_hang_up_reading_while_they_are_talking_is_not_believed(self):
         # 2026-10-08: the End button vanished 20s into a live call.

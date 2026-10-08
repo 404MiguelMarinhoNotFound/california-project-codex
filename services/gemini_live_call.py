@@ -54,6 +54,8 @@ _GOODBYE_GRACE_S = 0.8
 _NUDGE_AFTER_S = 2.5
 # A "they hung up" reading is not believed if they spoke this recently.
 _LIVE_IF_HEARD_S = 8.0
+# Loudest loopback block below this (0-1 RMS) means she heard nothing at all.
+_SILENT_PEAK = 0.002
 _NUDGE_MAX = 2
 _NUDGE_TEXT = (
     "[The call has been answered and they are waiting for you. Greet them and "
@@ -102,24 +104,53 @@ TOOL_DECLARATIONS = [
 class CallLine:
     who: str  # "them" | "california"
     text: str
+    at: float | None = None  # seconds after the dial when this line began
+
+
+def _clock(seconds: float | None) -> str:
+    """12.4 -> "0:12"."""
+    if seconds is None:
+        return "?:??"
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 @dataclass
 class CallResult:
     lines: list[CallLine] = field(default_factory=list)
     outcome: dict | None = None
-    ended_by: str = ""  # end_call | hung_up | no_answer | max_duration | stopped | error
+    ended_by: str = ""  # end_call | hung_up | no_answer | max_duration | stopped | error | dial_failed
     duration_s: float = 0.0
     error: str = ""
+    # What the session saw, for the call log and the report. Every key is
+    # optional: a stage that did not happen is absent, never zero.
+    #   connect_s        opening the Live session
+    #   dial_s           Phone Link dialling (prefill, Call, first End button)
+    #   talk_window_s    from the end of the dial to the end of the call
+    #   answered_at_s    first words heard from them, after the dial
+    #   first_spoke_at_s her first words, after the dial
+    #   interruptions    times they talked over her (her audio dropped)
+    #   nudges           opening nudges sent (see _NUDGE_AFTER_S)
+    #   refused_hang_ups end_call refused as too early
+    #   unknown_tools    tool calls the agent does not have
+    #   loopback_source / loopback_peak / heard_nothing   her ears
+    stats: dict = field(default_factory=dict)
 
     @property
     def heard_them(self) -> bool:
         return any(line.who == "them" and line.text.strip() for line in self.lines)
 
-    def transcript(self, max_chars: int = 4000) -> str:
-        rows = [f"{'Them' if l.who == 'them' else 'California'}: {l.text.strip()}" for l in self.lines if l.text.strip()]
+    def transcript(self, max_chars: int = 4000, times: bool = False) -> str:
+        rows = [
+            (f"[{_clock(l.at)}] " if times and l.at is not None else "")
+            + f"{'Them' if l.who == 'them' else 'California'}: {l.text.strip()}"
+            for l in self.lines if l.text.strip()
+        ]
         text = "\n".join(rows)
         return text if len(text) <= max_chars else "...\n" + text[-max_chars:]
+
+    def _count(self, key: str) -> None:
+        self.stats[key] = self.stats.get(key, 0) + 1
 
 
 def _hang_up_too_early(result: "CallResult") -> str:
@@ -239,7 +270,7 @@ class LoopbackCapture:
             self._thread.join(timeout=2)
         if self.blocks:
             logger.info("Loopback: %d blocks from %s, peak level %.4f%s", self.blocks, self.source,
-                        self.peak, " (SILENT: she heard nothing)" if self.peak < 0.002 else "")
+                        self.peak, " (SILENT: she heard nothing)" if self.peak < _SILENT_PEAK else "")
 
 
 class CableSpeaker:
@@ -433,19 +464,29 @@ class GeminiLiveAgent:
                 clock["them_at"] = time.monotonic()
             if result.lines and result.lines[-1].who == who:
                 result.lines[-1].text += text
-            else:
-                result.lines.append(CallLine(who, text))
+                return
+            at = round(max(0.0, time.monotonic() - clock["started"]), 1)
+            result.lines.append(CallLine(who, text, at))
+            if text.strip():
+                key = "answered_at_s" if who == "them" else "first_spoke_at_s"
+                result.stats.setdefault(key, at)
 
         client = self.client_factory(self.client_kwargs)
         speaker = self.speaker_factory()
         capture = self.capture_factory()
         speaker.start()
+        connecting = time.monotonic()
         try:
             async with client.aio.live.connect(model=self.model, config=self._config(prompt)) as session:
+                result.stats["connect_s"] = round(time.monotonic() - connecting, 1)
                 capture.start(on_block)
+                dialling = time.monotonic()
                 if dial is not None and not await asyncio.to_thread(dial):
+                    result.stats["dial_s"] = round(time.monotonic() - dialling, 1)
                     result.ended_by = "dial_failed"
                     return
+                if dial is not None:
+                    result.stats["dial_s"] = round(time.monotonic() - dialling, 1)
                 # The clocks run from the dial, not from connecting.
                 clock["started"] = time.monotonic()
 
@@ -503,6 +544,7 @@ class GeminiLiveAgent:
                         if them_at is None or time.monotonic() - them_at < _NUDGE_AFTER_S:
                             continue
                         nudges += 1
+                        result._count("nudges")
                         logger.info("Call agent: they spoke and she has not; nudge %d", nudges)
                         try:
                             await session.send_client_content(
@@ -537,15 +579,22 @@ class GeminiLiveAgent:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                result.stats["talk_window_s"] = round(time.monotonic() - clock["started"], 1)
         finally:
             capture.stop()
             speaker.stop()
+            peak = getattr(capture, "peak", None)
+            if isinstance(peak, (int, float)) and getattr(capture, "blocks", 0):
+                result.stats["loopback_peak"] = round(float(peak), 4)
+                result.stats["heard_nothing"] = peak < _SILENT_PEAK
+                result.stats["loopback_source"] = str(getattr(capture, "source", "") or "")
 
     async def _handle(self, msg, session, speaker, add_line, finish, result: CallResult) -> None:
         content = getattr(msg, "server_content", None)
         if content is not None:
             if getattr(content, "interrupted", False):
                 speaker.flush()
+                result._count("interruptions")
             turn = getattr(content, "model_turn", None)
             for part in (getattr(turn, "parts", None) or []):
                 data = getattr(getattr(part, "inline_data", None), "data", None)
@@ -569,11 +618,13 @@ class GeminiLiveAgent:
                 too_early = _hang_up_too_early(result)
                 if too_early:
                     logger.info("Call agent: end_call refused, %s", too_early)
+                    result._count("refused_hang_ups")
                     responses.append(_reply(call, {"error": too_early}, _SILENT))
                     continue
                 end = True
                 responses.append(_reply(call, {"ok": True}, _SILENT))
             else:
+                result._count("unknown_tools")
                 responses.append(_reply(call, {"error": "unknown tool"}, _SILENT))
         await session.send_tool_response(function_responses=responses)
         if end:

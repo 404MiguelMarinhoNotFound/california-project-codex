@@ -233,6 +233,27 @@ class NumberTests(_Base):
                 self.assertEqual(result.message, "I won't call that number myself.")
 
 
+class ReportFieldsTests(_Base):
+    def test_the_report_knows_how_the_call_was_placed(self):
+        resolve = mock.Mock(return_value=ContactMatch(key="Sérgio Nokia", phone="+351969685405", certain=True))
+        svc = self._svc(resolve=resolve)
+        self._place(svc, brief=CallBrief(to="Sérgio", kind="personal", goal="chat"), number="")
+        report = svc.pop_report()
+        self.assertEqual(report.number_source, "from your contacts")
+        self.assertEqual((report.dial_status, report.hang_up_status), ("DIALED", "ENDED"))
+        self.assertRegex(report.call_id, r"^\d{8}-\d{6}$")
+        self.assertTrue(report.ended_at >= report.started_at)
+        self.assertEqual(report.backend, svc.backend)
+
+    def test_the_log_line_carries_the_metadata(self):
+        svc = self._svc()
+        self._place(svc)
+        with open(self.log_path, encoding="utf-8") as handle:
+            record = json.loads(handle.readlines()[-1])
+        self.assertEqual(record["meta"]["dial_status"], "DIALED")
+        self.assertEqual(record["meta"]["ended_how"], "California said goodbye and hung up")
+
+
 class OutcomeAfterTheCallTests(_Base):
     """The live agent no longer reports an outcome; it is read from the transcript."""
 
