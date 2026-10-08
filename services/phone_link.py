@@ -51,9 +51,10 @@ interface IPolicyConfigCal { void a(); void b(); void c(); void d(); void e(); v
   [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string id, int role); }
 [ComImport, Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9")] class PolicyConfigClientCal {}
 public static class CalAudio {
-  public static string GetDefaultCapture() {
+  public static string GetDefault(int flow) {
     var e = (IMMDeviceEnumeratorCal)new MMDeviceEnumeratorCal(); IMMDeviceCal d; string id;
-    Marshal.ThrowExceptionForHR(e.GetDefaultAudioEndpoint(1, 0, out d)); Marshal.ThrowExceptionForHR(d.GetId(out id)); return id; }
+    Marshal.ThrowExceptionForHR(e.GetDefaultAudioEndpoint(flow, 0, out d)); Marshal.ThrowExceptionForHR(d.GetId(out id)); return id; }
+  public static string GetDefaultCapture() { return GetDefault(1); }
   public static void SetDefault(string id) {
     var p = (IPolicyConfigCal)new PolicyConfigClientCal();
     for (int r = 0; r < 3; r++) Marshal.ThrowExceptionForHR(p.SetDefaultEndpoint(id, r)); }
@@ -61,6 +62,8 @@ public static class CalAudio {
 """
 
 _GET_MIC = "Add-Type -TypeDefinition @'\n" + _AUDIO_TYPES + "\n'@\n[CalAudio]::GetDefaultCapture()"
+
+_GET_SPEAKER = "Add-Type -TypeDefinition @'\n" + _AUDIO_TYPES + "\n'@\n[CalAudio]::GetDefault(0)"
 
 _SET_MIC = "Add-Type -TypeDefinition @'\n" + _AUDIO_TYPES + "\n'@\n[CalAudio]::SetDefault('__DEVICE__'); 'OK'"
 
@@ -174,6 +177,11 @@ DumpPhone
 
 _IN_CALL = _UIA + "if (CallWindow) { 'YES' } else { 'NO' }"
 
+# Same check, but on a miss after the call was seen it logs every Phone Link
+# button first: on 2026-10-08 the End button vanished 20s into a live call,
+# and the next time it happens the log says what it turned into.
+_IN_CALL_DUMP = _UIA + "if (CallWindow) { 'YES' } else { DumpPhone; 'NO' }"
+
 _HANG_UP = _UIA_KEYS + r"""
 $e = EndButton
 if (-not $e) { 'NO_CALL'; exit 0 }
@@ -259,7 +267,8 @@ class PhoneLinkDialer:
         answered before the button could be seen, and reading its absence as
         "ended" cut the call off before she spoke.
         """
-        status = _run_ps(_IN_CALL, timeout_s=10)
+        script = _IN_CALL_DUMP if getattr(self, "_saw_call", False) else _IN_CALL
+        status = _run_ps(script, timeout_s=10)
         if status == "YES":
             self._saw_call = True
             self._gone = 0
@@ -291,6 +300,9 @@ class MicRoute:
     default mic pointing at the cable.
     """
 
+    _GET = _GET_MIC
+    _WHAT = "microphone"
+
     def __init__(self, endpoint_name: str):
         self.endpoint_name = endpoint_name
         self.previous_id = ""
@@ -300,27 +312,45 @@ class MicRoute:
         target = _run_ps(_FIND_ENDPOINT.replace("__NAME__", self.endpoint_name.replace("'", "''")))
         if not target:
             raise RuntimeError(f"audio endpoint not found: {self.endpoint_name}")
-        self.previous_id = _run_ps(_GET_MIC)
+        self.previous_id = _run_ps(self._GET)
         if not self.previous_id:
             # Switching without knowing what to put back would leave the room
             # mic on the cable after the call, and California deaf.
-            raise RuntimeError("could not read the current default microphone")
+            raise RuntimeError(f"could not read the current default {self._WHAT}")
         # PnP reports the GUID upper-case, IMMDevice lower-case: same device.
         if self.previous_id.lower() == target.lower():
             return self
         if _run_ps(_SET_MIC.replace("__DEVICE__", target)) != "OK":
-            raise RuntimeError("could not switch the default microphone")
+            raise RuntimeError(f"could not switch the default {self._WHAT}")
         self.switched = True
-        logger.info("Default microphone -> %s for the call", self.endpoint_name)
+        logger.info("Default %s -> %s for the call", self._WHAT, self.endpoint_name)
         return self
 
     def __exit__(self, *exc) -> None:
         if self.switched and self.previous_id:
             if _run_ps(_SET_MIC.replace("__DEVICE__", self.previous_id)) == "OK":
-                logger.info("Default microphone restored")
+                logger.info("Default %s restored", self._WHAT)
             else:
-                logger.error("Could not restore the default microphone (%s)", self.previous_id)
+                logger.error("Could not restore the default %s (%s)", self._WHAT, self.previous_id)
         return None
+
+
+class SpeakerRoute(MicRoute):
+    """
+    Context manager: make `endpoint_name` the default SPEAKER for the call, restore after.
+
+    Found 2026-10-08, calling Sergio: Bluetooth headphones ("Black Diamond") had
+    connected and become the default output. In a call Windows moves Bluetooth
+    headphones to their hands-free profile, a different endpoint from the
+    "Headphones" one the loopback was recording, so the callee played where
+    California could not hear: 35 seconds of a real person on the line and
+    nothing in her ears. The call must not depend on whatever happens to be
+    the default output, so for its length Phone Link plays on a fixed device
+    and the loopback records that same device by name.
+    """
+
+    _GET = _GET_SPEAKER
+    _WHAT = "speaker"
 
 
 def is_windows_with_powershell() -> bool:

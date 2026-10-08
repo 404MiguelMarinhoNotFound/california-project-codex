@@ -2075,6 +2075,28 @@ English when asked, recorded `booked` and hung up herself, 74s. Getting there fo
   and someone has been heard (a voicemail greeting counts). The `record_outcome` tool
   that came with it is gone -- see "How she talks" below.
 
+**A real call where she heard nothing (2026-10-08, calling Sérgio).** He picked up for
+~35s; the transcript was empty on both sides, so she never spoke (the opening nudge
+needs them heard first) and he hung up on silence. Three causes, all fixed:
+
+- **Her ears followed "the default speaker", and that moved.** Bluetooth headphones
+  ("Black Diamond", category Audio.Headphone) had connected and become the default
+  output. In a call Windows moves Bluetooth headphones to their hands-free endpoint, not
+  the "Headphones" one the loopback recorded. Now `phone_link.SpeakerRoute` pins the
+  default speaker to `phone.call_speaker_endpoint` (Realtek) for the call, restoring the
+  previous one after, exactly like `MicRoute`, and `LoopbackCapture(device=...)` records
+  that same speaker by name. Verified on the real laptop: tone heard at peak 0.30 with the
+  headphones connected, default restored afterwards.
+- **The capture thread could not use the audio API at all** when soundcard had been
+  imported on another thread first: soundcard calls `CoInitializeEx` only on its importing
+  thread, so the capture thread got 0x800401F0 (CO_E_NOTINITIALIZED). The thread now
+  initialises COM itself. That error used to die silently with the thread; it is logged
+  now, and every call logs the loopback's peak level, "SILENT" when she heard nothing.
+- **Phone Link's End button vanished ~20s into the live call**, so the call was read as
+  hung up. A "gone" reading is no longer believed if they spoke in the last
+  `_LIVE_IF_HEARD_S` (8s), and once a call has been seen, a miss logs every Phone Link
+  button (`_IN_CALL_DUMP`) so the next occurrence shows what the button became.
+
 **How she talks: measured, not guessed (2026-10-08).** Master Miguel's complaint was not
 the voice but the wording: "hi I am California, Miguel's AI", a recited brief, robotic.
 The method, so it can be repeated:

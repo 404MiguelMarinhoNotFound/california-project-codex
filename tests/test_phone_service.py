@@ -84,17 +84,20 @@ class _Base(unittest.TestCase):
             logging={"include_transcripts": include_transcripts},
         )
 
-        @contextlib.contextmanager
-        def route():
-            self.mic_routes.append("enter")
-            try:
-                yield
-            finally:
-                self.mic_routes.append("exit")
+        def route(what):
+            @contextlib.contextmanager
+            def cm():
+                self.mic_routes.append("enter" if what == "mic" else "speaker enter")
+                try:
+                    yield
+                finally:
+                    self.mic_routes.append("exit" if what == "mic" else "speaker exit")
+            return cm
 
         return PhoneService(
             cfg, resolve_contact=resolve, dialer=self.dialer,
-            agent_factory=lambda: self.agent, mic_route_factory=route,
+            agent_factory=lambda: self.agent, mic_route_factory=route("mic"),
+            speaker_route_factory=route("speaker"),
         )
 
     def _place(self, svc, brief=None, number="+351912345678"):
@@ -272,7 +275,7 @@ class CallLifecycleTests(_Base):
     def test_mic_is_routed_for_the_call_and_restored(self):
         svc = self._svc()
         self._place(svc)
-        self.assertEqual(self.mic_routes, ["enter", "exit"])
+        self.assertEqual(self.mic_routes, ["enter", "speaker enter", "speaker exit", "exit"])
 
     def test_a_failed_dial_reports_without_hanging_up(self):
         self.dialer = FakeDialer(dial_status="NOT_PREFILLED")
@@ -290,7 +293,7 @@ class CallLifecycleTests(_Base):
         report = svc.pop_report()
         self.assertEqual(report.status, "dial_failed")
         self.assertIn("Phone Link isn't connected to the phone", report.result.error)
-        self.assertEqual(self.mic_routes, ["enter", "exit"])
+        self.assertEqual(self.mic_routes, ["enter", "speaker enter", "speaker exit", "exit"])
 
     def test_an_unconfirmed_dial_still_runs_the_call(self):
         """2026-10-07: the call rang and was answered while no call window was visible."""
@@ -357,7 +360,7 @@ class CallLifecycleTests(_Base):
         self.assertIsNotNone(report)
         self.assertEqual(report.result.ended_by, "error")
         self.assertIn("socket closed", report.result.error)
-        self.assertEqual(self.mic_routes, ["enter", "exit"])
+        self.assertEqual(self.mic_routes, ["enter", "speaker enter", "speaker exit", "exit"])
         self.assertIsNone(svc._active)
 
     def test_status_line_before_during_after(self):
@@ -537,6 +540,30 @@ class PhoneLinkInCallTests(unittest.TestCase):
 
 
 class PhoneLinkScriptTests(unittest.TestCase):
+    def test_the_speaker_route_reads_and_restores_the_render_default(self):
+        from services import phone_link
+
+        calls = []
+
+        def run_ps(script, timeout_s=0):
+            calls.append(script)
+            if "Get-PnpDevice" in script:
+                return "{0.0.0.00000000}.{realtek}"
+            if "GetDefault(0)" in script:
+                return "{0.0.0.00000000}.{headphones}"
+            return "OK"
+
+        with mock.patch.object(phone_link, "_run_ps", side_effect=run_ps):
+            with phone_link.SpeakerRoute("Speakers (Realtek High Definition Audio)"):
+                pass
+        sets = [c for c in calls if "[CalAudio]::SetDefault(" in c]
+        self.assertIn("{realtek}", sets[0])
+        self.assertIn("{headphones}", sets[-1])  # put back what was there
+
+    def test_no_speaker_endpoint_means_no_switch(self):
+        cfg = config_for_tests(phone={"enabled": True, "call_speaker_endpoint": ""})
+        self.assertIsInstance(PhoneService(cfg)._speaker_route(), contextlib.nullcontext)
+
     def test_the_in_call_poll_compiles_no_csharp(self):
         # It runs every couple of seconds for the whole call.
         from services import phone_link

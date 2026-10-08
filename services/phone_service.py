@@ -23,6 +23,7 @@ read-back of the SAME number and the SAME brief, exactly like WhatsApp's.
 from __future__ import annotations
 
 import importlib.util
+import contextlib
 import json
 import logging
 import os
@@ -127,6 +128,7 @@ class PhoneService:
         dialer=None,
         agent_factory: Callable | None = None,
         mic_route_factory: Callable | None = None,
+        speaker_route_factory: Callable | None = None,
         room_speaking: Callable[[], bool] | None = None,
         summarize: Callable | None = None,
     ):
@@ -152,6 +154,10 @@ class PhoneService:
         self.confirm_timeout_s = max(10.0, float(cfg.get("confirm_timeout_ms") or 120000) / 1000.0)
         self.cable_output = str(cfg.get("cable_output_device") or "CABLE Input")
         self.cable_mic_endpoint = str(cfg.get("cable_mic_endpoint") or "CABLE Output (VB-Audio Virtual Cable)")
+        # Where the callee plays and where she listens: pinned for the call,
+        # never "whatever the default speaker is" (see phone_link.SpeakerRoute).
+        # Empty keeps the default speaker, for machines without that device.
+        self.call_speaker_endpoint = str(cfg.get("call_speaker_endpoint") or "")
         self.default_country = str(cfg.get("default_country") or "351")
         self.allowed_country_codes = [str(c) for c in (cfg.get("allowed_country_codes") or [self.default_country])]
         self.blocked_prefixes = [str(p) for p in (cfg.get("blocked_prefixes") or _DEFAULT_BLOCKED_PREFIXES)]
@@ -163,6 +169,7 @@ class PhoneService:
         self._dialer = dialer
         self._agent_factory = agent_factory
         self._mic_route_factory = mic_route_factory
+        self._speaker_route_factory = speaker_route_factory
         self._room_speaking = room_speaking
         # What the call achieved is read from the transcript after it ends
         # (services/call_outcome.py), with the same Claude model the room
@@ -266,6 +273,7 @@ class PhoneService:
             language_code=self.language_code,
             silence_ms=self.silence_ms,
             cable_device=self.cable_output,
+            listen_device=self.call_speaker_endpoint,
         )
 
     def _mic_route(self):
@@ -274,6 +282,15 @@ class PhoneService:
         from services.phone_link import MicRoute
 
         return MicRoute(self.cable_mic_endpoint)
+
+    def _speaker_route(self):
+        if self._speaker_route_factory is not None:
+            return self._speaker_route_factory()
+        if not self.call_speaker_endpoint:
+            return contextlib.nullcontext()
+        from services.phone_link import SpeakerRoute
+
+        return SpeakerRoute(self.call_speaker_endpoint)
 
     # ------------------------------------------------------------- numbers
 
@@ -413,7 +430,7 @@ class PhoneService:
                 return dial_status[-1] in _DIALED
 
             prompt = build_call_prompt(brief, owner=self.owner, callback_number=self.callback_number)
-            with self._mic_route():
+            with self._mic_route(), self._speaker_route():
                 agent = self._make_agent()
                 result = agent.run(
                     prompt,
