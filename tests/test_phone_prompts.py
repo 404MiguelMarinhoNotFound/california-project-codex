@@ -114,6 +114,19 @@ class ConversationalShapeTests(unittest.TestCase):
         self.assertIn("West Coast", prompt)
         self.assertIn("no edgy or political jokes", prompt)
 
+    def test_capabilities_come_only_from_the_notes(self):
+        # The real call to Sergio, 2026-10-08: "temperature, even security systems".
+        prompt = build_call_prompt(_brief(kind="personal"))
+        self.assertIn("exactly what your notes say, nothing more", prompt)
+
+    def test_no_promises_for_later(self):
+        # Same call: "we can talk about it later", with must_not saying no promises.
+        self.assertIn("Never offer anything for later", build_call_prompt(_brief(kind="personal")))
+
+    def test_the_notes_are_a_checklist(self):
+        # Same call: "say you have no tools on this call" was in the notes and never said.
+        self.assertIn("Your notes are a checklist", build_call_prompt(_brief(kind="personal")))
+
     def test_a_message_to_someone_he_knows_is_warm_and_in_beats(self):
         prompt = build_call_prompt(_brief(kind="deliver_message", to="Marta"))
         self.assertIn('"tu"', prompt)
