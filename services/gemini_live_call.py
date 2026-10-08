@@ -198,16 +198,20 @@ class LoopbackCapture:
             # imports it. When anything imported it earlier on another thread,
             # this one has no COM and every call fails with 0x800401F0
             # (CO_E_NOTINITIALIZED): measured 2026-10-08, a deaf capture. So
-            # this thread initialises COM itself (MTA, as soundcard does).
+            # this thread initialises COM itself (MTA, as soundcard does) --
+            # AFTER importing soundcard: when this thread is the first to
+            # import it, soundcard's own CoInitializeEx must run first, or it
+            # gets S_FALSE ("already initialised") and raises 0x100000001
+            # (found on the next real call, 2026-10-08).
             com = None
-            if sys.platform == "win32":
-                import ctypes
-
-                com = ctypes.windll.ole32
-                com.CoInitializeEx(None, 0)
             try:
                 import soundcard as sc
 
+                if sys.platform == "win32":
+                    import ctypes
+
+                    com = ctypes.windll.ole32
+                    com.CoInitializeEx(None, 0)  # S_OK or S_FALSE; balanced below either way
                 speaker = self._speaker(sc)
                 self.source = str(speaker.name)
                 logger.info("Loopback: listening to %s", self.source)
