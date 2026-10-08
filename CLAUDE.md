@@ -286,6 +286,7 @@ california/
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
 │   ├── list_whatsapp_groups.py     # Read every WhatsApp group off the chat list and refresh the cache
+│   ├── fix_phone_link.py           # Bring Phone Link's calling link back: Try again, laptop Bluetooth off/on; --check to report
 │   ├── probe_phone_backend.py      # Connect Gemini Live with the phone config, no call: credentials, latency, her first line
 │   ├── eval_phone_conversation.py  # Simulated calls (Claude as callee, spoken pt-PT TTS) scored for how she talks
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
@@ -2125,11 +2126,44 @@ English when asked, recorded `booked` and hung up herself, 74s. Getting there fo
   able to connect to your mobile device", Windows shows every Bluetooth profile of the
   phone `connected=False`, and restarting Phone Link or pressing Try again does not help.
   Reconnecting the phone in Bluetooth settings does. The dial reports
-  `PHONE_NOT_CONNECTED` with that fix in words.
+  `PHONE_NOT_CONNECTED` with that fix in words. **`uv run python tools/fix_phone_link.py`**
+  (`phone_link.repair_calling_link`) does the laptop side: checks the Calls tab (touches
+  nothing if the dial pad is up), presses Try again, then turns the laptop's Bluetooth
+  radio off and on through `Windows.Devices.Radios` (no admin) and presses Try again until
+  the dial pad returns. On 2026-10-08 that was not enough: the phone came back
+  `connected=True` but its Hands-Free endpoints stayed `Unknown`, and neither restarting
+  Phone Link nor the Bluetooth audio driver's own reconnect (KSPROPSETID_BtAudio
+  ONESHOT_RECONNECT, what Settings' Connect sends, reached via
+  `IConnector::GetDeviceIdConnectedTo` -> the filter's `IMMDevice` -> `IKsControl`; via
+  `IPart::Activate` it answers E_NOINTERFACE) brought the calling profile back. The
+  remaining step is on the phone: toggle its Bluetooth, or check "Phone calls" is allowed
+  for the laptop in its Bluetooth device settings.
 - **The model tried to hang up before speaking** (Vertex, 0.75s in: `record_outcome` +
   `end_call` before a word). `_hang_up_too_early` refuses `end_call` until she has spoken
   and someone has been heard (a voicemail greeting counts). The `record_outcome` tool
   that came with it is gone -- see "How she talks" below.
+
+**A real call where she heard nothing (2026-10-08, calling Sérgio).** He picked up for
+~35s; the transcript was empty on both sides, so she never spoke (the opening nudge
+needs them heard first) and he hung up on silence. Three causes, all fixed:
+
+- **Her ears followed "the default speaker", and that moved.** Bluetooth headphones
+  ("Black Diamond", category Audio.Headphone) had connected and become the default
+  output. In a call Windows moves Bluetooth headphones to their hands-free endpoint, not
+  the "Headphones" one the loopback recorded. Now `phone_link.SpeakerRoute` pins the
+  default speaker to `phone.call_speaker_endpoint` (Realtek) for the call, restoring the
+  previous one after, exactly like `MicRoute`, and `LoopbackCapture(device=...)` records
+  that same speaker by name. Verified on the real laptop: tone heard at peak 0.30 with the
+  headphones connected, default restored afterwards.
+- **The capture thread could not use the audio API at all** when soundcard had been
+  imported on another thread first: soundcard calls `CoInitializeEx` only on its importing
+  thread, so the capture thread got 0x800401F0 (CO_E_NOTINITIALIZED). The thread now
+  initialises COM itself. That error used to die silently with the thread; it is logged
+  now, and every call logs the loopback's peak level, "SILENT" when she heard nothing.
+- **Phone Link's End button vanished ~20s into the live call**, so the call was read as
+  hung up. A "gone" reading is no longer believed if they spoke in the last
+  `_LIVE_IF_HEARD_S` (8s), and once a call has been seen, a miss logs every Phone Link
+  button (`_IN_CALL_DUMP`) so the next occurrence shows what the button became.
 
 **How she talks: measured, not guessed (2026-10-08).** Master Miguel's complaint was not
 the voice but the wording: "hi I am California, Miguel's AI", a recited brief, robotic.

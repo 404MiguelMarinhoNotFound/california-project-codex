@@ -30,6 +30,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +53,10 @@ interface IPolicyConfigCal { void a(); void b(); void c(); void d(); void e(); v
   [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string id, int role); }
 [ComImport, Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9")] class PolicyConfigClientCal {}
 public static class CalAudio {
-  public static string GetDefaultCapture() {
+  public static string GetDefault(int flow) {
     var e = (IMMDeviceEnumeratorCal)new MMDeviceEnumeratorCal(); IMMDeviceCal d; string id;
-    Marshal.ThrowExceptionForHR(e.GetDefaultAudioEndpoint(1, 0, out d)); Marshal.ThrowExceptionForHR(d.GetId(out id)); return id; }
+    Marshal.ThrowExceptionForHR(e.GetDefaultAudioEndpoint(flow, 0, out d)); Marshal.ThrowExceptionForHR(d.GetId(out id)); return id; }
+  public static string GetDefaultCapture() { return GetDefault(1); }
   public static void SetDefault(string id) {
     var p = (IPolicyConfigCal)new PolicyConfigClientCal();
     for (int r = 0; r < 3; r++) Marshal.ThrowExceptionForHR(p.SetDefaultEndpoint(id, r)); }
@@ -61,6 +64,8 @@ public static class CalAudio {
 """
 
 _GET_MIC = "Add-Type -TypeDefinition @'\n" + _AUDIO_TYPES + "\n'@\n[CalAudio]::GetDefaultCapture()"
+
+_GET_SPEAKER = "Add-Type -TypeDefinition @'\n" + _AUDIO_TYPES + "\n'@\n[CalAudio]::GetDefault(0)"
 
 _SET_MIC = "Add-Type -TypeDefinition @'\n" + _AUDIO_TYPES + "\n'@\n[CalAudio]::SetDefault('__DEVICE__'); 'OK'"
 
@@ -174,6 +179,11 @@ DumpPhone
 
 _IN_CALL = _UIA + "if (CallWindow) { 'YES' } else { 'NO' }"
 
+# Same check, but on a miss after the call was seen it logs every Phone Link
+# button first: on 2026-10-08 the End button vanished 20s into a live call,
+# and the next time it happens the log says what it turned into.
+_IN_CALL_DUMP = _UIA + "if (CallWindow) { 'YES' } else { DumpPhone; 'NO' }"
+
 _HANG_UP = _UIA_KEYS + r"""
 $e = EndButton
 if (-not $e) { 'NO_CALL'; exit 0 }
@@ -182,6 +192,116 @@ if ($pressed -ne 'SENT') { $pressed; exit 0 }
 Start-Sleep -Milliseconds 800
 if (EndButton) { 'STILL_IN_CALL' } else { 'ENDED' }
 """
+
+# --- The calling link -------------------------------------------------------
+# Phone Link's Bluetooth calling link drops on its own (three times in two
+# days). The Calls pane then shows DialerPaneErrorTitle ("We weren't able to
+# connect to your mobile device") with a Try again button, and its own advice
+# is to toggle Bluetooth off and on. `repair_calling_link` does that from the
+# laptop side; `tools/fix_phone_link.py` runs it by hand.
+
+# READY (dial pad with a Call button), BROKEN (the error), NO_WINDOW, UNKNOWN
+# (Phone Link open on another tab).
+_CALLS_STATE = _UIA + r"""
+$win = MainWindow
+if (-not $win) { 'NO_WINDOW'; exit 0 }
+if (ById $win 'DialerPaneErrorTitle') { 'BROKEN'; exit 0 }
+if (ById $win 'ButtonCall') { 'READY'; exit 0 }
+'UNKNOWN'
+"""
+
+_TRY_AGAIN = _UIA_KEYS + r"""
+$win = MainWindow
+if (-not $win) { 'NO_WINDOW'; exit 0 }
+$btn = ById $win 'DialerPaneErrorActionButton'
+if (-not $btn) { 'NO_BUTTON'; exit 0 }
+PressEnterOn $win $btn 'DialerPaneErrorActionButton'
+"""
+
+# Toggle the laptop's Bluetooth radio through Windows.Devices.Radios (no admin
+# rights needed). Prints the final state.
+_BLUETOOTH_RADIO = r"""
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+  $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+  $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($op, [Type]$type) {
+  $task = $asTask.MakeGenericMethod($type).Invoke($null, @($op)); $task.Wait(-1) | Out-Null; $task.Result }
+[Windows.Devices.Radios.Radio, Windows.System.Devices, ContentType=WindowsRuntime] | Out-Null
+[Windows.Devices.Radios.RadioAccessStatus, Windows.System.Devices, ContentType=WindowsRuntime] | Out-Null
+$access = Await ([Windows.Devices.Radios.Radio]::RequestAccessAsync()) ([Windows.Devices.Radios.RadioAccessStatus])
+if ($access -ne 'Allowed') { "ACCESS_$access"; exit 0 }
+$radios = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+$bt = $radios | Where-Object { $_.Kind -eq 'Bluetooth' } | Select-Object -First 1
+if (-not $bt) { 'NO_RADIO'; exit 0 }
+Await ($bt.SetStateAsync('__STATE__')) ([Windows.Devices.Radios.RadioAccessStatus]) | Out-Null
+Start-Sleep -Milliseconds 500
+[string]$bt.State
+"""
+
+
+def calls_state() -> str:
+    """READY, BROKEN, NO_WINDOW or UNKNOWN (see _CALLS_STATE); "" if PowerShell failed."""
+    return _run_ps(_CALLS_STATE, timeout_s=20)
+
+
+def bluetooth_radio(state: str) -> str:
+    """Set the laptop's Bluetooth radio to "On" or "Off"; returns the state it reports."""
+    return _run_ps(_BLUETOOTH_RADIO.replace("__STATE__", state), timeout_s=30)
+
+
+def repair_calling_link(
+    wait_s: float = 60.0,
+    off_s: float = 4.0,
+    poll_s: float = 3.0,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[bool, list[str]]:
+    """
+    Bring Phone Link's calling link back. (ready, steps taken) -- never raises.
+
+    Cheapest first: if it is already up, nothing is touched. Then Try again,
+    which alone has not fixed it before but costs nothing. Then the laptop's
+    Bluetooth radio off and on, which reconnects the phone (and, as a side
+    effect, any Bluetooth headphones), then Try again until the dial pad is
+    back or `wait_s` runs out. The phone's own Bluetooth is out of reach: if
+    this fails, toggling it on the phone is the remaining step.
+    """
+    steps: list[str] = []
+    state = calls_state()
+    steps.append(f"Phone Link calls: {state or 'no answer from PowerShell'}")
+    if state == "READY":
+        return True, steps
+
+    def wait_until_ready(seconds: float) -> bool:
+        deadline = clock() + seconds
+        while clock() < deadline:
+            now = calls_state()
+            if now == "READY":
+                return True
+            if now == "BROKEN":
+                _run_ps(_TRY_AGAIN)
+            sleep(poll_s)
+        return False
+
+    if state == "BROKEN":
+        steps.append(f"Try again: {_run_ps(_TRY_AGAIN) or 'no answer'}")
+        if wait_until_ready(10.0):
+            steps.append("Calling link back after Try again")
+            return True, steps
+
+    off = bluetooth_radio("Off")
+    steps.append(f"Laptop Bluetooth off: {off or 'no answer'}")
+    sleep(off_s)
+    on = bluetooth_radio("On")
+    steps.append(f"Laptop Bluetooth on: {on or 'no answer'}")
+    if on != "On":
+        return False, steps
+    if wait_until_ready(wait_s):
+        steps.append("Calling link back after the Bluetooth toggle")
+        return True, steps
+    steps.append(f"Still not connected after {int(wait_s)}s: toggle Bluetooth on the phone too")
+    return False, steps
 
 
 def _run_ps(script: str, timeout_s: float = _PS_TIMEOUT_S) -> str:
@@ -259,7 +379,8 @@ class PhoneLinkDialer:
         answered before the button could be seen, and reading its absence as
         "ended" cut the call off before she spoke.
         """
-        status = _run_ps(_IN_CALL, timeout_s=10)
+        script = _IN_CALL_DUMP if getattr(self, "_saw_call", False) else _IN_CALL
+        status = _run_ps(script, timeout_s=10)
         if status == "YES":
             self._saw_call = True
             self._gone = 0
@@ -291,6 +412,9 @@ class MicRoute:
     default mic pointing at the cable.
     """
 
+    _GET = _GET_MIC
+    _WHAT = "microphone"
+
     def __init__(self, endpoint_name: str):
         self.endpoint_name = endpoint_name
         self.previous_id = ""
@@ -300,27 +424,45 @@ class MicRoute:
         target = _run_ps(_FIND_ENDPOINT.replace("__NAME__", self.endpoint_name.replace("'", "''")))
         if not target:
             raise RuntimeError(f"audio endpoint not found: {self.endpoint_name}")
-        self.previous_id = _run_ps(_GET_MIC)
+        self.previous_id = _run_ps(self._GET)
         if not self.previous_id:
             # Switching without knowing what to put back would leave the room
             # mic on the cable after the call, and California deaf.
-            raise RuntimeError("could not read the current default microphone")
+            raise RuntimeError(f"could not read the current default {self._WHAT}")
         # PnP reports the GUID upper-case, IMMDevice lower-case: same device.
         if self.previous_id.lower() == target.lower():
             return self
         if _run_ps(_SET_MIC.replace("__DEVICE__", target)) != "OK":
-            raise RuntimeError("could not switch the default microphone")
+            raise RuntimeError(f"could not switch the default {self._WHAT}")
         self.switched = True
-        logger.info("Default microphone -> %s for the call", self.endpoint_name)
+        logger.info("Default %s -> %s for the call", self._WHAT, self.endpoint_name)
         return self
 
     def __exit__(self, *exc) -> None:
         if self.switched and self.previous_id:
             if _run_ps(_SET_MIC.replace("__DEVICE__", self.previous_id)) == "OK":
-                logger.info("Default microphone restored")
+                logger.info("Default %s restored", self._WHAT)
             else:
-                logger.error("Could not restore the default microphone (%s)", self.previous_id)
+                logger.error("Could not restore the default %s (%s)", self._WHAT, self.previous_id)
         return None
+
+
+class SpeakerRoute(MicRoute):
+    """
+    Context manager: make `endpoint_name` the default SPEAKER for the call, restore after.
+
+    Found 2026-10-08, calling Sergio: Bluetooth headphones ("Black Diamond") had
+    connected and become the default output. In a call Windows moves Bluetooth
+    headphones to their hands-free profile, a different endpoint from the
+    "Headphones" one the loopback was recording, so the callee played where
+    California could not hear: 35 seconds of a real person on the line and
+    nothing in her ears. The call must not depend on whatever happens to be
+    the default output, so for its length Phone Link plays on a fixed device
+    and the loopback records that same device by name.
+    """
+
+    _GET = _GET_SPEAKER
+    _WHAT = "speaker"
 
 
 def is_windows_with_powershell() -> bool:

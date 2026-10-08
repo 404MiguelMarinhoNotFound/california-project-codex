@@ -1059,6 +1059,11 @@ phone:
   # recording endpoint Phone Link must use as its microphone.
   cable_output_device: "CABLE Input"
   cable_mic_endpoint: "CABLE Output (VB-Audio Virtual Cable)"
+  # Where the callee plays and where she listens, pinned for the length of a
+  # call (restored after). Never left to "the default speaker": on 2026-10-08
+  # Bluetooth headphones had become the default, the call audio went to their
+  # hands-free side, and she heard nothing on a real call. "" = default speaker.
+  call_speaker_endpoint: "Speakers (Realtek High Definition Audio)"
   # One line per call: outcome and, unless logging.include_transcripts is
   # false, both sides of the conversation.
   log_path: "logs/calls.jsonl"

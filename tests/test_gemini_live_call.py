@@ -130,7 +130,7 @@ class FakeSpeaker:
 
 class _Base(unittest.TestCase):
     def setUp(self):
-        for name, value in (("_WATCH_INTERVAL_S", 0.02), ("_GOODBYE_GRACE_S", 0.05), ("_NUDGE_AFTER_S", 0.3)):
+        for name, value in (("_WATCH_INTERVAL_S", 0.02), ("_GOODBYE_GRACE_S", 0.05), ("_NUDGE_AFTER_S", 0.3), ("_LIVE_IF_HEARD_S", 0.3)):
             patcher = mock.patch.object(glc, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -213,6 +213,40 @@ class ToolReplySchedulingTests(_Base):
 
         reply = _reply(NS(id="1", name="end_call"), {"ok": True}, "WHEN_IDLE")
         self.assertEqual(types.FunctionResponse(**reply).scheduling.value, "WHEN_IDLE")
+
+
+class HangUpCrossCheckTests(_Base):
+    def test_a_hang_up_reading_while_they_are_talking_is_not_believed(self):
+        # 2026-10-08: the End button vanished 20s into a live call.
+        session = FakeSession([[heard("Estou?")], [said("Olá!")]])
+        with mock.patch.object(glc, "_LIVE_IF_HEARD_S", 60):
+            result = self.agent(session).run("p", max_call_s=0.5, no_answer_s=30, still_connected=lambda: False)
+        self.assertEqual(result.ended_by, "max_duration")
+
+    def test_a_quiet_line_that_reads_ended_is_ended(self):
+        session = FakeSession([[heard("Estou?")]])
+        result = self.agent(session).run("p", max_call_s=30, no_answer_s=30, still_connected=lambda: False)
+        self.assertEqual(result.ended_by, "hung_up")
+
+
+class LoopbackDeviceTests(unittest.TestCase):
+    """She must listen to the speaker the call plays on, not whatever is default."""
+
+    def _sc(self):
+        realtek, headphones = NS(name="Speakers (Realtek High Definition Audio)"), NS(name="Headphones (Black Diamond)")
+        return NS(all_speakers=lambda: [headphones, realtek], default_speaker=lambda: headphones)
+
+    def test_the_named_speaker_is_used_over_the_default(self):
+        cap = glc.LoopbackCapture(device="Speakers (Realtek")
+        self.assertEqual(cap._speaker(self._sc()).name, "Speakers (Realtek High Definition Audio)")
+
+    def test_no_name_or_a_missing_one_falls_back_to_the_default(self):
+        self.assertEqual(glc.LoopbackCapture()._speaker(self._sc()).name, "Headphones (Black Diamond)")
+        self.assertEqual(glc.LoopbackCapture(device="Nope")._speaker(self._sc()).name, "Headphones (Black Diamond)")
+
+    def test_the_agent_hands_its_listen_device_to_the_capture(self):
+        agent = GeminiLiveAgent(client_kwargs={}, model="m", listen_device="Speakers (Realtek")
+        self.assertEqual(agent.capture_factory().device, "Speakers (Realtek")
 
 
 class OpeningNudgeTests(_Base):
