@@ -30,6 +30,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +192,116 @@ if ($pressed -ne 'SENT') { $pressed; exit 0 }
 Start-Sleep -Milliseconds 800
 if (EndButton) { 'STILL_IN_CALL' } else { 'ENDED' }
 """
+
+# --- The calling link -------------------------------------------------------
+# Phone Link's Bluetooth calling link drops on its own (three times in two
+# days). The Calls pane then shows DialerPaneErrorTitle ("We weren't able to
+# connect to your mobile device") with a Try again button, and its own advice
+# is to toggle Bluetooth off and on. `repair_calling_link` does that from the
+# laptop side; `tools/fix_phone_link.py` runs it by hand.
+
+# READY (dial pad with a Call button), BROKEN (the error), NO_WINDOW, UNKNOWN
+# (Phone Link open on another tab).
+_CALLS_STATE = _UIA + r"""
+$win = MainWindow
+if (-not $win) { 'NO_WINDOW'; exit 0 }
+if (ById $win 'DialerPaneErrorTitle') { 'BROKEN'; exit 0 }
+if (ById $win 'ButtonCall') { 'READY'; exit 0 }
+'UNKNOWN'
+"""
+
+_TRY_AGAIN = _UIA_KEYS + r"""
+$win = MainWindow
+if (-not $win) { 'NO_WINDOW'; exit 0 }
+$btn = ById $win 'DialerPaneErrorActionButton'
+if (-not $btn) { 'NO_BUTTON'; exit 0 }
+PressEnterOn $win $btn 'DialerPaneErrorActionButton'
+"""
+
+# Toggle the laptop's Bluetooth radio through Windows.Devices.Radios (no admin
+# rights needed). Prints the final state.
+_BLUETOOTH_RADIO = r"""
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+  $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+  $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($op, [Type]$type) {
+  $task = $asTask.MakeGenericMethod($type).Invoke($null, @($op)); $task.Wait(-1) | Out-Null; $task.Result }
+[Windows.Devices.Radios.Radio, Windows.System.Devices, ContentType=WindowsRuntime] | Out-Null
+[Windows.Devices.Radios.RadioAccessStatus, Windows.System.Devices, ContentType=WindowsRuntime] | Out-Null
+$access = Await ([Windows.Devices.Radios.Radio]::RequestAccessAsync()) ([Windows.Devices.Radios.RadioAccessStatus])
+if ($access -ne 'Allowed') { "ACCESS_$access"; exit 0 }
+$radios = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+$bt = $radios | Where-Object { $_.Kind -eq 'Bluetooth' } | Select-Object -First 1
+if (-not $bt) { 'NO_RADIO'; exit 0 }
+Await ($bt.SetStateAsync('__STATE__')) ([Windows.Devices.Radios.RadioAccessStatus]) | Out-Null
+Start-Sleep -Milliseconds 500
+[string]$bt.State
+"""
+
+
+def calls_state() -> str:
+    """READY, BROKEN, NO_WINDOW or UNKNOWN (see _CALLS_STATE); "" if PowerShell failed."""
+    return _run_ps(_CALLS_STATE, timeout_s=20)
+
+
+def bluetooth_radio(state: str) -> str:
+    """Set the laptop's Bluetooth radio to "On" or "Off"; returns the state it reports."""
+    return _run_ps(_BLUETOOTH_RADIO.replace("__STATE__", state), timeout_s=30)
+
+
+def repair_calling_link(
+    wait_s: float = 60.0,
+    off_s: float = 4.0,
+    poll_s: float = 3.0,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[bool, list[str]]:
+    """
+    Bring Phone Link's calling link back. (ready, steps taken) -- never raises.
+
+    Cheapest first: if it is already up, nothing is touched. Then Try again,
+    which alone has not fixed it before but costs nothing. Then the laptop's
+    Bluetooth radio off and on, which reconnects the phone (and, as a side
+    effect, any Bluetooth headphones), then Try again until the dial pad is
+    back or `wait_s` runs out. The phone's own Bluetooth is out of reach: if
+    this fails, toggling it on the phone is the remaining step.
+    """
+    steps: list[str] = []
+    state = calls_state()
+    steps.append(f"Phone Link calls: {state or 'no answer from PowerShell'}")
+    if state == "READY":
+        return True, steps
+
+    def wait_until_ready(seconds: float) -> bool:
+        deadline = clock() + seconds
+        while clock() < deadline:
+            now = calls_state()
+            if now == "READY":
+                return True
+            if now == "BROKEN":
+                _run_ps(_TRY_AGAIN)
+            sleep(poll_s)
+        return False
+
+    if state == "BROKEN":
+        steps.append(f"Try again: {_run_ps(_TRY_AGAIN) or 'no answer'}")
+        if wait_until_ready(10.0):
+            steps.append("Calling link back after Try again")
+            return True, steps
+
+    off = bluetooth_radio("Off")
+    steps.append(f"Laptop Bluetooth off: {off or 'no answer'}")
+    sleep(off_s)
+    on = bluetooth_radio("On")
+    steps.append(f"Laptop Bluetooth on: {on or 'no answer'}")
+    if on != "On":
+        return False, steps
+    if wait_until_ready(wait_s):
+        steps.append("Calling link back after the Bluetooth toggle")
+        return True, steps
+    steps.append(f"Still not connected after {int(wait_s)}s: toggle Bluetooth on the phone too")
+    return False, steps
 
 
 def _run_ps(script: str, timeout_s: float = _PS_TIMEOUT_S) -> str:

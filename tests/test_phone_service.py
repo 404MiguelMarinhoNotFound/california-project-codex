@@ -588,5 +588,63 @@ class PhoneLinkScriptTests(unittest.TestCase):
         self.assertFalse(any("[CalAudio]::SetDefault(" in c for c in calls))
 
 
+
+
+class RepairCallingLinkTests(unittest.TestCase):
+    """tools/fix_phone_link.py: cheapest step first, never touches a working link."""
+
+    def _run(self, states, radio=("Off", "On")):
+        from services import phone_link
+
+        states = list(states)
+        radio = list(radio)
+        calls = {"try_again": 0, "radio": []}
+
+        def state():
+            return states.pop(0) if len(states) > 1 else states[0]
+
+        def run_ps(script, timeout_s=0):
+            calls["try_again"] += 1
+            return "SENT"
+
+        def bt(value):
+            calls["radio"].append(value)
+            return radio.pop(0)
+
+        now = [0.0]
+        with mock.patch.object(phone_link, "calls_state", side_effect=state), \
+                mock.patch.object(phone_link, "_run_ps", side_effect=run_ps), \
+                mock.patch.object(phone_link, "bluetooth_radio", side_effect=bt):
+            ready, steps = phone_link.repair_calling_link(
+                wait_s=10, sleep=lambda s: now.__setitem__(0, now[0] + s), clock=lambda: now[0])
+        return ready, steps, calls
+
+    def test_a_working_link_is_left_alone(self):
+        ready, steps, calls = self._run(["READY"])
+        self.assertTrue(ready)
+        self.assertEqual((calls["try_again"], calls["radio"]), (0, []))
+
+    def test_try_again_alone_is_enough_sometimes(self):
+        ready, steps, calls = self._run(["BROKEN", "READY"])
+        self.assertTrue(ready)
+        self.assertEqual(calls["radio"], [])
+
+    def test_otherwise_bluetooth_is_toggled_off_then_on(self):
+        ready, steps, calls = self._run(["BROKEN"] * 8 + ["READY"])
+        self.assertTrue(ready)
+        self.assertEqual(calls["radio"], ["Off", "On"])
+        self.assertIn("Bluetooth toggle", steps[-1])
+
+    def test_still_down_says_to_toggle_the_phone(self):
+        ready, steps, calls = self._run(["BROKEN"])
+        self.assertFalse(ready)
+        self.assertIn("on the phone", steps[-1])
+
+    def test_a_radio_that_does_not_come_back_on_stops_there(self):
+        ready, steps, calls = self._run(["BROKEN"], radio=("Off", "Off"))
+        self.assertFalse(ready)
+        self.assertEqual(calls["radio"], ["Off", "On"])
+
+
 if __name__ == "__main__":
     unittest.main()
