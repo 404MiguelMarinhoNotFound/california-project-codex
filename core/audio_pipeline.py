@@ -336,6 +336,10 @@ class AudioPipeline:
             self._speaker_dead = False
             logger.debug("Speaker open at %d Hz", sample_rate)
 
+    def speaker_open(self) -> bool:
+        """True while a turn holds the speaker (wake to last word). Lock-free read."""
+        return self._speaker is not None
+
     def close_speaker(self, tail_s: float | None = None) -> None:
         """
         Close the turn's speaker session.

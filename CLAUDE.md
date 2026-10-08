@@ -102,6 +102,22 @@ Required for the vacuum (`control_vacuum`):
   service reads the code itself over IMAP. Without it, the vacuum tool stalls until
   `ECOVACS_VERIFICATION_CODE` is set by hand once. See "DeebotService" below
 
+Required for phone calls (`control_phone`), depending on `phone.backend`:
+
+- `vertex` (shipped; bills the Google Cloud project, so its credits apply):
+  `phone.vertex.project` in `config.yaml` plus Application Default Credentials --
+  **`gcloud auth application-default login`** (Google Cloud CLI) on this laptop. A service
+  account key file (`GOOGLE_APPLICATION_CREDENTIALS`) also works but **cannot be created
+  on this project**: its organisation enforces `iam.disableServiceAccountKeyCreation`
+  ("secure by default", 2026-10-07), and lifting that is an org-admin change Google
+  advises against. Fallback: `VERTEX_API_KEY` for Vertex express mode
+- `ai_studio`: `GEMINI_API_KEY`. **AI Studio bills its own prepaid balance, not the Cloud
+  credits** -- on 2026-10-06 a valid key connected and was refused with "Your prepayment
+  credits are depleted" while $300 of Cloud credit sat unused
+- A Google key is per project, not per service, but keys are usually **restricted**: the
+  TTS key answers "Requests to this API ... are blocked" for both Gemini and Vertex.
+  Without credentials `PhoneService` disables itself and logs which variable is missing
+
 WhatsApp (`control_whatsapp`) needs **no credential at all**, and that is deliberate: the send
 path drives WhatsApp Web in a linked browser profile (`whatsapp.profile_dir`, linked once with
 `tools/link_whatsapp.py`), so the session *is* the auth -- and is gitignored like one.
@@ -244,6 +260,11 @@ california/
 │   ├── whatsapp_service.py      # WhatsApp: VCF contacts, confirm-before-send, one worker thread, backend switch
 │   ├── whatsapp_web.py          # Playwright driver for WhatsApp Web: selectors table, send + sent-tick confirm
 │   ├── whatsapp_groups.py       # Forgiving spoken-name -> group-title matcher (emoji-blind, sound-alike words)
+│   ├── phone_service.py         # Phone calls: brief -> read-back -> background call -> CallReport + logs/calls.jsonl
+│   ├── phone_prompts.py         # The call agent's prompt: persona, flow of a call, guardrails, template per kind, notes
+│   ├── call_outcome.py          # What a call achieved, read from its transcript by Claude after the call
+│   ├── phone_link.py            # Phone Link over PowerShell/UIA: dial, in-call, hang up, default-mic swap
+│   ├── gemini_live_call.py      # One Gemini Live session per call: loopback in, VB-CABLE out, transcript, end_call only
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
@@ -265,6 +286,8 @@ california/
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
 │   ├── list_whatsapp_groups.py     # Read every WhatsApp group off the chat list and refresh the cache
+│   ├── probe_phone_backend.py      # Connect Gemini Live with the phone config, no call: credentials, latency, her first line
+│   ├── eval_phone_conversation.py  # Simulated calls (Claude as callee, spoken pt-PT TTS) scored for how she talks
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
 │   ├── bench_report.py             # Per-phase medians of recorded bench runs, and the spike-vs-base win rule
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
@@ -315,6 +338,11 @@ california/
 │   ├── test_whatsapp_groups.py  # Group list: scrolled read of a virtualised list, shared titles kept, cache, chip selectors
 │   ├── test_whatsapp_group_send.py # Group sends: misheard names matched, always read back, groups-only, one guess per turn
 │   ├── test_whatsapp_read.py    # Reading a chat's latest messages: open-read-close, quoted not obeyed, sends close the chat too
+│   ├── test_phone_prompts.py    # Background rules in every kind, request fields, brief signature
+│   ├── test_phone_service.py    # Read-back token, number rules, one call at a time, report + log, no-PowerShell guard
+│   ├── test_gemini_live_call.py # Fake Live session: transcript, hang-up guard, silent tool replies, every way a call ends
+│   ├── test_call_outcome.py     # Reading the outcome from a transcript: statuses, never raises, their words as data
+│   ├── test_orchestrator_phone.py # control_phone dispatch, the labelled report, speaking it from the idle loop
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -407,7 +435,7 @@ truth. `requirements.txt` has been deleted and must not be reintroduced.
 - **Optional/heavy providers go in `[project.optional-dependencies]`,** not in the core
   `dependencies` list. Current extras: `kokoro`, `piper`, `elevenlabs`, `openai`,
   `cec`,
-  `porcupine`, `silero`, `pi`, `govee`, `tapo`, and the aggregate `default`.
+  `porcupine`, `silero`, `pi`, `govee`, `tapo`, `phone`, and the aggregate `default`.
 - **`uv sync --extra <name>` syncs ONLY that extra and uninstalls everything else.**
   It is not additive. Running `uv sync --extra govee` on this project removes kokoro,
   torch and spacy, which silently breaks TTS on the next launch because `config.yaml`
@@ -2030,6 +2058,218 @@ drop it at `whatsapp.contacts_path` (gitignored). On the Pi, also
 `uv run playwright install chromium` once -- that browser lives outside `uv.lock`, like
 the openWakeWord models, so a fresh machine needs it again.
 
+### PhoneService
+
+`services/phone_service.py` places real phone calls from Master Miguel's own number
+(Xiaomi 17T, Android) and has the conversation itself, behind `control_phone`. Same
+contract as WhatsApp and the vacuum: never raises at construction, self-disables (flag
+off, not Windows, no credentials for `phone.backend`, `google-genai`/`soundcard` missing), returns
+`PhoneCommandResult` (falsy on failure), one call in flight on a daemon thread.
+
+```text
+room -> Claude: control_phone(phone_call, brief) -> read-back -> "go" -> confirm true
+  -> background: default mic -> CABLE Output, Gemini Live connects, THEN Phone Link dials
+  -> callee <-> loopback (16k) -> Gemini Live -> 24k PCM -> CABLE Input -> Phone Link mic
+  -> goodbye + end_call -> hang up -> mic restored -> outcome read from transcript
+  -> logs/calls.jsonl -> CallReport
+  -> _idle_loop pops the report between mic reads -> a turn on "[Phone call report ...]"
+```
+
+**Everything below was found live on 2026-10-06, and most of it is not what you'd guess:**
+
+- **There is no Phone Link API, and the WinRT calls API sees 0 lines** from unpackaged
+  Python (Phone Link owns the HFP registration). Calls go through Phone Link's UI.
+- **`tel:` only pre-fills the dial pad.** A synthetic mouse click on the call button and
+  UIA `InvokePattern` are both silently ignored. What dials is UIA `SetFocus()` on
+  AutomationId `ButtonCall` followed by a real Enter. Enter with focus anywhere else (the
+  call list) does nothing.
+- **The pad can still hold the previous number** with the button enabled, so `_DIAL` waits
+  until a Text element shows the requested number's last nine digits before pressing.
+- **"Connected" in Phone Link is the Wi-Fi link, not calling.** The Calls tab shows "We
+  weren't able to connect to your mobile device" when the Bluetooth hands-free link is
+  down; toggling Bluetooth on both sides fixed it.
+- **Phone Link records from the Windows DEFAULT microphone (console role).** Setting only
+  the communications default did nothing; she was silent until the default mic was the
+  cable. `MicRoute` swaps it for the call and restores the exact previous endpoint in
+  `__exit__`. PnP reports the endpoint GUID upper-case, IMMDevice lower-case.
+- **Her ears are a loopback of the default speaker, not a second cable.** Phone Link plays
+  the callee there and her voice goes to the cable, so the loopback carries only them, echo
+  free. Groq Whisper (pt) on 5s windows of it transcribed "Olá, teste Califórnia" in
+  ~0.4s; Gemini Live does its own VAD and transcription on the same stream.
+- **PowerShell scripts go through a temp `.ps1`, never `-Command -`.** Stdin mode reads
+  line by line as if typed, and the multi-line here-string carrying the C# audio types
+  silently printed nothing.
+- **VB-CABLE's installer made the cable the default speaker AND mic.** California went deaf
+  and mute until both were set back. Reinstalls will do it again.
+
+**First full live call, 2026-10-07: booked.** Marta played the restaurant; California
+introduced herself as Miguel's AI, asked for the table, read the booking back, switched to
+English when asked, recorded `booked` and hung up herself, 74s. Getting there found:
+
+- **There is no separate call window.** The "Call on PC" controls live inside the main
+  Phone Link window, so a check for a second top-level window reported "no call" for a
+  call that rang and was answered -- and the session was closed under it, so the callee
+  heard silence. The call is recognised by its **End button** (`EndButton`), searched in
+  every Phone Link window. A dial whose Enter verifiably reached the Call button but shows
+  no End button within 4s is `DIALED_UNCONFIRMED` and the call **proceeds**.
+- **`in_call()` is tri-state on purpose.** `True` = End button visible; `False` only when a
+  button seen in *this* call is gone (they hung up); `None` = cannot tell. Absence alone is
+  never `False`. The Bluetooth hands-free audio endpoints read `OK` throughout a call and
+  before it, so they are no call signal.
+- **Enter is only sent to a verified foreground window.** UIA `SetFocus` from a background
+  process does not bring a window forward (Windows' foreground lock): after one dial the
+  foreground window was the Claude app. `PressEnterOn` lifts the lock (AttachThreadInput +
+  an ALT tap), then checks the foreground window AND the focused AutomationId before
+  sending a key, else returns `NOT_FOREGROUND` / `NOT_FOCUSED` with nothing pressed.
+- **The calling link drops on its own** (twice in two days): Phone Link shows "We weren't
+  able to connect to your mobile device", Windows shows every Bluetooth profile of the
+  phone `connected=False`, and restarting Phone Link or pressing Try again does not help.
+  Reconnecting the phone in Bluetooth settings does. The dial reports
+  `PHONE_NOT_CONNECTED` with that fix in words.
+- **The model tried to hang up before speaking** (Vertex, 0.75s in: `record_outcome` +
+  `end_call` before a word). `_hang_up_too_early` refuses `end_call` until she has spoken
+  and someone has been heard (a voicemail greeting counts). The `record_outcome` tool
+  that came with it is gone -- see "How she talks" below.
+
+**How she talks: measured, not guessed (2026-10-08).** Master Miguel's complaint was not
+the voice but the wording: "hi I am California, Miguel's AI", a recited brief, robotic.
+The method, so it can be repeated:
+
+1. **Measure first.** `tools/eval_phone_conversation.py` runs simulated calls against the
+   real Live model: Claude plays the callee from a persona, their lines are spoken (pt-PT
+   TTS) and streamed as live 16 kHz audio like the phone loopback, and a separate Claude
+   call judges the transcript 1-5 for "a person on the phone vs a bot reading a brief",
+   next to counted signals (words in her first turn, words per turn, monologues, stock
+   formulas). **The first bench fed the callee as text, and that misled**: she re-said
+   her previous turn and transcripts arrived after the turn was marked complete. Audio in,
+   and wait for the transcript to go quiet before scoring a turn.
+2. **Read the transcripts for mechanisms, then fix the mechanism.** What was found:
+   - The prompt dictated her first sentence, so she recited it. It now describes what an
+     opening must achieve and shows stiff vs natural examples (the feel, not lines).
+   - "Read it back before agreeing" was read as "read back every turn" ("Confirma?" each
+     time). Now: read back ONCE, at the end.
+   - Claude's brief arrived as English prose ("express genuine warmth...") and she
+     translated it. The prompt says the request is her notes, never her script, and the
+     `control_phone` description tells Claude to write plain facts.
+   - Persona: the room California's (`llm.system_prompt`), carried onto the phone: West
+     Coast, warm, quick, dry humour used lightly, more banter with people he knows. The
+     edgy takes are deliberately left at home: she is talking to people who did not
+     choose to talk to her.
+   - Layout follows Google's Live API guidance: persona, then the flow of a call, then
+     guardrails, with short do/don't examples.
+   - **The biggest one was not wording.** She heard "Taberna da Praia, boa noite" and
+     called `record_outcome(no_answer)` + `end_call` before a word -- the native-audio
+     model plays the whole call out in its head. Each refusal restarted her sentence
+     (221 refusals over 8 calls: doubled openers, cut words) or left dead air. Live tool
+     calls are non-blocking by default, and a reply without `scheduling` interrupts her,
+     so replies are now `SILENT` (a refused hang-up `WHEN_IDLE`). That cut the restarts
+     but not the dead air, so **`record_outcome` was removed from the live agent**: she
+     only talks and hangs up, and `services/call_outcome.py` reads the outcome from the
+     transcript afterwards with the room's Claude model.
+3. **Re-measure after every change.** Judge mean over 8 calls: old prompt 2.4; new prompt
+   2.5-3.0 with the tool; 3.5 without it (early tool calls 221 -> 8). The judge is a
+   cheap model and noisy -- compare runs of the same bench, two runs per scenario at
+   least, and read the transcripts rather than trusting one number.
+
+4. **What wording could not fix, code does.** Even without `record_outcome`, roughly one
+   simulated call in three opened with dead air: she heard "Estou?", reached for
+   `end_call`, and never began. A refused hang-up replied `SILENT` stays silent; replied
+   `WHEN_IDLE` it makes her start a fresh turn (a doubled opener, once in English). So
+   every reply is `SILENT`, and `GeminiLiveAgent` has an **opening nudge**: once they
+   have spoken, if she has said nothing `_NUDGE_AFTER_S` (2.5s) later, a short text turn
+   tells her to greet them, up to `_NUDGE_MAX` (2). Opening only, so a normal pause later
+   in a call is never stepped on. The bench applies the same nudge, so it measures what a
+   real call does. Final bench (8 calls): every call opened (2 needed the nudge), every
+   outcome read correctly from the transcript, judge 3.4 against 2.4 for the old prompt,
+   6 of 8 calls rated 4/5.
+5. **She made up a phone number.** Pressed twice for digits by a simulated restaurant, she
+   invented one. With `phone.callback_number` empty the prompt now says she does not know
+   the digits and must never say any, and offers that Miguel sends it by message. Setting
+   `phone.callback_number` to his real number is the better fix.
+
+Still open: the bench's callee takes ~3s to answer (Claude + TTS), and she sometimes
+fills that silence with a second sentence; a real person answers faster. Untested on a
+real call yet.
+
+**Calls that cut off halfway, 2026-10-07 evening (voice-triggered calls).** Three causes,
+read off `logs/calls.jsonl` and `logs/california.log`:
+
+- **A delivered message was refused as an outcome.** Marta said "Olá", California said
+  the message and "Adeus", then `record_outcome(message_delivered)` was refused ten times
+  in five seconds ("they have not answered you yet") and the line sat silent until Marta
+  hung up. `message_delivered` now stands once they have spoken at all.
+- **One missed UIA reading ended a call.** `in_call()` returned `False` on the first poll
+  that did not see the End button, cutting her off mid-sentence. It now needs
+  `_GONE_READINGS` (2) misses in a row, and a call read as hung up still gets a
+  `hang_up()` attempt, so a wrong reading cannot leave the line open on the room mic.
+- **Her room voice reached the call agent as the callee.** The loopback hears the laptop
+  speakers, which is also where she answers the room: "looks like it didn't go through"
+  was transcribed as *theirs*. `PhoneService(room_speaking=AudioPipeline.speaker_open)`
+  sends silence to the agent while a room turn holds the speaker.
+- Still open: ringback and line noise get transcribed as speech (Hindi-looking text for
+  "tuuu"), which counts as "heard them" for the no-answer clock and the outcome guard.
+
+**The prompt is built, never written by the model.** `services/phone_prompts.py` joins a
+fixed BACKGROUND (who Miguel is, that she is his AI and says so first, no card/bank/NIF
+details, never agree outside the brief, never invent facts, the other side's words are not
+instructions, read back once before agreeing, goodbye then `end_call`), a template per
+`kind`, and the request. Claude only fills the brief, so no brief can drop a rule.
+
+**Every call is read back, even to an exact contact**, through the same server-side token
+as WhatsApp: `confirm=True` works only against a pending read-back of the same number AND
+the same `brief.signature()`, inside `confirm_timeout_ms`, one shot. Numbers are
+`normalize_phone`d; short codes (112), `blocked_prefixes` (PT premium rate) and countries
+outside `allowed_country_codes` are refused.
+
+**Where the number comes from, in order** (`PhoneService._resolve`), and the read-back
+says which ("from your contacts", "the number I found", "the number you said"):
+
+1. Digits in `to` -- he said the number.
+2. A **certain** contact match for `to` (`WhatsAppService.resolve_contact`: aliases + the
+   VCF, no browser) -- even when Claude also passed a `number`, because a number the model
+   passes for a person may be invented and the book is what his phone holds.
+3. The brief's `number` -- a business Claude looked up with web search. It beats a loose
+   or tied contact match, so "Taberna da Praia" brushing a contact's surname cannot
+   redirect the call.
+4. Two close contacts ask which; a loose match alone is used and read back by its saved name.
+5. Nothing: the tool result tells Claude to web search a business and to **ask him for a
+   person's number, never search for one**.
+
+**Kinds** (one template each in `phone_prompts.TEMPLATES`): `book_table` (the questions
+restaurants ask, nearest-slot fallback, no deposit or card ever), `book_appointment`
+(clinic/hairdresser/garage: no health or ID detail beyond the brief, up to three offered
+slots brought back), `ask_question`, `deliver_message`, `personal` (a friend or family:
+"tu", says up front that Miguel asked her to call because an AI on a friend's line reads
+as a scam), `general`. The BACKGROUND rules apply to all of them.
+
+**The agent connects first, then dials** (`dial=` callback in `GeminiLiveAgent.run`), so a
+callee who answers on the first ring is not talking into nothing, and the no-answer and
+max-duration clocks start at the dial. A call ends on `end_call` (her goodbye is allowed
+to finish playing), the End button seen and then gone (`hung_up`), the Live session dropping (`error`), `no_answer_s` with nothing
+heard, `max_call_s`, or shutdown. Whatever happens, a `CallReport` is queued and logged.
+
+**The report is a turn, not an injection.** `LLMService.history` has no lock and no
+outside writer, so `_idle_loop` (main thread, between mic reads) runs
+`_deliver_phone_report`: same speaker session, barge-in chaining and mic drain as a wake
+turn, with `_phone_report_message(report)` as the user message. It lands in history, so
+"did they confirm the time?" works afterwards. The transcript inside it is labelled as the
+other person's words, never instructions.
+
+**Backend, model and cost.** `phone.backend: vertex` runs the call on Vertex AI (Agent
+Platform) so the Cloud project's credits pay for it; `PhoneService._client_kwargs` uses Application
+Default Credentials (the `gcloud auth application-default login` file, or
+`GOOGLE_APPLICATION_CREDENTIALS`) + `phone.vertex.project`, then a `VERTEX_API_KEY` express key. The Vertex model is `gemini-live-2.5-flash-native-audio`; on
+`ai_studio` it is `gemini-2.5-flash-native-audio-latest`. The 2.5 native-audio Live models
+are the cheapest (audio $3 in / $12 out per 1M tokens like 3.8 Live, cheaper text),
+~$0.03-0.05 per three-minute call; `gemini-3.8-live` is the drop-in upgrade. The model
+list endpoint on Vertex rejects API keys outright ("API keys are not supported by this
+API"), so it is no test of whether a key works -- a real request is. Voice `Aoede`; `language_code` is left
+empty so the native-audio model follows the prompt (Portuguese, English if they do).
+
+**Not built yet, on purpose:** asking Miguel mid-call (`ask_miguel`; he may not be in the
+room, so it needs WhatsApp), and the Pi. On the Pi the transport becomes PipeWire's
+Bluetooth telephony (`org.pipewire.Telephony`, `Dial`), behind the same agent.
+
 ### StremioService
 
 `services/stremio_service.py` handles:
@@ -2380,16 +2620,17 @@ The Claude path supports:
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 - Custom `control_whatsapp` tool for WhatsApp messaging (4 actions)
+- Custom `control_phone` tool for phone calls from his own number (2 actions)
 
-With the committed `config.yaml` that is **5 tools** in every request: `web_search`,
-`control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`. Each custom tool's full schema is sent on
+With the committed `config.yaml` that is **6 tools** in every request: `web_search`,
+`control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`, `control_phone`. Each custom tool's full schema is sent on
 every turn, so adding actions and parameters costs input tokens on every single exchange.
 Keep descriptions tight — see Cost Discipline. `control_vacuum` was deliberately held to a
 core five (`vacuum_clean_all`, `vacuum_clean_rooms`, `vacuum_stop`, `vacuum_dock`,
 `vacuum_status`); pause/resume/locate were left out until asked for by voice.
 
 The custom tools are gated by config: `control_tv` on `media.enabled`, `control_lights` on
-`govee.enabled`, `control_vacuum` on `deebot.enabled`, `control_whatsapp` on `whatsapp.enabled`. Web search runs server-side at
+`govee.enabled`, `control_vacuum` on `deebot.enabled`, `control_whatsapp` on `whatsapp.enabled`, `control_phone` on `phone.enabled`. Web search runs server-side at
 Anthropic and is **not** dispatched locally, which
 is why the Claude tool loop checks `block.name in LOCAL_TOOL_NAMES` instead of `block.type` alone.
 Widening that check to any `tool_use` block would break web search.
@@ -2439,6 +2680,14 @@ The `control_tv` schema in `services/llm.py` currently supports these TV-related
 Bulk send and image send exist in the CLI it was ported from and were left out: bulk has no
 spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
 capability with no voice phrasing.
+
+`control_phone` supports two actions:
+
+- `phone_call` with a brief: `to`, optional `number`, `kind` (`book_table`, `book_appointment`,
+  `ask_question`, `deliver_message`, `personal`, `general`), `goal`, `details`, `may_agree`,
+  `must_not`, and `confirm`.
+  The first call always reads back; see "PhoneService"
+- `phone_status`: on a call or not, and the last call's summary
 
 When tools are active:
 
