@@ -1550,6 +1550,8 @@ def _dispatch_phone(params: dict, phone_svc) -> str:
     action = params.get("action")
     if action == "phone_status":
         return phone_svc.status_line()
+    if action == "phone_find":
+        return phone_svc.find_phone().message
     if action == "phone_log":
         records = phone_svc.recent_calls(params.get("count") or 5)
         if not records:

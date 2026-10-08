@@ -48,6 +48,18 @@ class DispatchTests(unittest.TestCase):
     def test_status(self):
         self.assertEqual(_dispatch_phone({"action": "phone_status"}, _svc()), "No call right now.")
 
+    def test_find_phone_rings_without_a_read_back(self):
+        service = _svc()
+        service.find_phone.return_value = PhoneCommandResult(True, "It's ringing on his phone now.")
+        self.assertEqual(_dispatch_phone({"action": "phone_find"}, service), "It's ringing on his phone now.")
+        service.find_phone.assert_called_once_with()
+        service.call.assert_not_called()
+
+    def test_find_phone_when_not_set_up(self):
+        disabled = mock.Mock(enabled=False)
+        self.assertEqual(_dispatch_phone({"action": "phone_find"}, disabled), "Phone calls aren't set up right now.")
+        disabled.find_phone.assert_not_called()
+
     def test_unknown_action(self):
         self.assertEqual(_dispatch_phone({"action": "phone_hack"}, _svc()), "unknown action")
 

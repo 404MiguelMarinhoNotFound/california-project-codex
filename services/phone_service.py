@@ -50,6 +50,22 @@ _MSG_NO_NUMBER = (
 )
 _MSG_BLOCKED = "I won't call that number myself."
 
+# Find my phone, one line per way it can end. The fixes differ, so none is
+# collapsed into "couldn't": a closed window, a dropped link and a lock on the
+# laptop each send him somewhere else.
+_FIND_LINES = {
+    "PLAYING": "It's ringing on his phone now, a sound for about twenty seconds. Say 'again' if he needs longer.",
+    "ALREADY_PLAYING": "The phone is already playing its sound. Tell him to listen for it.",
+    "NO_WINDOW": "Phone Link won't open on the laptop, so I couldn't ring the phone.",
+    "NO_BUTTON": "Phone Link is open but I can't see its Play sound button. The phone may be disconnected from the laptop.",
+    "DISABLED": "Phone Link says the phone isn't reachable right now, so Play sound is greyed out. Check it's on Wi-Fi and Bluetooth.",
+    "NO_CONFIRM": "Phone Link didn't show its Play sound confirmation, so nothing rang. Try again in a moment.",
+    "NOT_STARTED": "I pressed Play sound but the phone didn't start it. It may be out of reach of the laptop.",
+    "NOT_FOREGROUND": "I couldn't bring Phone Link to the front, so I didn't press anything. Try again in a moment.",
+    "NOT_FOCUSED": "I couldn't reach the Play sound button, so I didn't press anything. Try again in a moment.",
+}
+_MSG_FIND_FAILED = "I couldn't ring the phone, Phone Link didn't answer."
+
 # A dial that went out. DIALED_UNCONFIRMED: Enter reached the verified Call
 # button, but Phone Link's call screen is invisible to automation (2026-10-07:
 # the call rang and was answered while the old check reported failure).
@@ -502,6 +518,30 @@ class PhoneService:
         )
         self._thread.start()
         return PhoneCommandResult(True, f"Calling {label} now. The report comes when the call ends.")
+
+    def find_phone(self) -> PhoneCommandResult:
+        """
+        Ring the phone with Phone Link's "Play sound" (about 20 seconds).
+
+        Not during a call: it drives the same Phone Link window and takes the
+        foreground, which would disturb a call in progress. Blocks for the few
+        seconds the UI takes, on the caller's thread, like the other tools.
+        """
+        if not self.enabled:
+            return PhoneCommandResult(False, _MSG_DISABLED)
+        with self._lock:
+            busy = self._active is not None
+        if busy:
+            return PhoneCommandResult(False, _MSG_BUSY)
+        try:
+            status = self._get_dialer().play_sound()
+        except Exception:
+            logger.exception("Find my phone failed")
+            status = ""
+        line = _FIND_LINES.get(status)
+        if line is None:
+            return PhoneCommandResult(False, _MSG_FIND_FAILED)
+        return PhoneCommandResult(status in ("PLAYING", "ALREADY_PLAYING"), line)
 
     def status_line(self) -> str:
         with self._lock:
