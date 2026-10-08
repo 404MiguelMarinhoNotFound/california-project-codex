@@ -330,12 +330,15 @@ CONTROL_PHONE_TOOL = {
         "to him and only repeat the same call with confirm true once he says go. "
         "The call then runs in the background; say you are calling and that you "
         "will tell him how it went. The result arrives later as a [Phone call "
-        "report] message. phone_status says whether a call is going on."
+        "report] message, with timing, turns and a timestamped transcript. "
+        "phone_status says whether a call is going on and how the last one went; "
+        "phone_log lists the last calls (count, default 5) from the call log."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["phone_call", "phone_status"]},
+            "action": {"type": "string", "enum": ["phone_call", "phone_status", "phone_log"]},
+            "count": {"type": "integer", "description": "phone_log only: how many recent calls, 1-20."},
             "to": {"type": "string", "description": "Who to call: a contact name as spoken, a business name, or a number."},
             "number": {"type": "string", "description": "The phone number, when known. Digits, optional +."},
             "kind": {

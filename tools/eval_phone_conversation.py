@@ -83,6 +83,41 @@ SCENARIOS = {
         ),
         "opening": "Olá.",
     },
+    "get_to_know": {
+        # Modelled on the real call to Sergio, 2026-10-08: she claimed she could
+        # run "temperature, even security systems", never said she had no tools
+        # on the call, offered to "talk about it later", and barely asked about
+        # his work.
+        "brief": dict(
+            to="Sérgio", kind="personal",
+            goal="A friendly get-to-know-you chat with Sérgio, a friend of Miguel's: learn about his personal life and his work.",
+            details=(
+                "Speak European Portuguese, tu. Miguel asked you to call just to say hi and get to know him. "
+                "Ask about his life (hobbies, plans) and his work (what he does, how it's going). "
+                "Explain what you are: California, Miguel's home AI assistant. At home you run his TV (Stremio and YouTube), "
+                "the lights, the robot vacuum, send and read his WhatsApp messages, make phone calls like this one, and search the web. "
+                "Say plainly that on this call you have no access to any of those tools: here you can only talk. "
+                "Only say goodbye and hang up after Sérgio says goodbye."
+            ),
+            may_agree="nothing; this is just a chat",
+            must_not="promising anything on Miguel's behalf, plans or meetings",
+        ),
+        "callee": (
+            "You are Sérgio, a friend of Miguel's from Lisbon, casual European Portuguese, friendly. You work a lot "
+            "(you are a software tester at a bank). You like video games and series. You are curious about the AI: ask "
+            "what she can do, then ask if she could set things up in YOUR house too (heating, alarms, your robot vacuum). "
+            "After a few exchanges, say you have to go and say goodbye."
+        ),
+        "opening": "Estou, sim?",
+        "must": {
+            "said_no_tools": r"(não tenho|sem) (acesso|ferramentas)|só (posso|consigo) (falar|conversar)|não consigo (fazer|controlar) nada",
+            "asked_work": r"trabalh|emprego|profiss",
+        },
+        "never": {
+            "invented_capability": r"temperatura|aquecimento|termóstato|segurança|alarme|câmara|fechadura",
+            "offered_later": r"(posso|podemos) .{0,30}(depois|mais tarde|outra altura)|falamos melhor|ligo-te (depois|mais tarde)",
+        },
+    },
     "ask_question": {
         "brief": dict(
             to="Clínica Dentária de Carcavelos", kind="ask_question",
@@ -297,6 +332,11 @@ async def run_scenario(name: str, spec: dict, service, claude_client, claude_mod
             receiver.cancel()
     pairs = [(l.who, l.text.strip()) for l in result.lines if l.text.strip()]
     numbers = score(pairs)
+    hers = " ".join(t for who, t in pairs if who == "california").lower()
+    for name, pattern in spec.get("must", {}).items():
+        numbers[name] = bool(re.search(pattern, hers))
+    for name, pattern in spec.get("never", {}).items():
+        numbers[name] = bool(re.search(pattern, hers))
     numbers["judge"], numbers["why"] = judge(claude_client, claude_model, pairs)
     # Read the outcome the way a real call does, after it ends.
     from services.call_outcome import summarize_call
@@ -313,7 +353,16 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--json", help="also write results to this file")
     parser.add_argument("-v", "--verbose", action="store_true", help="log the agent's tool calls")
+    parser.add_argument("--prompts", help="score a saved copy of services/phone_prompts.py instead (A/B runs)")
     args = parser.parse_args()
+    if args.prompts:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("services.phone_prompts", args.prompts)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules["services.phone_prompts"] = module
+        print(f"(prompts from {args.prompts})")
     if args.verbose:
         import logging
 
@@ -355,6 +404,10 @@ def main() -> int:
     print("\n=== summary ===")
     for key in ("first_words", "avg_words", "long_turns", "questions", "script_phrases", "judge"):
         print(f"  {key:15s} {mean(key)}")
+    checks = sorted({k for r in results for k in r["score"] if isinstance(r["score"][k], bool)})
+    for key in checks:
+        runs = [r["score"][key] for r in results if key in r["score"]]
+        print(f"  {key:15s} {sum(runs)}/{len(runs)} runs")
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump(results, handle, ensure_ascii=False, indent=1)

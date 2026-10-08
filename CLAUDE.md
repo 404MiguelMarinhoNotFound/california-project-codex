@@ -286,6 +286,7 @@ california/
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
 │   ├── list_whatsapp_groups.py     # Read every WhatsApp group off the chat list and refresh the cache
+│   ├── fix_phone_link.py           # Bring Phone Link's calling link back: Try again, laptop Bluetooth off/on; --check to report
 │   ├── probe_phone_backend.py      # Connect Gemini Live with the phone config, no call: credentials, latency, her first line
 │   ├── eval_phone_conversation.py  # Simulated calls (Claude as callee, spoken pt-PT TTS) scored for how she talks
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
@@ -2125,11 +2126,44 @@ English when asked, recorded `booked` and hung up herself, 74s. Getting there fo
   able to connect to your mobile device", Windows shows every Bluetooth profile of the
   phone `connected=False`, and restarting Phone Link or pressing Try again does not help.
   Reconnecting the phone in Bluetooth settings does. The dial reports
-  `PHONE_NOT_CONNECTED` with that fix in words.
+  `PHONE_NOT_CONNECTED` with that fix in words. **`uv run python tools/fix_phone_link.py`**
+  (`phone_link.repair_calling_link`) does the laptop side: checks the Calls tab (touches
+  nothing if the dial pad is up), presses Try again, then turns the laptop's Bluetooth
+  radio off and on through `Windows.Devices.Radios` (no admin) and presses Try again until
+  the dial pad returns. On 2026-10-08 that was not enough: the phone came back
+  `connected=True` but its Hands-Free endpoints stayed `Unknown`, and neither restarting
+  Phone Link nor the Bluetooth audio driver's own reconnect (KSPROPSETID_BtAudio
+  ONESHOT_RECONNECT, what Settings' Connect sends, reached via
+  `IConnector::GetDeviceIdConnectedTo` -> the filter's `IMMDevice` -> `IKsControl`; via
+  `IPart::Activate` it answers E_NOINTERFACE) brought the calling profile back. The
+  remaining step is on the phone: toggle its Bluetooth, or check "Phone calls" is allowed
+  for the laptop in its Bluetooth device settings.
 - **The model tried to hang up before speaking** (Vertex, 0.75s in: `record_outcome` +
   `end_call` before a word). `_hang_up_too_early` refuses `end_call` until she has spoken
   and someone has been heard (a voicemail greeting counts). The `record_outcome` tool
   that came with it is gone -- see "How she talks" below.
+
+**A real call where she heard nothing (2026-10-08, calling Sérgio).** He picked up for
+~35s; the transcript was empty on both sides, so she never spoke (the opening nudge
+needs them heard first) and he hung up on silence. Three causes, all fixed:
+
+- **Her ears followed "the default speaker", and that moved.** Bluetooth headphones
+  ("Black Diamond", category Audio.Headphone) had connected and become the default
+  output. In a call Windows moves Bluetooth headphones to their hands-free endpoint, not
+  the "Headphones" one the loopback recorded. Now `phone_link.SpeakerRoute` pins the
+  default speaker to `phone.call_speaker_endpoint` (Realtek) for the call, restoring the
+  previous one after, exactly like `MicRoute`, and `LoopbackCapture(device=...)` records
+  that same speaker by name. Verified on the real laptop: tone heard at peak 0.30 with the
+  headphones connected, default restored afterwards.
+- **The capture thread could not use the audio API at all** when soundcard had been
+  imported on another thread first: soundcard calls `CoInitializeEx` only on its importing
+  thread, so the capture thread got 0x800401F0 (CO_E_NOTINITIALIZED). The thread now
+  initialises COM itself. That error used to die silently with the thread; it is logged
+  now, and every call logs the loopback's peak level, "SILENT" when she heard nothing.
+- **Phone Link's End button vanished ~20s into the live call**, so the call was read as
+  hung up. A "gone" reading is no longer believed if they spoke in the last
+  `_LIVE_IF_HEARD_S` (8s), and once a call has been seen, a miss logs every Phone Link
+  button (`_IN_CALL_DUMP`) so the next occurrence shows what the button became.
 
 **How she talks: measured, not guessed (2026-10-08).** Master Miguel's complaint was not
 the voice but the wording: "hi I am California, Miguel's AI", a recited brief, robotic.
@@ -2247,6 +2281,29 @@ callee who answers on the first ring is not talking into nothing, and the no-ans
 max-duration clocks start at the dial. A call ends on `end_call` (her goodbye is allowed
 to finish playing), the End button seen and then gone (`hung_up`), the Live session dropping (`error`), `no_answer_s` with nothing
 heard, `max_call_s`, or shutdown. Whatever happens, a `CallReport` is queued and logged.
+
+**What comes back after a call (2026-10-08).** Master Miguel asked for "the call log, all
+relevant metadata, how long it took". Three layers, one source:
+
+- `GeminiLiveAgent` fills `CallResult.stats` while the call runs: `connect_s`, `dial_s`,
+  `answered_at_s` (dial -> first words heard), `first_spoke_at_s`, `talk_window_s`,
+  `interruptions`, `nudges`, `refused_hang_ups`, `unknown_tools`, and her ears
+  (`loopback_source`, `loopback_peak`, `heard_nothing`). Every `CallLine` carries `at`,
+  seconds after the dial, so the transcript is timestamped. A stage that did not happen is
+  absent, never zero -- the `turns.jsonl` rule.
+- `PhoneService` adds what only it knows: `call_id`, `started_at`/`ended_at`,
+  `number_source`, Phone Link's `dial_status` and `hang_up_status`, backend, model, voice.
+  `CallReport.metadata()` derives the rest once: `ring_s`, `talk_s` (talk window minus
+  ring), turns and words per side, and `ended_how` in words.
+- `call_record()` is the one shape of a call: `logs/calls.jsonl` writes it (brief, outcome,
+  `meta`, timed transcript), and `phone_log` / `phone_status` read it back through
+  `call_log_line()`. The `ts` key stays first and keeps its old name for older readers.
+
+The spoken report (`_phone_report_message`) gets the readable part: number and where it
+came from, how it ended, a timing line ("started 11:26, rang 4s before they answered,
+talked 2m10s, 2m23s in all"), turns and interruptions, the outcome, and the transcript with
+`[m:ss]` stamps. Routine internals (nudges, an unconfirmed dial) stay in the log; only a
+real problem is spoken (an error, or `heard_nothing`).
 
 **The report is a turn, not an injection.** `LLMService.history` has no lock and no
 outside writer, so `_idle_loop` (main thread, between mic reads) runs
@@ -2620,7 +2677,7 @@ The Claude path supports:
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 - Custom `control_whatsapp` tool for WhatsApp messaging (4 actions)
-- Custom `control_phone` tool for phone calls from his own number (2 actions)
+- Custom `control_phone` tool for phone calls from his own number (3 actions)
 
 With the committed `config.yaml` that is **6 tools** in every request: `web_search`,
 `control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`, `control_phone`. Each custom tool's full schema is sent on
@@ -2681,13 +2738,15 @@ Bulk send and image send exist in the CLI it was ported from and were left out: 
 spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
 capability with no voice phrasing.
 
-`control_phone` supports two actions:
+`control_phone` supports three actions:
 
 - `phone_call` with a brief: `to`, optional `number`, `kind` (`book_table`, `book_appointment`,
   `ask_question`, `deliver_message`, `personal`, `general`), `goal`, `details`, `may_agree`,
   `must_not`, and `confirm`.
   The first call always reads back; see "PhoneService"
-- `phone_status`: on a call or not, and the last call's summary
+- `phone_status`: on a call or not, and the last call's line (when, who, result, how long)
+- `phone_log`: the last calls from `logs/calls.jsonl`, newest first (`count`, default 5,
+  max 20). Reads the file, so it survives restarts and reads lines from before `meta` existed
 
 When tools are active:
 

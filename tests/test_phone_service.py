@@ -84,17 +84,20 @@ class _Base(unittest.TestCase):
             logging={"include_transcripts": include_transcripts},
         )
 
-        @contextlib.contextmanager
-        def route():
-            self.mic_routes.append("enter")
-            try:
-                yield
-            finally:
-                self.mic_routes.append("exit")
+        def route(what):
+            @contextlib.contextmanager
+            def cm():
+                self.mic_routes.append("enter" if what == "mic" else "speaker enter")
+                try:
+                    yield
+                finally:
+                    self.mic_routes.append("exit" if what == "mic" else "speaker exit")
+            return cm
 
         return PhoneService(
             cfg, resolve_contact=resolve, dialer=self.dialer,
-            agent_factory=lambda: self.agent, mic_route_factory=route,
+            agent_factory=lambda: self.agent, mic_route_factory=route("mic"),
+            speaker_route_factory=route("speaker"),
         )
 
     def _place(self, svc, brief=None, number="+351912345678"):
@@ -230,6 +233,27 @@ class NumberTests(_Base):
                 self.assertEqual(result.message, "I won't call that number myself.")
 
 
+class ReportFieldsTests(_Base):
+    def test_the_report_knows_how_the_call_was_placed(self):
+        resolve = mock.Mock(return_value=ContactMatch(key="Sérgio Nokia", phone="+351969685405", certain=True))
+        svc = self._svc(resolve=resolve)
+        self._place(svc, brief=CallBrief(to="Sérgio", kind="personal", goal="chat"), number="")
+        report = svc.pop_report()
+        self.assertEqual(report.number_source, "from your contacts")
+        self.assertEqual((report.dial_status, report.hang_up_status), ("DIALED", "ENDED"))
+        self.assertRegex(report.call_id, r"^\d{8}-\d{6}$")
+        self.assertTrue(report.ended_at >= report.started_at)
+        self.assertEqual(report.backend, svc.backend)
+
+    def test_the_log_line_carries_the_metadata(self):
+        svc = self._svc()
+        self._place(svc)
+        with open(self.log_path, encoding="utf-8") as handle:
+            record = json.loads(handle.readlines()[-1])
+        self.assertEqual(record["meta"]["dial_status"], "DIALED")
+        self.assertEqual(record["meta"]["ended_how"], "California said goodbye and hung up")
+
+
 class OutcomeAfterTheCallTests(_Base):
     """The live agent no longer reports an outcome; it is read from the transcript."""
 
@@ -272,7 +296,7 @@ class CallLifecycleTests(_Base):
     def test_mic_is_routed_for_the_call_and_restored(self):
         svc = self._svc()
         self._place(svc)
-        self.assertEqual(self.mic_routes, ["enter", "exit"])
+        self.assertEqual(self.mic_routes, ["enter", "speaker enter", "speaker exit", "exit"])
 
     def test_a_failed_dial_reports_without_hanging_up(self):
         self.dialer = FakeDialer(dial_status="NOT_PREFILLED")
@@ -290,7 +314,7 @@ class CallLifecycleTests(_Base):
         report = svc.pop_report()
         self.assertEqual(report.status, "dial_failed")
         self.assertIn("Phone Link isn't connected to the phone", report.result.error)
-        self.assertEqual(self.mic_routes, ["enter", "exit"])
+        self.assertEqual(self.mic_routes, ["enter", "speaker enter", "speaker exit", "exit"])
 
     def test_an_unconfirmed_dial_still_runs_the_call(self):
         """2026-10-07: the call rang and was answered while no call window was visible."""
@@ -357,7 +381,7 @@ class CallLifecycleTests(_Base):
         self.assertIsNotNone(report)
         self.assertEqual(report.result.ended_by, "error")
         self.assertIn("socket closed", report.result.error)
-        self.assertEqual(self.mic_routes, ["enter", "exit"])
+        self.assertEqual(self.mic_routes, ["enter", "speaker enter", "speaker exit", "exit"])
         self.assertIsNone(svc._active)
 
     def test_status_line_before_during_after(self):
@@ -537,6 +561,30 @@ class PhoneLinkInCallTests(unittest.TestCase):
 
 
 class PhoneLinkScriptTests(unittest.TestCase):
+    def test_the_speaker_route_reads_and_restores_the_render_default(self):
+        from services import phone_link
+
+        calls = []
+
+        def run_ps(script, timeout_s=0):
+            calls.append(script)
+            if "Get-PnpDevice" in script:
+                return "{0.0.0.00000000}.{realtek}"
+            if "GetDefault(0)" in script:
+                return "{0.0.0.00000000}.{headphones}"
+            return "OK"
+
+        with mock.patch.object(phone_link, "_run_ps", side_effect=run_ps):
+            with phone_link.SpeakerRoute("Speakers (Realtek High Definition Audio)"):
+                pass
+        sets = [c for c in calls if "[CalAudio]::SetDefault(" in c]
+        self.assertIn("{realtek}", sets[0])
+        self.assertIn("{headphones}", sets[-1])  # put back what was there
+
+    def test_no_speaker_endpoint_means_no_switch(self):
+        cfg = config_for_tests(phone={"enabled": True, "call_speaker_endpoint": ""})
+        self.assertIsInstance(PhoneService(cfg)._speaker_route(), contextlib.nullcontext)
+
     def test_the_in_call_poll_compiles_no_csharp(self):
         # It runs every couple of seconds for the whole call.
         from services import phone_link
@@ -559,6 +607,64 @@ class PhoneLinkScriptTests(unittest.TestCase):
                 with phone_link.MicRoute("CABLE Output (VB-Audio Virtual Cable)"):
                     pass
         self.assertFalse(any("[CalAudio]::SetDefault(" in c for c in calls))
+
+
+
+
+class RepairCallingLinkTests(unittest.TestCase):
+    """tools/fix_phone_link.py: cheapest step first, never touches a working link."""
+
+    def _run(self, states, radio=("Off", "On")):
+        from services import phone_link
+
+        states = list(states)
+        radio = list(radio)
+        calls = {"try_again": 0, "radio": []}
+
+        def state():
+            return states.pop(0) if len(states) > 1 else states[0]
+
+        def run_ps(script, timeout_s=0):
+            calls["try_again"] += 1
+            return "SENT"
+
+        def bt(value):
+            calls["radio"].append(value)
+            return radio.pop(0)
+
+        now = [0.0]
+        with mock.patch.object(phone_link, "calls_state", side_effect=state), \
+                mock.patch.object(phone_link, "_run_ps", side_effect=run_ps), \
+                mock.patch.object(phone_link, "bluetooth_radio", side_effect=bt):
+            ready, steps = phone_link.repair_calling_link(
+                wait_s=10, sleep=lambda s: now.__setitem__(0, now[0] + s), clock=lambda: now[0])
+        return ready, steps, calls
+
+    def test_a_working_link_is_left_alone(self):
+        ready, steps, calls = self._run(["READY"])
+        self.assertTrue(ready)
+        self.assertEqual((calls["try_again"], calls["radio"]), (0, []))
+
+    def test_try_again_alone_is_enough_sometimes(self):
+        ready, steps, calls = self._run(["BROKEN", "READY"])
+        self.assertTrue(ready)
+        self.assertEqual(calls["radio"], [])
+
+    def test_otherwise_bluetooth_is_toggled_off_then_on(self):
+        ready, steps, calls = self._run(["BROKEN"] * 8 + ["READY"])
+        self.assertTrue(ready)
+        self.assertEqual(calls["radio"], ["Off", "On"])
+        self.assertIn("Bluetooth toggle", steps[-1])
+
+    def test_still_down_says_to_toggle_the_phone(self):
+        ready, steps, calls = self._run(["BROKEN"])
+        self.assertFalse(ready)
+        self.assertIn("on the phone", steps[-1])
+
+    def test_a_radio_that_does_not_come_back_on_stops_there(self):
+        ready, steps, calls = self._run(["BROKEN"], radio=("Off", "Off"))
+        self.assertFalse(ready)
+        self.assertEqual(calls["radio"], ["Off", "On"])
 
 
 if __name__ == "__main__":

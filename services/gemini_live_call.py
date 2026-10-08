@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -51,6 +52,10 @@ _GOODBYE_GRACE_S = 0.8
 # this long after their last words, she is told to speak. Opening only, so a
 # normal pause later in the call is never stepped on. Up to _NUDGE_MAX times.
 _NUDGE_AFTER_S = 2.5
+# A "they hung up" reading is not believed if they spoke this recently.
+_LIVE_IF_HEARD_S = 8.0
+# Loudest loopback block below this (0-1 RMS) means she heard nothing at all.
+_SILENT_PEAK = 0.002
 _NUDGE_MAX = 2
 _NUDGE_TEXT = (
     "[The call has been answered and they are waiting for you. Greet them and "
@@ -99,24 +104,53 @@ TOOL_DECLARATIONS = [
 class CallLine:
     who: str  # "them" | "california"
     text: str
+    at: float | None = None  # seconds after the dial when this line began
+
+
+def _clock(seconds: float | None) -> str:
+    """12.4 -> "0:12"."""
+    if seconds is None:
+        return "?:??"
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 @dataclass
 class CallResult:
     lines: list[CallLine] = field(default_factory=list)
     outcome: dict | None = None
-    ended_by: str = ""  # end_call | hung_up | no_answer | max_duration | stopped | error
+    ended_by: str = ""  # end_call | hung_up | no_answer | max_duration | stopped | error | dial_failed
     duration_s: float = 0.0
     error: str = ""
+    # What the session saw, for the call log and the report. Every key is
+    # optional: a stage that did not happen is absent, never zero.
+    #   connect_s        opening the Live session
+    #   dial_s           Phone Link dialling (prefill, Call, first End button)
+    #   talk_window_s    from the end of the dial to the end of the call
+    #   answered_at_s    first words heard from them, after the dial
+    #   first_spoke_at_s her first words, after the dial
+    #   interruptions    times they talked over her (her audio dropped)
+    #   nudges           opening nudges sent (see _NUDGE_AFTER_S)
+    #   refused_hang_ups end_call refused as too early
+    #   unknown_tools    tool calls the agent does not have
+    #   loopback_source / loopback_peak / heard_nothing   her ears
+    stats: dict = field(default_factory=dict)
 
     @property
     def heard_them(self) -> bool:
         return any(line.who == "them" and line.text.strip() for line in self.lines)
 
-    def transcript(self, max_chars: int = 4000) -> str:
-        rows = [f"{'Them' if l.who == 'them' else 'California'}: {l.text.strip()}" for l in self.lines if l.text.strip()]
+    def transcript(self, max_chars: int = 4000, times: bool = False) -> str:
+        rows = [
+            (f"[{_clock(l.at)}] " if times and l.at is not None else "")
+            + f"{'Them' if l.who == 'them' else 'California'}: {l.text.strip()}"
+            for l in self.lines if l.text.strip()
+        ]
         text = "\n".join(rows)
         return text if len(text) <= max_chars else "...\n" + text[-max_chars:]
+
+    def _count(self, key: str) -> None:
+        self.stats[key] = self.stats.get(key, 0) + 1
 
 
 def _hang_up_too_early(result: "CallResult") -> str:
@@ -157,25 +191,75 @@ def _reply(call, response: dict, scheduling: str) -> dict:
 
 
 class LoopbackCapture:
-    """The callee, as the default speaker plays them. 16 kHz mono int16 blocks."""
+    """
+    The callee, as a speaker plays them. 16 kHz mono int16 blocks.
 
-    def __init__(self, samplerate: int = INPUT_RATE, block_ms: int = _BLOCK_MS):
+    `device` names the speaker to record (a prefix of its name). It used to be
+    whatever the default speaker was at the time, and on 2026-10-08 that was a
+    pair of Bluetooth headphones the call audio never reached: she heard
+    nothing for 35 seconds of a real call. PhoneService now pins the default
+    speaker for the call (`phone_link.SpeakerRoute`) and passes the same name
+    here. Empty `device` keeps the old default-speaker behaviour.
+
+    The capture thread used to die silently; its error is logged now, and
+    `peak` (loudest block, 0-1 RMS) says afterwards whether she heard anything.
+    """
+
+    def __init__(self, samplerate: int = INPUT_RATE, block_ms: int = _BLOCK_MS, device: str = ""):
         self.samplerate = samplerate
         self.frames = int(samplerate * block_ms / 1000)
+        self.device = device
+        self.peak = 0.0
+        self.blocks = 0
+        self.source = ""
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+    def _speaker(self, sc):
+        if self.device:
+            for speaker in sc.all_speakers():
+                if str(speaker.name).startswith(self.device):
+                    return speaker
+            logger.warning("Loopback: no speaker named %r; using the default one", self.device)
+        return sc.default_speaker()
+
     def start(self, on_block: Callable[[bytes], None]) -> None:
         def loop():
-            import soundcard as sc
+            # soundcard calls CoInitializeEx only on the thread that first
+            # imports it. When anything imported it earlier on another thread,
+            # this one has no COM and every call fails with 0x800401F0
+            # (CO_E_NOTINITIALIZED): measured 2026-10-08, a deaf capture. So
+            # this thread initialises COM itself (MTA, as soundcard does) --
+            # AFTER importing soundcard: when this thread is the first to
+            # import it, soundcard's own CoInitializeEx must run first, or it
+            # gets S_FALSE ("already initialised") and raises 0x100000001
+            # (found on the next real call, 2026-10-08).
+            com = None
+            try:
+                import soundcard as sc
 
-            speaker = sc.default_speaker()
-            mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-            with mic.recorder(samplerate=self.samplerate, channels=1) as rec:
-                while not self._stop.is_set():
-                    block = rec.record(numframes=self.frames)[:, 0]
-                    pcm = np.clip(block * 32767.0, -32768, 32767).astype("<i2").tobytes()
-                    on_block(pcm)
+                if sys.platform == "win32":
+                    import ctypes
+
+                    com = ctypes.windll.ole32
+                    com.CoInitializeEx(None, 0)  # S_OK or S_FALSE; balanced below either way
+                speaker = self._speaker(sc)
+                self.source = str(speaker.name)
+                logger.info("Loopback: listening to %s", self.source)
+                mic = sc.get_microphone(id=self.source, include_loopback=True)
+                with mic.recorder(samplerate=self.samplerate, channels=1) as rec:
+                    while not self._stop.is_set():
+                        block = rec.record(numframes=self.frames)[:, 0]
+                        self.blocks += 1
+                        level = float(np.sqrt(np.mean(np.square(block)))) if block.size else 0.0
+                        self.peak = max(self.peak, level)
+                        pcm = np.clip(block * 32767.0, -32768, 32767).astype("<i2").tobytes()
+                        on_block(pcm)
+            except Exception:
+                logger.exception("Loopback capture failed: California cannot hear the call")
+            finally:
+                if com is not None:
+                    com.CoUninitialize()
 
         self._thread = threading.Thread(target=loop, name="call-loopback", daemon=True)
         self._thread.start()
@@ -184,6 +268,9 @@ class LoopbackCapture:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2)
+        if self.blocks:
+            logger.info("Loopback: %d blocks from %s, peak level %.4f%s", self.blocks, self.source,
+                        self.peak, " (SILENT: she heard nothing)" if self.peak < _SILENT_PEAK else "")
 
 
 class CableSpeaker:
@@ -279,6 +366,7 @@ class GeminiLiveAgent:
         language_code: str = "",
         silence_ms: int = 700,
         cable_device: str = "CABLE Input",
+        listen_device: str = "",
         client_factory: Callable | None = None,
         capture_factory: Callable | None = None,
         speaker_factory: Callable | None = None,
@@ -289,7 +377,7 @@ class GeminiLiveAgent:
         self.language_code = language_code
         self.silence_ms = silence_ms
         self.client_factory = client_factory or _default_client_factory
-        self.capture_factory = capture_factory or LoopbackCapture
+        self.capture_factory = capture_factory or (lambda: LoopbackCapture(device=listen_device))
         self.speaker_factory = speaker_factory or (lambda: CableSpeaker(cable_device))
 
     def _config(self, prompt: str):
@@ -376,19 +464,29 @@ class GeminiLiveAgent:
                 clock["them_at"] = time.monotonic()
             if result.lines and result.lines[-1].who == who:
                 result.lines[-1].text += text
-            else:
-                result.lines.append(CallLine(who, text))
+                return
+            at = round(max(0.0, time.monotonic() - clock["started"]), 1)
+            result.lines.append(CallLine(who, text, at))
+            if text.strip():
+                key = "answered_at_s" if who == "them" else "first_spoke_at_s"
+                result.stats.setdefault(key, at)
 
         client = self.client_factory(self.client_kwargs)
         speaker = self.speaker_factory()
         capture = self.capture_factory()
         speaker.start()
+        connecting = time.monotonic()
         try:
             async with client.aio.live.connect(model=self.model, config=self._config(prompt)) as session:
+                result.stats["connect_s"] = round(time.monotonic() - connecting, 1)
                 capture.start(on_block)
+                dialling = time.monotonic()
                 if dial is not None and not await asyncio.to_thread(dial):
+                    result.stats["dial_s"] = round(time.monotonic() - dialling, 1)
                     result.ended_by = "dial_failed"
                     return
+                if dial is not None:
+                    result.stats["dial_s"] = round(time.monotonic() - dialling, 1)
                 # The clocks run from the dial, not from connecting.
                 clock["started"] = time.monotonic()
 
@@ -424,7 +522,15 @@ class GeminiLiveAgent:
                             finish("no_answer")
                         elif still_connected is not None:
                             connected = await asyncio.to_thread(still_connected)
-                            if connected is False:
+                            them_at = clock.get("them_at")
+                            heard_recently = them_at is not None and time.monotonic() - them_at < _LIVE_IF_HEARD_S
+                            if connected is False and heard_recently:
+                                # 2026-10-08: Phone Link's End button vanished
+                                # 20s into a live call. Someone talking means
+                                # the line is up, whatever the screen says.
+                                logger.info("Call agent: Phone Link says ended, but they spoke %.0fs ago; staying on",
+                                            time.monotonic() - them_at)
+                            elif connected is False:
                                 finish("hung_up")
 
                 async def opening_nudge():
@@ -438,6 +544,7 @@ class GeminiLiveAgent:
                         if them_at is None or time.monotonic() - them_at < _NUDGE_AFTER_S:
                             continue
                         nudges += 1
+                        result._count("nudges")
                         logger.info("Call agent: they spoke and she has not; nudge %d", nudges)
                         try:
                             await session.send_client_content(
@@ -472,15 +579,22 @@ class GeminiLiveAgent:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                result.stats["talk_window_s"] = round(time.monotonic() - clock["started"], 1)
         finally:
             capture.stop()
             speaker.stop()
+            peak = getattr(capture, "peak", None)
+            if isinstance(peak, (int, float)) and getattr(capture, "blocks", 0):
+                result.stats["loopback_peak"] = round(float(peak), 4)
+                result.stats["heard_nothing"] = peak < _SILENT_PEAK
+                result.stats["loopback_source"] = str(getattr(capture, "source", "") or "")
 
     async def _handle(self, msg, session, speaker, add_line, finish, result: CallResult) -> None:
         content = getattr(msg, "server_content", None)
         if content is not None:
             if getattr(content, "interrupted", False):
                 speaker.flush()
+                result._count("interruptions")
             turn = getattr(content, "model_turn", None)
             for part in (getattr(turn, "parts", None) or []):
                 data = getattr(getattr(part, "inline_data", None), "data", None)
@@ -504,11 +618,13 @@ class GeminiLiveAgent:
                 too_early = _hang_up_too_early(result)
                 if too_early:
                     logger.info("Call agent: end_call refused, %s", too_early)
+                    result._count("refused_hang_ups")
                     responses.append(_reply(call, {"error": too_early}, _SILENT))
                     continue
                 end = True
                 responses.append(_reply(call, {"ok": True}, _SILENT))
             else:
+                result._count("unknown_tools")
                 responses.append(_reply(call, {"error": "unknown tool"}, _SILENT))
         await session.send_tool_response(function_responses=responses)
         if end:

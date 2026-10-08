@@ -23,6 +23,7 @@ read-back of the SAME number and the SAME brief, exactly like WhatsApp's.
 from __future__ import annotations
 
 import importlib.util
+import contextlib
 import json
 import logging
 import os
@@ -80,6 +81,18 @@ class PhoneCommandResult:
         return self.success
 
 
+# How a call ended, in words for the report.
+_ENDED_HOW = {
+    "end_call": "California said goodbye and hung up",
+    "hung_up": "they hung up",
+    "no_answer": "nobody answered",
+    "max_duration": "the time limit ended it",
+    "stopped": "it was stopped (California shut down)",
+    "error": "it failed",
+    "dial_failed": "it never went out",
+}
+
+
 @dataclass
 class CallReport:
     label: str
@@ -87,6 +100,51 @@ class CallReport:
     brief: CallBrief
     result: CallResult
     started_at: str = ""
+    # Everything about the call that is not the conversation itself, so the
+    # log and the spoken report can say how it went, not just what was said.
+    call_id: str = ""
+    ended_at: str = ""
+    number_source: str = ""  # "from your contacts" | "the number I found" | "the number you said"
+    dial_status: str = ""  # Phone Link's answer to the dial (DIALED, DIALED_UNCONFIRMED, PHONE_NOT_CONNECTED...)
+    hang_up_status: str = ""  # Phone Link's answer to the hang-up (ENDED, NO_CALL...)
+    backend: str = ""
+    model: str = ""
+    voice: str = ""
+
+    def metadata(self) -> dict:
+        """The numbers that describe the call, derived once for the log and the report."""
+        r, stats = self.result, self.result.stats
+        hers = [l.text.strip() for l in r.lines if l.who == "california" and l.text.strip()]
+        theirs = [l.text.strip() for l in r.lines if l.who == "them" and l.text.strip()]
+        answered = stats.get("answered_at_s")
+        window = stats.get("talk_window_s")
+        meta = {
+            "call_id": self.call_id,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "total_s": r.duration_s,
+            "ring_s": answered,  # dial -> first words heard (None: nobody spoke)
+            "talk_s": round(window - answered, 1) if answered is not None and window is not None else None,
+            "she_first_spoke_s": stats.get("first_spoke_at_s"),
+            "ended_by": r.ended_by,
+            "ended_how": _ENDED_HOW.get(r.ended_by, r.ended_by or "unknown"),
+            "status": self.status,
+            "her_turns": len(hers),
+            "their_turns": len(theirs),
+            "her_words": sum(len(t.split()) for t in hers),
+            "their_words": sum(len(t.split()) for t in theirs),
+            "number_source": self.number_source,
+            "dial_status": self.dial_status,
+            "hang_up_status": self.hang_up_status,
+            "backend": self.backend,
+            "model": self.model,
+            "voice": self.voice,
+        }
+        for key in ("connect_s", "dial_s", "interruptions", "nudges", "refused_hang_ups",
+                    "unknown_tools", "loopback_peak", "heard_nothing", "loopback_source"):
+            if key in stats:
+                meta[key] = stats[key]
+        return meta
 
     @property
     def status(self) -> str:
@@ -110,6 +168,58 @@ def _user_adc_path() -> str:
     return os.path.join(os.path.expanduser("~"), ".config", "gcloud", "application_default_credentials.json")
 
 
+def call_record(report: CallReport, include_transcript: bool = True) -> dict:
+    """One call as the log stores it (logs/calls.jsonl); also what phone_log reads back."""
+    record = {
+        "ts": report.started_at,  # kept first and under its old name: older lines use it
+        "to": report.label,
+        "number": report.number,
+        "kind": report.brief.normalized_kind(),
+        "goal": report.brief.goal,
+        "brief": {
+            "details": report.brief.details,
+            "may_agree": report.brief.may_agree,
+            "must_not": report.brief.must_not,
+        },
+        "status": report.status,
+        "ended_by": report.result.ended_by,
+        "duration_s": report.result.duration_s,
+        "outcome": report.result.outcome,
+        "error": report.result.error,
+        "meta": report.metadata(),
+    }
+    if include_transcript:
+        record["transcript"] = [
+            {"who": l.who, "at": l.at, "text": l.text.strip()} for l in report.result.lines if l.text.strip()
+        ]
+    return record
+
+
+def short_duration(seconds) -> str:
+    seconds = int(round(seconds or 0))
+    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def call_log_line(record: dict) -> str:
+    """One spoken-friendly line for a logged call. Works on old log lines too (no "meta")."""
+    meta = record.get("meta") or {}
+    when = str(record.get("ts") or "")
+    try:
+        when = datetime.fromisoformat(when).strftime("%d %b %H:%M")
+    except ValueError:
+        pass
+    status = str(record.get("status") or "unknown").replace("_", " ")
+    line = f"{when}, {record.get('to') or record.get('number')}: {status}, {short_duration(record.get('duration_s'))} in all"
+    if meta.get("talk_s") is not None:
+        line += f" (talked {short_duration(meta['talk_s'])})"
+    summary = (record.get("outcome") or {}).get("summary")
+    if summary:
+        line += f". {summary}"
+    elif record.get("error"):
+        line += f". {record['error']}"
+    return line.rstrip(".") + "."
+
+
 def _spoken_number(number: str) -> str:
     """+351961136786 -> '961 136 786' (local) for the read-back."""
     digits = number.lstrip("+")
@@ -127,6 +237,7 @@ class PhoneService:
         dialer=None,
         agent_factory: Callable | None = None,
         mic_route_factory: Callable | None = None,
+        speaker_route_factory: Callable | None = None,
         room_speaking: Callable[[], bool] | None = None,
         summarize: Callable | None = None,
     ):
@@ -152,6 +263,10 @@ class PhoneService:
         self.confirm_timeout_s = max(10.0, float(cfg.get("confirm_timeout_ms") or 120000) / 1000.0)
         self.cable_output = str(cfg.get("cable_output_device") or "CABLE Input")
         self.cable_mic_endpoint = str(cfg.get("cable_mic_endpoint") or "CABLE Output (VB-Audio Virtual Cable)")
+        # Where the callee plays and where she listens: pinned for the call,
+        # never "whatever the default speaker is" (see phone_link.SpeakerRoute).
+        # Empty keeps the default speaker, for machines without that device.
+        self.call_speaker_endpoint = str(cfg.get("call_speaker_endpoint") or "")
         self.default_country = str(cfg.get("default_country") or "351")
         self.allowed_country_codes = [str(c) for c in (cfg.get("allowed_country_codes") or [self.default_country])]
         self.blocked_prefixes = [str(p) for p in (cfg.get("blocked_prefixes") or _DEFAULT_BLOCKED_PREFIXES)]
@@ -163,6 +278,7 @@ class PhoneService:
         self._dialer = dialer
         self._agent_factory = agent_factory
         self._mic_route_factory = mic_route_factory
+        self._speaker_route_factory = speaker_route_factory
         self._room_speaking = room_speaking
         # What the call achieved is read from the transcript after it ends
         # (services/call_outcome.py), with the same Claude model the room
@@ -266,6 +382,7 @@ class PhoneService:
             language_code=self.language_code,
             silence_ms=self.silence_ms,
             cable_device=self.cable_output,
+            listen_device=self.call_speaker_endpoint,
         )
 
     def _mic_route(self):
@@ -274,6 +391,15 @@ class PhoneService:
         from services.phone_link import MicRoute
 
         return MicRoute(self.cable_mic_endpoint)
+
+    def _speaker_route(self):
+        if self._speaker_route_factory is not None:
+            return self._speaker_route_factory()
+        if not self.call_speaker_endpoint:
+            return contextlib.nullcontext()
+        from services.phone_link import SpeakerRoute
+
+        return SpeakerRoute(self.call_speaker_endpoint)
 
     # ------------------------------------------------------------- numbers
 
@@ -372,7 +498,7 @@ class PhoneService:
                 return PhoneCommandResult(False, _MSG_BUSY)
             self._active = {"label": label, "number": resolved, "since": time.monotonic()}
         self._thread = threading.Thread(
-            target=self._run_call, args=(brief, resolved, label), name="phone-call", daemon=True
+            target=self._run_call, args=(brief, resolved, label, source), name="phone-call", daemon=True
         )
         self._thread.start()
         return PhoneCommandResult(True, f"Calling {label} now. The report comes when the call ends.")
@@ -384,9 +510,24 @@ class PhoneService:
             seconds = int(time.monotonic() - active["since"])
             return f"On the phone with {active['label']}, {seconds // 60}m{seconds % 60:02d}s in."
         if last is not None:
-            summary = (last.result.outcome or {}).get("summary") or last.status.replace("_", " ")
-            return f"No call right now. The last one, to {last.label}: {summary}"
+            return "No call right now. The last one: " + call_log_line(call_record(last, include_transcript=False))
         return "No call right now, and none earlier this session."
+
+    def recent_calls(self, count: int = 5) -> list[dict]:
+        """The last `count` calls from the call log, newest first. Survives restarts."""
+        count = max(1, min(int(count or 5), 20))
+        try:
+            with open(self.log_path, encoding="utf-8") as handle:
+                rows = handle.readlines()[-count:]
+        except OSError:
+            return []
+        records = []
+        for row in reversed(rows):
+            try:
+                records.append(json.loads(row))
+            except ValueError:
+                continue
+        return records
 
     def pop_report(self) -> CallReport | None:
         try:
@@ -401,8 +542,10 @@ class PhoneService:
 
     # ------------------------------------------------------------- the call
 
-    def _run_call(self, brief: CallBrief, number: str, label: str) -> None:
-        started_at = datetime.now().isoformat(timespec="seconds")
+    def _run_call(self, brief: CallBrief, number: str, label: str, source: str = "") -> None:
+        started = datetime.now()
+        started_at = started.isoformat(timespec="seconds")
+        hang_up_status = ""
         result = CallResult()
         dial_status: list[str] = []
         try:
@@ -413,7 +556,7 @@ class PhoneService:
                 return dial_status[-1] in _DIALED
 
             prompt = build_call_prompt(brief, owner=self.owner, callback_number=self.callback_number)
-            with self._mic_route():
+            with self._mic_route(), self._speaker_route():
                 agent = self._make_agent()
                 result = agent.run(
                     prompt,
@@ -435,6 +578,7 @@ class PhoneService:
                     # NO_CALL is only reassuring once the call was seen on
                     # screen, which "hung_up" (seen, then gone) implies.
                     hung = dialer.hang_up()
+                    hang_up_status = hung or ""
                     unseen = (
                         dial_status[-1] == "DIALED_UNCONFIRMED"
                         and result.ended_by != "hung_up"
@@ -452,7 +596,15 @@ class PhoneService:
             result.error = str(exc)[:300]
         if result.outcome is None and result.lines:
             result.outcome = self._read_outcome(brief, result)
-        report = CallReport(label=label, number=number, brief=brief, result=result, started_at=started_at)
+        report = CallReport(
+            label=label, number=number, brief=brief, result=result, started_at=started_at,
+            call_id=started.strftime("%Y%m%d-%H%M%S"),
+            ended_at=datetime.now().isoformat(timespec="seconds"),
+            number_source=source,
+            dial_status=dial_status[-1] if dial_status else "",
+            hang_up_status=hang_up_status,
+            backend=self.backend, model=self.model, voice=self.voice,
+        )
         self._log(report)
         with self._lock:
             self._active = None
@@ -475,20 +627,7 @@ class PhoneService:
             return None
 
     def _log(self, report: CallReport) -> None:
-        record = {
-            "ts": report.started_at,
-            "to": report.label,
-            "number": report.number,
-            "kind": report.brief.normalized_kind(),
-            "goal": report.brief.goal,
-            "status": report.status,
-            "ended_by": report.result.ended_by,
-            "duration_s": report.result.duration_s,
-            "outcome": report.result.outcome,
-            "error": report.result.error,
-        }
-        if self.include_transcripts:
-            record["transcript"] = [{"who": l.who, "text": l.text.strip()} for l in report.result.lines]
+        record = call_record(report, include_transcript=self.include_transcripts)
         try:
             os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
             with open(self.log_path, "a", encoding="utf-8") as handle:
