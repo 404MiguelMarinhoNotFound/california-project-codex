@@ -382,6 +382,17 @@ LOCAL_TOOL_NAMES = {
 }
 
 
+def _without_thinking(content) -> list:
+    """Drop thinking blocks before a round goes into history.
+
+    They are needed inside the turn (the request that answers a tool call
+    must echo them) but not after it, and on Haiku 5.5 / Opus 5.5 a thinking
+    block is only valid while everything before it is unchanged -- which
+    `_trim_history` dropping the oldest exchange breaks, a 400 every turn.
+    """
+    return [b for b in content if b.type not in ("thinking", "redacted_thinking")]
+
+
 def _paired_server_blocks(content) -> list:
     """
     The content of an assistant message as it may be stored in history: every
@@ -507,6 +518,15 @@ class LLMService:
             self.max_tokens = claude_cfg["max_tokens"]
             self.web_search_enabled = claude_cfg.get("web_search", False)
             self.max_searches = claude_cfg.get("max_searches_per_turn", 5)
+            # Sent only when configured: Haiku 4.5 rejects `effort`, Opus 5.5
+            # rejects disabled thinking, so nothing is assumed about the model.
+            self.claude_extra = {}
+            if "thinking" in claude_cfg:
+                self.claude_extra["thinking"] = (
+                    {"type": "adaptive"} if claude_cfg["thinking"] else {"type": "disabled"}
+                )
+            if claude_cfg.get("effort"):
+                self.claude_extra["output_config"] = {"effort": claude_cfg["effort"]}
             logger.info(f"LLM initialized: Claude ({self.model}), web_search={self.web_search_enabled}")
         elif self.provider == "groq":
             from groq import Groq
@@ -799,6 +819,7 @@ class LLMService:
                 system=self._build_system_prompt(),
                 messages=messages,
                 tools=tools if tools else anthropic.NOT_GIVEN,
+                **getattr(self, "claude_extra", {}),
             ) as stream:
                 for text in stream.text_stream:
                     response_ref["text"] += text
@@ -856,7 +877,7 @@ class LLMService:
                 {"role": "user", "content": tool_results},
             ])
             self.history.extend([
-                {"role": "assistant", "content": _paired_server_blocks(response.content)},
+                {"role": "assistant", "content": _without_thinking(_paired_server_blocks(response.content))},
                 {"role": "user", "content": tool_results},
             ])
 

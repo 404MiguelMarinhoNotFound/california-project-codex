@@ -72,9 +72,11 @@ class _FakeMessages:
         self._turns = list(turns)
         self._events = events
         self.calls = []          # the `messages` payload sent on each request
+        self.kwargs = []         # every request's full keyword arguments
 
     def stream(self, **kwargs):
         self.calls.append([dict(m) for m in kwargs["messages"]])
+        self.kwargs.append(kwargs)
         deltas, content, stop_reason = self._turns.pop(0)
         return _FakeStream(deltas, content, stop_reason, self._events)
 
@@ -131,6 +133,47 @@ class ClaudeStreamingTests(unittest.TestCase):
         self.assertEqual(first, "first ")
         self.assertNotIn(("final", None), events)   # response not finished yet
         list(gen)                                   # drain
+
+    # --- thinking (Haiku 5.5 thinks by default) -----------------------------
+
+    def test_the_shipped_config_sends_thinking_disabled(self):
+        svc, _ = self._service([(["ok"], [], "end_turn")])
+        list(svc.stream_response("hey"))
+        self.assertEqual(svc.client.messages.kwargs[0]["thinking"], {"type": "disabled"})
+
+    def test_no_thinking_key_sends_no_thinking_parameter(self):
+        """Haiku 4.5 rejects `effort` and Opus 5.5 rejects disabled thinking."""
+        cfg = _config()
+        del cfg["llm"]["claude"]["thinking"]
+        cfg["llm"]["claude"].pop("effort", None)
+        with mock.patch.dict("os.environ", {"ANTHROPIC_API_KEY": "x"}), \
+             mock.patch("anthropic.Anthropic"):
+            svc = LLMService(cfg)
+        svc.client = _FakeClient([(["ok"], [], "end_turn")], [])
+        list(svc.stream_response("hey"))
+        kwargs = svc.client.messages.kwargs[0]
+        self.assertNotIn("thinking", kwargs)
+        self.assertNotIn("output_config", kwargs)
+
+    def test_thinking_blocks_stay_in_the_turn_but_not_in_history(self):
+        """
+        Trimming the oldest exchange edits the prefix, which invalidates any
+        thinking block stored after it -- a 400 on every later turn.
+        """
+        thinking = _Block("thinking")
+        call = _Block("tool_use", name="control_lights", input={"action": "light_on"}, id="t1")
+        turns = [
+            ([], [thinking, call], "tool_use"),
+            (["Done."], [], "end_turn"),
+        ]
+        svc, _ = self._service(turns)
+        svc.tool_handler = lambda name, args: "ok"
+        list(svc.stream_response("lights on"))
+
+        second_request = svc.client.messages.calls[1]
+        self.assertIn(thinking, second_request[-2]["content"])
+        stored = [m for m in svc.history if m["role"] == "assistant" and isinstance(m["content"], list)]
+        self.assertEqual([b.type for b in stored[0]["content"]], ["tool_use"])
 
     def test_full_text_is_accumulated_into_history(self):
         turns = [(["a", "b", "c"], [], "end_turn")]

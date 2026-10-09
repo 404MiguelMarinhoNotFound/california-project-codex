@@ -211,8 +211,13 @@ llm:
   # "openai"    → OpenAI or any compat.  (set OPENAI_API_KEY in .env, optionally set base_url)
   provider: "claude"
   claude:
-    model: "claude-haiku-4-5-20251001"
+    model: "claude-haiku-5-5"
     max_tokens: 1000      # Keep short for voice — 300 tokens ≈ 30s of speech
+    # Haiku 5.5 thinks by default (Haiku 4.5 never did). Off keeps the voice
+    # latency 4.5 had, and keeps thinking blocks out of history, where trimming
+    # old exchanges would invalidate them (a 400). Omit the key to send nothing.
+    thinking: false
+    # effort: "medium"      # low | medium | high | xhigh | max; omitted = model default (medium on Haiku 5.5)
     web_search: true        # ← add this
     max_searches_per_turn: 3
   groq:

@@ -384,7 +384,7 @@ def main() -> int:
         print("Phone backend not configured:", service._client_kwargs()[1])
         return 1
     claude = anthropic.Anthropic()
-    claude_model = (config.get("llm", {}).get("claude", {}) or {}).get("model", "claude-haiku-4-5-20251001")
+    claude_model = (config.get("llm", {}).get("claude", {}) or {}).get("model", "claude-haiku-5-5")
 
     results = []
     for name in args.scenarios:

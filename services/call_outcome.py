@@ -25,7 +25,7 @@ from services.phone_prompts import CallBrief
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+_DEFAULT_MODEL = "claude-haiku-5-5"
 
 _SYSTEM = """\
 You read the transcript of a phone call that an AI assistant made for Miguel, and \
@@ -72,7 +72,7 @@ def summarize_call(brief: CallBrief, transcript: str, model: str = "", client=No
     try:
         reply = client.messages.create(
             model=model or _DEFAULT_MODEL,
-            max_tokens=300,
+            max_tokens=1024,  # room for thinking: Haiku 5.5 thinks by default
             system=_SYSTEM % json.dumps(OUTCOME_STATUSES),
             messages=[{"role": "user", "content": f"{notes}\n\nTranscript:\n{transcript}"}],
         )
