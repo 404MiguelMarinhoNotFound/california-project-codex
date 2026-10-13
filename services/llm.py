@@ -393,6 +393,82 @@ def _without_thinking(content) -> list:
     return [b for b in content if b.type not in ("thinking", "redacted_thinking")]
 
 
+def _no_server_tool_hook(event: str, info: dict) -> None:
+    pass
+
+
+def _field(obj, name, default=None):
+    """An attribute of an SDK object, or a key of a dict standing in for one."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+class _ServerToolWatcher:
+    """
+    Turns raw Claude stream events into server-tool start / end calls.
+
+    A `server_tool_use` block opening is the start; its query streams in as
+    input_json_delta and is reported once the block closes; the matching
+    `*_tool_result` block is the end, failed when its content is an error
+    object rather than a list of results. The result can arrive in a LATER
+    stream of the same turn (a search asked for alongside a local tool runs on
+    the next request), so ids are matched, not positions. Never raises.
+    """
+
+    def __init__(self, hook):
+        self._hook = hook
+        self._open: dict[int, dict] = {}     # block index -> {"id", "name", "json"}
+        self._queries: dict[str, str] = {}   # tool id -> query, for the end call
+
+    def _call(self, event: str, info: dict) -> None:
+        try:
+            self._hook(event, info)
+        except Exception:
+            logger.debug("on_server_tool hook failed", exc_info=True)
+
+    def feed(self, event) -> None:
+        try:
+            kind = _field(event, "type")
+            if kind == "content_block_start":
+                block = _field(event, "content_block")
+                btype = _field(block, "type") or ""
+                if btype == "server_tool_use":
+                    tool_id = str(_field(block, "id") or "")
+                    name = str(_field(block, "name") or "server_tool")
+                    self._open[_field(event, "index")] = {"id": tool_id, "name": name, "json": ""}
+                    self._call("start", {"id": tool_id, "name": name})
+                elif btype.endswith("_tool_result") and btype != "tool_result":
+                    tool_id = str(_field(block, "tool_use_id") or "")
+                    content = _field(block, "content")
+                    failed = not isinstance(content, (list, tuple))
+                    count = 0 if failed else len(content)
+                    error = _field(content, "error_code") if failed else None
+                    name = "web_search" if btype.startswith("web_search") else btype[: -len("_tool_result")]
+                    self._call("end", {
+                        "id": tool_id, "name": name, "ok": not failed,
+                        "query": self._queries.pop(tool_id, None),
+                        "result": f"error: {error}" if failed else f"{count} result{'s' if count != 1 else ''}",
+                    })
+            elif kind == "content_block_delta":
+                current = self._open.get(_field(event, "index"))
+                delta = _field(event, "delta")
+                if current is not None and _field(delta, "type") == "input_json_delta":
+                    current["json"] += str(_field(delta, "partial_json") or "")
+            elif kind == "content_block_stop":
+                current = self._open.pop(_field(event, "index"), None)
+                if current is not None:
+                    try:
+                        query = json.loads(current["json"] or "{}").get("query")
+                    except (ValueError, AttributeError):
+                        query = None
+                    if isinstance(query, str) and query.strip():
+                        self._queries[current["id"]] = query
+                        self._call("input", {"id": current["id"], "name": current["name"], "query": query})
+        except Exception:
+            logger.debug("server tool event not understood", exc_info=True)
+
+
 def _paired_server_blocks(content) -> list:
     """
     The content of an assistant message as it may be stored in history: every
@@ -438,6 +514,13 @@ class LLMService:
 
         # Tool handler callback — set by orchestrator for control_tv dispatch
         self.tool_handler: callable | None = None
+
+        # Server tools (web search) run at Anthropic inside the stream, so they
+        # never reach tool_handler. This hears about them: on_server_tool(event,
+        # info) with event "start" / "input" / "end" and info {"id", "name",
+        # "query", "ok", "result"}. The orchestrator points it at the live UI;
+        # it must never be able to break a reply, so every call is guarded.
+        self.on_server_tool = _no_server_tool_hook
 
         # Whether media tools are available (set after config is checked)
         self.media_enabled = config.get("media", {}).get("enabled", False)
@@ -806,6 +889,7 @@ class LLMService:
             })
 
         messages = list(self.history)
+        watcher = _ServerToolWatcher(self.on_server_tool)
 
         while True:
             # messages.stream() yields real token deltas. The old messages.create()
@@ -821,10 +905,18 @@ class LLMService:
                 tools=tools if tools else anthropic.NOT_GIVEN,
                 **getattr(self, "claude_extra", {}),
             ) as stream:
-                for text in stream.text_stream:
-                    response_ref["text"] += text
-                    response_ref["last_text"] += text
-                    yield text
+                # The raw events, not stream.text_stream: text arrives as the
+                # SDK's derived "text" events exactly as text_stream yields it,
+                # and the content_block_* events around it are where a web
+                # search starts and ends (see _ServerToolWatcher).
+                for event in stream:
+                    if _field(event, "type") == "text":
+                        text = _field(event, "text") or ""
+                        response_ref["text"] += text
+                        response_ref["last_text"] += text
+                        yield text
+                    else:
+                        watcher.feed(event)
                 response = stream.get_final_message()
 
             # Tool calls are dispatched only after the text has been streamed out,
