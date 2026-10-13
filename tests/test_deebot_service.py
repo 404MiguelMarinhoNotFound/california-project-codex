@@ -497,6 +497,37 @@ class SessionTests(unittest.TestCase):
         (deebot_session._credentials_path(tmp)).write_bytes(b"\xff\xfe not json")
         self.assertIsNone(deebot_session.load_cached_credentials(tmp))
 
+    def _built_credentials(self, expires_in_s):
+        import time
+
+        tmp = tempfile.mkdtemp()
+        deebot_session._credentials_path(tmp).write_text(
+            '{"token": "t", "user_id": "u", "expires_at": %f}' % (time.time() + expires_in_s),
+            encoding="utf-8",
+        )
+
+        async def _build():
+            authenticator = await deebot_session.build_authenticator(
+                Mock(), device_id="d", country="PT", email="e@example.com",
+                password="pw", state_dir=tmp,
+            )
+            credentials = authenticator._credentials
+            await authenticator.teardown()
+            return credentials
+
+        return asyncio.run(_build())
+
+    def test_an_expired_cached_token_is_not_preloaded(self):
+        # Preloading it armed the library's refresh timer at a negative delay,
+        # which fired a second, racing password login and logged its device
+        # verification demand as an ERROR traceback at every boot after expiry.
+        self.assertIsNone(self._built_credentials(-3600))
+
+    def test_a_valid_cached_token_is_preloaded(self):
+        credentials = self._built_credentials(6 * 24 * 3600)
+        self.assertIsNotNone(credentials)
+        self.assertEqual(credentials.token, "t")
+
     def test_a_stale_env_code_falls_back_to_gmail_instead_of_stopping(self):
         # Codes expire in 24h and ECOVACS_VERIFICATION_CODE outlives them, so a
         # stale value must not shadow the automatic path forever.

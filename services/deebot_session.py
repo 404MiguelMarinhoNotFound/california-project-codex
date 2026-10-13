@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,12 @@ REASON_VERIFIED_ENV = "verified_via_env"
 REASON_VERIFIED_GMAIL = "verified_via_gmail"
 REASON_NEEDS_CODE = "needs_code"
 REASON_GMAIL_TIMEOUT = "gmail_timeout"
+
+# A cached token this close to expiry is treated as already gone. Preloading one
+# arms deebot-client's refresh timer at 99% of the remaining validity, which for
+# an expired token is a negative delay: it fires at once and runs its own forced
+# password login alongside ours.
+_PRELOAD_MARGIN_S = 60
 
 
 def _device_id_path(state_dir: Path | str) -> Path:
@@ -141,6 +148,14 @@ async def build_authenticator(
     authenticator.subscribe(_on_credentials_changed)
 
     cached = load_cached_credentials(state_dir)
+    if cached is not None and cached.expires_at <= time.time() + _PRELOAD_MARGIN_S:
+        # Not preloaded, so authenticate() logs in fresh and owns the device
+        # verification. Preloaded, the library's refresh timer fired a second
+        # login at once, hit the same verification demand and logged it as an
+        # ERROR traceback ("An exception occurred during refreshing token")
+        # while our path was already reading the code from Gmail (2026-10-13).
+        logger.debug("Deebot: cached token expired, logging in fresh")
+        cached = None
     if cached is not None:
         # Preload so authenticate() finds a still-valid token and skips the
         # gated password-login endpoint entirely. There's no public setter
