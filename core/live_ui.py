@@ -45,6 +45,7 @@ _STATIC = {
     "index.html": ("index.html", "text/html; charset=utf-8"),
     "app.js": ("app.js", "text/javascript; charset=utf-8"),
     "app.css": ("app.css", "text/css; charset=utf-8"),
+    "halo.js": ("halo.js", "text/javascript; charset=utf-8"),
     # ~600 KB the stdlib server cannot gzip, and versioned by ui/vendor/README.md,
     # so a phone downloads it once a day rather than on every page load.
     "vendor/three.min.js": ("vendor/three.min.js", "text/javascript; charset=utf-8", _IMMUTABLE),

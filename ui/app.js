@@ -41,6 +41,7 @@
     const node = $("state");
     node.dataset.state = state;
     $("state-label").textContent = STATE_LABELS[state] || state;
+    haloState(state);
   }
 
   function setLink(kind, label) {
@@ -119,6 +120,9 @@
   }
 
   function onWakeHit(d) {
+    // The earliest sign of a wake: the acknowledgement line plays before the
+    // published state leaves idle, so the halo cannot wait for `state`.
+    if (d.phase === "idle" && !d.ignored && halo) halo.wake();
     const li = el("li", d.ignored ? "ignored" : "");
     li.append(el("span", "", new Date().toLocaleTimeString([], TIME) + " "));
     li.append(el("b", "", Number(d.score).toFixed(3)));
@@ -144,6 +148,8 @@
   }
 
   function startTurn(d) {
+    setMood("none");
+    caption.clear();
     turn = { id: d.turn, startedAt: Date.now(), marks: {}, fields: {}, tools: [], sentences: [] };
     $("now-empty").hidden = true;
     $("now-body").hidden = false;
@@ -225,6 +231,211 @@
       clearInterval(clockTimer);
       setTimeout(() => { if (!turn) resetNow(); }, 4000);
     }
+  }
+
+  // ----------------------------------------------------------------- halo
+  // ui/halo.js draws; this section turns events into its inputs. Her voice
+  // never plays in the browser, so each clip_start carries its loudness
+  // envelope and VoiceClock replays it against this page's own clock.
+  const MOOD_WORDS = { none: "", happy: "happy", smug: "smug", unimpressed: "unimpressed", sheepish: "sheepish", roll: "eye-roll" };
+  const debug = new URLSearchParams(location.search).has("debug");
+  let halo = null;
+  let haloShown = null;      // last state handed to the halo, to spot transitions
+  let mood = "none";
+  let moodTimer = null;
+
+  const VoiceClock = {
+    clip: null,                                   // {id, start, hz, env, ms}
+    begin(d) {
+      const offset = hello && hello.voice_offset_ms != null ? Number(hello.voice_offset_ms) : 120;
+      this.clip = { id: d.clip, start: performance.now() + offset, hz: Number(d.hz) || 25, env: d.env || [], ms: Number(d.ms) || 0 };
+      return this.clip;
+    },
+    // A stopped clip (barge-in, "stop") drops at once so the ring settles; a
+    // clip that ran out ends by its duration, which the offset already shifts.
+    end(d) { if (this.clip && this.clip.id === d.clip && d.stopped) this.clip = null; },
+    level(now) {
+      const c = this.clip;
+      if (!c) return 0;
+      const t = (now - c.start) / 1000;
+      if (t < 0) return 0;                        // waiting out voice_offset_ms
+      if (t * 1000 > c.ms + 150) { this.clip = null; return 0; }
+      const i = Math.floor(t * c.hz);
+      return c.env[Math.min(i, c.env.length - 1)] || 0;
+    },
+  };
+
+  // The sentence she is saying, revealed word by word over the clip.
+  const caption = {
+    words: [], start: 0, ms: 0, shown: -1, clip: null, frozen: false,
+    show(text, clip) {
+      this.words = String(text).split(/\s+/).filter(Boolean);
+      this.start = clip.start; this.ms = clip.ms; this.clip = clip.id; this.shown = -1;
+      this.frozen = false;
+      if (reducedMotion) this.render(this.words.length);
+    },
+    // She was cut off: leave the words she got to, reveal no more.
+    freeze() { this.frozen = true; },
+    clear() { this.words = []; this.shown = -1; this.clip = null; this.frozen = false; $("halo-caption").replaceChildren(); },
+    tick(now) {
+      if (!this.words.length || reducedMotion || this.frozen) return;
+      const elapsed = Math.max(0, now - this.start);
+      const n = this.ms > 0 ? Math.ceil(this.words.length * Math.min(1, elapsed / this.ms)) : this.words.length;
+      if (n !== this.shown) this.render(n);
+    },
+    render(n) {
+      this.shown = n;
+      const w = this.words;
+      if (n <= 0) {
+        $("halo-caption").replaceChildren(el("span", "rest", w.join(" ")));
+        return;
+      }
+      $("halo-caption").replaceChildren(
+        el("span", "said", w.slice(0, n - 1).join(" ") + (n > 1 ? " " : "")),
+        el("span", "now", w[n - 1]),
+        el("span", "rest", n < w.length ? " " + w.slice(n).join(" ") : ""),
+      );
+    },
+  };
+
+  function haloState(state) {
+    const prev = haloShown;
+    haloShown = state;
+    $("halo-state").textContent = (STATE_LABELS[state] || state).toLowerCase();
+    if (halo) halo.setState(state);
+    if (state === prev) return;
+    if (state === "listening") caption.clear();
+    // Back to idle: let the mood linger, then clear it.
+    if (state === "idle") holdMood();
+  }
+
+  function setMood(m) {
+    mood = MOOD_WORDS[m] !== undefined ? m : "none";
+    if (halo) halo.setMood(mood);
+    $("halo-mood").textContent = MOOD_WORDS[mood];
+    $("halo-mood-sep").hidden = mood === "none";
+    clearTimeout(moodTimer);
+    if (haloShown === "idle") holdMood();
+  }
+
+  function holdMood() {
+    clearTimeout(moodTimer);
+    if (mood === "none") return;
+    const hold = hello && hello.mood_hold_ms != null ? Number(hello.mood_hold_ms) : 6000;
+    moodTimer = setTimeout(() => { if (haloShown === "idle") setMood("none"); }, hold);
+  }
+
+  function onClipStart(d) {
+    if (d.kind === "ack" && halo) halo.wake();
+    const clip = VoiceClock.begin(d);
+    if (d.text) caption.show(d.text, clip);
+  }
+
+  function onClipEnd(d) {
+    const playing = VoiceClock.clip && VoiceClock.clip.id === d.clip;
+    VoiceClock.end(d);
+    if (d.stopped && playing && halo) halo.hush();
+    if (d.stopped && caption.clip === d.clip) caption.freeze();
+  }
+
+  function onMic(d) { if (halo) halo.setMic(Number(d.level) || 0); }
+
+  function onMood(d) { setMood(d.mood || "none"); }
+
+  function haloFrame(now) {
+    requestAnimationFrame(haloFrame);
+    if (halo) halo.setVoice(VoiceClock.level(now));
+    caption.tick(now);
+  }
+
+  function showPill() {
+    document.body.classList.remove("has-halo");
+  }
+
+  function setupHalo() {
+    const section = $("halo");
+    if (typeof window.createHalo !== "function" || !window.THREE) {
+      section.hidden = false;
+      section.classList.add("nogl");
+      $("halo-nogl").hidden = false;
+      return;
+    }
+    halo = window.createHalo($("halo-canvas"), {
+      small: window.matchMedia("(max-width: 700px)").matches,
+      reducedMotion,
+      palette: "dusk",
+      debug,
+    });
+    section.hidden = false;
+    if (!halo.ok) {
+      halo = null;
+      section.classList.add("nogl");
+      $("halo-nogl").hidden = false;
+      return;
+    }
+    document.body.classList.add("has-halo");
+    halo.setState(lastState);
+    requestAnimationFrame(haloFrame);
+    setupAmbient();
+  }
+
+  // A server with `ui.halo: false` gets the page exactly as it was before.
+  function haloAllowed(h) {
+    if (h.halo !== false || !halo) return;
+    halo.dispose();
+    halo = null;
+    $("halo").hidden = true;
+    setAmbient(false);
+    showPill();
+  }
+
+  // Ambient mode: only the halo, full screen, the screen kept awake. Every
+  // browser API here is optional; a refusal just leaves the overlay.
+  let wakeLock = null;
+  let ownFullscreen = false;
+
+  async function keepAwake() {
+    try {
+      if (navigator.wakeLock && document.visibilityState === "visible") {
+        wakeLock = await navigator.wakeLock.request("screen");
+      }
+    } catch (err) { wakeLock = null; }
+  }
+
+  function setAmbient(on) {
+    document.body.classList.toggle("ambient", on);
+    const btn = $("halo-full");
+    btn.setAttribute("aria-pressed", String(on));
+    btn.textContent = on ? "Exit full screen" : "Full screen";
+    if (on) {
+      const root = document.documentElement;
+      if (root.requestFullscreen && !document.fullscreenElement) {
+        root.requestFullscreen().then(() => { ownFullscreen = true; }).catch(() => {});
+      }
+      keepAwake();
+    } else {
+      if (document.fullscreenElement && ownFullscreen && document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {});
+      }
+      ownFullscreen = false;
+      if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    }
+    if (halo) halo.resize();
+  }
+
+  function setupAmbient() {
+    $("halo-full").addEventListener("click", () => setAmbient(!document.body.classList.contains("ambient")));
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && document.body.classList.contains("ambient")) setAmbient(false);
+    });
+    document.addEventListener("fullscreenchange", () => {
+      if (!document.fullscreenElement && ownFullscreen) setAmbient(false);
+    });
+    // The spec releases a wake lock whenever the page is hidden; take it back.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && document.body.classList.contains("ambient")) keepAwake();
+    });
+    if (location.hash === "#ambient") setAmbient(true);
   }
 
   // ----------------------------------------------------------------- feed
@@ -376,6 +587,9 @@
     $("hits").replaceChildren();
     spark.points = [];
     $("call").hidden = true;
+    VoiceClock.clip = null;
+    caption.clear();
+    setMood("none");
   }
 
   const HANDLERS = {
@@ -392,6 +606,10 @@
     call_state: onCallState,
     call_line: onCallLine,
     log: onLog,
+    clip_start: onClipStart,
+    clip_end: onClipEnd,
+    mic: onMic,
+    mood: onMood,
   };
 
   function markAlive() {
@@ -425,6 +643,7 @@
       serverStarted = h.started;
       hello = h;
       setThresholds(h);
+      haloAllowed(h);
       lastEventAt = Date.now();
     });
     for (const [kind, fn] of Object.entries(HANDLERS)) {
@@ -454,5 +673,6 @@
   window.addEventListener("resize", drawSpark);
   setupLog();
   resetNow();
+  setupHalo();
   connect();
 })();

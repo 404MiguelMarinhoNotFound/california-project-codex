@@ -45,7 +45,7 @@ class LiveUITests(unittest.TestCase):
         self.assertEqual(resp.getheader("Cache-Control"), "no-store")
 
     def test_assets_are_served_under_the_token(self):
-        for name in ("app.js", "app.css"):
+        for name in ("app.js", "app.css", "halo.js"):
             conn, resp = self._get(f"/s3cret-token/{name}")
             resp.read()
             conn.close()
