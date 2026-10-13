@@ -21,6 +21,17 @@
     </div>
   </header>
 
+  <section class="halo" id="halo" aria-label="California" hidden>
+    <canvas id="halo-canvas" aria-label="California. The ring of light changes with her state, her voice and her mood."></canvas>
+    <div class="halo-hud">
+      <span class="halo-name">CALIFORNIA</span>
+      <span class="halo-read"><span id="halo-state">connecting</span><span id="halo-mood-sep" hidden> · </span><span id="halo-mood"></span></span>
+    </div>
+    <div class="halo-caption" id="halo-caption" aria-live="polite"></div>
+    <button class="halo-full" id="halo-full" type="button" aria-pressed="false">Full screen</button>
+    <p class="halo-nogl" id="halo-nogl" hidden>This browser can't draw the halo.</p>
+  </section>
+
   <div class="banner" id="banner" hidden></div>
 
   <main class="grid">
@@ -103,6 +114,8 @@
     </section>
   </main>
 
+  <script src="vendor/three.min.js"></script>
+  <script src="halo.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

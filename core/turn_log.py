@@ -182,7 +182,10 @@ class TurnTimer:
         """Live only: a tool call began. The record gets it from tool()."""
         self._publish("turn_tool_start", {"name": name, "action": action, "start_ms": self.now_ms()})
 
-    def tool(self, name: str, action: str | None, started_ms: int, result: str | None) -> None:
+    def tool(self, name: str, action: str | None, started_ms: int, result: str | None,
+             ok: bool | None = None) -> None:
+        """`ok`: did the device action happen (True/False), absent when the tool
+        had nothing to report -- a status read, or a question back."""
         with self._lock:
             entry = {
                 "name": name,
@@ -191,6 +194,8 @@ class TurnTimer:
                 "ms": self._ms() - started_ms,
                 "result": (result or "")[:160],
             }
+            if ok is True or ok is False:
+                entry["ok"] = ok
             self._tools.append(entry)
         self._publish("turn_tool", entry)
 

@@ -10,7 +10,9 @@ the first sentence while the LLM is still generating.
 """
 
 import collections
+import contextvars
 import glob
+import itertools
 import os
 import random
 import re
@@ -22,22 +24,29 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from services.activation_phrases import EchoGate, resolve_tier, strip_activation_echo
-from services.deebot_service import DeebotService
-from services.govee_service import GoveeService, clamp_percent, resolve_color
+from services.cec_wake import WakeResult
+from services.deebot_service import DeebotCommandResult, DeebotService
+from services.govee_service import GoveeCommandResult, GoveeService, clamp_percent, resolve_color
 from services.media_service import MediaService
 from services.light_shadow import LightShadow
 from services.now_playing import NowPlaying
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
 from services.whatsapp_groups import GroupMatch
 from services.whatsapp_groups import speakable_title as speakable_group_title
-from services.whatsapp_service import WhatsAppService, looks_like_phone
+from services.whatsapp_service import (
+    _MSG_NEEDS_LINK as _WHATSAPP_NEEDS_LINK,
+    _MSG_UNCONFIRMED as _WHATSAPP_UNCONFIRMED,
+    WhatsAppService,
+    looks_like_phone,
+)
 from services.phone_prompts import CallBrief
 from services.phone_service import PhoneService, call_log_line, short_duration
 from services.surfshark_service import SurfsharkService
-from services.tv_volume import TvVolume
+from services.tv_volume import TvVolume, VolumeResult
 from services.youtube_playlist_resolver import resolve_playlist_choice
 from services.youtube_search import speakable_title, top_video
-from core.event_bus import NULL_BUS, BusLogHandler, EventBus, WakeScorePublisher
+from core.audio_levels import envelope, level
+from core.event_bus import NULL_BUS, BusLogHandler, EventBus, MicLevelPublisher, WakeScorePublisher
 from core.turn_log import NULL_TURN, TurnLogWriter, TurnTimer
 
 logger = logging.getLogger(__name__)
@@ -45,6 +54,39 @@ logger = logging.getLogger(__name__)
 _LIGHTS_UNREACHABLE = "I couldn't reach your lights just now."
 _VACUUM_UNREACHABLE = "I couldn't reach the vacuum just now."
 _WHATSAPP_UNREACHABLE = "I couldn't send that WhatsApp message just now."
+
+# A send that did not go out at all, as opposed to a question back (a
+# read-back, "which one?"), which is never a failure. See _guard_whatsapp_send.
+_WHATSAPP_FAILED_LINES = frozenset({
+    _WHATSAPP_UNREACHABLE, _WHATSAPP_NEEDS_LINK, _WHATSAPP_UNCONFIRMED,
+})
+
+# Whether the device action the current tool call asked for actually happened:
+# True, False, or None for "nothing to say" (a status read, a question back).
+# The live UI's halo reads it as a mood. A context var rather than a new
+# parameter on every dispatcher: they stay module-level and service-injected,
+# and tool calls run one at a time on the main thread inside the LLM stream,
+# so nothing can leak between calls (_handle_tool_call sets and resets it).
+_TOOL_OUTCOME: contextvars.ContextVar = contextvars.ContextVar("tool_outcome", default=None)
+
+
+def _report(ok) -> None:
+    """Record whether the device action this tool call asked for actually happened.
+
+    Compared with `is True` / `is False`: tests pass bare Mocks, whose results
+    are truthy Mocks, and a Mock must never be read as a success.
+    """
+    if ok is True or ok is False:
+        _TOOL_OUTCOME.set(ok)
+
+
+def _report_typed(result, result_type) -> None:
+    """Report a typed result (GoveeCommandResult and kin define __bool__).
+
+    Only a real instance counts, so a Mock result reports nothing.
+    """
+    if isinstance(result, result_type):
+        _report(bool(result))
 
 
 # Packages that more than one boot thread imports for the first time. Importing
@@ -430,6 +472,7 @@ def _dispatch_tv_volume(action: str, params: dict, tv_volume) -> str:
 
     if action in ("mute", "unmute"):
         result = tv_volume.set_mute(action == "mute")
+        _report_typed(result, VolumeResult)
         if result:
             return "TV muted" if action == "mute" else "TV unmuted"
         return off_line
@@ -444,6 +487,8 @@ def _dispatch_tv_volume(action: str, params: dict, tv_volume) -> str:
         amount = abs(int(amount))
         result = tv_volume.change(amount if action == "volume_up" else -amount)
 
+    if isinstance(result, VolumeResult) and not result.needs_confirm:
+        _report(bool(result))  # needs_confirm is a question back, not a failure
     if result:
         if result.capped:
             return (f"TV volume {result.level}, that's my cap. Ask for a number "
@@ -684,6 +729,8 @@ def _dispatch_tv(
         if result.requires_confirmation:
             return result.message or AUTOPLAY_FALLBACK_LINE
         if result.success:
+            if result.target_mode in ("episode", "movie_detail"):
+                _report(result.success)  # actually playing; a detail page says nothing
             if result.target_mode == "episode" and getattr(result, "started_from_first_episode", False) is not True:
                 response = f"Continuing {title}."
             else:
@@ -693,6 +740,7 @@ def _dispatch_tv(
                 "playing" if result.target_mode == "episode" else "opened",
             )
             return _append_route_warning(response, route_warning)
+        _report(result.success)
         return result.message or AUTOPLAY_FALLBACK_LINE
 
     elif action == "stremio_play":
@@ -721,12 +769,15 @@ def _dispatch_tv(
         if result.requires_confirmation:
             return result.message or AUTOPLAY_FALLBACK_LINE
         if result.success:
+            if result.target_mode in ("episode", "movie_detail"):
+                _report(result.success)  # actually playing; a detail page says nothing
             response = _stremio_opened_line(title, result)
             _remember_launch(
                 now_playing, "stremio", title,
                 "playing" if result.target_mode == "episode" else "opened",
             )
             return _append_route_warning(response, route_warning)
+        _report(result.success)
         return result.message or AUTOPLAY_FALLBACK_LINE
 
     # YouTube
@@ -748,6 +799,7 @@ def _dispatch_tv(
         ok = media_svc.youtube_playlist(playlist_id)
         logger.info("[timing] youtube_playlist dispatch took %.3fs ok=%s", time.monotonic() - t_yt, ok)
         if not ok:
+            _report(ok)
             return "I couldn't open that YouTube playlist right now."
         if matched_key:
             _remember_launch(now_playing, "youtube", f"your {matched_key} playlist")
@@ -781,6 +833,7 @@ def _dispatch_tv(
             ok = media_svc.youtube_search(query)
             logger.info("[timing] youtube_search dispatch took %.3fs ok=%s", time.monotonic() - t_yt, ok)
             if not ok:
+                _report(ok)
                 return "I couldn't open YouTube search right now."
             _remember_launch(now_playing, "youtube", query, "opened")
             if getattr(media_svc, "youtube_search_autoplay", False):
@@ -802,6 +855,7 @@ def _dispatch_tv(
             time.monotonic() - t_play, playback.opened, playback.started, playback.title,
         )
         if not playback.opened:
+            _report(playback.opened)
             return "I couldn't open that on YouTube right now."
         if playback.started is False:
             # The link went and the session never moved. Same line Stremio
@@ -815,6 +869,7 @@ def _dispatch_tv(
             _remember_launch(now_playing, "youtube", spoken, "opened")
             response = f"I put {spoken} on YouTube, but I couldn't confirm it started."
             return _append_route_warning(response, route_warning)
+        _report(playback.started)  # the session stamp moved: confirmed playing
         _remember_launch(now_playing, "youtube", spoken)
         response = f"Playing {spoken} on YouTube."
         return _append_route_warning(response, route_warning)
@@ -842,22 +897,27 @@ def _dispatch_tv(
         # _ensure_playable, so nothing was said at all.
         if say_now:
             say_now("Hold on, waking everything up.")
-        if media_svc.turn_on():
+        woke = media_svc.turn_on()
+        if woke:
             # The box is up. The television is a separate claim, carried in
             # tv_confirmed; compare by identity, a bare Mock is truthy.
             result = getattr(media_svc, "last_wake_result", None)
             if result is not None and getattr(result, "needs_pairing", False) is True:
                 logger.warning("turn_on: box up, pairing needed: %s", result.detail)
+                _report(False)
                 return "the box is on, but the TV needs me approved on screen again"
             confirmed = getattr(result, "tv_confirmed", True)
             if confirmed is False:
                 logger.warning("turn_on: box up, TV not showing it: %s", result.detail)
+                _report(False)
                 return ("the box is on but the TV isn't showing it, give it a second "
                         "or grab the remote")
             if confirmed is None:
                 logger.info("turn_on: box up, TV unconfirmed: %s", result.detail)
                 return "the box is on and the TV should be coming up"
+            _report(woke)
             return "TV is on"
+        _report(False)
         # A rejected pairing token and a dead TV need opposite fixes. Saying
         # "use the remote" when the real answer is "approve me on screen" sends
         # Master Miguel to the wrong one, so branch on it.
@@ -871,7 +931,9 @@ def _dispatch_tv(
     elif action in ("turn_off", "sleep"):
         if not media_svc:
             return "media service not available"
-        if media_svc.turn_off():
+        slept = media_svc.turn_off()
+        _report(slept if slept else False)
+        if slept:
             if getattr(media_svc, "tv_only_standby", False) is True:
                 return "TV going to standby, the box stays up"
             return "TV going to standby"
@@ -889,6 +951,7 @@ def _dispatch_tv(
         except (TypeError, ValueError):
             return "which HDMI port?"
         result = media_svc.switch_hdmi(port)
+        _report_typed(result, WakeResult)
         if result:
             return f"switched to HDMI {port}"
         if getattr(result, "needs_pairing", False):
@@ -938,6 +1001,19 @@ def _drain_queue(q: queue.Queue) -> None:
             q.get_nowait()
         except queue.Empty:
             return
+
+
+def _score_of(wake_word) -> float:
+    """
+    The detector's last score for the live UI, or 0.0 when it has none.
+
+    Never raises: the idle loop calls this on every wake, and the tests drive
+    it with a Mock detector whose last_score is a Mock, which float() rejects.
+    """
+    try:
+        return round(float(getattr(wake_word, "last_score", 0.0) or 0.0), 4)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _chunk_rms(audio_chunk: np.ndarray) -> float:
@@ -1098,6 +1174,7 @@ def _dispatch_lights(params: dict, govee_svc, light_shadow=None) -> str:
     if action in ("light_on", "light_off"):
         on = action == "light_on"
         result = govee_svc.set_power(key, on=on)
+        _report_typed(result, GoveeCommandResult)
         if result:
             # `if result:` is a SUCCESS check. GoveeCommandResult defines
             # __bool__, so a failure is falsy and must not update memory.
@@ -1112,6 +1189,7 @@ def _dispatch_lights(params: dict, govee_svc, light_shadow=None) -> str:
             return "Tell me what brightness you want, from 1 to 100."
         percent = clamp_percent(raw)
         result = govee_svc.set_brightness(key, percent)
+        _report_typed(result, GoveeCommandResult)
         if result:
             # The clamped value, because that is what the strip was sent.
             # Brightness does NOT imply power: the strip accepts this while off.
@@ -1128,6 +1206,7 @@ def _dispatch_lights(params: dict, govee_svc, light_shadow=None) -> str:
         if not rgb:
             return f"I don't know the colour {requested}."
         result = govee_svc.set_color(key, rgb)
+        _report_typed(result, GoveeCommandResult)
         if result:
             # The spoken word, not the rgb. There is no rgb-to-name map here.
             if light_shadow:
@@ -1203,23 +1282,27 @@ def _dispatch_vacuum(params: dict, deebot_svc) -> str:
 
         if action == "vacuum_clean_all":
             result = deebot_svc.clean_all()
+            _report_typed(result, DeebotCommandResult)
             if result:
                 return "Cleaning the whole house."
             return result.message or _VACUUM_UNREACHABLE
 
         result = deebot_svc.clean_rooms(keys)
+        _report_typed(result, DeebotCommandResult)
         if result:
             return f"Cleaning {_join_rooms(keys)}."
         return result.message or _VACUUM_UNREACHABLE
 
     if action == "vacuum_stop":
         result = deebot_svc.stop()
+        _report_typed(result, DeebotCommandResult)
         if result:
             return "Vacuum stopped."
         return result.message or _VACUUM_UNREACHABLE
 
     if action == "vacuum_dock":
         result = deebot_svc.dock()
+        _report_typed(result, DeebotCommandResult)
         if result:
             return "Sending the vacuum home."
         return result.message or _VACUUM_UNREACHABLE
@@ -1661,6 +1744,16 @@ class Orchestrator:
     # orchestrators publish into nothing.
     bus = NULL_BUS
     _wake_meter = None
+    _published_state = None
+    # The halo's inputs (see _attach_live_ui). None until a live UI is running,
+    # so a test orchestrator offers mic levels into nothing.
+    _mic_meter = None
+    _clip_ids = itertools.count(1)
+    _include_text = True
+    # Which activation the last published mood belonged to, and whether a
+    # failure has been shown in it. See _publish_mood.
+    _mood_seq = -1
+    _mood_failed = False
     # Which activation the last WhatsApp send belonged to, and whether it went
     # anywhere. See _guard_whatsapp_send.
     _activation_seq = 0
@@ -1912,6 +2005,9 @@ class Orchestrator:
 
         logger.info("All components initialized in %.1fs", time.monotonic() - boot_start)
 
+        # Last, because the hooks go on self.audio, which phase 1 built.
+        self._attach_live_ui(config)
+
     def _play_bootup_sound(self):
         """Pick a random WAV from `sounds.bootup_dir` and play it."""
         import soundfile as sf
@@ -1928,7 +2024,7 @@ class Orchestrator:
         logger.info("Bootup sound: %s", os.path.basename(chosen))
         try:
             audio, sr = sf.read(chosen, dtype="float32")
-            self.audio.play_audio(audio, sr, blocking=True)
+            self.audio.play_audio(audio, sr, blocking=True, kind="boot")
         except Exception:
             logger.exception("Failed to play bootup sound %s", chosen)
 
@@ -2006,6 +2102,7 @@ class Orchestrator:
             logger.warning("Audio buffer overflow")
 
         audio_chunk = self.audio.bytes_to_numpy(audio_bytes)
+        self._offer_mic(audio_chunk, "idle")
 
         # Keep the last couple of seconds so a capture can show what she
         # actually heard, including the audio *before* the wake fired.
@@ -2017,10 +2114,7 @@ class Orchestrator:
         self._offer_wake_score("idle")
         if hit:
             # Wake word detected!
-            self.bus.publish("wake_hit", {
-                "score": round(float(getattr(self.wake_word, "last_score", 0.0) or 0.0), 4),
-                "phase": "idle",
-            })
+            self.bus.publish("wake_hit", {"score": _score_of(self.wake_word), "phase": "idle"})
             pre_roll = list(self._capture_ring) if self._capture_ring is not None else []
 
             # The speaker is opened once here and held through the whole
@@ -2080,7 +2174,7 @@ class Orchestrator:
         finally:
             if barged_in:
                 self._turn.set(outcome="barged_in")
-            self._turn.finish()
+            self._mood_for_turn_end(self._turn.finish())
             self._turn = NULL_TURN
 
     def _handle_activation(self, mic_stream, pre_roll=None) -> bool:
@@ -2102,7 +2196,7 @@ class Orchestrator:
         finally:
             if barged_in:
                 self._turn.set(outcome="barged_in")
-            self._turn.finish()
+            self._mood_for_turn_end(self._turn.finish())
             self._turn = NULL_TURN
 
     def _run_activation(self, mic_stream, pre_roll=None) -> bool:
@@ -2285,6 +2379,7 @@ class Orchestrator:
             audio_bytes, overflowed = mic_stream.read(self.audio.chunk_samples)
             audio_chunk = self.audio.bytes_to_numpy(audio_bytes)
             chunks.append(audio_chunk)
+            self._offer_mic(audio_chunk, "recording")
 
             if not gate.armed:
                 if not gate.update(time.monotonic() - started, _chunk_rms(audio_chunk)):
@@ -2483,6 +2578,7 @@ class Orchestrator:
             while not stop.is_set():
                 audio_bytes, _ = mic_stream.read(self.audio.chunk_samples)
                 chunk = self.audio.bytes_to_numpy(audio_bytes)
+                self._offer_mic(chunk, "reply")
                 hit = self.wake_word.process_audio(chunk, threshold=self._barge_in_threshold)
                 score = float(getattr(self.wake_word, "last_score", 0.0) or 0.0)
                 peak = max(peak, score)
@@ -2578,7 +2674,7 @@ class Orchestrator:
             if self._turn_writer is None or self._turn_writer.include_text:
                 self.bus.publish("sentence", {"text": text})
             try:
-                self.audio.play_audio(audio_data, sample_rate, blocking=True)
+                self.audio.play_audio(audio_data, sample_rate, blocking=True, text=text)
             except Exception as e:
                 logger.error(f"TTS playback error: {e}")
             finally:
@@ -2606,11 +2702,20 @@ class Orchestrator:
         action = tool_input.get("action") if isinstance(tool_input, dict) else None
         self._turn.tool_started(tool_name, action)
         result = None
+        token = _TOOL_OUTCOME.set(None)
         try:
             result = self._dispatch_tool(tool_name, tool_input)
             return result
         finally:
-            self._turn.tool(tool_name, action, started, result if result is not None else "<raised>")
+            ok = _TOOL_OUTCOME.get()
+            _TOOL_OUTCOME.reset(token)
+            if result is None:
+                ok = False  # the tool raised
+            self._turn.tool(
+                tool_name, action, started,
+                result if result is not None else "<raised>", ok=ok,
+            )
+            self._publish_mood_for_tool(tool_name, action, result, ok)
 
     def _dispatch_tool(self, tool_name: str, tool_input: dict) -> str:
         if tool_name == "control_tv":
@@ -2657,8 +2762,14 @@ class Orchestrator:
             )
         line = _dispatch_whatsapp(tool_input, self.whatsapp_service, say_now=self._say_now)
         if is_send:
+            sent = line.startswith(("Sent to", "Set."))
             self._whatsapp_send_seq = self._activation_seq
-            self._whatsapp_send_unresolved = not line.startswith(("Sent to", "Set."))
+            self._whatsapp_send_unresolved = not sent
+            # A read-back or "which one?" is a question, never a failure.
+            if sent:
+                _report(True)
+            elif line in _WHATSAPP_FAILED_LINES:
+                _report(False)
         return line
 
     def _stremio_sync_loop(self, interval_minutes: int):
@@ -2728,7 +2839,7 @@ class Orchestrator:
         try:
             audio, sr = self.tts.synthesize(text)
             if len(audio) > 0:
-                self.audio.play_audio(audio, sr, blocking=True)
+                self.audio.play_audio(audio, sr, blocking=True, text=text)
         except Exception as e:
             logger.error(f"Direct speak error: {e}")
 
@@ -2754,6 +2865,96 @@ class Orchestrator:
             logger.exception("Live UI failed to start; carrying on without it")
             self.live_ui = None
 
+    # Envelope rate for clip_start. The page reads `hz` from each event, so this
+    # can change without touching it.
+    _ENVELOPE_HZ = 25
+
+    def _attach_live_ui(self, config: dict) -> None:
+        """
+        Feed the halo: her voice per clip, the mic level, and nothing else.
+
+        Runs at the end of __init__, after phase 1 has built self.audio. With
+        no live UI running it does nothing at all: the hooks stay None and the
+        mic meter stays None, so playback and recording pay nothing.
+        """
+        if getattr(self, "live_ui", None) is None:
+            return
+        try:
+            ui_cfg = config.get("ui") or {}
+            self._mic_meter = MicLevelPublisher(
+                self.bus, hz=float(ui_cfg.get("mic_publish_hz", 15))
+            )
+            self._clip_ids = itertools.count(1)
+            self._include_text = (
+                (config.get("logging") or {}).get("include_transcripts", True) is not False
+            )
+            self.audio.on_clip_start = self._on_clip_start
+            self.audio.on_clip_end = self._on_clip_end
+        except Exception:
+            logger.exception("Live UI halo hooks failed to attach; carrying on without them")
+
+    def _on_clip_start(self, data, sample_rate, text, kind) -> int:
+        """A clip is about to play: publish its loudness envelope for the halo."""
+        clip = next(self._clip_ids)
+        try:
+            samples = len(data)
+        except TypeError:
+            samples = 0
+        payload = {
+            "clip": clip,
+            "kind": kind,
+            "hz": self._ENVELOPE_HZ,
+            "ms": int(round(samples / sample_rate * 1000)) if sample_rate else 0,
+            "env": envelope(data, sample_rate, self._ENVELOPE_HZ),
+        }
+        if text and self._include_text:
+            payload["text"] = text
+        self.bus.publish("clip_start", payload)
+        return clip
+
+    def _on_clip_end(self, clip, stopped) -> None:
+        self.bus.publish("clip_end", {"clip": clip, "stopped": bool(stopped)})
+
+    def _offer_mic(self, chunk, phase: str) -> None:
+        """One mic chunk's level to the halo. ~10us, and nothing without a UI."""
+        meter = self._mic_meter
+        if meter is not None:
+            meter.offer(level(chunk), phase=phase)
+
+    def _publish_mood_for_tool(self, tool_name, action, result, ok) -> None:
+        """Phase-1 moods: a tool that raised or failed is sheepish, one that worked happy."""
+        name = f"{tool_name}.{action}" if action else str(tool_name)
+        if result is None:
+            self._publish_mood("sheepish", f"{name} raised")
+        elif ok is False:
+            self._publish_mood("sheepish", f"{name} failed")
+        elif ok is True:
+            self._publish_mood("happy", f"{name} worked")
+
+    def _mood_for_turn_end(self, record) -> None:
+        if isinstance(record, dict) and record.get("outcome") == "error":
+            self._publish_mood("sheepish", "turn error")
+
+    def _publish_mood(self, mood: str, reason: str) -> None:
+        """
+        Tell the halo how the turn went. The last report in a turn wins, except
+        that a failure is never overwritten by a later success in the same turn:
+        "the lights worked but the TV didn't" should not end looking pleased.
+        Never raises.
+        """
+        try:
+            seq = self._activation_seq
+            if seq != self._mood_seq:
+                self._mood_seq = seq
+                self._mood_failed = False
+            if mood == "happy" and self._mood_failed:
+                return
+            if mood == "sheepish":
+                self._mood_failed = True
+            self.bus.publish("mood", {"mood": mood, "reason": reason})
+        except Exception:
+            pass
+
     def _stop_live_ui(self) -> None:
         live_ui = getattr(self, "live_ui", None)
         if live_ui is not None:
@@ -2763,9 +2964,17 @@ class Orchestrator:
             logging.getLogger().removeHandler(handler)
 
     def _set_state(self, state: str) -> None:
-        """Drive the LEDs and tell the live UI. The UI can never block the LEDs."""
+        """
+        Drive the LEDs and tell the live UI. The UI can never block the LEDs.
+
+        Published only on a change: _idle_loop re-asserts "idle" on every 40ms
+        mic chunk, and 25 identical events a second pushed every turn out of
+        the live UI's 500-event replay ring within about 20 seconds.
+        """
         self.leds.set_state(state)
-        self.bus.publish("state", {"state": state})
+        if state != self._published_state:
+            self._published_state = state
+            self.bus.publish("state", {"state": state})
 
     def _offer_wake_score(self, phase: str) -> None:
         meter = self._wake_meter

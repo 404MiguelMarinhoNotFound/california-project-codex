@@ -195,6 +195,18 @@ ui:
   port: 8765
   ring_size: 500              # events kept in memory so a page opened mid-turn is not blank
   wake_publish_hz: 10         # wake score updates per second (each carries the peak since the last)
+  # The halo at the top of the page (ui/halo.js): her voice, the mic and her
+  # mood drawn as a ring of embers. Her voice never plays in the browser, so its
+  # loudness travels with each clip (core/audio_levels.py) and the page replays it.
+  halo: true                  # false shows the plain state pill instead, exactly as before the halo
+  # Delay before the page animates a clip, so the ring moves with the sound and
+  # not ahead of it: the laptop speaker's output latency (~100-180ms of PortAudio
+  # buffering measured on MME). 120 is a starting guess -- tune it by eye on the
+  # real laptop until the ripples land on her syllables, and record the date.
+  voice_offset_ms: 120
+  mic_publish_hz: 15          # mic level updates per second (each carries the peak since the last)
+  mood_hold_ms: 6000          # how long happy/sheepish lingers in idle before it clears
+  palette: "dusk"             # reserved for later palettes; only dusk ships
   # On every boot, in the background: open the page in Firefox (skipped when a
   # Firefox tab already shows it) and WhatsApp the link to
   # CALIFORNIA_UI_NOTIFY_NUMBER from .env (not here: the repository is public).

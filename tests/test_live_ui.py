@@ -5,6 +5,7 @@ with a California running on the same machine.
 """
 
 import http.client
+import json
 import os
 import socket
 import unittest
@@ -44,7 +45,7 @@ class LiveUITests(unittest.TestCase):
         self.assertEqual(resp.getheader("Cache-Control"), "no-store")
 
     def test_assets_are_served_under_the_token(self):
-        for name in ("app.js", "app.css"):
+        for name in ("app.js", "app.css", "halo.js"):
             conn, resp = self._get(f"/s3cret-token/{name}")
             resp.read()
             conn.close()
@@ -107,6 +108,57 @@ class LiveUITests(unittest.TestCase):
         conn.close()
         self.assertIn('"threshold"', hello["data"])
         self.assertIn('"barge_in_threshold"', hello["data"])
+
+    def test_vendored_three_is_served_under_the_token(self):
+        conn, resp = self._get("/s3cret-token/vendor/three.min.js")
+        body = resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(resp.getheader("Content-Type").startswith("text/javascript"))
+        self.assertIn(b"@license", body[:200])
+        self.assertIn(b"THREE", body[:2000])
+
+    def test_vendored_three_is_404_without_the_token(self):
+        for path in ("/vendor/three.min.js", "/wrong/vendor/three.min.js",
+                     "/s3cret-token/vendor/../app.js", "/s3cret-token/vendor/",
+                     "/s3cret-token/vendor/README.md"):
+            conn, resp = self._get(path)
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 404, path)
+
+    def test_vendored_three_is_cacheable_and_the_page_is_not(self):
+        conn, resp = self._get("/s3cret-token/vendor/three.min.js")
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.getheader("Cache-Control"), "public, max-age=86400, immutable")
+        self.assertEqual(resp.getheader("X-Content-Type-Options"), "nosniff")
+        for name in ("", "app.js", "app.css"):
+            conn, resp = self._get(f"/s3cret-token/{name}")
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.getheader("Cache-Control"), "no-store", name)
+            self.assertIn("worker-src 'none'", resp.getheader("Content-Security-Policy"))
+
+    def test_hello_carries_voice_offset_palette_mood_hold_and_halo(self):
+        conn, resp = self._get("/s3cret-token/events")
+        (hello,) = self._read_events(resp, 1)
+        conn.close()
+        data = json.loads(hello["data"])
+        shipped = config_for_tests()["ui"]
+        self.assertEqual(data["voice_offset_ms"], shipped["voice_offset_ms"])
+        self.assertEqual(data["mood_hold_ms"], shipped["mood_hold_ms"])
+        self.assertEqual(data["palette"], "dusk")
+        self.assertIs(data["halo"], True)
+
+    def test_hello_defaults_when_the_halo_keys_are_absent(self):
+        from core.live_ui import _hello
+
+        data = _hello({"ui": {"halo": False, "voice_offset_ms": "nonsense"}})
+        self.assertIs(data["halo"], False)
+        self.assertEqual(data["voice_offset_ms"], 120)
+        self.assertEqual(data["mood_hold_ms"], 6000)
+        self.assertEqual(data["palette"], "dusk")
 
 
 class LiveUILifecycleTests(unittest.TestCase):

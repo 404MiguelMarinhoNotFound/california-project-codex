@@ -234,7 +234,8 @@ california/
 │   ├── audio_pipeline.py        # Microphone capture and playback
 │   ├── wake_word.py             # Wake-word detection
 │   ├── turn_log.py              # Rotating log file + one timing record per turn (logs/)
-│   ├── event_bus.py             # Live events for the UI: never blocks, never raises; wake scores live-only
+│   ├── event_bus.py             # Live events for the UI: never blocks, never raises; wake scores, clips, mic live-only
+│   ├── audio_levels.py          # Loudness on one dBFS scale: a clip's 25 Hz envelope and a mic chunk's level, for the halo
 │   ├── live_ui.py               # Read-only web page on the LAN: SSE stream, token in the path
 │   ├── live_ui_announce.py      # Each boot: WhatsApp him the page's link, open it in Firefox if no tab has it
 │   └── vad.py                   # Voice activity detection
@@ -271,7 +272,8 @@ california/
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
-├── ui/                          # The live page: index.html, app.css, app.js (no build step)
+├── ui/                          # The live page: index.html, app.css, app.js, halo.js (no build step)
+│   └── vendor/                  # three.min.js r149, vendored; version and SHA-256 in its README
 ├── training/                    # Wake-word training, runs on Modal, see training/README.md
 │   ├── modal_train.py           # Modal app: setup / smoke / train entrypoints
 │   ├── california.yaml          # Run 1 config, kept for comparison
@@ -295,6 +297,7 @@ california/
 │   ├── eval_phone_conversation.py  # Simulated calls (Claude as callee, spoken pt-PT TTS) scored for how she talks
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
 │   ├── bench_report.py             # Per-phase medians of recorded bench runs, and the spike-vs-base win rule
+│   ├── demo_live_ui.py             # Scripted turns into a real live UI; --check is a headless Playwright pass
 │   ├── score_wakeword.py           # Wake-word scores: live, recall (--dir), false positives (--negatives), threshold sweep
 │   ├── record_wakeword.py          # Records real wake-word takes to fold into training as positives
 │   ├── probe_stremio_sync.py       # Refreshes and inspects Stremio watch-state cache
@@ -349,7 +352,10 @@ california/
 │   ├── test_call_outcome.py     # Reading the outcome from a transcript: statuses, never raises, their words as data
 │   ├── test_orchestrator_phone.py # control_phone dispatch, the labelled report, speaking it from the idle loop
 │   ├── test_event_bus.py        # Bus: replay, live-only wake scores, slow pages never block, TurnTimer publishes live
-│   ├── test_live_ui.py          # Token-in-path 404s, static whitelist, SSE replay then live, Last-Event-ID
+│   ├── test_live_ui.py          # Token-in-path 404s, static whitelist, SSE replay then live, Last-Event-ID, vendored three.js cached
+│   ├── test_live_ui_orchestrator.py # Halo wiring: clip text/envelope/kind, transcripts off, mic from three places, ack before listening
+│   ├── test_audio_levels.py     # Envelope and mic level: dBFS scale, bounds, length, dtypes, speed
+│   ├── test_mood_rules.py       # Phase-1 moods: worked/failed/raised, questions and status report nothing, no Mock success
 │   ├── test_live_ui_announce.py # mozlz4 tabs read, open-once in Firefox, link sent once, busy retried only
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
@@ -3530,6 +3536,20 @@ Current automated coverage exists for:
   not end the turn; `_idle_loop` chains a barged-in turn into another activation
   on one speaker session; and a closed LLM generator keeps the partial answer
   in history
+- Halo inputs: `envelope()` and `level()` on one dBFS scale (silence zero, never
+  above one, length rounded up, int16/float32/stereo agree, under 5ms for 10s);
+  `PeakThrottle` keeping the peak, `WakeScorePublisher` unchanged, clip/mic events
+  live-only and moods replayed; the pipeline's clip hooks (start before the first
+  write, end after the last, `stopped` on a stop, nothing for a refused clip,
+  exactly one end on every exit path including the write-failure fallback, a
+  raising hook never stopping playback); the orchestrator publishing clip text,
+  envelope, duration and kind, omitting text with `include_transcripts: false`,
+  offering mic levels from idle, recording and reply, and publishing nothing with
+  no UI; a barge-in publishing a stopped `clip_end` for the clip playing; and the
+  phase-1 moods (`tests/test_mood_rules.py`): worked is happy, failed or raised is
+  sheepish, a detail page, a read-back and every status read report nothing, a bare
+  `Mock` is never a success, nothing leaks between tool calls, a failure beats a
+  later success in one turn, and the turn record carries `ok`
 
 ### Live UI: watch her from the sofa (2026-10-13)
 
@@ -3544,7 +3564,8 @@ from the boot log (`Live UI: http://<laptop>:8765/<token>/`) on the phone.
 - **Live, not historical.** `core/event_bus.py` is published to from the thread where
   each thing happens: `TurnTimer` publishes every `mark`/`set`/`tool` as it is made
   (before, the turn only existed once `finish()` wrote `turns.jsonl`),
-  `Orchestrator._set_state` replaces every direct `leds.set_state`, the idle loop and
+  `Orchestrator._set_state` replaces every direct `leds.set_state` (and publishes only a
+  *change*: `_idle_loop` re-asserts idle every 40ms, which flooded the replay ring), the idle loop and
   the reply listener offer `wake_word.last_score`, `_audio_player_worker` publishes
   the sentence it is playing, `GeminiLiveAgent(on_line=...)` publishes each piece of a
   call transcript, and `BusLogHandler` publishes log records. Nothing is read from disk.
@@ -3566,7 +3587,7 @@ from the boot log (`Live UI: http://<laptop>:8765/<token>/`) on the phone.
 - **The token is in the path**, so the page's relative `app.js`, `app.css` and `events`
   carry it with no JavaScript, and everything else, `/` included, is a 404. Set
   `CALIFORNIA_UI_TOKEN` in `.env` so a bookmark survives restarts; unset, a new one is
-  generated each run. Only three whitelisted files are ever served. Everything on the
+  generated each run. Only whitelisted files are ever served. Everything on the
   page is written with `textContent`, never as HTML, because other people's WhatsApp
   text reaches it through tool results and logs.
 - **`logging.include_transcripts: false` governs the page too**: transcript, reply,
@@ -3588,6 +3609,90 @@ from the boot log (`Live UI: http://<laptop>:8765/<token>/`) on the phone.
   `ui.announce.open_firefox` / `ui.announce.whatsapp` switch either step off.
 - `tests/config_fixture.py` turns `ui.enabled` off, because the shipped value binds a
   LAN port. `tests/test_live_ui.py` turns it back on, bound to loopback on port 0.
+
+### The halo: her voice, drawn (2026-10-13)
+
+The top of the live page is a ring of embers with a core of light, `ui/halo.js`
+on vendored three.js (`ui/vendor/three.min.js`, r149, the last UMD build; version,
+source and SHA-256 in `ui/vendor/README.md`). Dusk palette: rose `#ff6fa8`, violet
+`#b388ff`, coral `#ff9a6b`; the rest of the page moved from orange to the same rose
+(light theme `#c2185b` / `#6a3fc8`, every pair checked AA). Plan:
+`docs/superpowers/plans/2026-10-13-live-ui-orb.md`.
+
+| state | the halo |
+|---|---|
+| idle | a dim cloud drifting, the core breathing |
+| wake | the cloud snaps into a ring with a flash |
+| listening | the ring tightens and leans in, its edge on his voice |
+| thinking | it spins up and a comet runs round it |
+| speaking | each syllable pushes the ring out; loud ones send a ripple |
+
+Moods layer on top: happy (warmer, sparkling), sheepish (smaller, cooler, dimmer).
+Smug, unimpressed and the eye-roll are drawn but nothing sends them yet (phase 2).
+
+- **Her voice never plays in the browser, so its loudness travels with the clip.**
+  `AudioPipeline.on_clip_start(data, sr, text, kind)` / `on_clip_end(clip, stopped)`
+  fire for every clip that actually plays: one start before the first block, one end
+  from a single `finally` (stopped=True when a stop cut it). A clip refused by a stop
+  already in force reports nothing; the non-blocking acknowledgement reports a start
+  only. The hooks never raise into playback. `Orchestrator._on_clip_start` publishes
+  `clip_start` with a 25 Hz envelope from `core/audio_levels.envelope()`, the duration
+  and `kind` (`reply`, `ack`, `boot`, `error`), and the text unless
+  `logging.include_transcripts` is false. The page replays the envelope against its
+  own clock (`VoiceClock` in `ui/app.js`), so no cross-device timestamp is involved.
+- **dBFS, not raw RMS.** Speech spans ~30 dB; a linear scale left quiet syllables at
+  zero. `DB_FLOOR = -60` and `DB_CEIL = -10` at the top of `core/audio_levels.py`
+  are first guesses, **not yet calibrated on real Chirp clips** -- do that on the
+  laptop before tuning anything on the page.
+- **`ui.voice_offset_ms` (120) is also uncalibrated.** It delays the page's replay to
+  match the speaker's output latency. Tune it by eye until ripples land on her
+  syllables, and write the value and date into `config.yaml`.
+- **The mic level** is offered from the three places a chunk already exists (idle
+  loop, recorder, reply listener) through `MicLevelPublisher`, 15/s, each carrying
+  the peak since the last. `PeakThrottle` is the shared throttle; `WakeScorePublisher`
+  is a thin subclass of it with an unchanged event.
+- **`clip_start`, `clip_end` and `mic` are live-only**, like the wake score: a
+  replayed clip would animate audio that finished long ago, and the mic rate would
+  evict turns from the ring. `mood` IS replayed, so a page opened mid-turn has it.
+- **The halo wakes on the wake word, not on `state`.** With
+  `sounds.activation_blocking: true` the acknowledgement plays out while the
+  published state is still `idle`. So the page wakes the halo on `wake_hit`
+  (`phase: idle`, not ignored) and on `clip_start` with `kind: ack`.
+  `test_activation_line_publishes_an_ack_clip_before_state_listening` pins the order.
+- **Moods come from tool outcomes, through a context var, not new parameters.**
+  `_report(ok)` sets `_TOOL_OUTCOME`, which `_handle_tool_call` sets to `None` before
+  each dispatch and resets after, so the dispatchers stay module-level and
+  service-injected. Each `_report` sits next to an existing success check and no
+  spoken line changed. Only `True`/`False` count, and a typed result only by
+  `isinstance` (`_report_typed`), so a bare `Mock` is never a success. Worked: happy.
+  Failed or raised, or the turn ended in `error`: sheepish. A failure in a turn is
+  never overwritten by a later success in it. Status reads and questions back (a
+  read-back, "which one?", `requires_confirmation`) report nothing: she never looks
+  sheepish for asking. Stremio counts as worked only when actually playing
+  (`episode` or `movie_detail`), YouTube search only when the session stamp moved,
+  and a playlist never (it has no confirmation). The turn record's tool entries gain
+  an optional `ok`. Phone calls report nothing: their outcome arrives minutes later.
+- **A stopped clip settles at once.** On a stopped `clip_end` the page drops the clip
+  and calls `halo.hush()`, a fast release, so the ring is still within ~0.3s of a
+  barge-in instead of the ~0.6s the normal release takes.
+- **Fallbacks.** No WebGL, or three.js failed to load: a one-line notice and the old
+  state pill. `ui.halo: false` gives the pre-halo page exactly. A lost stream renders
+  the halo at 40% as idle, so a stale page never looks alive.
+- **Ambient mode**: the Full screen button or `#ambient` in the URL hides everything
+  but the halo, requests full screen and a screen wake lock (re-requested when the
+  page becomes visible again; both optional).
+- **`uv run python tools/demo_live_ui.py`** plays three scripted turns into a real bus
+  and server (token `demo`, port 8799) without California.
+  `uv run --no-project --with playwright --with numpy --with pyyaml python tools/demo_live_ui.py --check`
+  opens it in headless Chromium at 390x844 and 1280x900 in both schemes, screenshots
+  every state and mood into `debug/live_ui/`, and fails on a console error, a
+  horizontal scroll, a ring still moving 300ms after a barge-in, or a broken
+  ambient/fallback path. `--no-project` keeps `uv.lock` untouched; set
+  `CHROMIUM_PATH` if Chromium is not where Playwright put it.
+- **The served files are now five**: `index.html`, `app.js`, `app.css`, `halo.js` and
+  `vendor/three.min.js`, the last with a one-day immutable `Cache-Control` (~600 KB
+  the stdlib server cannot gzip); everything else stays `no-store`. The CSP adds
+  `worker-src 'none'`.
 
 ### Runtime logs: read these before guessing at latency
 
@@ -4064,6 +4169,17 @@ just the commits.
   The merged PR shipped every flag on; the follow-up set them to what was
   measured (H6 on, H7 off, H8 off until measured, H9 on for the tail) and fixed
   the bench so H8 can be measured.
+
+- **"Bring California to life on the live page" (2026-10-13, branch
+  `ccr-cc285211-5jqocu`).** Drafted three concepts, then the sun with a wireframe
+  shell, eyes, and finally the halo in the Dusk palette (links in the plan,
+  `docs/superpowers/plans/2026-10-13-live-ui-orb.md`). Implemented without the
+  hardware: clip hooks and envelopes, mic levels, phase-1 moods through a context
+  var, vendored three.js, `ui/halo.js`, and a demo tool with a Playwright check.
+  Found on the way: the plan's 300ms settle could not be met with the draft's 0.2s
+  release, hence `halo.hush()`. **Not yet done: the live calibration** --
+  `ui.voice_offset_ms` and `audio_levels.DB_FLOOR`/`DB_CEIL` against real Chirp
+  clips on the laptop, and the `first_audio` latency comparison with the UI on and off.
 
 -----
 
