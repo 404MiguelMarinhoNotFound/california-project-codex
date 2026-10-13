@@ -126,8 +126,10 @@ to the phone: readable only by Master Miguel, SYSTEM and Administrators (fixed
 WhatsApp (`control_whatsapp`) needs **no credential at all**, and that is deliberate: the send
 path drives WhatsApp Web in a linked browser profile (`whatsapp.profile_dir`, linked once with
 `tools/link_whatsapp.py`), so the session *is* the auth -- and is gitignored like one.
-What it does need is `contacts.vcf` at `whatsapp.contacts_path` -- a VCF export of the phone's
-address book, gitignored because it is several hundred real people's phone numbers -- and,
+What it does need is a contact book: `phone_contacts.json`, the snapshot "Contact sync" reads
+off the phone over ADB, or failing that `contacts.vcf` at `whatsapp.contacts_path` -- a VCF
+export of the phone's address book. Both are gitignored because they are several hundred real
+people's phone numbers -- and,
 optionally, `whatsapp_aliases.yaml` at `whatsapp.aliases_path`: the spoken nicknames, gitignored
 for the same reason, since the repository is public.
 
@@ -266,7 +268,8 @@ california/
 │   ├── tts.py                   # Text-to-speech
 │   ├── tts_text_sanitizer.py    # Text cleanup for TTS timing
 │   ├── youtube_playlist_resolver.py # Matches voice playlist names and picks one saved ID at random
-│   ├── whatsapp_service.py      # WhatsApp: VCF contacts, confirm-before-send, one worker thread, backend switch
+│   ├── whatsapp_service.py      # WhatsApp: phone-snapshot (else VCF) contacts, confirm-before-send, one worker thread, backend switch
+│   ├── contact_sync.py          # The phone's contact book over ADB (read-only) into phone_contacts.json, weekly
 │   ├── whatsapp_web.py          # Playwright driver for WhatsApp Web: selectors table, send + sent-tick confirm
 │   ├── whatsapp_groups.py       # Forgiving spoken-name -> group-title matcher (emoji-blind, sound-alike words)
 │   ├── phone_service.py         # Phone calls: brief -> read-back -> background call -> CallReport + logs/calls.jsonl
@@ -347,6 +350,7 @@ california/
 │   ├── test_youtube_playlist_resolver.py # Matching, aliases, and random-selection coverage
 │   ├── test_youtube_search_autoplay.py # Query -> video id -> watch link, session-stamp verification, spoken lines
 │   ├── test_whatsapp_service.py # WhatsApp self-disable, VCF parsing, match certainty, the confirm token, no-keyboard guard
+│   ├── test_contact_sync.py     # Rows folded per contact, atomic snapshot, SHRUNK/UNREADABLE keep the book, BUSY, counts-only logs
 │   ├── test_orchestrator_whatsapp.py # control_whatsapp dispatch: spoken lines, the read-back guard, the interim line
 │   ├── test_whatsapp_web.py     # Playwright driver on a fake page, outcome lines, one-thread worker, no-browser guard
 │   ├── test_whatsapp_unread.py  # Unread from the chat list: never opens a chat, senders-first lines, messages quoted not obeyed
@@ -375,7 +379,8 @@ california/
 ├── vpn_state.json               # Generated locally, Surfshark diagnostic cache
 ├── watch_state.json             # Generated locally, cached Stremio progress
 ├── .deebot_device_id            # Generated locally, the Ecovacs device id that got verified
-├── contacts.vcf                 # Local only: the phone's contacts export (WhatsApp)
+├── phone_contacts.json          # Local only: the phone's contact book, synced over ADB weekly (WhatsApp, calls)
+├── contacts.vcf                 # Local only: the phone's contacts export, the fallback when there is no snapshot
 ├── whatsapp_aliases.yaml        # Local only: WhatsApp nickname -> contact map
 ├── whatsapp_groups.json         # Local only: cached WhatsApp group titles (list_groups)
 ├── .whatsapp_profile/           # Local only: the linked WhatsApp Web browser session
@@ -1817,6 +1822,16 @@ and wrong for four hundred people: "ana" would resolve to "Joana" as confidently
 was and returns ambiguity rather than a best guess -- exactly what the confirm step
 needs. `match_name` is still used for the small `aliases` map, like the lights.
 
+**The book comes from the phone first, the VCF second (2026-10-14).** `_load_contacts`
+reads `phone_contacts.json` (`contacts_sync.snapshot_path`) when contact sync is enabled
+and the snapshot holds anyone, and `contacts.vcf` only otherwise; `contacts_source` says
+which (`"phone"`, `"vcf"`, or `""` for no book at all). A missing, empty or corrupt
+snapshot falls back to the VCF with a warning and never touches the boot.
+`reload_contacts` is what `ContactSync` calls after it writes, so a weekly sync lands
+without a restart, and a read-back already pending survives the swap: the confirmation
+token is keyed on contact key and number, not on the list. Everything below about the
+VCF still holds for the fallback. See "Contact sync" below.
+
 **The phone's VCF export is vCard 2.1, and a name with an accent or an emoji is
 quoted-printable.** Android writes `FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=6D=61...`
 for any non-ASCII name, and wraps a long one with a trailing `=` and **no** leading space
@@ -2092,10 +2107,94 @@ the tick alone missed two of his messages, which read as "Miguel".
   sending), and the line names whose chat it was.
 
 Setup: `uv sync --extra default`, `uv run python tools/link_whatsapp.py` once (scan the
-QR code from the phone's Linked devices screen), export the phone's contacts as VCF and
-drop it at `whatsapp.contacts_path` (gitignored). On the Pi, also
+QR code from the phone's Linked devices screen), and either let contact sync read the
+phone over ADB (below) or export the phone's contacts as VCF and drop it at
+`whatsapp.contacts_path` (gitignored). On the Pi, also
 `uv run playwright install chromium` once -- that browser lives outside `uv.lock`, like
 the openWakeWord models, so a fresh machine needs it again.
+
+### Contact sync
+
+`services/contact_sync.py` (`ContactSync`) reads the phone's own contact book over ADB
+into `phone_contacts.json`, which `WhatsAppService` loads in place of `contacts.vcf` --
+and `PhoneService` with it, since calls resolve names through
+`WhatsAppService.resolve_contact`. `contacts.vcf` was a hand export that went stale the
+day it was made. Lookups never touch the phone: the snapshot is a file, so WhatsApp and
+calls keep resolving names with the phone off the network. Plan:
+`docs/superpowers/plans/2026-10-13-weekly-contact-sync.md`.
+
+**What the phone returns (probed read-only, 2026-10-13).** One
+`content query --uri content://com.android.contacts/data/phones` answered **845 rows for
+418 distinct `contact_id`s in 1.4s**. A row is one (raw contact, number), and a person
+appears once per account -- Google, WhatsApp, Duo/Meet, the SIM -- with the WhatsApp and
+Duo rows copying the Google numbers. `contacts_from_rows` therefore folds rows per
+`contact_id`, normalises each number (cutting a `,` pause or `;` wait suffix first),
+ranks them the way the VCF loader does (default number 3, mobile 2, home 1) and
+deduplicates. Two ids with the same name stay two contacts: the "which one?" question
+depends on it. A card with no name or no usable number is dropped. Measured end to end
+on 2026-10-14: **413 contacts, 2.0s** for the first sync, **1.4s** for the next.
+
+- **Values are printed raw**: `Row: <n> key=value, key=value`, no quoting, `NULL` for
+  null. Names are free text and `data1` may legally hold `,` and `;`, so the row cannot
+  be split on `", "`. `parse_content_rows` (in `services/phone_adb.py`) anchors on the
+  known key sequence, and **`display_name` is the last column of the projection** because
+  only the last value can safely run to the end of the line. A line it cannot place is
+  counted as `unparsed`, never guessed. `test_projection_keeps_display_name_last` pins it.
+- **Decoded as UTF-8 the output is clean** (88 non-ASCII names and 28 with emoji came
+  through intact), which removes the quoted-printable problem the VCF has.
+
+**A shell `content query`, not a mode of the `callaudio` helper.** The shell user already
+holds `READ_CONTACTS`, the query is one round trip, and it needs neither the helper push
+nor its hash-checked launch. A helper mode would add a dex rebuild, a hash bump and a
+`HELPER_MISMATCH` path, all for JSON-escaped output that the anchored parser makes
+unnecessary. `AdbPhone.query` calls `ready(need_interception=False, need_helper=False)`,
+sends exactly one shell command, never pushes or runs the helper, and refuses a URI or
+key that is not a plain identifier, so no caller can inject shell. It is read-only:
+never `insert`, `update` or `delete`. Revisit the helper only if a real name ever breaks
+the parser, which the `unparsed` count will show.
+
+**Two rules keep a bad answer from deleting his people:**
+
+- **Zero contacts is never a book.** A phone with a contact book does not answer with
+  none, so `[]`, or rows that fold to nothing, is `UNREADABLE` and the snapshot is left
+  alone.
+- **`SHRUNK`: a book below `min_keep_ratio` (0.5) of the last one is not written.** A
+  half-synced account, a revoked permission or a provider hiccup can return a fraction of
+  the book; writing it would quietly drop half his contacts until the next week. He is
+  told the two counts and the old list is kept.
+
+Every outcome has its own line (`SYNCED`, `UNCHANGED`, `NO_PHONE` with the snapshot's
+age, `LOCKED_DOWN` for Security settings off, `UNREADABLE`, `SHRUNK`, `BUSY`,
+`DISABLED`). `ContactSyncResult` is falsy unless `SYNCED`/`UNCHANGED`, like every other
+result type here. One sync at a time: a second one, voice and loop together, is refused
+as `BUSY`, and a sync never touches a call in progress because `query` never runs the
+helper. The snapshot is written to `<path>.tmp` and `os.replace`d, so a crash never
+leaves half a book; a corrupt one reads as "no snapshot", which makes a sync due at once.
+
+**Logs and spoken lines carry counts only** -- `Contacts synced from phone: 413 contacts
+(+2 -0 ~1) in 1.4s` -- never a name or a number. The logs get shared when debugging and
+the repository is public. Failures log the exception *type*, not its message, for the
+same reason. `test_logs_and_messages_carry_no_names_or_numbers` pins it. The contact
+roster is still never put in the system prompt.
+
+**When it runs.** `Orchestrator._contacts_sync_loop` (thread `contacts-sync`, stopped by
+`_background_stop`) **checks first, then waits** -- the reverse of the other loops -- so
+a snapshot older than `interval_days` (7), or missing, is synced right after boot
+without delaying `__init__`. After that it asks `due()` every `check_interval_minutes`
+(360), so a phone that was off the network is retried within hours, not a week later.
+Construction runs no adb; the `AdbPhone` is built on the first sync.
+
+**By voice: "refresh my contacts"** is `control_phone`'s `phone_sync_contacts`. It is
+handled in `_dispatch_phone` **before** the `phone_svc.enabled` gate, through a trailing
+`contact_sync=None` parameter: it needs adb, not the call backend's Gemini credentials,
+so "phone calls aren't set up" would be the wrong answer. A raising sync is a spoken
+failure, never a traceback.
+
+Config is the top-level `contacts_sync:` block (`enabled`, `snapshot_path`,
+`interval_days`, `check_interval_minutes`, `min_keep_ratio`). It self-disables off
+Windows, without adb at `phone.adb.path`, or when neither WhatsApp nor phone calls is
+enabled (nothing would read it). `tests/config_fixture.py` points `snapshot_path` at a
+nonexistent file so a test never reads or overwrites his real book.
 
 ### PhoneService
 
@@ -2360,8 +2459,9 @@ says which ("from your contacts", "the number I found", "the number you said"):
 
 1. Digits in `to` -- he said the number.
 2. A **certain** contact match for `to` (`WhatsAppService.resolve_contact`: aliases + the
-   VCF, no browser) -- even when Claude also passed a `number`, because a number the model
-   passes for a person may be invented and the book is what his phone holds.
+   phone contact snapshot, else the VCF; no browser) -- even when Claude also passed a
+   `number`, because a number the model passes for a person may be invented and the book
+   is what his phone holds.
 3. The brief's `number` -- a business Claude looked up with web search. It beats a loose
    or tied contact match, so "Taberna da Praia" brushing a contact's surname cannot
    redirect the call.
@@ -2786,7 +2886,7 @@ The Claude path supports:
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 - Custom `control_whatsapp` tool for WhatsApp messaging (4 actions)
-- Custom `control_phone` tool for phone calls from his own number and finding his phone (4 actions)
+- Custom `control_phone` tool for phone calls from his own number, finding his phone and refreshing his contacts (5 actions)
 
 With the committed `config.yaml` that is **6 tools** in every request: `web_search`,
 `control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`, `control_phone`. Each custom tool's full schema is sent on
@@ -2847,7 +2947,7 @@ Bulk send and image send exist in the CLI it was ported from and were left out: 
 spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
 capability with no voice phrasing.
 
-`control_phone` supports four actions:
+`control_phone` supports five actions:
 
 - `phone_call` with a brief: `to`, optional `number`, `kind` (`book_table`, `book_appointment`,
   `ask_question`, `deliver_message`, `personal`, `general`), `goal`, `details`, `may_agree`,
@@ -2857,6 +2957,8 @@ capability with no voice phrasing.
 - `phone_log`: the last calls from `logs/calls.jsonl`, newest first (`count`, default 5,
   max 20). Reads the file, so it survives restarts and reads lines from before `meta` existed
 - `phone_find`: rings his phone ~20s with an alarm beep over ADB; no read-back (see "Find my phone")
+- `phone_sync_contacts`: re-reads the phone's contact book over ADB now ("refresh my contacts");
+  handled before the calls gate, so it works with calls off (see "Contact sync")
 
 When tools are active:
 
@@ -3546,6 +3648,17 @@ Current automated coverage exists for:
   quotes and labels every message, describes a photo rather than inventing it, asks
   which of two people, clamps the count, and unread still never opens a chat
 - That the contact roster is never injected into the system prompt
+- Contact sync (`tests/test_contact_sync.py`, plus snapshot cases in
+  `tests/test_whatsapp_service.py`, `tests/test_orchestrator_phone.py` and
+  `tests/test_phone_adb.py`): rows folded per contact with account duplicates dropped,
+  the default number first, a pause suffix cut, same-name ids kept apart; free text
+  parsed with `display_name` last; the snapshot round-trips and is written atomically;
+  zero rows is UNREADABLE and a shrunken book is not written; no phone, locked down and
+  a second sync at once (BUSY) each a line, never a raise; due after seven days or on a
+  corrupt snapshot; the query never pushes or runs the helper and never writes; the
+  snapshot beats the VCF and a corrupt one falls back to it; a read-back survives a
+  reload; `phone_sync_contacts` works with calls disabled; the loop syncs before its
+  first wait; and no log or spoken line carries a name or a number
 - The phone over ADB (`tests/test_phone_adb.py`, `tests/test_phone_call_audio.py`): the
   phone found by mDNS name or attached IP:port and never the Mi Box on :5555; no phone,
   Security settings off and no interception each a status, never an exception, with
