@@ -34,22 +34,29 @@ logger = logging.getLogger(__name__)
 
 UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ui")
 
-# The only files ever served. No path from the URL is joined onto a directory.
+# The only files ever served. No path from the URL is joined onto a directory:
+# the lookup is an exact dict match, so "vendor/three.min.js" needs no joining
+# logic and "../" can never reach anything. An optional third element is the
+# Cache-Control for that file; the default is no-store.
+_NO_STORE = "no-store"
+_IMMUTABLE = "public, max-age=86400, immutable"
 _STATIC = {
     "": ("index.html", "text/html; charset=utf-8"),
     "index.html": ("index.html", "text/html; charset=utf-8"),
     "app.js": ("app.js", "text/javascript; charset=utf-8"),
     "app.css": ("app.css", "text/css; charset=utf-8"),
+    # ~600 KB the stdlib server cannot gzip, and versioned by ui/vendor/README.md,
+    # so a phone downloads it once a day rather than on every page load.
+    "vendor/three.min.js": ("vendor/three.min.js", "text/javascript; charset=utf-8", _IMMUTABLE),
 }
 
 _HEARTBEAT_S = 15.0
 _SECURITY_HEADERS = (
-    ("Cache-Control", "no-store"),
     ("Referrer-Policy", "no-referrer"),
     ("X-Content-Type-Options", "nosniff"),
     ("Content-Security-Policy",
      "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
-     "style-src 'self'; script-src 'self'; frame-ancestors 'none'"),
+     "style-src 'self'; script-src 'self'; worker-src 'none'; frame-ancestors 'none'"),
 )
 
 
@@ -126,13 +133,27 @@ def _hello(config: dict) -> dict:
     """Per-connection context the page needs to draw itself."""
     ww = (config or {}).get("wake_word") or {}
     logging_cfg = (config or {}).get("logging") or {}
+    ui_cfg = (config or {}).get("ui") or {}
     threshold = ww.get("threshold")
     return {
         "threshold": threshold,
         "barge_in_threshold": ww.get("barge_in_threshold", threshold),
         "transcripts": logging_cfg.get("include_transcripts", True) is not False,
         "started": time.time(),
+        # The halo (ui/halo.js). voice_offset_ms delays the page's animation of
+        # a clip to match the laptop speaker's output latency.
+        "halo": ui_cfg.get("halo", True) is not False,
+        "voice_offset_ms": _int(ui_cfg.get("voice_offset_ms"), 120),
+        "mood_hold_ms": _int(ui_cfg.get("mood_hold_ms"), 6000),
+        "palette": str(ui_cfg.get("palette") or "dusk"),
     }
+
+
+def _int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _make_handler(ui: LiveUI):
@@ -165,7 +186,8 @@ def _make_handler(ui: LiveUI):
             entry = _STATIC.get(rest)
             if entry is None:
                 return self._not_found()
-            name, ctype = entry
+            name, ctype = entry[0], entry[1]
+            cache = entry[2] if len(entry) > 2 else _NO_STORE
             try:
                 with open(os.path.join(ui.ui_dir, name), "rb") as fh:
                     body = fh.read()
@@ -174,6 +196,7 @@ def _make_handler(ui: LiveUI):
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", cache)
             for k, v in _SECURITY_HEADERS:
                 self.send_header(k, v)
             self.end_headers()
