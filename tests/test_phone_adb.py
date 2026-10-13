@@ -10,7 +10,7 @@ from unittest import mock
 from services import phone_adb
 from services.phone_adb import ACTIVE, ALERTING, DIALING, IDLE, AdbPhone
 
-PHONE = "192.168.1.101:38731"
+PHONE = "192.168.1.101:38731"  # config-literal: adb devices/mdns output shape, not the deployment
 MDNS_NAME = "adb-4POJ4DWOJBXWIVLB-lmuzi2._adb-tls-connect._tcp"
 
 

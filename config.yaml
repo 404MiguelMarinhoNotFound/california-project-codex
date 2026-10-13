@@ -1102,15 +1102,15 @@ phone:
   confirm_timeout_ms: 120000
   default_country: "351"
   allowed_country_codes: ["351"]
-  # Where her voice goes (an output device name prefix), and the Windows
-  # recording endpoint Phone Link must use as its microphone.
-  cable_output_device: "CABLE Input"
-  cable_mic_endpoint: "CABLE Output (VB-Audio Virtual Cable)"
-  # Where the callee plays and where she listens, pinned for the length of a
-  # call (restored after). Never left to "the default speaker": on 2026-10-08
-  # Bluetooth headphones had become the default, the call audio went to their
-  # hands-free side, and she heard nothing on a real call. "" = default speaker.
-  call_speaker_endpoint: "Speakers (Realtek High Definition Audio)"
+  # The phone itself, over Wireless debugging (paired once, plus HyperOS
+  # "USB debugging (Security settings)" on). Calls are placed and their audio
+  # carried by the phone: no Phone Link, no VB-CABLE (moved to deprecated/
+  # 2026-10-13). See android/callaudio/README.md.
+  adb:
+    path: "adb"
+    serial: ""            # empty: found over mDNS or its attached IP:port, never the Mi Box
+    port: 27183           # adb forward port for the call-audio socket
+    mute_phone_mic: true  # keep the phone's own mic (the room) out of the call
   # One line per call: outcome and, unless logging.include_transcripts is
   # false, both sides of the conversation.
   log_path: "logs/calls.jsonl"

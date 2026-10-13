@@ -564,7 +564,7 @@ class LLMService:
         ]
 
         # Phone calls (control_phone). Gated on config like the others; the
-        # service self-disables without its key or Phone Link and then answers
+        # service self-disables without its key or adb and then answers
         # "aren't set up" rather than disappearing from the model.
         self.phone_enabled = bool((config.get("phone", {}) or {}).get("enabled", False))
 

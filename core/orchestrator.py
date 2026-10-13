@@ -1944,7 +1944,6 @@ class Orchestrator:
         self.phone_service = PhoneService(
             config,
             resolve_contact=getattr(self.whatsapp_service, "resolve_contact", None),
-            room_speaking=getattr(self.audio, "speaker_open", None),
             publish=self.bus.publish,
         )
 
