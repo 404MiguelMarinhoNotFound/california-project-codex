@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest.mock import MagicMock, Mock
 
-from core.event_bus import NULL_BUS, BusLogHandler, EventBus, WakeScorePublisher
+from core.event_bus import NULL_BUS, BusLogHandler, EventBus, MicLevelPublisher, WakeScorePublisher
 from core.turn_log import TurnLogWriter, TurnTimer
 
 
@@ -141,6 +141,54 @@ class WakeScorePublisherTests(unittest.TestCase):
 
     def test_a_bad_score_does_not_raise(self):
         WakeScorePublisher(EventBus()).offer("not a number", "idle")
+
+
+    def test_wake_score_publisher_unchanged_after_refactor(self):
+        """WakeScorePublisher now rides on PeakThrottle; its event must not move."""
+        bus = EventBus()
+        _, q = bus.subscribe()
+        WakeScorePublisher(bus, hz=0).offer(0.123456, "reply", threshold=0.5)
+        (event,) = _drain(q)
+        self.assertEqual(event["kind"], "wake")
+        self.assertEqual(event["data"], {"score": 0.1235, "phase": "reply", "threshold": 0.5})
+        self.assertEqual(list(event["data"]), ["score", "phase", "threshold"])
+
+
+class HaloEventTests(unittest.TestCase):
+    def test_clip_and_mic_events_are_live_only(self):
+        bus = EventBus(ring_size=5)
+        bus.publish("turn_end", {"turn": 1})
+        _, q = bus.subscribe()
+        for kind in ("clip_start", "clip_end", "mic"):
+            for _ in range(20):
+                bus.publish(kind, {"clip": 1})
+        self.assertEqual(q.qsize(), 60)  # all streamed live
+        backlog, _ = bus.subscribe()
+        self.assertEqual([e["kind"] for e in backlog], ["turn_end"])
+
+    def test_mood_events_are_replayed(self):
+        bus = EventBus()
+        bus.publish("mood", {"mood": "happy", "reason": "control_lights.light_on worked"})
+        backlog, _ = bus.subscribe()
+        self.assertEqual([e["kind"] for e in backlog], ["mood"])
+
+    def test_mic_publisher_keeps_the_peak_between_publishes(self):
+        bus = EventBus()
+        _, q = bus.subscribe()
+        now = [50.0]
+        meter = MicLevelPublisher(bus, hz=15, clock=lambda: now[0])
+        meter.offer(0.1, phase="idle")        # published
+        now[0] += 0.02
+        meter.offer(0.77, phase="idle")       # held, inside the 66ms window
+        now[0] += 0.02
+        meter.offer(0.2, phase="idle")        # held
+        now[0] += 0.05
+        meter.offer(0.05, phase="recording")  # published, carrying the 0.77
+        data = [e["data"] for e in _drain(q)]
+        self.assertEqual(data, [{"level": 0.1, "phase": "idle"}, {"level": 0.77, "phase": "recording"}])
+
+    def test_mic_publisher_never_raises(self):
+        MicLevelPublisher(EventBus()).offer("loud", phase="idle")
 
 
 class TurnTimerLiveTests(unittest.TestCase):

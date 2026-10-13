@@ -35,7 +35,9 @@ _SUBSCRIBER_QUEUE = 1000
 # kept in the ring it would push every turn out of a 500-event replay within a
 # minute, and a page opened mid-session would show an hour of history as
 # nothing but the last 50 seconds of room tone.
-_LIVE_ONLY = frozenset({"wake", "ping"})
+# The halo's inputs are the same shape of problem: a replayed clip would
+# animate audio that finished long ago, and the mic level arrives 15 a second.
+_LIVE_ONLY = frozenset({"wake", "ping", "clip_start", "clip_end", "mic"})
 # Logs replay from their own ring, so a chatty minute cannot evict turns either.
 _LOG_KINDS = frozenset({"log"})
 _LOG_RING = 300
@@ -145,31 +147,59 @@ class BusLogHandler(logging.Handler):
             self._local.busy = False
 
 
-class WakeScorePublisher:
+class PeakThrottle:
     """
-    The live wake score, throttled to `hz`, keeping the peak in between.
+    Publish one number as `kind`, throttled to `hz`, keeping the peak in between.
 
-    The detector scores every 80ms; a phone does not need every frame, but a
-    one-frame spike to 0.9 is exactly the frame worth seeing, so each publish
-    carries the maximum since the last one rather than a sample.
+    A phone does not need every frame, but a one-frame spike is exactly the
+    frame worth seeing, so each publish carries the maximum since the last one
+    rather than a sample. `offer` never raises.
     """
 
-    def __init__(self, bus, hz: float = 10.0, clock=time.monotonic):
+    def __init__(self, bus, kind: str, key: str, hz: float = 10.0, clock=time.monotonic, digits: int = 4):
         self._bus = bus
+        self._kind = kind
+        self._key = key
         self._interval = 1.0 / hz if hz and hz > 0 else 0.0
         self._clock = clock
+        self._digits = digits
         self._peak = 0.0
         self._last = 0.0
 
-    def offer(self, score: float, phase: str, **extra) -> None:
+    def offer(self, value: float, **extra) -> None:
         try:
-            score = float(score or 0.0)
-            self._peak = max(self._peak, score)
+            value = float(value or 0.0)
+            self._peak = max(self._peak, value)
             now = self._clock()
             if now - self._last < self._interval:
                 return
             self._last = now
             peak, self._peak = self._peak, 0.0
-            self._bus.publish("wake", {"score": round(peak, 4), "phase": phase, **extra})
+            self._bus.publish(self._kind, {self._key: round(peak, self._digits), **extra})
         except Exception:
             pass
+
+
+class WakeScorePublisher(PeakThrottle):
+    """
+    The live wake score, throttled to `hz`, keeping the peak in between.
+
+    The detector scores every 80ms; a one-frame spike to 0.9 is the one that
+    matters, hence the peak.
+    """
+
+    def __init__(self, bus, hz: float = 10.0, clock=time.monotonic):
+        super().__init__(bus, "wake", "score", hz=hz, clock=clock, digits=4)
+
+    def offer(self, score: float, phase: str, **extra) -> None:
+        super().offer(score, phase=phase, **extra)
+
+
+class MicLevelPublisher(PeakThrottle):
+    """The mic's loudness (core/audio_levels.level) as `mic` events for the halo."""
+
+    def __init__(self, bus, hz: float = 15.0, clock=time.monotonic):
+        super().__init__(bus, "mic", "level", hz=hz, clock=clock, digits=2)
+
+    def offer(self, level: float, phase: str, **extra) -> None:
+        super().offer(level, phase=phase, **extra)
