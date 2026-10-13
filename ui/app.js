@@ -148,6 +148,7 @@
   }
 
   function startTurn(d) {
+    latestTurn = Math.max(latestTurn, Number(d.turn) || 0);
     setMood("none");
     caption.clear();
     turn = { id: d.turn, startedAt: Date.now(), marks: {}, fields: {}, tools: [], sentences: [] };
@@ -165,7 +166,11 @@
       return li;
     }));
     clearInterval(clockTimer);
-    const tick = () => { if (turn) $("now-clock").textContent = fmtMs(Date.now() - turn.startedAt); };
+    const tick = () => {
+      if (!turn) return;
+      $("now-clock").textContent = fmtMs(Date.now() - turn.startedAt);
+      tickRail();
+    };
     tick();
     clockTimer = setInterval(tick, 100);
   }
@@ -200,31 +205,250 @@
     p.append(el("span", "current", d.text));
   }
 
-  function onToolStart(d) {
-    if (!turn || turn.id !== d.turn) return;
-    const li = el("li", "running");
-    li.dataset.key = `${d.name}:${d.start_ms}`;
-    li.append(
-      el("span", "tool-name", d.action ? `${d.name}.${d.action}` : d.name),
-      el("span", "tool-ms", "running"),
-    );
+  // ---------------------------------------------------------------- tools
+  // Every tool call is a row in the Now panel's rail and, while the halo is
+  // drawing, a satellite off the ring (ui/halo.js). Both read the same entry.
+  const DEVICE = {
+    control_tv: "tv", control_lights: "lights", control_vacuum: "vacuum",
+    control_whatsapp: "whatsapp", control_phone: "phone", web_search: "web",
+  };
+  const DEVICE_WORD = { tv: "TV", lights: "Lights", vacuum: "Vacuum", whatsapp: "WhatsApp", phone: "Phone", web: "Web", tool: "Tool" };
+  // What each action usually takes, in ms, from the bench numbers in CLAUDE.md.
+  // The ring fills against it, so a 33s deep wake reads as normal, not stuck.
+  // Absent: no honest estimate (a web search, a call), and the ring sweeps.
+  const USUAL = {
+    control_tv: {
+      turn_on: 33000, turn_off: 4000, stremio_play: 20000, stremio_continue: 20000,
+      stremio_get_progress: 400, stremio_sync_library: 1000, youtube_search: 6000,
+      youtube_playlist: 5000, get_status: 1000, switch_hdmi: 3000, launch_app: 3000,
+      volume_up: 300, volume_down: 300, volume_set: 300, mute: 300, unmute: 300,
+      play_pause: 600, stop: 600, next: 600, prev: 600, fast_forward: 600, rewind: 600,
+      go_home: 600, go_back: 600,
+    },
+    control_lights: { light_on: 1000, light_off: 1000, light_brightness: 1000, light_color: 1000, light_status: 600 },
+    control_vacuum: { vacuum_status: 2000, vacuum_clean_rooms: 5000, vacuum_clean_all: 5000, vacuum_stop: 1000, vacuum_dock: 1000 },
+    control_whatsapp: { whatsapp_send: 2000, whatsapp_unread: 3000, whatsapp_read: 2500, whatsapp_find_contact: 200 },
+    control_phone: { phone_find: 1500, phone_status: 200, phone_log: 200 },
+  };
+  const usual = (name, action) => (USUAL[name] && USUAL[name][action]) || 0;
+  const deviceOf = (name) => DEVICE[name] || "tool";
+  const actionWords = (d) => (d.action || d.name || "").replace(/^(whatsapp|vacuum|light|stremio|phone)_/, "").replace(/_/g, " ");
+  const toolKey = (d) => `${d.turn}:${d.name}:${d.start_ms}`;
+  const toolEntries = new Map();      // key -> entry; the live state of every call shown
+  let replaying = true;               // the backlog before the server's `replayed`
+  const endedTurns = new Set();
+  let latestTurn = 0;
+
+  // The server's clock, seen from here: the smallest (local - server) gap over
+  // the events received is the best guess at skew plus latency. Only used to
+  // age a call that started before this page saw it (a replay).
+  let skewMs = null;
+  function noteServerTs(ts) {
+    if (typeof ts !== "number") return;
+    const gap = Date.now() - ts * 1000;
+    if (skewMs === null || gap < skewMs) skewMs = gap;
+  }
+  const perfAt = (ts) => {
+    if (typeof ts !== "number" || skewMs === null) return performance.now();
+    const ageMs = Date.now() - skewMs - ts * 1000;
+    return performance.now() - Math.max(0, ageMs);
+  };
+
+  function railRow(key, d, dev) {
+    let li = $("tools").querySelector(`[data-key="${CSS.escape(key)}"]`);
+    if (li) return li;
+    li = el("li");
+    li.dataset.key = key;
+    li.dataset.st = "run";
+    li.style.setProperty("--tint", window.haloTint ? window.haloTint(dev) : "var(--accent)");
+    const glyph = window.haloGlyph ? window.haloGlyph(dev, "g") : el("span", "g");
+    const name = el("span", "tool-name", actionWords(d));
+    name.append(el("small", "", DEVICE_WORD[dev]));
+    const trk = el("span", "trk");
+    trk.append(el("span", "fill"));
+    if (usual(d.name, d.action)) trk.append(el("span", "exp"));
+    const ms = el("span", "tool-ms", "0ms");
+    ms.append(el("small", "", "running"));
+    li.append(glyph, name, trk, ms);
     $("tools").append(li);
+    return li;
+  }
+
+  function railLabel(li, dev, target) {
+    li.querySelector(".tool-name small").textContent = target ? `${DEVICE_WORD[dev]} \u00b7 ${target}` : DEVICE_WORD[dev];
+  }
+
+  function railBar(li, ms, expected) {
+    const scale = Math.max(expected || 0, ms, expected ? 0 : 1000) * 1.1;
+    li.querySelector(".fill").style.width = Math.min(100, (100 * ms) / scale).toFixed(1) + "%";
+    const exp = li.querySelector(".exp");
+    if (exp) exp.style.left = ((100 * expected) / scale).toFixed(1) + "%";
+    li.querySelector(".tool-ms").firstChild.textContent = fmtMs(Math.round(ms));
+  }
+
+  // Tick the running rows; called by the turn clock.
+  function tickRail() {
+    for (const li of $("tools").querySelectorAll('li[data-st="run"]')) {
+      const e = toolEntries.get(li.dataset.key);
+      if (e) railBar(li, performance.now() - e.t0, e.expected);
+    }
+  }
+
+  const NOTE = { ok: "", done: "", fail: "failed", ask: "waiting for you", lost: "no result" };
+  const RAIL_WORD = { ok: "worked", done: "done", fail: "failed", ask: "waiting for you", lost: "no result", live: "on a call" };
+
+  function satStart(e) {
+    if (halo && !replaying) halo.toolStart(e.key, { dev: e.dev, label: e.label, expected: e.expected, t0: e.t0 });
+  }
+
+  function onToolStart(d) {
+    const key = toolKey(d);
+    const dev = deviceOf(d.name);
+    const label = hello && hello.transcripts === false ? "" : (d.target || "");
+    let e = toolEntries.get(key);
+    if (e) {
+      // A repeat start is a label update: web search learns its query late.
+      if (label) e.label = label;
+      if (halo && !replaying && label) halo.toolStart(key, { label });
+    } else {
+      e = { key, turn: d.turn, name: d.name, action: d.action, dev, label, expected: usual(d.name, d.action),
+            t0: perfAt(d.ts), ts: d.ts, st: "run", endTs: null };
+      toolEntries.set(key, e);
+      // He answered: a read-back from an earlier turn has done its job.
+      for (const other of toolEntries.values()) {
+        if (other.st === "ask" && other.turn !== d.turn) retire(other);
+      }
+      satStart(e);
+    }
+    if (turn && turn.id === d.turn) {
+      const li = railRow(key, d, dev);
+      railLabel(li, dev, label);
+    }
   }
 
   function onTool(d) {
-    if (!turn || turn.id !== d.turn) return;
-    let li = $("tools").querySelector(`[data-key="${CSS.escape(`${d.name}:${d.start_ms}`)}"]`);
-    if (!li) {
-      li = el("li");
-      li.append(el("span", "tool-name", d.action ? `${d.name}.${d.action}` : d.name), el("span", "tool-ms"));
-      $("tools").append(li);
+    const key = toolKey(d);
+    const dev = deviceOf(d.name);
+    let e = toolEntries.get(key);
+    if (!e) {
+      // The start was lost (a dropped event, a reconnect): show the end anyway.
+      onToolStart({ ...d });
+      e = toolEntries.get(key);
     }
-    li.classList.remove("running");
-    li.querySelector(".tool-ms").textContent = fmtMs(d.ms);
-    if (d.result) li.append(el("span", "tool-result", d.result));
+    const label = hello && hello.transcripts === false ? "" : (d.target || e.label);
+    e.label = label;
+    const st = d.ok === true ? "ok" : d.ok === false ? "fail" : d.awaiting === true ? "ask" : "done";
+    // A placed call carries on after the turn: it orbits until the call ends.
+    const live = d.name === "control_phone" && d.action === "phone_call" && d.ok === true;
+    e.st = live ? "live" : st;
+    e.endTs = d.ts;
+    e.ms = d.ms;
+    if (halo && !replaying) {
+      if (live) halo.toolLive(key, "ringing");
+      else halo.toolEnd(key, st, st === "ok" || st === "done" ? fmtMs(d.ms) : NOTE[st], d.ms);
+    }
+    if (!live && st !== "ask") toolEntries.delete(key);
+    if (turn && turn.id === d.turn) {
+      const li = railRow(key, d, dev);
+      railLabel(li, dev, label);
+      li.dataset.st = live ? "ask" : st;
+      railBar(li, d.ms, e.expected);
+      li.querySelector(".tool-ms small").textContent = RAIL_WORD[live ? "live" : st];
+      if (d.result && hello && hello.transcripts !== false) {
+        li.querySelector(".tool-result")?.remove();
+        li.append(el("span", "tool-result", d.result));
+      }
+    }
+  }
+
+  function retire(e) {
+    toolEntries.delete(e.key);
+    if (halo && !replaying) halo.toolRemove(e.key);
+  }
+
+  // A turn is over: whatever never reported back is shown as lost, not left
+  // spinning forever, and a parked read-back from before it lets go.
+  function toolsAtTurnEnd(turnId) {
+    endedTurns.add(turnId);
+    for (const e of [...toolEntries.values()]) {
+      if (e.turn === turnId && e.st === "run") {
+        toolEntries.delete(e.key);
+        if (halo && !replaying) halo.toolEnd(e.key, "lost", NOTE.lost);
+      } else if (e.st === "ask" && e.turn < turnId) {
+        retire(e);
+      }
+    }
+    for (const li of $("tools").querySelectorAll('li[data-st="run"]')) {
+      li.dataset.st = "lost";
+      li.querySelector(".tool-ms small").textContent = RAIL_WORD.lost;
+    }
+  }
+
+  // The phone call: its satellite stays up while the call runs, pulses on each
+  // line, and goes when the call ends. A page opened mid-call (or a call whose
+  // tool event is out of the ring) still gets one from call_state.
+  function liveCall() {
+    return [...toolEntries.values()].reverse().find((e) => e.dev === "phone" && e.st === "live");
+  }
+
+  function callSatellite(d) {
+    if (d.state === "ended") {
+      const e = liveCall();
+      if (!e) return;
+      toolEntries.delete(e.key);
+      const failed = d.ended_by === "error" || d.ended_by === "dial_failed";
+      if (halo && !replaying) halo.toolEnd(e.key, failed ? "fail" : "done", failed ? "call failed" : "call ended");
+      return;
+    }
+    let e = liveCall();
+    if (!e) {
+      const key = `call:${d.started_at || d.ts}`;
+      const label = hello && hello.transcripts === false ? "" : (d.label || "");
+      e = { key, turn: 0, name: "control_phone", action: "phone_call", dev: "phone", label, expected: 0,
+            t0: perfAt(d.ts), ts: d.ts, st: "live", endTs: null };
+      toolEntries.set(key, e);
+      if (halo && !replaying) { satStart(e); halo.toolLive(key, ""); }
+    }
+    e.note = d.state === "dialing" ? "on the call" : "starting";
+    // The timer reads the call's length, like the Call panel: from the dial.
+    if (d.state === "dialing") { e.t0 = perfAt(d.ts); e.ts = d.ts; }
+    if (halo && !replaying) halo.toolLive(e.key, e.note, d.state === "dialing" ? e.t0 : undefined);
+  }
+
+  function onCallLinePulse() {
+    const e = liveCall();
+    if (e && halo && !replaying) halo.toolPulse(e.key);
+  }
+
+  // The backlog is in. Draw only what is still happening: a call still
+  // running in a turn that has not ended, a read-back from the last turn
+  // still inside its window, a phone call in progress. Finished calls from
+  // the replay are history; animating them would replay ten docks at once.
+  function onReplayed(d) {
+    noteServerTs(d.ts);
+    replaying = false;
+    if (!halo) return;
+    halo.toolsClear();
+    for (const e of [...toolEntries.values()]) {
+      e.t0 = perfAt(e.ts);
+      const askFresh = e.st === "ask" && e.turn === latestTurn && typeof e.endTs === "number"
+        && (Date.now() - (skewMs || 0)) / 1000 - e.endTs < 120;
+      if (e.st === "run" && !endedTurns.has(e.turn)) {
+        satStart(e);
+      } else if (askFresh) {
+        satStart(e);
+        halo.toolEnd(e.key, "ask", NOTE.ask, e.ms);
+      } else if (e.st === "live") {
+        satStart(e);
+        halo.toolLive(e.key, e.note || "");
+      } else {
+        toolEntries.delete(e.key);
+      }
+    }
   }
 
   function onTurnEnd(d) {
+    toolsAtTurnEnd(d.turn);
     addTurnToFeed(d.record || {}, d.ts);
     if (turn && turn.id === d.turn) {
       turn = null;
@@ -360,12 +584,26 @@
       $("halo-nogl").hidden = false;
       return;
     }
-    halo = window.createHalo($("halo-canvas"), {
-      small: window.matchMedia("(max-width: 700px)").matches,
-      reducedMotion,
-      palette: "dusk",
-      debug,
-    });
+    try {
+      halo = window.createHalo($("halo-canvas"), {
+        small: window.matchMedia("(max-width: 700px)").matches,
+        reducedMotion,
+        palette: "dusk",
+        debug,
+        overlay: { sats: $("halo-sats") },
+      });
+    } catch (err) {
+      // A halo that cannot start must never take the page down with it: this
+      // runs before connect(), so a throw here used to leave a dead page.
+      console.error("halo", err);
+      halo = null;
+    }
+    if (!halo) {
+      section.hidden = false;
+      section.classList.add("nogl");
+      $("halo-nogl").hidden = false;
+      return;
+    }
     section.hidden = false;
     if (!halo.ok) {
       halo = null;
@@ -486,7 +724,8 @@
     const marksLine = STAGES.filter(([k]) => k in marks).map(([k, n]) => `${n} ${fmtMs(marks[k])}`).join("  ");
     if (marksLine) detail.append(el("div", "mono", marksLine));
     for (const t of r.tools || []) {
-      detail.append(el("div", "mono", `${t.name}.${t.action || ""} ${fmtMs(t.ms)}: ${t.result || ""}`));
+      const how = t.ok === true ? "worked" : t.ok === false ? "failed" : t.awaiting ? "asked" : "";
+      detail.append(el("div", "mono", `${t.name}.${t.action || ""}${t.target ? " (" + t.target + ")" : ""} ${fmtMs(t.ms)}${how ? " " + how : ""}: ${t.result || ""}`));
     }
     if (r.reply) detail.append(el("div", "", r.reply));
     if (r.error) detail.append(el("div", "", r.error));
@@ -505,6 +744,7 @@
   let callStarted = null;
 
   function onCallState(d) {
+    callSatellite(d);
     const panel = $("call");
     if (d.state === "starting") {
       panel.hidden = false;
@@ -528,6 +768,7 @@
   }
 
   function onCallLine(d) {
+    onCallLinePulse();
     $("call").hidden = false;
     const list = $("call-lines");
     let li = list.querySelector(`[data-index="${d.index}"]`);
@@ -590,6 +831,10 @@
     VoiceClock.clip = null;
     caption.clear();
     setMood("none");
+    toolEntries.clear();
+    endedTurns.clear();
+    latestTurn = 0;
+    if (halo) halo.toolsClear();
   }
 
   const HANDLERS = {
@@ -610,6 +855,7 @@
     clip_end: onClipEnd,
     mic: onMic,
     mood: onMood,
+    replayed: onReplayed,
   };
 
   function markAlive() {
@@ -642,6 +888,9 @@
       if (serverStarted !== null && h.started !== serverStarted) resetAll();
       serverStarted = h.started;
       hello = h;
+      // Everything until the server's `replayed` marker is backlog.
+      replaying = true;
+      skewMs = null;
       setThresholds(h);
       haloAllowed(h);
       lastEventAt = Date.now();
@@ -651,6 +900,7 @@
         markAlive();
         try {
           const d = JSON.parse(e.data);
+          noteServerTs(d.ts);
           fn(d, d.ts);
         } catch (err) {
           console.error(kind, err);
@@ -668,7 +918,37 @@
       setLink("connecting", "stalled");
     }
     if (spark.points.length) { trimSpark(); drawSpark(); }
+    pruneTools();
   }, 1000);
+
+  // Belt and braces for a lost turn_end: nothing in toolEntries lives forever.
+  function pruneTools() {
+    const now = performance.now();
+    for (const e of [...toolEntries.values()]) {
+      const age = (now - e.t0) / 1000;
+      if ((e.st === "run" && age > 300) || (e.st === "ask" && age > 180) || (e.st === "live" && age > 3600)) retire(e);
+    }
+  }
+
+  // Read by tools/demo_live_ui.py --check, only with ?debug in the URL.
+  if (debug) {
+    window.__tools = {
+      get entries() { return toolEntries.size; },
+      get rows() { return $("tools").children.length; },
+    };
+    // How many satellite labels poke outside the halo stage.
+    window.__labelBounds = () => {
+      const stage = $("halo").getBoundingClientRect();
+      let out = 0, n = 0;
+      for (const tag of document.querySelectorAll("#halo-sats .sat .tag")) {
+        const r = tag.getBoundingClientRect();
+        if (!r.width || Number(getComputedStyle(tag.parentElement).opacity) < 0.3) continue;
+        n++;
+        if (r.left < stage.left - 1 || r.right > stage.right + 1 || r.top < stage.top - 1 || r.bottom > stage.bottom + 1) out++;
+      }
+      return { n, out };
+    };
+  }
 
   window.addEventListener("resize", drawSpark);
   setupLog();
