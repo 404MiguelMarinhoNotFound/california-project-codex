@@ -1635,6 +1635,21 @@ stores no token at all); confirmed against upstream
 id in `.deebot_device_id` must stay stable across runs or every login
 re-triggers verification.
 
+**The token is renewed in the background, not just at boot (2026-10-13).** Boot
+logs in through the room-drift check, but a run longer than the ~7-day token left
+the first vacuum command doing the login and the emailed code itself (28s
+measured, up to 90s). `Orchestrator._deebot_token_loop` calls
+`DeebotService.refresh_token_if_expiring()` every `token_check_interval_minutes`
+(180); with more than `token_refresh_margin_hours` (12) left it only reads
+`.deebot_credentials.json`, otherwise it logs in fresh (`build_authenticator(...,
+preload=False)`, since a preloaded valid token makes `authenticate()`
+short-circuit) and saves the new token itself, because the subscribe callback is
+a task that `asyncio.run` cancels unstarted. It goes through `_run`, so a command
+landing during a renewal is refused as busy, about once a week. Relatedly, an
+**expired** cached token is never preloaded: preloading arms deebot-client's
+refresh timer at a negative delay, which fired a second, racing login and logged
+its verification demand as an ERROR traceback at boot.
+
 **Rooms: cached id first, live name as the fallback and the self-heal.**
 `deebot.rooms` in `config.yaml` maps each room key to a cached numeric `id`, so
 "clean the kitchen" is one REST call. Ecovacs' room ids shift after a remap, so

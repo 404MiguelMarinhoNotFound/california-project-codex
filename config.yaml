@@ -942,6 +942,13 @@ deebot:
   country: null                   # null = ECOVACS_COUNTRY from .env (default PT)
   command_timeout_ms: 30000
   verification_email_timeout_ms: 90000
+  # The login token lasts ~7 days and only boot renews it, so a run longer than
+  # that left the first vacuum command doing the login + emailed code itself
+  # (28-90s). Every check_interval, a token with less than margin left is
+  # renewed in the background. The check reads a local file; only a renewal
+  # touches the network. 0 turns the loop off.
+  token_check_interval_minutes: 180
+  token_refresh_margin_hours: 12
   rooms:
     living room:
       id: 0

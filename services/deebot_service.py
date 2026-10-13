@@ -137,6 +137,11 @@ class DeebotService:
         # unreachable robot still answers in seconds.
         self._wait_timeout_s = self.command_timeout_s + self.verification_email_timeout_s
 
+        self.token_check_interval_minutes = _as_int(cfg.get("token_check_interval_minutes"), 180)
+        self.token_refresh_margin_s = (
+            max(0, _as_int(cfg.get("token_refresh_margin_hours"), 12)) * 3600
+        )
+
         self.rooms = self._build_rooms(cfg.get("rooms") or {})
 
         try:
@@ -366,6 +371,61 @@ class DeebotService:
                     await bot.teardown()
                 except Exception:  # noqa: BLE001
                     pass
+
+    def refresh_token_if_expiring(self) -> bool | None:
+        """Log in early when the cached token is about to expire.
+
+        None means nothing was due (disabled, or the token has more than the
+        margin left) and nothing touched the network. Otherwise True/False is
+        whether the renewal worked; a False is retried on the next check, and a
+        command meanwhile still logs in by itself, exactly as before.
+
+        It runs through _run like any command, so a voice command that lands
+        during a renewal is refused as busy rather than queued -- the same
+        rule, for at most the verification budget, about once a week.
+        """
+        if not self.enabled:
+            return None
+        cached = deebot_session.load_cached_credentials(self.state_dir)
+        if cached is not None and cached.expires_at - time.time() > self.token_refresh_margin_s:
+            return None
+
+        logger.info("Deebot: login token expires soon, renewing it in the background")
+        result = self._run(self._renew_token)
+        ok = isinstance(result, tuple) and result[0] is True
+        if not ok:
+            logger.warning("Deebot: background token renewal failed, will retry")
+        return ok
+
+    async def _renew_token(self) -> tuple[bool, str]:
+        import aiohttp
+
+        from deebot_client.exceptions import AuthenticationError
+
+        async with aiohttp.ClientSession() as session:
+            authenticator = await deebot_session.build_authenticator(
+                session,
+                device_id=deebot_session.stable_device_id(self.state_dir),
+                country=self.country,
+                email=self.email,
+                password=self.password,
+                state_dir=self.state_dir,
+                preload=False,
+            )
+            try:
+                ok, reason = await self._authenticate(authenticator)
+                credentials = authenticator._credentials  # noqa: SLF001
+                if ok and credentials is not None:
+                    # Saved here, not left to the subscribe callback: that runs
+                    # as a task, and asyncio.run cancels it unstarted when this
+                    # coroutine returns straight after the login.
+                    deebot_session._save_credentials(credentials, self.state_dir)  # noqa: SLF001
+                return ok, reason
+            except AuthenticationError as exc:
+                logger.warning("Deebot: background token renewal rejected: %r", exc)
+                return False, "rejected"
+            finally:
+                await authenticator.teardown()
 
     async def _command(self, fn):
         import aiohttp

@@ -1819,6 +1819,22 @@ class Orchestrator:
         self.llm.light_names = list(self.govee_service.lights)
         self.llm.default_light = self.govee_service.default_light
 
+        # The vacuum's login token, renewed before it expires so a long run never
+        # hands the emailed-code wait to a voice command.
+        token_interval = getattr(self.deebot_service, "token_check_interval_minutes", 0)
+        if (
+            getattr(self.deebot_service, "enabled", False) is True
+            and isinstance(token_interval, int)
+            and token_interval > 0
+        ):
+            threading.Thread(
+                target=self._deebot_token_loop,
+                args=(token_interval,),
+                name="deebot-token",
+                daemon=True,
+            ).start()
+            logger.info("Deebot token renewal check started (%d min interval)", token_interval)
+
         # Same for the vacuum's rooms. Cached ids in config.yaml can go stale
         # after a remap; the drift check is a best-effort background warning,
         # never a blocker and never a config rewrite.
@@ -2660,6 +2676,20 @@ class Orchestrator:
                 self.whatsapp_service.refresh_groups_in_background()
             except Exception as exc:
                 logger.warning("Background WhatsApp group refresh failed: %s", exc)
+
+    def _deebot_token_loop(self, interval_minutes: int):
+        """
+        Renew the Ecovacs token before it expires, like _stremio_sync_loop.
+
+        Boot already logs in (the room-drift check), so the first pass waits a
+        full interval. Most passes only read .deebot_credentials.json.
+        """
+        interval_seconds = max(60, interval_minutes * 60)
+        while not self._background_stop.wait(interval_seconds):
+            try:
+                self.deebot_service.refresh_token_if_expiring()
+            except Exception as exc:
+                logger.warning("Background Deebot token renewal failed: %s", exc)
 
     def _handle_command(self, transcript: str) -> bool:
         """

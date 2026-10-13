@@ -134,8 +134,14 @@ async def build_authenticator(
     email: str,
     password: str,
     state_dir: Path | str = ROOT,
+    preload: bool = True,
 ):
-    """Build an Authenticator wired to persist/reuse credentials across runs."""
+    """Build an Authenticator wired to persist/reuse credentials across runs.
+
+    `preload=False` skips the cached token, so the next authenticate() logs in
+    fresh even while that token is still valid. That is the early renewal in
+    DeebotService.refresh_token_if_expiring.
+    """
     from deebot_client.authentication import Authenticator, create_rest_config
     from deebot_client.util import md5
 
@@ -147,7 +153,7 @@ async def build_authenticator(
 
     authenticator.subscribe(_on_credentials_changed)
 
-    cached = load_cached_credentials(state_dir)
+    cached = load_cached_credentials(state_dir) if preload else None
     if cached is not None and cached.expires_at <= time.time() + _PRELOAD_MARGIN_S:
         # Not preloaded, so authenticate() logs in fresh and owns the device
         # verification. Preloaded, the library's refresh timer fired a second

@@ -8,6 +8,7 @@ test pins that.
 import asyncio
 import os
 import tempfile
+import time
 import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -559,6 +560,94 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(
             [c.args[0] for c in authenticator.verify_device.await_args_list], ["000000", "123456"]
         )
+
+
+class TokenRenewalTests(unittest.TestCase):
+    """The background renewal: free when nothing is due, a fresh login when it is."""
+
+    def _cache(self, service, expires_in_s):
+        deebot_session._credentials_path(service.state_dir).write_text(
+            '{"token": "old", "user_id": "u", "expires_at": %f}' % (time.time() + expires_in_s),
+            encoding="utf-8",
+        )
+
+    def _renew(self, service, auth_result=(True, deebot_session.REASON_VERIFIED_GMAIL)):
+        from deebot_client.models import Credentials
+
+        authenticator = Mock(teardown=AsyncMock())
+        authenticator._credentials = Credentials(
+            token="new", user_id="u", expires_at=time.time() + 7 * 24 * 3600
+        )
+        build = AsyncMock(return_value=authenticator)
+        with patch("aiohttp.ClientSession"),              patch.object(deebot_session, "build_authenticator", new=build),              patch.object(deebot_session, "authenticate", new=AsyncMock(return_value=auth_result)):
+            result = service.refresh_token_if_expiring()
+        return result, build, authenticator
+
+    def test_a_token_with_time_left_is_left_alone_and_touches_nothing(self):
+        service = _service()
+        self._cache(service, 3 * 24 * 3600)
+        with patch.object(service, "_run", side_effect=AssertionError("network")):
+            self.assertIsNone(service.refresh_token_if_expiring())
+
+    def test_a_token_inside_the_margin_is_renewed_with_a_fresh_login(self):
+        service = _service()
+        self._cache(service, 3600)
+        result, build, authenticator = self._renew(service)
+        self.assertIs(result, True)
+        # preload=False is the point: a preloaded token that is still valid
+        # would make authenticate() short-circuit and renew nothing.
+        self.assertIs(build.await_args.kwargs["preload"], False)
+        self.assertEqual(deebot_session.load_cached_credentials(service.state_dir).token, "new")
+        authenticator.teardown.assert_awaited_once()
+
+    def test_no_cached_token_is_due(self):
+        service = _service()
+        result, _, _ = self._renew(service)
+        self.assertIs(result, True)
+
+    def test_a_failed_renewal_keeps_the_old_token_and_reports_false(self):
+        service = _service()
+        self._cache(service, 3600)
+        result, _, _ = self._renew(service, auth_result=(False, deebot_session.REASON_GMAIL_TIMEOUT))
+        self.assertIs(result, False)
+        self.assertEqual(deebot_session.load_cached_credentials(service.state_dir).token, "old")
+
+    def test_a_disabled_service_never_renews(self):
+        service = _service(enabled=False)
+        with patch.object(service, "_run", side_effect=AssertionError("network")):
+            self.assertIsNone(service.refresh_token_if_expiring())
+
+    def test_preload_false_ignores_a_valid_cached_token(self):
+        tmp = tempfile.mkdtemp()
+        deebot_session._credentials_path(tmp).write_text(
+            '{"token": "t", "user_id": "u", "expires_at": %f}' % (time.time() + 3 * 24 * 3600),
+            encoding="utf-8",
+        )
+
+        async def _build():
+            authenticator = await deebot_session.build_authenticator(
+                Mock(), device_id="d", country="PT", email="e@example.com",
+                password="pw", state_dir=tmp, preload=False,
+            )
+            credentials = authenticator._credentials
+            await authenticator.teardown()
+            return credentials
+
+        self.assertIsNone(asyncio.run(_build()))
+
+
+class TokenLoopTests(unittest.TestCase):
+    def test_the_loop_checks_each_interval_and_survives_an_error(self):
+        from core.orchestrator import Orchestrator
+
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._background_stop = Mock()
+        orch._background_stop.wait = Mock(side_effect=[False, False, True])
+        orch.deebot_service = Mock()
+        orch.deebot_service.refresh_token_if_expiring = Mock(side_effect=[RuntimeError("down"), None])
+        orch._deebot_token_loop(180)
+        self.assertEqual(orch.deebot_service.refresh_token_if_expiring.call_count, 2)
+        orch._background_stop.wait.assert_called_with(180 * 60)
 
 
 class GmailVerificationTests(unittest.TestCase):
