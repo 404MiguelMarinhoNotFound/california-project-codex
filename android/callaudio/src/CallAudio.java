@@ -39,6 +39,9 @@ public final class CallAudio {
         }
         @Override public int getDeviceId() { return 0; }
         @Override public String getAttributionTag() { return null; }
+        // AudioManager.setMicrophoneMute reads the caller's user id off its
+        // Context; null here crashed the bridge mid-call (2026-10-13 20:18).
+        @Override public int getUserId() { return 0; }
         @Override public Context getApplicationContext() { return this; }
     }
 
@@ -286,12 +289,19 @@ public final class CallAudio {
         // The phone's own mic would put the room (him, the TV) into the call
         // under her voice. Injection is a separate uplink mix, so muting the
         // mic leaves her audible -- verified live, see android/callaudio/README.md.
-        final boolean muteMic = args.length > 4 && args[4].equals("mutemic");
+        // Optional: a mute that fails must never take her voice with it -- an
+        // uncaught exception here killed the whole bridge on a live call.
+        boolean muteMic = args.length > 4 && args[4].equals("mutemic");
         boolean micWasMuted = false;
         if (muteMic) {
-            micWasMuted = (Boolean) call(am, "isMicrophoneMute", new Class<?>[]{});
-            call(am, "setMicrophoneMute", new Class<?>[]{boolean.class}, true);
-            log("mic muted (was " + micWasMuted + ")");
+            try {
+                micWasMuted = (Boolean) call(am, "isMicrophoneMute", new Class<?>[]{});
+                call(am, "setMicrophoneMute", new Class<?>[]{boolean.class}, true);
+                log("mic muted (was " + micWasMuted + ")");
+            } catch (Throwable t) {
+                muteMic = false;
+                log("mic mute failed, call continues unmuted: " + (t.getCause() != null ? t.getCause() : t));
+            }
         }
 
         // Once a second: where each stream was routed, how far the track has
