@@ -2052,6 +2052,17 @@ Current automated coverage exists for:
   sheepish, a detail page, a read-back and every status read report nothing, a bare
   `Mock` is never a success, nothing leaks between tool calls, a failure beats a
   later success in one turn, and the turn record carries `ok`
+- Tool satellites (`tests/test_tool_satellites.py`): each tool's label, never a
+  message body or a phone number, junk input never raising; the label trimmed to
+  one short line, a repeat start updating it, and none anywhere with transcripts
+  off; `awaiting` for a read-back, "which one?", Stremio's source question and a
+  volume past the cap, never with `ok`, never from a bare `Mock`, moving no
+  mood and not leaking into the next call; a web search reported onto the turn
+  with its query, failed on an error result, dropped from an ended turn, stale
+  starts pruned. In `tests/test_llm_claude_streaming.py`: the raw events give
+  start, query and end while text flows exactly as before, a search answered on
+  the next request still ends, a raising hook never reaches the reply, and a
+  barge-in mid-search keeps the partial answer
 
 ### Live UI: watch her from the sofa (2026-10-13)
 
@@ -2183,6 +2194,108 @@ Smug, unimpressed and the eye-roll are drawn but nothing sends them yet (phase 2
   `vendor/three.min.js`, the last with a one-day immutable `Cache-Control` (~600 KB
   the stdlib server cannot gzip); everything else stays `no-store`. The CSP adds
   `worker-src 'none'`.
+
+### Tool satellites: what she is doing with her hands (2026-10-13)
+
+Every tool call buds off the halo as a **satellite**: the device's glyph (TV,
+bulb, vacuum, chat, phone, globe), a progress ring that fills against what that
+action **usually** takes, a live timer in real seconds, and a short label. A
+tether of embers runs out from the core while it works and back in when it
+docks. The ring brightens where it came off (the comet uniform pinned to its
+angle). How it ends:
+
+| outcome | the satellite | the rail row |
+|---|---|---|
+| worked (`ok: true`) | docks into the ring with a tick and a small flash | `worked` |
+| finished with nothing to claim (`ok` absent: a status read) | docks, no tick | `done` |
+| failed (`ok: false`, or the tool raised) | turns coral, a cross, shakes, sinks, fades | `failed` |
+| asked him something (`awaiting: true`) | parks with a dashed, pulsing outline: "waiting for you" | `waiting for you` |
+| no end ever arrived (turn ended first) | fades as "no result" | `no result` |
+| a placed phone call | stays in orbit after the turn, pulses on each call line, timer from the dial | `on a call` |
+
+- **The rail replaces the Now panel's old tool list**, rather than sitting next
+  to it: one row per call with the glyph, the action and its label, a bar with a
+  tick at the usual duration, the real ms and the outcome word. It is what
+  carries the tools when the halo cannot draw (no WebGL, `ui.halo: false`).
+- **Usual durations live in `ui/app.js` (`USUAL`)**, from the bench numbers in
+  this file: `turn_on` 33s (the deep wake; an awake box finishes early),
+  `stremio_play` 20s, lights 1s, WhatsApp send 2s, vacuum status 2s, a clean 5s
+  (the status guard runs first). Web search and phone calls have **no honest
+  estimate** and get a sweeping arc instead of a ring. A ring that runs past
+  1.5x its estimate dims (never dashes: dashed means "waiting for you"). These
+  are first guesses, not a calibration.
+- **`target`, the label, is never message text or a number.**
+  `core.orchestrator._tool_target` builds it from the tool input ("Fallout
+  S2E9", "attic", "to Marta", "kitchen, hall"); a `to` that looks like a phone
+  number becomes "a number", a call brief and a message body are never read.
+  `TurnTimer` trims it to 40 characters and drops it entirely with
+  `logging.include_transcripts: false` (it is in `_TEXT_FIELDS`), and the page
+  drops any label it receives when `hello.transcripts` is false.
+- **`awaiting` is its own outcome, never folded into `ok`.** A read-back,
+  "which one?", Stremio's "want the first source?" and a volume past the cap
+  report nothing to the mood (a question is not a failure) but used to look
+  identical to a status read. `_TOOL_AWAITING` is a second context var next to
+  `_TOOL_OUTCOME`, set by `_await_answer()` in the dispatchers and by
+  `_await_if_asked(result)` for typed results. `WhatsAppCommandResult` and
+  `PhoneCommandResult` gained `awaiting: bool = False`, set only where the
+  service arms a confirmation; `getattr(..., "awaiting") is True`, so a bare
+  `Mock` never asks. No spoken line changed. A parked satellite lets go when a
+  tool starts in a later turn (he answered), when a later turn ends, or after
+  two minutes.
+- **Web search is reported from the raw stream.** It runs at Anthropic inside
+  the stream and never reaches `tool_handler`. `_stream_claude` now iterates the
+  stream's events instead of `stream.text_stream`: the SDK's derived `text`
+  events carry exactly what `text_stream` yielded, and `_ServerToolWatcher`
+  reads the rest -- `content_block_start` of a `server_tool_use` is the start,
+  its `input_json_delta`s are the query (reported when the block stops), and a
+  `*_tool_result` block is the end, failed when its content is an error object
+  rather than a list. The result may arrive in the **next** stream of the same
+  turn (search plus a local tool in one response), so ids are matched, not
+  positions. `LLMService.on_server_tool(event, info)` defaults to a no-op and
+  every call is guarded, so a broken hook cannot touch a reply; LLMService
+  imports nothing from the UI. `Orchestrator._on_server_tool` puts it on the
+  turn like any tool (action `search`), minus the mood: a search is not a device
+  action. A second `turn_tool_start` with the same `start_ms` is a label update.
+- **`replayed` marks the end of the backlog.** The server sends it once after
+  the replay on every connection. Before it, the page only keeps state; at it,
+  it draws what is still going on (a tool running in a turn that has not ended,
+  a read-back from the last turn inside its window, a call in progress), aged by
+  the event `ts` against the server clock it has seen. Without it, opening the
+  page replayed a dock animation for every tool call in the ring at once.
+- **Nothing lives forever.** A turn that ends with a tool still running marks it
+  lost; a lost `turn_end` is covered by a five-minute cap in the halo and a prune
+  in the page; at most six satellites show, the oldest finished one giving way.
+  A 180-turn compressed session (about 30 minutes of use) ends with zero
+  satellites, zero entries and a flat DOM outside the capped feed and log.
+- **The tethers are WebGL, the satellites DOM.** The first build drew tethers as
+  an animated SVG over the whole stage, and that repainted the stage every
+  frame: 43 -> 81 ms a frame on the swiftshader CPU path. As a line plus a row of
+  ember points in the scene, four satellites cost 40 -> 44 ms. Label sizes are
+  read only when their text changes, and styles are written only when they
+  change, for the same reason. Satellites and labels are separated as boxes, so
+  six on a phone do not sit on each other.
+- **Also fixed: `include_transcripts: false` kept tool results.** A result can
+  quote the request ("I've got Marta at +351...", a group read-back carries the
+  message itself), and it was published and written to `turns.jsonl` regardless.
+  `TurnTimer.tool` now stores `result` only with transcripts on; timings,
+  `ok` and `awaiting` stay.
+- **Also fixed: the page was dead under `prefers-reduced-motion`.** `resize()`
+  pokes the halo, and under reduced motion a poke settles, which touched
+  `settleTimer` before its `let`. `createHalo` threw, `setupHalo` runs before
+  `connect()`, and the page never opened its stream. `settleTimer` is declared
+  earlier, and `setupHalo` now catches a throwing halo and falls back to the
+  pill.
+- **`uv run --no-project --with playwright --with numpy --with pyyaml python
+  tools/demo_live_ui.py --check`** now also plays a tool script at 390x844,
+  1280x900 dark and 1280x900 light, with probes, and the edge cases: reduced
+  motion, `include_transcripts: false`, no WebGL, ambient, a page opened
+  mid-tool, a server restart mid-tool (`Last-Event-ID`), frame time with four
+  satellites, and the long session. `--only tools|edge|halo|390|1280` runs a part;
+  `--tools` without `--check` plays the tool script into a page you open
+  yourself.
+- **Still uncalibrated:** the `USUAL` table, `SAT_SLOTS` (where on the ring each
+  satellite sits; tuned on screenshots only), and everything the halo section
+  above already lists. Nothing here has met the real laptop or the real phone.
 
 ### Runtime logs: read these before guessing at latency
 
