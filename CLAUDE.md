@@ -102,7 +102,12 @@ Required for the vacuum (`control_vacuum`):
   service reads the code itself over IMAP. Without it, the vacuum tool stalls until
   `ECOVACS_VERIFICATION_CODE` is set by hand once. See "DeebotService" below
 
-Required for phone calls (`control_phone`), depending on `phone.backend`:
+Required for phone calls (`control_phone`): the phone itself, over ADB (no credential,
+but three one-time switches on the Xiaomi, see "PhoneService"): Developer options,
+**Wireless debugging** paired once with this laptop, and HyperOS **"USB debugging
+(Security settings)"** (needs a Mi account). The laptop's `~/.android/adbkey` IS the key
+to the phone: readable only by Master Miguel, SYSTEM and Administrators (fixed
+2026-10-13). Plus Gemini credentials, depending on `phone.backend`:
 
 - `vertex` (shipped; bills the Google Cloud project, so its credits apply):
   `phone.vertex.project` in `config.yaml` plus Application Default Credentials --
@@ -267,13 +272,15 @@ california/
 │   ├── phone_service.py         # Phone calls: brief -> read-back -> background call -> CallReport + logs/calls.jsonl
 │   ├── phone_prompts.py         # The call agent's prompt: persona, flow of a call, guardrails, template per kind, notes
 │   ├── call_outcome.py          # What a call achieved, read from its transcript by Claude after the call
-│   ├── phone_link.py            # Phone Link over PowerShell/UIA: dial, in-call, hang up, default-mic swap
-│   ├── gemini_live_call.py      # One Gemini Live session per call: loopback in, VB-CABLE out, transcript, end_call only
+│   ├── phone_adb.py             # The phone over ADB: find it (never the Mi Box), dial, call state, hang up, ring
+│   ├── phone_call_audio.py      # The call's audio from the phone: downlink in, uplink out, over adb forward
+│   ├── gemini_live_call.py      # One Gemini Live session per call: phone audio in/out, transcript, end_call only
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
 ├── ui/                          # The live page: index.html, app.css, app.js, halo.js (no build step)
 │   └── vendor/                  # three.min.js r149, vendored; version and SHA-256 in its README
+├── android/callaudio/           # Phone-side helper (dex, run as shell): Telecom + call-audio interception, see its README
 ├── training/                    # Wake-word training, runs on Modal, see training/README.md
 │   ├── modal_train.py           # Modal app: setup / smoke / train entrypoints
 │   ├── california.yaml          # Run 1 config, kept for comparison
@@ -292,7 +299,7 @@ california/
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
 │   ├── list_whatsapp_groups.py     # Read every WhatsApp group off the chat list and refresh the cache
-│   ├── fix_phone_link.py           # Bring Phone Link's calling link back: Try again, laptop Bluetooth off/on; --check to report
+│   ├── phone_adb_call.py           # Phone over ADB by hand: check, state, ring, call (no read-back; test calls go to Miguel)
 │   ├── probe_phone_backend.py      # Connect Gemini Live with the phone config, no call: credentials, latency, her first line
 │   ├── eval_phone_conversation.py  # Simulated calls (Claude as callee, spoken pt-PT TTS) scored for how she talks
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
@@ -347,7 +354,9 @@ california/
 │   ├── test_whatsapp_group_send.py # Group sends: misheard names matched, always read back, groups-only, one guess per turn
 │   ├── test_whatsapp_read.py    # Reading a chat's latest messages: open-read-close, quoted not obeyed, sends close the chat too
 │   ├── test_phone_prompts.py    # Background rules in every kind, request fields, brief signature
-│   ├── test_phone_service.py    # Read-back token, number rules, one call at a time, report + log, no-PowerShell guard
+│   ├── test_phone_service.py    # Read-back token, number rules, one call at a time, report + log, no-adb guard
+│   ├── test_phone_adb.py        # Discovery (never the Mi Box), Security-settings gate, hash-checked helper, dial/hang up/ring
+│   ├── test_phone_call_audio.py # Bridge: starts at the answer, 20 ms blocks, real-time pacing, flush, stop
 │   ├── test_gemini_live_call.py # Fake Live session: transcript, hang-up guard, silent tool replies, every way a call ends
 │   ├── test_call_outcome.py     # Reading the outcome from a transcript: statuses, never raises, their words as data
 │   ├── test_orchestrator_phone.py # control_phone dispatch, the labelled report, speaking it from the idle loop
@@ -2091,21 +2100,70 @@ the openWakeWord models, so a fresh machine needs it again.
 ### PhoneService
 
 `services/phone_service.py` places real phone calls from Master Miguel's own number
-(Xiaomi 17T, Android) and has the conversation itself, behind `control_phone`. Same
-contract as WhatsApp and the vacuum: never raises at construction, self-disables (flag
-off, not Windows, no credentials for `phone.backend`, `google-genai`/`soundcard` missing), returns
-`PhoneCommandResult` (falsy on failure), one call in flight on a daemon thread.
+(Xiaomi, HyperOS 3, Android 16, MediaTek) and has the conversation itself, behind
+`control_phone`. Same contract as WhatsApp and the vacuum: never raises at construction,
+self-disables (flag off, no `adb`, no credentials for `phone.backend`, `google-genai`
+missing), returns `PhoneCommandResult` (falsy on failure), one call in flight on a daemon
+thread.
 
 ```text
 room -> Claude: control_phone(phone_call, brief) -> read-back -> "go" -> confirm true
-  -> background: default mic -> CABLE Output, Gemini Live connects, THEN Phone Link dials
-  -> callee <-> loopback (16k) -> Gemini Live -> 24k PCM -> CABLE Input -> Phone Link mic
-  -> goodbye + end_call -> hang up -> mic restored -> outcome read from transcript
+  -> background: Gemini Live connects, THEN the phone dials (AdbPhone -> Telecom)
+  -> answered (call state ACTIVE) -> callaudio bridge: downlink 16k -> Gemini Live
+     -> 24k PCM -> injected into the call uplink; she is nudged 0.8 s after the answer
+  -> goodbye + end_call -> hang up -> outcome read from transcript
   -> logs/calls.jsonl -> CallReport
   -> _idle_loop pops the report between mic reads -> a turn on "[Phone call report ...]"
 ```
 
-**Everything below was found live on 2026-10-06, and most of it is not what you'd guess:**
+**The transport is the phone itself, over ADB (2026-10-13).** Plan:
+`docs/superpowers/plans/2026-10-13-phone-over-adb.md`. `services/phone_adb.py`
+(`AdbPhone`) keeps the dialer interface PhoneService always used (`dial`, `in_call`,
+`hang_up`, `play_sound`) and adds `audio()`, a `PhoneCallAudio`
+(`services/phone_call_audio.py`) whose `capture()`/`speaker()` faces are her ears and
+mouth. Everything on the phone runs through the `callaudio` helper
+(`android/callaudio/`, its README has the modes) as the shell user via `app_process`.
+No laptop audio device is involved, so the room cannot leak into a call through the
+laptop, and the phone's own mic is muted for the call (`phone.adb.mute_phone_mic`).
+Found live, in order, and none of it guessable:
+
+- **Phone Link's calling link stopped reconnecting** and six fixes failed live (phone and
+  laptop Bluetooth toggles, Try again, an HFP service bounce via
+  `BluetoothSetServiceState`, restarting both apps). The phone's own log showed why: the
+  laptop opens the Bluetooth link but never the hands-free one, and WinRT's
+  `PhoneLineTransportDevice.ConnectAsync` answers `DeniedBySystem` to anything that is
+  not a packaged app. That path is in `deprecated/` now.
+- **The shell has the permissions; HyperOS takes them away.** `CALL_PHONE`,
+  `CALL_AUDIO_INTERCEPTION`, `CAPTURE_AUDIO_OUTPUT`... are granted to `com.android.shell`,
+  but Xiaomi's `PKMSImpl` hook denies `CALL_PHONE` and `INJECT_EVENTS` system-wide until
+  **"USB debugging (Security settings)"** is on (`persist.security.adbinput=1`). `ready()`
+  checks it before every dial and says `LOCKED_DOWN` rather than half-placing a call.
+- **Telecom, not intents.** `am start -a android.intent.action.CALL` and `input keyevent`
+  are the hooked paths; `ITelecomService.placeCall` / `endCall` from the helper are not.
+- **`isPstnCallAudioInterceptable()` is true on this phone**, and it has the two HAL
+  devices it needs: `Telephony Tx` fed by `incall_music_uplink`, and `Voice Call In`.
+- **Her voice played nowhere until the track was pinned.** MediaTek's policy opened the
+  injection track on `TELEPHONY_TX`, then resolved its start to the earpiece and killed
+  it ("Device doesn't sync between startOutput[0x1] and getOutputForAttr"), 51 times in
+  3 s. `setPreferredDevice(TYPE_TELEPHONY)` plus the output's native 48 kHz stereo fixed
+  it: the first call where the callee heard her (2026-10-13 18:51) was the first with
+  both. The laptop still sends 24 kHz mono; the helper upsamples.
+- **The answer is a fact now, so she is told at once.** `PreciseCallState` foreground
+  `ACTIVE` is the answer; the bridge opens then, and `GeminiLiveAgent.run(answered=)`
+  nudges her `_ANSWERED_GRACE_S` (0.8 s) later. Without it the model reached for
+  `end_call` three times while the callee said "Hola" into silence.
+- **Gemini runs in `europe-west1`**: first audio 0.70 s against 0.95 s in `us-central1`
+  from Lisbon (3 runs each). `silence_duration_ms` stays 700 by his call.
+- **The helper runs with the shell's powers, so it is guarded.** Pushed read-only, and
+  its sha256 is checked against the local build in the same shell command that `exec`s
+  it (`HELPER_MISMATCH` otherwise, spoken). Discovery never returns a `:5555` device: the
+  Mi Box is on the same adb server.
+- **A downlink recording** goes to `debug/phone_adb/<call_id>-downlink.wav` when
+  `logging.include_transcripts` is on, and every turn logs a "Response gap" (their last
+  sound to her first audio) for latency work.
+
+**Until 2026-10-13 calls went through Phone Link. What follows up to "How she talks" is
+that history (found live 2026-10-06/08); the code is in `deprecated/`:**
 
 - **There is no Phone Link API, and the WinRT calls API sees 0 lines** from unpackaged
   Python (Phone Link owns the HFP registration). Calls go through Phone Link's UI.
@@ -2321,7 +2379,7 @@ relevant metadata, how long it took". Three layers, one source:
   seconds after the dial, so the transcript is timestamped. A stage that did not happen is
   absent, never zero -- the `turns.jsonl` rule.
 - `PhoneService` adds what only it knows: `call_id`, `started_at`/`ended_at`,
-  `number_source`, Phone Link's `dial_status` and `hang_up_status`, backend, model, voice.
+  `number_source`, the phone's `dial_status` and `hang_up_status`, backend, model, voice.
   `CallReport.metadata()` derives the rest once: `ring_s`, `talk_s` (talk window minus
   ring), turns and words per side, and `ended_how` in words.
 - `call_record()` is the one shape of a call: `logs/calls.jsonl` writes it (brief, outcome,
@@ -2352,30 +2410,18 @@ list endpoint on Vertex rejects API keys outright ("API keys are not supported b
 API"), so it is no test of whether a key works -- a real request is. Voice `Aoede`; `language_code` is left
 empty so the native-audio model follows the prompt (Portuguese, English if they do).
 
-**Find my phone: `phone_find` (2026-10-08).** "Where is my phone?" presses Phone Link's
-**Play sound** (AutomationId `RingMyPhoneIndicatorToggleButton` in the left pane, a toggle
-that rings the phone ~20s even on silent) through `PhoneLinkDialer.play_sound` ->
-`PhoneService.find_phone`. It is an action on `control_phone`, so no new tool schema, and it
-needs no read-back: ringing a phone is harmless and repeatable. Same rules as the dial:
-focus the button through UIA, then a real key through `PressEnterOn` (foreground and focus
-verified before any key); Phone Link is launched by its AUMID when closed; refused during a
-call, because it shares the window. Each outcome has its own spoken line (`_FIND_LINES`):
-`PLAYING`, `ALREADY_PLAYING`, `NO_WINDOW`, `NO_BUTTON`, `DISABLED` (greyed out = phone not
-reachable), `NO_CONFIRM`, `NOT_STARTED`, `NOT_FOREGROUND`, `NOT_FOCUSED`.
-
-**It is two presses, and the first one alone looks like a failure.** The toggle only opens a
-confirmation flyout ("The sound will play for 20 seconds..."); the flyout's own **Play sound**
-button (a plain `Button` named exactly "Play sound", no AutomationId, and focus lands on it)
-does the ringing. Until that was found, four live runs pressed the toggle, saw it stay `Off`
-and reported `NOT_STARTED` over a silent phone, and a hand click "also failed" only because
-the flyout was never confirmed. The script presses the toggle, waits for the flyout, presses
-its button, and takes `ToggleState` going `On` as proof (it returns to `Off` after 20s, seen
-live). An already-open flyout is reused, not toggled shut. Verified live 2026-10-08:
-`PLAYING` in 1.5s. `TogglePattern.Toggle` is ignored, like Invoke on the Call button.
+**Find my phone: `phone_find`.** "Where is my phone?" runs the helper's `ring` mode
+(`AdbPhone.play_sound`): a two-tone beep on the alarm stream at its max volume for
+~20 s, which plays through silent mode, with the previous alarm volume put back in a
+`finally` (verified 6 -> 15 -> 6, 2026-10-13). It returns `PLAYING` as soon as the beep
+starts and the beep runs on. No read-back (ringing is harmless and repeatable); refused
+during a call, when the beep would play into his ear. Lines per outcome in
+`_FIND_LINES`: `PLAYING`, `NO_PHONE`, `LOCKED_DOWN`, `RING_FAILED`. Until 2026-10-13 this
+pressed Phone Link's two-step "Play sound" flyout (that code is in `deprecated/`).
 
 **Not built yet, on purpose:** asking Miguel mid-call (`ask_miguel`; he may not be in the
-room, so it needs WhatsApp), and the Pi. On the Pi the transport becomes PipeWire's
-Bluetooth telephony (`org.pipewire.Telephony`, `Dial`), behind the same agent.
+room, so it needs WhatsApp). More of the phone over ADB (notifications, SMS, calendar,
+incoming-call announcements...) is parked in `docs/ideas/2026-10-13-phone-toolkit.md`.
 
 ### StremioService
 
@@ -2797,7 +2843,7 @@ capability with no voice phrasing.
 - `phone_status`: on a call or not, and the last call's line (when, who, result, how long)
 - `phone_log`: the last calls from `logs/calls.jsonl`, newest first (`count`, default 5,
   max 20). Reads the file, so it survives restarts and reads lines from before `meta` existed
-- `phone_find`: rings his phone ~20s through Phone Link's Play sound; no read-back (see "Find my phone")
+- `phone_find`: rings his phone ~20s with an alarm beep over ADB; no read-back (see "Find my phone")
 
 When tools are active:
 
@@ -3487,6 +3533,14 @@ Current automated coverage exists for:
   quotes and labels every message, describes a photo rather than inventing it, asks
   which of two people, clamps the count, and unread still never opens a chat
 - That the contact roster is never injected into the system prompt
+- The phone over ADB (`tests/test_phone_adb.py`, `tests/test_phone_call_audio.py`): the
+  phone found by mDNS name or attached IP:port and never the Mi Box on :5555; no phone,
+  Security settings off and no interception each a status, never an exception, with
+  nothing dialled; the helper pushed only when its hash differs, always read-only, and
+  never run when swapped; only digits dialled; a dial that never registers is
+  NOT_PLACED; in_call unknown until a call was seen; the bridge started only at the
+  answer, 20 ms blocks to the agent, her voice paced to real time and cut by a flush,
+  stop unblocking the reader and removing the forward; no real adb from either file
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
@@ -4295,6 +4349,19 @@ just the commits.
   `ui.voice_offset_ms` and `audio_levels.DB_FLOOR`/`DB_CEIL` against real Chirp
   clips on the laptop, and the `first_audio` latency comparison with the UI on and off.
 
+
+- **"Phone Link has common bugs... route everything via adb" (2026-10-13, branch
+  `feat/phone-over-adb`).** Phone Link's Calls tab was broken; six fixes tried live,
+  none worked (the laptop never re-opens the hands-free link). Paired the phone over
+  Wireless debugging and found the shell holds call and call-audio permissions, then
+  hit HyperOS's Security-settings gate, the Telecom-vs-intent hook, and MediaTek's
+  injection-track loop, each in turn, over four test calls to Marta: the last one she
+  heard and answered. Then moved Gemini to `europe-west1`, ran a security review of
+  what was enabled (only this laptop's key is authorized; the key's ACL was widened to
+  a Codex sandbox group and was tightened; the helper is now hash-checked), parked a
+  list of further phone features in `docs/ideas/`, and wired it all into
+  `control_phone` with Phone Link moved to `deprecated/`. Test calls go to Master
+  Miguel from now on, not Marta.
 -----
 
 ## Known Bugs / Audit
