@@ -2066,7 +2066,8 @@ from the boot log (`Live UI: http://<laptop>:8765/<token>/`) on the phone.
 - **Live, not historical.** `core/event_bus.py` is published to from the thread where
   each thing happens: `TurnTimer` publishes every `mark`/`set`/`tool` as it is made
   (before, the turn only existed once `finish()` wrote `turns.jsonl`),
-  `Orchestrator._set_state` replaces every direct `leds.set_state`, the idle loop and
+  `Orchestrator._set_state` replaces every direct `leds.set_state` (and publishes only a
+  *change*: `_idle_loop` re-asserts idle every 40ms, which flooded the replay ring), the idle loop and
   the reply listener offer `wake_word.last_score`, `_audio_player_worker` publishes
   the sentence it is playing, `GeminiLiveAgent(on_line=...)` publishes each piece of a
   call transcript, and `BusLogHandler` publishes log records. Nothing is read from disk.

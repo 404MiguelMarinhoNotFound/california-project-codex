@@ -222,3 +222,33 @@ class WithoutUITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublishHygieneTests(unittest.TestCase):
+    """Two PR #51 bugs found while building the halo."""
+
+    def _orch(self):
+        from core.event_bus import EventBus
+        from core.orchestrator import Orchestrator
+
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.leds = Mock()
+        orch.bus = EventBus()
+        return orch
+
+    def test_a_repeated_state_is_published_once(self):
+        orch = self._orch()
+        for _ in range(50):          # _idle_loop re-asserts idle every 40ms chunk
+            orch._set_state("idle")
+        orch._set_state("listening")
+        orch._set_state("listening")
+        states = [e["data"]["state"] for e in orch.bus.subscribe()[0] if e["kind"] == "state"]
+        self.assertEqual(states, ["idle", "listening"])
+        self.assertEqual(orch.leds.set_state.call_count, 52)   # the LEDs still see every call
+
+    def test_wake_score_of_a_mock_detector_is_zero_not_a_crash(self):
+        from core.orchestrator import _score_of
+
+        self.assertEqual(_score_of(Mock()), 0.0)
+        self.assertEqual(_score_of(Mock(last_score=0.91234)), 0.9123)
+        self.assertEqual(_score_of(object()), 0.0)

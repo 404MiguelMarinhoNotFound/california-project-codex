@@ -1003,6 +1003,19 @@ def _drain_queue(q: queue.Queue) -> None:
             return
 
 
+def _score_of(wake_word) -> float:
+    """
+    The detector's last score for the live UI, or 0.0 when it has none.
+
+    Never raises: the idle loop calls this on every wake, and the tests drive
+    it with a Mock detector whose last_score is a Mock, which float() rejects.
+    """
+    try:
+        return round(float(getattr(wake_word, "last_score", 0.0) or 0.0), 4)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _chunk_rms(audio_chunk: np.ndarray) -> float:
     """RMS of an int16 chunk, on the same scale as vad.energy_threshold."""
     if len(audio_chunk) == 0:
@@ -1731,6 +1744,7 @@ class Orchestrator:
     # orchestrators publish into nothing.
     bus = NULL_BUS
     _wake_meter = None
+    _published_state = None
     # The halo's inputs (see _attach_live_ui). None until a live UI is running,
     # so a test orchestrator offers mic levels into nothing.
     _mic_meter = None
@@ -2100,10 +2114,7 @@ class Orchestrator:
         self._offer_wake_score("idle")
         if hit:
             # Wake word detected!
-            self.bus.publish("wake_hit", {
-                "score": round(float(getattr(self.wake_word, "last_score", 0.0) or 0.0), 4),
-                "phase": "idle",
-            })
+            self.bus.publish("wake_hit", {"score": _score_of(self.wake_word), "phase": "idle"})
             pre_roll = list(self._capture_ring) if self._capture_ring is not None else []
 
             # The speaker is opened once here and held through the whole
@@ -2953,9 +2964,17 @@ class Orchestrator:
             logging.getLogger().removeHandler(handler)
 
     def _set_state(self, state: str) -> None:
-        """Drive the LEDs and tell the live UI. The UI can never block the LEDs."""
+        """
+        Drive the LEDs and tell the live UI. The UI can never block the LEDs.
+
+        Published only on a change: _idle_loop re-asserts "idle" on every 40ms
+        mic chunk, and 25 identical events a second pushed every turn out of
+        the live UI's 500-event replay ring within about 20 seconds.
+        """
         self.leds.set_state(state)
-        self.bus.publish("state", {"state": state})
+        if state != self._published_state:
+            self._published_state = state
+            self.bus.publish("state", {"state": state})
 
     def _offer_wake_score(self, phase: str) -> None:
         meter = self._wake_meter
