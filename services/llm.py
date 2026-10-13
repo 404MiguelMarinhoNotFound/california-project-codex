@@ -334,12 +334,13 @@ CONTROL_PHONE_TOOL = {
         "phone_status says whether a call is going on and how the last one went; "
         "phone_log lists the last calls (count, default 5) from the call log. "
         "phone_find rings his phone for about 20 seconds so he can find it (where is "
-        "my phone, I lost my phone); it needs no confirmation, so just do it."
+        "my phone, I lost my phone); it needs no confirmation, so just do it. "
+        "phone_sync_contacts re-reads his phone's contact book now (refresh my contacts); it is also done weekly by itself."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["phone_call", "phone_status", "phone_log", "phone_find"]},
+            "action": {"type": "string", "enum": ["phone_call", "phone_status", "phone_log", "phone_find", "phone_sync_contacts"]},
             "count": {"type": "integer", "description": "phone_log only: how many recent calls, 1-20."},
             "to": {"type": "string", "description": "Who to call: a contact name as spoken, a business name, or a number."},
             "number": {"type": "string", "description": "The phone number, when known. Digits, optional +."},

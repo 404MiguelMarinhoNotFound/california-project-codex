@@ -39,6 +39,7 @@ from services.whatsapp_service import (
     WhatsAppService,
     looks_like_phone,
 )
+from services.contact_sync import ContactSync
 from services.phone_prompts import CallBrief
 from services.phone_service import PhoneService, call_log_line, short_duration
 from services.surfshark_service import SurfsharkService
@@ -1723,7 +1724,32 @@ def _dispatch_whatsapp(params: dict, whatsapp_svc, say_now=None) -> str:
     return "unknown action"
 
 
-def _dispatch_phone(params: dict, phone_svc) -> str:
+_CONTACT_SYNC_FAILED = "I couldn't refresh your contacts just now. I kept the ones I had."
+
+
+def _sync_contacts(contact_sync) -> str:
+    """phone_sync_contacts: the ContactSync line, with the mood it implies.
+
+    BUSY and DISABLED are neither a success nor a failure, so they report
+    nothing. A raise (the snapshot could not be written) is spoken, not thrown.
+    """
+    if contact_sync is None:
+        return "Contact sync isn't set up."
+    try:
+        result = contact_sync.sync()
+    except Exception as exc:
+        logger.warning("Contact sync failed: %s", type(exc).__name__)
+        _report(False)
+        return _CONTACT_SYNC_FAILED
+    status = getattr(result, "status", None)
+    if status in ("SYNCED", "UNCHANGED"):
+        _report(True)
+    elif status in ("NO_PHONE", "UNREADABLE", "SHRUNK", "LOCKED_DOWN"):
+        _report(False)
+    return result.message
+
+
+def _dispatch_phone(params: dict, phone_svc, contact_sync=None) -> str:
     """
     control_phone -> PhoneService. Module-level with the service injected, like
     the other dispatchers, so tests drive it with a bare Mock.
@@ -1731,10 +1757,15 @@ def _dispatch_phone(params: dict, phone_svc) -> str:
     The service's own lines are returned verbatim: the read-back is phrased for
     the model to relay, and "Calling X now" means the call really went to the
     background worker.
+
+    phone_sync_contacts comes before the enabled gate: it needs adb, not the
+    call backend's credentials, so "phone calls aren't set up" is no answer.
     """
+    action = params.get("action")
+    if action == "phone_sync_contacts":
+        return _sync_contacts(contact_sync)
     if not phone_svc or not getattr(phone_svc, "enabled", False):
         return "Phone calls aren't set up right now."
-    action = params.get("action")
     if action == "phone_status":
         return phone_svc.status_line()
     if action == "phone_find":
@@ -1947,6 +1978,13 @@ class Orchestrator:
             publish=self.bus.publish,
         )
 
+        # The phone's own contact book, re-read over adb weekly (and at boot
+        # when the snapshot is stale) for WhatsApp and calls to resolve names
+        # against. Construction only: the first sync runs on the loop below.
+        self.contact_sync = ContactSync(
+            config, on_synced=getattr(self.whatsapp_service, "reload_contacts", None)
+        )
+
         if media_enabled:
             self.media_service = built["media"]
             self.surfshark_service = SurfsharkService(config, self.media_service)
@@ -2014,6 +2052,20 @@ class Orchestrator:
                 daemon=True,
             ).start()
             logger.info("WhatsApp group refresh started (%d min interval)", groups_interval)
+
+        # The contact snapshot: checked at once (a stale one syncs without
+        # delaying boot), then every check_interval_minutes. A fresh snapshot
+        # costs a file read; a missed phone simply retries next pass.
+        if self.contact_sync.enabled is True:
+            threading.Thread(
+                target=self._contacts_sync_loop,
+                args=(self.contact_sync.check_interval_minutes,),
+                name="contacts-sync",
+                daemon=True,
+            ).start()
+            logger.info(
+                "Contact sync check started (%d min interval)", self.contact_sync.check_interval_minutes
+            )
 
         # Register tool handler so LLM can dispatch control_tv / control_lights
         self.llm.tool_handler = self._handle_tool_call
@@ -2885,7 +2937,9 @@ class Orchestrator:
         if tool_name == "control_whatsapp":
             return self._guard_whatsapp_send(tool_input)
         if tool_name == "control_phone":
-            return _dispatch_phone(tool_input, getattr(self, "phone_service", None))
+            return _dispatch_phone(
+                tool_input, getattr(self, "phone_service", None), getattr(self, "contact_sync", None)
+            )
         return "unknown tool"
 
     def _guard_whatsapp_send(self, tool_input: dict) -> str:
@@ -2943,6 +2997,24 @@ class Orchestrator:
                 self.whatsapp_service.refresh_groups_in_background()
             except Exception as exc:
                 logger.warning("Background WhatsApp group refresh failed: %s", exc)
+
+    def _contacts_sync_loop(self, interval_minutes: int):
+        """
+        Keep the phone contact snapshot fresh, like _whatsapp_groups_loop.
+
+        Unlike the other loops it checks FIRST, then waits: a stale snapshot is
+        synced right after boot, without delaying __init__. Failures log the
+        exception type only (never a name or number) and the next pass retries.
+        """
+        interval_seconds = max(60, interval_minutes * 60)
+        while True:
+            try:
+                if self.contact_sync.due():
+                    self.contact_sync.sync()
+            except Exception as exc:
+                logger.warning("Background contact sync failed: %s", type(exc).__name__)
+            if self._background_stop.wait(interval_seconds):
+                return
 
     def _deebot_token_loop(self, interval_minutes: int):
         """

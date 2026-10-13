@@ -4,7 +4,8 @@ import unittest
 from types import SimpleNamespace as NS
 from unittest import mock
 
-from core.orchestrator import Orchestrator, _dispatch_phone, _phone_report_message
+from core.orchestrator import _TOOL_OUTCOME, Orchestrator, _dispatch_phone, _phone_report_message
+from services.contact_sync import ContactSyncResult
 from services.gemini_live_call import CallLine, CallResult
 from services.phone_prompts import CallBrief
 from services.phone_service import CallReport, PhoneCommandResult, PhoneService
@@ -62,6 +63,105 @@ class DispatchTests(unittest.TestCase):
 
     def test_unknown_action(self):
         self.assertEqual(_dispatch_phone({"action": "phone_hack"}, _svc()), "unknown action")
+
+
+_SYNCED_LINE = "Contacts refreshed from your phone: 3, 1 new, 0 gone, 0 changed."
+
+
+def _syncer(status="SYNCED", message=_SYNCED_LINE, **counts):
+    sync = mock.Mock()
+    sync.sync.return_value = ContactSyncResult(status, message=message, **counts)
+    return sync
+
+
+class ContactSyncDispatchTests(unittest.TestCase):
+    def _mood(self, params, phone_svc, sync):
+        token = _TOOL_OUTCOME.set(None)
+        try:
+            line = _dispatch_phone(params, phone_svc, sync)
+            return line, _TOOL_OUTCOME.get()
+        finally:
+            _TOOL_OUTCOME.reset(token)
+
+    def test_sync_contacts_speaks_the_service_line(self):
+        sync = _syncer(count=3, added=1)
+        line = _dispatch_phone({"action": "phone_sync_contacts"}, mock.Mock(enabled=True), sync)
+        self.assertEqual(line, _SYNCED_LINE)
+        sync.sync.assert_called_once_with()
+
+    def test_sync_contacts_works_with_calls_disabled(self):
+        # Contact sync needs adb, not Gemini credentials.
+        sync = _syncer()
+        line = _dispatch_phone({"action": "phone_sync_contacts"}, mock.Mock(enabled=False), sync)
+        self.assertEqual(line, _SYNCED_LINE)
+        sync.sync.assert_called_once_with()
+        self.assertEqual(_dispatch_phone({"action": "phone_sync_contacts"}, None, sync), _SYNCED_LINE)
+
+    def test_sync_contacts_without_a_syncer(self):
+        self.assertEqual(
+            _dispatch_phone({"action": "phone_sync_contacts"}, mock.Mock(enabled=True)),
+            "Contact sync isn't set up.",
+        )
+
+    def test_a_raising_sync_is_a_spoken_failure_not_a_traceback(self):
+        sync = mock.Mock()
+        sync.sync.side_effect = OSError("disk full")
+        line, mood = self._mood({"action": "phone_sync_contacts"}, None, sync)
+        self.assertEqual(line, "I couldn't refresh your contacts just now. I kept the ones I had.")
+        self.assertIs(mood, False)
+
+    def test_moods(self):
+        cases = {
+            "SYNCED": True, "UNCHANGED": True,
+            "NO_PHONE": False, "UNREADABLE": False, "SHRUNK": False, "LOCKED_DOWN": False,
+            "BUSY": None, "DISABLED": None,
+        }
+        for status, expected in cases.items():
+            with self.subTest(status=status):
+                _, mood = self._mood({"action": "phone_sync_contacts"}, None, _syncer(status, message="x"))
+                self.assertIs(mood, expected)
+
+    def test_old_two_argument_calls_still_work(self):
+        service = _svc()
+        service.find_phone.return_value = PhoneCommandResult(True, "It's ringing on his phone now.")
+        self.assertEqual(_dispatch_phone({"action": "phone_find"}, service), "It's ringing on his phone now.")
+
+
+class ContactsLoopTests(unittest.TestCase):
+    def _orch(self, waits, due=(True,)):
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._background_stop = mock.Mock()
+        orch._background_stop.wait.side_effect = list(waits)
+        orch.contact_sync = mock.Mock()
+        orch.contact_sync.due.side_effect = list(due)
+        return orch
+
+    def test_due_at_boot_syncs_before_the_first_wait(self):
+        orch = self._orch(waits=[True])
+        order = []
+        orch.contact_sync.sync.side_effect = lambda: order.append("sync")
+        orch._background_stop.wait.side_effect = lambda s: order.append(("wait", s)) or True
+        orch._contacts_sync_loop(360)
+        self.assertEqual(order, ["sync", ("wait", 360 * 60)])
+
+    def test_fresh_snapshot_does_not_sync(self):
+        orch = self._orch(waits=[True], due=[False])
+        orch._contacts_sync_loop(360)
+        orch.contact_sync.sync.assert_not_called()
+
+    def test_a_raising_sync_does_not_end_the_loop(self):
+        orch = self._orch(waits=[False, True], due=[True, True])
+        orch.contact_sync.sync.side_effect = OSError("disk full")
+        with self.assertLogs("core.orchestrator", level="WARNING") as logs:
+            orch._contacts_sync_loop(360)
+        self.assertEqual(orch.contact_sync.due.call_count, 2)
+        self.assertEqual(orch.contact_sync.sync.call_count, 2)
+        self.assertTrue(all("OSError" in line and "disk full" not in line for line in logs.output))
+
+    def test_the_wait_has_a_one_minute_floor(self):
+        orch = self._orch(waits=[True], due=[False])
+        orch._contacts_sync_loop(0)
+        orch._background_stop.wait.assert_called_once_with(60)
 
 
 def _report(**result_kw):
