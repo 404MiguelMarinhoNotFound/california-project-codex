@@ -2,8 +2,9 @@
 
 Implementation plan. Status: **approved design, not started.**
 
-- Branch: `ccr-cc285211-5jqocu` (PR #51).
-- Builds on that PR's live UI: `core/event_bus.py`, `core/live_ui.py` and `ui/`.
+- Branch: `ccr-cc285211-5jqocu`, restarted from master after PR #51 merged.
+- Builds on the live UI that PR #51 shipped: `core/event_bus.py`, `core/live_ui.py` and `ui/`.
+- Also on master since then: `core/live_ui_announce.py`, which WhatsApps the URL and opens it in Firefox on boot, and hex tokens. Nothing in this plan touches those; keep `tests/test_live_ui_announce.py` green.
 
 ## Contents
 
@@ -73,10 +74,19 @@ Each input changes a small set of animation targets. The halo eases toward them,
 | state | ring | core | other |
 |---|---|---|---|
 | idle | Loosens into a dim spherical cloud drifting slowly (`loose → 1`) | Dim, breathing (period about 5.7 s) | Spin 0.08 rad/s |
-| wake | Cloud snaps to the ring (`loose → 0` over about 0.2 s); scale pops 12 % | Flash (`wakeFlash = 1`, decays in about 0.6 s) | Fires on any transition out of idle |
+| wake | Cloud snaps to the ring (`loose → 0` over about 0.2 s); scale pops 12 % | Flash (`wakeFlash = 1`, decays in about 0.6 s) | Fires on the **wake-word hit** itself (see the note below), not only on leaving idle |
 | listening | Tightens (`push = -0.12 - mic × 0.12`), leans toward the viewer (x −0.22 rad) | Brightens with the mic level | Spin 0.28 |
 | thinking | Spins up (1.6 rad/s); a comet head runs round the ring | Slightly brighter (`heat`) | Comet speed 4.2 rad/s |
 | speaking | Pushes out per syllable (`push = voice × 0.22`); embers grow | Scales and flares with the voice | A ripple leaves when the voice crosses 0.55 upward (cooldown 0.32 s) |
+
+**The wake sound.** `_run_activation` plays the acknowledgement line *before* it calls `_set_state("listening")`. With `sounds.activation_blocking: true` (the shipped value), the line plays out entirely while the published state is still `idle`. If the halo keyed the wake on `state` alone, she would say "Sup?" over a dim idle cloud.
+
+So the halo also wakes on:
+
+- `wake_hit` with `phase: "idle"` and no `ignored`. This is the earliest signal, published in `_idle_loop` the instant the detector fires.
+- `clip_start` with `kind: "ack"`. It drives the voice level like any clip, so the ring pushes out with the acknowledgement line.
+
+Waking twice is harmless: `wake()` is idempotent while `loose` is already below 0.5. The bootup line (`kind: "boot"`) also drives the voice level, so the halo visibly speaks its greeting at startup.
 
 ### By mood
 
@@ -468,6 +478,7 @@ window.createHalo = function createHalo(canvas, opts) -> {
   setVoice(level),            // 0..1, already smoothed by VoiceClock
   setMic(level),              // 0..1, raw; smoothed inside
   setMood(mood),              // "none" | "happy" | "smug" | "unimpressed" | "sheepish" | "roll"
+  wake(),                     // snap the idle cloud into the ring with the flash; idempotent
   resize(), dispose(),
   get ok()                    // false when WebGL failed; caller shows the pill instead
 }
@@ -517,7 +528,11 @@ const VoiceClock = {
 - A stopped `clip_end` drops the clip at once, so the ring settles within one release time (0.2 s).
 - `offsetMs` comes from `hello.voice_offset_ms`.
 
-**New `HANDLERS` entries:** `clip_start`, `clip_end`, `mic`, `mood`. The existing `state` handler also calls `halo.setState`.
+**New `HANDLERS` entries:** `clip_start`, `clip_end`, `mic`, `mood`.
+
+- The existing `state` handler also calls `halo.setState`.
+- The existing `wake_hit` handler calls `halo.wake()` when `phase === "idle" && !ignored`.
+- `clip_start` with `kind === "ack"` also calls `halo.wake()` (§2, the wake sound).
 
 **Caption.** On `clip_start` with `text`, the halo caption shows the sentence. Words are revealed at `index = ceil(words × elapsed / ms)` on each animation frame, the same calculation as the draft's `renderCaption`. Without `text`, the caption stays empty.
 
@@ -635,6 +650,10 @@ All new tests run under the existing hermetic guards. Each name states the behav
 
 - `test_barge_in_publishes_stopped_clip_end_for_the_clip_playing`
 
+### `tests/test_activation_phrases.py` or the wiring test file (extend)
+
+- `test_activation_line_publishes_an_ack_clip_before_state_listening` pins the order the page relies on: `wake_hit` → `clip_start(kind=ack)` → `state: listening`.
+
 ### `tests/test_live_ui_orchestrator.py` (new)
 
 Orchestrator wiring, built with `__new__` like the others.
@@ -698,7 +717,7 @@ A Playwright script (`--check`) then opens the page at 390×844 and 1280×900:
 ### 12.3 On the real laptop (with Master Miguel)
 
 1. Run `uv run python main.py` and open the boot-log URL on the phone.
-2. Idle: a dim drifting cloud. Say "California": the cloud snaps into a ring with a flash.
+2. Idle: a dim drifting cloud. Say "California": the cloud snaps into a ring with a flash **as the acknowledgement line starts**, and the ring moves with that line.
 3. "Put on Fallout":
    - the ring edge follows his voice while recording;
    - the comet runs while she thinks;
