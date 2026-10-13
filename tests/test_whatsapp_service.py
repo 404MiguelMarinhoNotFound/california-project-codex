@@ -760,6 +760,118 @@ class ReloadTests(unittest.TestCase):
         self.assertTrue(service.resolve_contact("Marta Zuka"))
 
 
+def _snapshot(names: list[tuple[str, str]]) -> Path:
+    """A phone-contact snapshot in Task 2's format, written by its own writer."""
+    from datetime import datetime
+
+    from services.contact_sync import write_snapshot
+
+    path = Path(tempfile.mkdtemp()) / "phone_contacts.json"
+    write_snapshot(path, [Contact(n, [p]) for n, p in names], datetime(2026, 10, 1, 9, 0))
+    return path
+
+
+def _snap_service(snapshot: Path, book: Path | None = None, enabled: bool = True) -> WhatsAppService:
+    """`_service`, plus contacts_sync pointed at a tmp snapshot (a path override)."""
+    cfg = {"enabled": True, "contacts_path": str(book or _book())}
+    config = config_for_tests(
+        whatsapp=cfg,
+        contacts_sync={"enabled": enabled, "snapshot_path": str(snapshot)},
+    )
+    config["whatsapp"]["aliases"] = {}
+    with patch.object(WhatsAppService, "_probe_platform", return_value=True):
+        return WhatsAppService(config)
+
+
+_RUI_VCF = """BEGIN:VCARD
+VERSION:2.1
+FN:Rui Vcf
+TEL;CELL;PREF:+351912000999
+END:VCARD
+"""
+
+
+class SnapshotBookTests(unittest.TestCase):
+    """The phone's own book (contacts_sync) wins; contacts.vcf is the fallback."""
+
+    def test_the_snapshot_beats_the_vcf(self):
+        service = _snap_service(_snapshot([("Ana Exemplo", "+351912000123")]), _book(_RUI_VCF))
+        self.assertEqual([c.name for c in service.contacts], ["Ana Exemplo"])
+        self.assertEqual(service.contacts_source, "phone")
+
+    def test_an_empty_or_missing_snapshot_falls_back_to_the_vcf(self):
+        for snap in (_snapshot([]), Path(tempfile.mkdtemp()) / "absent.json"):
+            service = _snap_service(snap, _book(_RUI_VCF))
+            self.assertEqual([c.name for c in service.contacts], ["Rui Vcf"])
+            self.assertEqual(service.contacts_source, "vcf")
+
+    def test_a_corrupt_snapshot_falls_back_to_the_vcf(self):
+        snap = Path(tempfile.mkdtemp()) / "phone_contacts.json"
+        snap.write_text("{", encoding="utf-8")
+        with self.assertLogs("services.contact_sync", level="WARNING"):
+            service = _snap_service(snap, _book(_RUI_VCF))
+        self.assertEqual([c.name for c in service.contacts], ["Rui Vcf"])
+        self.assertEqual(service.contacts_source, "vcf")
+
+    def test_snapshot_ignored_when_sync_disabled(self):
+        service = _snap_service(
+            _snapshot([("Ana Exemplo", "+351912000123")]), _book(_RUI_VCF), enabled=False
+        )
+        self.assertEqual([c.name for c in service.contacts], ["Rui Vcf"])
+        self.assertEqual(service.contacts_source, "vcf")
+        self.assertIsNone(service.snapshot_path)
+
+    def test_no_book_at_all_has_no_source(self):
+        service = _snap_service(Path(tempfile.mkdtemp()) / "absent.json", Path(tempfile.mkdtemp()) / "none.vcf")
+        self.assertEqual(service.contacts, [])
+        self.assertEqual(service.contacts_source, "")
+
+    def test_reload_picks_up_a_new_snapshot(self):
+        snap = _snapshot([("Ana Exemplo", "+351912000123")])
+        service = _snap_service(snap, _book(_RUI_VCF))
+        old = service.contacts
+        from datetime import datetime
+
+        from services.contact_sync import write_snapshot
+
+        write_snapshot(
+            snap,
+            [Contact("Ana Exemplo", ["+351912000123"]), Contact("Bruno Exemplo", ["+351912000456"])],
+            datetime(2026, 10, 8, 9, 0),
+        )
+        self.assertEqual(service.reload_contacts(), 2)
+        self.assertEqual(service.contacts_source, "phone")
+        # Swapped by assignment, so a reader holding the old list keeps a whole one.
+        self.assertIsNot(service.contacts, old)
+        self.assertEqual([c.name for c in old], ["Ana Exemplo"])
+
+    def test_a_reload_between_read_back_and_go_keeps_the_confirmation(self):
+        snap = _snapshot([("Marta Zuka", "+351933852719")])
+        service = _snap_service(snap, _book(_RUI_VCF))
+        transport = _drive(service)
+        match = service.resolve_contact("Martah")
+        self.assertFalse(match.certain)
+        self.assertFalse(service.send(match, "hello"))
+        service.reload_contacts()
+        again = service.resolve_contact("Martah")
+        self.assertTrue(service.send(again, "hello", confirm=True))
+        self.assertEqual(transport.sent, [("+351933852719", "hello")])
+
+    def test_the_fixture_never_reads_the_real_snapshot(self):
+        self.assertEqual(
+            config_for_tests()["contacts_sync"]["snapshot_path"], "/nonexistent/phone_contacts.json"
+        )
+
+    def test_the_shipped_snapshot_path_is_gitignored(self):
+        """Real people's numbers, like contacts.vcf."""
+        from tests.config_fixture import real_config
+
+        path = real_config()["contacts_sync"]["snapshot_path"]
+        ignored = (Path(__file__).resolve().parents[1] / ".gitignore").read_text().split()
+        self.assertIn(path, ignored)
+        self.assertIn(path + ".tmp", ignored)
+
+
 class ShippedConfigTests(unittest.TestCase):
     def test_the_shipped_config_has_a_whatsapp_block(self):
         cfg = config_for_tests()["whatsapp"]

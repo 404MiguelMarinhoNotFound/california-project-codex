@@ -51,6 +51,11 @@ whatsapp_aliases.yaml
 whatsapp_groups.json
 whatsapp_groups.json.tmp
 
+# The phone's contact book, synced over ADB (contacts_sync.snapshot_path).
+# A few hundred real people's phone numbers -- local-only like contacts.vcf.
+phone_contacts.json
+phone_contacts.json.tmp
+
 # Runtime logs (config logging.dir). Transcripts and replies, local only.
 logs/
 

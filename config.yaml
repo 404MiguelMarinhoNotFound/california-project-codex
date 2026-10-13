@@ -1061,6 +1061,16 @@ whatsapp:
     # the landlord: "Joao Silva"
     # mum: {contact: "Maria Silva", prefer: "+351"}
 
+# The phone's own contact book, read over ADB (phone.adb) into a local
+# snapshot that WhatsApp and phone calls resolve names against. Read-only on
+# the phone; contacts.vcf stays the fallback. Gitignored: real people's numbers.
+contacts_sync:
+  enabled: true
+  snapshot_path: "phone_contacts.json"
+  interval_days: 7              # boot syncs when older than this, then weekly
+  check_interval_minutes: 360   # how often the loop asks "is it due"; a missed phone retries here
+  min_keep_ratio: 0.5           # a book shrunk below half the last one is not written
+
 # ============================================================
 # PHONE CALLS (control_phone) -- from Master Miguel's own number
 # ============================================================
