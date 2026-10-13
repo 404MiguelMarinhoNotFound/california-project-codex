@@ -145,6 +145,9 @@ _SEND_MARGIN_S = 10.0
 class WhatsAppCommandResult:
     success: bool
     message: str = ""
+    # A read-back: nothing was sent, and it waits for his yes. Not a failure;
+    # the live UI parks the call on "waiting for you" rather than dropping it.
+    awaiting: bool = False
 
     def __bool__(self) -> bool:
         return self.success
@@ -1122,6 +1125,7 @@ class WhatsAppService:
             return WhatsAppCommandResult(
                 False,
                 f"I've got {match.key} at {match.phone}. Say send it and I will.",
+                awaiting=True,
             )
 
         return self._run(lambda: self._send_now(match.phone, message))
@@ -1277,6 +1281,7 @@ class WhatsAppService:
                 f"NOT SENT YET. The group is {spoken}. Read the message back to Master Miguel "
                 f"and ask if you should send it, then wait for his yes. Never say it went out "
                 f"until a later call returns that it was sent. Message: {message}",
+                awaiting=True,
             )
         return self._run(lambda: self._send_group_now(match.title, message))
 
@@ -1423,6 +1428,7 @@ class WhatsAppService:
             return WhatsAppCommandResult(
                 False,
                 f"I've got {match.key} at {match.phone}. Say send it and I'll set it for {at}.",
+                awaiting=True,
             )
 
         phone, key = match.phone, match.key

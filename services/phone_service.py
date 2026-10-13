@@ -92,6 +92,8 @@ _DEFAULT_BLOCKED_PREFIXES = ["+351760", "+351761", "+351762", "+351707", "+35170
 class PhoneCommandResult:
     success: bool
     message: str = ""
+    # A read-back or "which one?": nothing dialled, waiting for his answer.
+    awaiting: bool = False
 
     def __bool__(self) -> bool:
         return self.success
@@ -474,7 +476,7 @@ class PhoneService:
         candidates = list(getattr(match, "candidates", None) or [])
         if candidates:
             names = ", ".join(candidates[:-1]) + f" or {candidates[-1]}" if len(candidates) > 1 else candidates[0]
-            return "", "", "", PhoneCommandResult(False, f"Which {who}: {names}?")
+            return "", "", "", PhoneCommandResult(False, f"Which {who}: {names}?", awaiting=True)
         if phone:
             # A loose match: the read-back names the contact, so he hears who it picked.
             return phone, getattr(match, "key", "") or who, "from your contacts", None
@@ -526,6 +528,7 @@ class PhoneService:
                 f"Ready to call {label} at {_spoken_number(resolved)} ({source}) to {what}. "
                 "Read that back to Master Miguel, including where the number came from, "
                 "and only call again with confirm true once he says go.",
+                awaiting=True,
             )
 
         with self._lock:

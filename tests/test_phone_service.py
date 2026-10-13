@@ -117,6 +117,7 @@ class ReadBackTests(_Base):
         self.assertIn("Ready to call Taberna da Praia at 912 345 678", result.message)
         self.assertEqual(self.dialer.dialed, [])
         self.assertEqual(self.agent.prompts, [])
+        self.assertIs(result.awaiting, True)   # the live UI shows it waiting for him
 
     def test_confirm_on_a_first_attempt_still_reads_back(self):
         svc = self._svc()
@@ -130,6 +131,7 @@ class ReadBackTests(_Base):
         first, second = self._place(svc)
         self.assertFalse(first)
         self.assertTrue(second)
+        self.assertIs(second.awaiting, False)
         self.assertIn("Calling Taberna da Praia now", second.message)
         self.assertEqual(self.dialer.dialed, ["+351912345678"])
         report = svc.pop_report()

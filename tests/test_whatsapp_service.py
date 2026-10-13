@@ -546,6 +546,12 @@ class ConfirmationTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertIn("Marta Zuka", result.message)
         self.assertEqual(self.transport.sent, [])
+        # The live UI parks it on "waiting for you" rather than showing a failure.
+        self.assertIs(result.awaiting, True)
+
+    def test_a_sent_message_is_not_awaiting(self):
+        self.service.send(self.match, "hello")
+        self.assertIs(self.service.send(self.match, "hello", confirm=True).awaiting, False)
 
     def test_confirm_on_a_first_attempt_still_reads_back(self):
         """The model setting the flag by itself must not be enough."""
