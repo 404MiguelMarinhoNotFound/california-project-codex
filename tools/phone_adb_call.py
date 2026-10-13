@@ -40,7 +40,7 @@ sys.path.insert(0, ROOT)
 
 logger = logging.getLogger("phone_adb")
 
-HELPER_LOCAL = os.path.join(ROOT, "tools", "android_call_audio", "callaudio.dex")
+HELPER_LOCAL = os.path.join(ROOT, "android", "callaudio", "callaudio.dex")
 HELPER_REMOTE = "/data/local/tmp/callaudio.dex"
 PORT = 27183
 REC_RATE = 16000  # what Gemini Live takes in

@@ -38,6 +38,7 @@ public final class CallAudio {
             return new AttributionSource.Builder(2000).setPackageName("com.android.shell").build();
         }
         @Override public int getDeviceId() { return 0; }
+        @Override public String getAttributionTag() { return null; }
         @Override public Context getApplicationContext() { return this; }
     }
 
@@ -106,6 +107,62 @@ public final class CallAudio {
         return o;
     }
 
+    /**
+     * Find my phone: a two-tone beep on the ALARM stream, which plays through
+     * silent mode, at the alarm stream's max volume. The previous alarm
+     * volume is put back in a finally, whatever happens.
+     */
+    static int ring(Object am, int seconds) throws Exception {
+        int alarm = field("android.media.AudioManager", "STREAM_ALARM");
+        Class<?>[] one = {int.class};
+        int before = (Integer) call(am, "getStreamVolume", one, alarm);
+        int max = (Integer) call(am, "getStreamMaxVolume", one, alarm);
+        Object track = null;
+        try {
+            call(am, "setStreamVolume", new Class<?>[]{int.class, int.class, int.class}, alarm, max, 0);
+            Object ab = Class.forName("android.media.AudioAttributes$Builder").getConstructor().newInstance();
+            call(ab, "setUsage", one, field("android.media.AudioAttributes", "USAGE_ALARM"));
+            call(ab, "setContentType", one, field("android.media.AudioAttributes", "CONTENT_TYPE_SONIFICATION"));
+            Object attrs = call(ab, "build", new Class<?>[]{});
+            Object tb = Class.forName("android.media.AudioTrack$Builder").getConstructor().newInstance();
+            call(tb, "setAudioAttributes", new Class<?>[]{Class.forName("android.media.AudioAttributes")}, attrs);
+            call(tb, "setAudioFormat", new Class<?>[]{Class.forName("android.media.AudioFormat")},
+                    format(TRACK_RATE, "CHANNEL_OUT_MONO"));
+            // Android 16's AudioTrack.Builder reads the attribution tag off a
+            // Context; app_process has none, so it gets the shell's.
+            call(tb, "setContext", new Class<?>[]{Context.class}, new FakeContext());
+            track = call(tb, "build", new Class<?>[]{});
+            call(track, "play", new Class<?>[]{});
+            System.out.println("RINGING");
+            System.out.flush();
+            short[] beep880 = tone(880, 300), beep660 = tone(660, 300), gap = new short[TRACK_RATE / 5];
+            Class<?>[] write = {short[].class, int.class, int.class};
+            long end = System.currentTimeMillis() + seconds * 1000L;
+            boolean high = true;
+            while (System.currentTimeMillis() < end) {
+                short[] beep = high ? beep880 : beep660;
+                call(track, "write", write, beep, 0, beep.length);
+                call(track, "write", write, gap, 0, gap.length);
+                high = !high;
+            }
+            return 0;
+        } finally {
+            if (track != null) {
+                try { call(track, "stop", new Class<?>[]{}); call(track, "release", new Class<?>[]{}); } catch (Throwable t) { }
+            }
+            call(am, "setStreamVolume", new Class<?>[]{int.class, int.class, int.class}, alarm, before, 0);
+            log("alarm volume " + before + " -> " + max + " -> restored " + call(am, "getStreamVolume", one, alarm));
+        }
+    }
+
+    static short[] tone(int hz, int ms) {
+        short[] out = new short[TRACK_RATE * ms / 1000];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (short) (Math.sin(2 * Math.PI * hz * i / TRACK_RATE) * 0.6 * 32767);
+        }
+        return out;
+    }
+
     /** ITelecomService straight from the service manager: no Activity, so HyperOS's start hook never sees it. */
     static Object telecom() throws Exception {
         Object binder = Class.forName("android.os.ServiceManager")
@@ -148,9 +205,30 @@ public final class CallAudio {
     public static void main(String[] args) throws Exception {
         String mode = args.length > 0 ? args[0] : "check";
         if (mode.equals("dial") || mode.equals("hangup")) {
-            System.exit(telecomCommand(mode, args));
+            int code;
+            try {
+                code = telecomCommand(mode, args);
+            } catch (Throwable t) {
+                Throwable cause = t.getCause() != null ? t.getCause() : t;
+                System.out.println("ERROR " + cause.getClass().getSimpleName() + ": " + cause.getMessage());
+                code = 1;
+            }
+            System.out.flush();
+            System.exit(code);
         }
         Object am = audioManager();
+        if (mode.equals("ring")) {
+            int code;
+            try {
+                code = ring(am, Integer.parseInt(args.length > 1 ? args[1] : "20"));
+            } catch (Throwable t) {
+                Throwable cause = t.getCause() != null ? t.getCause() : t;
+                System.out.println("ERROR " + cause.getClass().getSimpleName() + ": " + cause.getMessage());
+                code = 1;
+            }
+            System.out.flush();
+            System.exit(code);
+        }
         boolean ok = (Boolean) call(am, "isPstnCallAudioInterceptable", new Class<?>[]{});
         if (mode.equals("check")) {
             System.out.println("INTERCEPTABLE=" + ok);
@@ -205,6 +283,16 @@ public final class CallAudio {
                 + " track state=" + call(track, "getState", new Class<?>[]{}));
         call(record, "startRecording", new Class<?>[]{});
         call(track, "play", new Class<?>[]{});
+        // The phone's own mic would put the room (him, the TV) into the call
+        // under her voice. Injection is a separate uplink mix, so muting the
+        // mic leaves her audible -- verified live, see android/callaudio/README.md.
+        final boolean muteMic = args.length > 4 && args[4].equals("mutemic");
+        boolean micWasMuted = false;
+        if (muteMic) {
+            micWasMuted = (Boolean) call(am, "isMicrophoneMute", new Class<?>[]{});
+            call(am, "setMicrophoneMute", new Class<?>[]{boolean.class}, true);
+            log("mic muted (was " + micWasMuted + ")");
+        }
 
         // Once a second: where each stream was routed, how far the track has
         // actually played, and the audio mode. 2026-10-13: the track took one
@@ -263,6 +351,9 @@ public final class CallAudio {
             log("uplink ended: " + cause);
         }
         log("injected bytes=" + injected);
+        if (muteMic) {
+            try { call(am, "setMicrophoneMute", new Class<?>[]{boolean.class}, micWasMuted); } catch (Throwable t) { log("mic restore failed: " + t); }
+        }
         try { call(record, "stop", new Class<?>[]{}); call(track, "stop", new Class<?>[]{}); } catch (Throwable t) { }
         try { call(record, "release", new Class<?>[]{}); call(track, "release", new Class<?>[]{}); } catch (Throwable t) { }
         sock.close();

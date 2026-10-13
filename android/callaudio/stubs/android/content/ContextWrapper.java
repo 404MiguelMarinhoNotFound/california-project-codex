@@ -7,5 +7,6 @@ public class ContextWrapper extends Context {
     public String getOpPackageName() { return null; }
     public AttributionSource getAttributionSource() { return null; }
     public int getDeviceId() { return 0; }
+    public String getAttributionTag() { return null; }
     public Context getApplicationContext() { return null; }
 }
