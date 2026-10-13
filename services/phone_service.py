@@ -55,6 +55,7 @@ _MSG_BLOCKED = "I won't call that number myself."
 # collapsed into "couldn't".
 _FIND_LINES = {
     "PLAYING": "It's ringing on his phone now, a sound for about twenty seconds. Say 'again' if he needs longer.",
+    "ALREADY_PLAYING": "His phone is already ringing from a moment ago. Tell him to listen for it.",
     "NO_PHONE": "I can't reach his phone over Wi-Fi, so I couldn't ring it. Wireless debugging may be off on it.",
     "LOCKED_DOWN": "His phone is blocking me, so I couldn't ring it. USB debugging (Security settings) needs to be on.",
     "RING_FAILED": "His phone didn't start the sound. Try again in a moment.",
@@ -73,6 +74,7 @@ _DIAL_FAILURES = {
     "HELPER_MISMATCH": "The call helper on your phone isn't the one I installed, so I won't run it. "
                        "Something may have changed it.",
     "NOT_PLACED": "I asked your phone to call but the call never started.",
+    "BUSY": "You're already on a call on your phone, so I didn't dial over it.",
     "": "I couldn't reach your phone to place the call.",
 }
 
@@ -399,6 +401,7 @@ class PhoneService:
             capture_factory=audio.capture,
             speaker_factory=audio.speaker,
             on_line=self._on_call_line,
+            live_if_heard_s=0,
         )
 
     def _publish(self, kind: str, data: dict) -> None:
@@ -588,10 +591,21 @@ class PhoneService:
         try:
             dialer = self._get_dialer()
 
+            audio_box: list = []
+
             def dial() -> bool:
                 self._publish("call_state", {"state": "dialing", "label": label})
                 dial_status.append(dialer.dial(number))
-                return dial_status[-1] in _DIALED
+                placed = dial_status[-1] in _DIALED
+                if placed and audio_box and audio_box[0] is not None:
+                    audio_box[0].arm()  # only now may the bridge open on an ACTIVE call
+                return placed
+
+            def still_connected():
+                # A dead bridge means no ears and no mouth: end the call.
+                if audio_box and getattr(audio_box[0], "failed", False) is True:
+                    return False
+                return dialer.in_call()
 
             prompt = build_call_prompt(brief, owner=self.owner, callback_number=self.callback_number)
             self._publish("call_state", {
@@ -602,16 +616,19 @@ class PhoneService:
             record = (os.path.join("debug", "phone_adb", f"{started.strftime('%Y%m%d-%H%M%S')}-downlink.wav")
                       if self.include_transcripts else "")
             audio = dialer.audio(record) if hasattr(dialer, "audio") else None
+            audio_box.append(audio)
             agent = self._make_agent(audio)
             result = agent.run(
                 prompt,
                 max_call_s=self.max_call_s,
                 no_answer_s=self.no_answer_s,
-                still_connected=dialer.in_call,
+                still_connected=still_connected,
                 stop=self._stop,
                 dial=dial,
                 answered=audio.answered if audio is not None else None,
             )
+            if audio is not None and getattr(audio, "failed", False) is True:
+                result.error = result.error or "The call audio on your phone stopped, so I hung up."
             if result.ended_by == "dial_failed":
                 result.error = _DIAL_FAILURES.get(dial_status[-1] if dial_status else "", _DIAL_FAILURES[""])
             elif dial_status:

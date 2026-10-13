@@ -251,6 +251,18 @@ class HangUpCrossCheckTests(_Base):
             result = self.agent(session).run("p", max_call_s=0.5, no_answer_s=30, still_connected=lambda: False)
         self.assertEqual(result.ended_by, "max_duration")
 
+    def test_with_no_grace_a_hang_up_reading_is_believed_at_once(self):
+        # The phone's call state is authoritative; the grace was for Phone Link.
+        self.session = FakeSession([[heard("Estou?")]])
+        agent = GeminiLiveAgent(
+            client_kwargs={"api_key": "t"}, model="m", live_if_heard_s=0,
+            client_factory=lambda kw: FakeClient(self.session),
+            capture_factory=lambda: self.capture, speaker_factory=lambda: self.speaker,
+        )
+        result = agent.run("p", max_call_s=30, no_answer_s=30, still_connected=lambda: False)
+        self.assertEqual(result.ended_by, "hung_up")
+        self.assertLess(result.duration_s, 1.0)
+
     def test_a_quiet_line_that_reads_ended_is_ended(self):
         session = FakeSession([[heard("Estou?")]])
         result = self.agent(session).run("p", max_call_s=30, no_answer_s=30, still_connected=lambda: False)

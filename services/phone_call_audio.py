@@ -66,8 +66,17 @@ class PhoneCallAudio:
         self.gaps: list[float] = []
         self._sock: socket.socket | None = None
         self._proc: subprocess.Popen | None = None
+        self._forwarded = False
         self._stop = threading.Event()
         self._stopped = False
+        self._release_lock = threading.Lock()
+        # Set by PhoneService once ITS dial went out. Until then an ACTIVE
+        # state is someone else's call -- his own, which the bridge must
+        # never open on (final review, 2026-10-13).
+        self._armed = threading.Event()
+        # The helper died or never started while the call was up: the call
+        # has no ears or mouth any more and must end, not sit in silence.
+        self.failed = False
         self._out: queue.Queue[bytes] = queue.Queue()
         self._busy = threading.Event()
         self._wav = None
@@ -83,6 +92,10 @@ class PhoneCallAudio:
     def answered(self) -> bool:
         return self.connected_at is not None
 
+    def arm(self) -> None:
+        """Our dial went out: the next ACTIVE is the call to bridge."""
+        self._armed.set()
+
     # ------------------------------------------------------------- ears
 
     def start(self, on_block: Callable[[bytes], None]) -> None:
@@ -90,7 +103,7 @@ class PhoneCallAudio:
 
     def _wait_answered(self) -> bool:
         while not self._stop.is_set():
-            if self.phone.call_state() == ACTIVE:
+            if self._armed.is_set() and self.phone.call_state() == ACTIVE:
                 return True
             self._stop.wait(self._poll_s)
         return False
@@ -106,20 +119,23 @@ class PhoneCallAudio:
             line = (self._proc.stdout.readline() or "").strip()
             if line == "HELPER_MISMATCH":
                 logger.error("callaudio.dex on the phone is not this build; refusing to run it")
+                self.failed = True
                 return
             if not line.startswith("LISTENING"):
                 logger.error("Call audio helper did not start: %r", line[:200])
+                self.failed = True
                 return
             self.phone.forward(self.phone.port)
+            self._forwarded = True
             sock = self._connect(("127.0.0.1", self.phone.port), timeout=5)
+            self._sock = sock
+            if self._stop.is_set():
+                return  # stopped while the helper started: the finally closes it all
             sock.settimeout(None)
             try:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass  # a socketpair in tests
-            self._sock = sock
-            if self._stop.is_set():
-                return
             self.connected_at = time.monotonic()
             logger.info("Phone audio bridge connected")
             threading.Thread(target=self._log_helper, daemon=True).start()
@@ -135,9 +151,16 @@ class PhoneCallAudio:
                     pcm, pending = pending[:_BLOCK], pending[_BLOCK:]
                     self._heard(pcm)
                     on_block(pcm)
+            if not self._stop.is_set():
+                logger.error("The phone closed the call audio while the call was up")
+                self.failed = True
         except Exception:
             if not self._stop.is_set():
                 logger.exception("Phone audio bridge failed")
+                self.failed = True
+        finally:
+            if self._stop.is_set() or self.failed:
+                self._release()
 
     def _heard(self, pcm: bytes) -> None:
         self.blocks += 1
@@ -222,27 +245,40 @@ class PhoneCallAudio:
 
     # ------------------------------------------------------------- end
 
+    def _release(self) -> None:
+        """
+        Close what exists right now; safe to call from stop() and from the
+        bridge thread, in either order. A stop that lands while the helper is
+        still starting would otherwise leave the socket, the adb forward and
+        the phone-side helper (with his mic muted) behind.
+        """
+        with self._release_lock:
+            sock, self._sock = self._sock, None
+            if sock is not None:
+                for close in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
+                    try:
+                        close()
+                    except OSError:
+                        pass
+            proc, self._proc = self._proc, None
+            if proc is not None:
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            if self._forwarded:
+                self._forwarded = False
+                self.phone.unforward(self.phone.port)
+            wav, self._wav = self._wav, None
+            if wav is not None:
+                wav.close()
+
     def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
         self._stop.set()
-        sock = self._sock
-        if sock is not None:
-            for close in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
-                try:
-                    close()
-                except OSError:
-                    pass
-        if self._proc is not None:
-            try:
-                self._proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-        if self._proc is not None or sock is not None:
-            self.phone.unforward(self.phone.port)
-        if self._wav is not None:
-            self._wav.close()
+        self._release()
         logger.info("Phone audio: %d blocks heard, peak %.4f, %.1fs of her voice injected; response gaps %s",
                     self.blocks, self.peak, self.injected_s, self.gaps)
 

@@ -10,8 +10,8 @@ from services.phone_call_audio import PLAY_RATE, REC_RATE, PhoneCallAudio, _LEAD
 
 
 class FakeProc:
-    def __init__(self):
-        self.stdout = _Lines(["LISTENING 27183\n"])
+    def __init__(self, first="LISTENING 27183\n"):
+        self.stdout = _Lines([first])
         self.stderr = iter([])
         self.killed = False
 
@@ -33,8 +33,9 @@ class _Lines:
 class FakePhone:
     port = 27183
 
-    def __init__(self, states, mute=False):
+    def __init__(self, states, mute=False, first="LISTENING 27183\n"):
         self.states = list(states)
+        self.first = first
         self.mute_phone_mic = mute
         self.helper_args = []
         self.helper_at_state = []
@@ -46,7 +47,8 @@ class FakePhone:
     def helper(self, *args):
         self.helper_args.append(args)
         self.helper_at_state.append(self.states[0])
-        return FakeProc()
+        self.proc = FakeProc(self.first)
+        return self.proc
 
     def forward(self, port):
         self.forwarded.append(port)
@@ -60,11 +62,19 @@ class _Base(unittest.TestCase):
         self.ours, self.phone_end = socket.socketpair()
         self.addCleanup(self.phone_end.close)
 
-    def bridge(self, states=(ACTIVE,), mute=False):
-        self.phone = FakePhone(states, mute=mute)
-        bridge = PhoneCallAudio(self.phone, connect=lambda addr, timeout=None: self.ours, poll_s=0.01)
+    def bridge(self, states=(ACTIVE,), mute=False, armed=True, first="LISTENING 27183\n", connect=None):
+        self.phone = FakePhone(states, mute=mute, first=first)
+        bridge = PhoneCallAudio(self.phone, connect=connect or (lambda addr, timeout=None: self.ours), poll_s=0.01)
+        if armed:
+            bridge.arm()
         self.addCleanup(bridge.stop)
         return bridge
+
+    def wait_for(self, check, within=2.0):
+        deadline = time.monotonic() + within
+        while not check() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return check()
 
     def wait_connected(self, bridge, within=2.0):
         deadline = time.monotonic() + within
@@ -178,6 +188,53 @@ class FacesTests(_Base):
         speaker.stop()
         self.assertEqual(self.phone.unforwarded, [27183])
         self.assertEqual(capture.source, "phone downlink")
+
+
+class FinalReviewTests(_Base):
+    """Found by the whole-branch review, 2026-10-13."""
+
+    def test_the_bridge_waits_for_the_call_it_placed(self):
+        # His own call already ACTIVE must not get her: only a dial arms it.
+        bridge = self.bridge(states=(ACTIVE,), armed=False)
+        bridge.start(lambda pcm: None)
+        time.sleep(0.1)
+        self.assertEqual(self.phone.helper_args, [])
+        bridge.arm()
+        self.wait_connected(bridge)
+
+    def test_a_helper_that_does_not_start_fails_the_call(self):
+        bridge = self.bridge(first="HELPER_MISMATCH\n")
+        bridge.start(lambda pcm: None)
+        self.assertTrue(self.wait_for(lambda: bridge.failed))
+
+    def test_a_bridge_the_phone_closes_mid_call_fails_the_call(self):
+        bridge = self.bridge()
+        bridge.start(lambda pcm: None)
+        self.wait_connected(bridge)
+        self.phone_end.close()
+        self.assertTrue(self.wait_for(lambda: bridge.failed))
+
+    def test_a_stopped_bridge_is_not_a_failed_one(self):
+        bridge = self.bridge()
+        bridge.start(lambda pcm: None)
+        self.wait_connected(bridge)
+        bridge.stop()
+        time.sleep(0.05)
+        self.assertFalse(bridge.failed)
+
+    def test_a_stop_during_startup_leaves_nothing_open(self):
+        holder = {}
+
+        def connect(addr, timeout=None):
+            holder["bridge"].stop()  # they hung up while the helper started
+            return self.ours
+
+        bridge = self.bridge(connect=connect)
+        holder["bridge"] = bridge
+        bridge.start(lambda pcm: None)
+        self.assertTrue(self.wait_for(lambda: self.ours.fileno() == -1))
+        self.assertTrue(self.wait_for(lambda: self.phone.unforwarded == [27183]))
+        self.assertFalse(bridge.answered())
 
 
 if __name__ == "__main__":

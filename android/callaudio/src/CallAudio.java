@@ -254,7 +254,19 @@ public final class CallAudio {
         ServerSocket server = new ServerSocket(port, 1, InetAddress.getByName("127.0.0.1"));
         System.out.println("LISTENING " + port);
         System.out.flush();
-        Socket sock = server.accept();
+        // The laptop connects within a second of LISTENING. If it never does
+        // (it stopped while the helper started), exit rather than wait forever
+        // holding the port and, later, his muted mic (final review 2026-10-13).
+        server.setSoTimeout(20000);
+        Socket sock;
+        try {
+            sock = server.accept();
+        } catch (java.net.SocketTimeoutException e) {
+            log("no client within 20 s, exiting");
+            server.close();
+            System.exit(5);
+            return;
+        }
         sock.setTcpNoDelay(true);
         log("client connected");
 

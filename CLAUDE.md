@@ -2158,6 +2158,19 @@ Found live, in order, and none of it guessable:
   its sha256 is checked against the local build in the same shell command that `exec`s
   it (`HELPER_MISMATCH` otherwise, spoken). Discovery never returns a `:5555` device: the
   Mi Box is on the same adb server.
+- **Guards from the final review (2026-10-13), each with a test:** the cached serial is
+  re-checked against `adb devices` before every command (Wireless debugging takes a new
+  port on each reboot, and a stale serial read as LOCKED_DOWN, the wrong fix, until a
+  restart); a dial over a call already up is `BUSY` and the bridge only opens once
+  PhoneService arms it after ITS dial, so his own call is never taken over; a dial that
+  never shows in the call state is hung up before `NOT_PLACED`; a helper that dies or
+  never starts sets `PhoneCallAudio.failed` and ends the call instead of leaving it
+  open in silence; a stop during the helper's start-up closes the socket, the forward
+  and the helper (which also exits if nobody connects within 20 s); a second `ring`
+  while one plays is `ALREADY_PLAYING` (two would leave the alarm at max); and the
+  agent believes the phone's hang-up at once (`live_if_heard_s=0`; the 8 s grace was
+  for Phone Link's vanishing End button). The mic mute is optional: a mute that throws
+  is logged and the call continues (an uncaught one killed a live call's audio).
 - **A downlink recording** goes to `debug/phone_adb/<call_id>-downlink.wav` when
   `logging.include_transcripts` is on, and every turn logs a "Response gap" (their last
   sound to her first audio) for latency work.

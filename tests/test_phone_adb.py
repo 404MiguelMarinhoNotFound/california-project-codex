@@ -46,6 +46,8 @@ class FakeAdb:
             return "1 file pushed"
         if len(args) >= 3 and args[0] == "-s" and args[2] == "forward":
             return ""
+        if args[0] == "-s" and args[1] not in self.devices and args[1] not in self.mdns:
+            return ""  # "device not found" goes to stderr
         cmd = args[3] if len(args) > 3 and args[2] == "shell" else ""
         if "CallAudio" in cmd:
             if self.swapped or self.local_hash not in cmd or "exec app_process" not in cmd:
@@ -60,7 +62,8 @@ class FakeAdb:
             return f"{self.remote_hash}  /data/local/tmp/callaudio.dex\n"
         if "mPreciseCallState" in cmd:
             state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
-            return f"    mPreciseCallState=Ringing call state: 0, Foreground call state: {state}, Background call state: 0\n"
+            line = "    mPreciseCallState=Ringing call state: 0, Foreground call state: {}, Background call state: 0\n"
+            return line.format(IDLE) + line.format(state)  # one block per modem; the SIM in use second
         return ""
 
     def shell_cmds(self):
@@ -71,9 +74,13 @@ class FakeProc:
     def __init__(self, first_line: str):
         self.stdout = iter([first_line + "\n"])
         self.stderr = iter([])
+        self.killed = False
 
     def poll(self):
-        return None
+        return 0 if self.killed else None
+
+    def kill(self):
+        self.killed = True
 
 
 class _Base(unittest.TestCase):
@@ -89,9 +96,12 @@ class _Base(unittest.TestCase):
         self.popened: list[str] = []
         self.ring_line = "RINGING"
 
+        self.procs = []
+
         def popen(argv, **kw):
             self.popened.append(argv[-1])
-            return FakeProc(self.ring_line)
+            self.procs.append(FakeProc(self.ring_line))
+            return self.procs[-1]
 
         self.popen = popen
         # The whole file must never reach a real adb.
@@ -151,7 +161,7 @@ class DiscoveryTests(_Base):
     def test_a_configured_serial_skips_discovery(self):
         phone = self.phone(serial=PHONE)
         self.assertEqual(phone.ready(), "OK")
-        self.assertNotIn(["adb", "devices"], self.adb.calls)
+        self.assertNotIn(["adb", "mdns", "services"], self.adb.calls)
 
 
 class ReadyTests(_Base):
@@ -216,7 +226,7 @@ class DialTests(_Base):
 
     def test_a_helper_error_is_not_placed(self):
         self.adb.replies["dial"] = "ERROR SecurityException: CALL_PHONE permission required"
-        self.adb.states = [DIALING]
+        self.adb.states = [IDLE, DIALING]
         self.assertEqual(self.phone().dial("+351912345678"), "NOT_PLACED")
 
     def test_only_digits_are_dialled(self):
@@ -228,7 +238,7 @@ class DialTests(_Base):
 
 class InCallTests(_Base):
     def test_in_call_is_unknown_until_a_call_was_seen(self):
-        self.adb.states = [DIALING]
+        self.adb.states = [IDLE, DIALING]
         phone = self.phone()
         phone.dial("+351912345678")
         self.adb.states = [IDLE]
@@ -258,6 +268,53 @@ class PlaySoundTests(_Base):
     def test_play_sound_ring_failed(self):
         self.ring_line = "ERROR NullPointerException: no context"
         self.assertEqual(self.phone().play_sound(), "RING_FAILED")
+
+
+class FinalReviewTests(_Base):
+    """Found by the whole-branch review, 2026-10-13."""
+
+    def test_a_phone_that_moved_port_is_found_again(self):
+        # Wireless debugging takes a new port on every reboot or toggle.
+        phone = self.phone()
+        self.assertEqual(phone.ready(), "OK")
+        moved = "192.168.1.101:40000"  # config-literal: adb devices output shape, not the deployment
+        self.adb.devices = f"List of devices attached\n{moved}\tdevice\n"
+        self.adb.mdns = f"adb-x\t_adb-tls-connect._tcp\t{moved}\n"
+        self.assertEqual(phone.ready(), "OK")
+        self.assertEqual(phone.serial, moved)
+
+    def test_a_vanished_phone_is_no_phone_not_locked_down(self):
+        phone = self.phone()
+        self.assertEqual(phone.ready(), "OK")
+        self.adb.devices = "List of devices attached\n"
+        self.adb.mdns = ""
+        self.assertEqual(phone.ready(), "NO_PHONE")
+        self.assertEqual(phone.dial("+351912345678"), "NO_PHONE")
+
+    def test_a_dial_that_never_registers_is_hung_up(self):
+        self.adb.states = [IDLE]
+        self.assertEqual(self.phone().dial("+351912345678"), "NOT_PLACED")
+        self.assertTrue(any("CallAudio hangup" in c for c in self.adb.shell_cmds()))
+
+    def test_call_state_reads_every_modem(self):
+        self.adb.states = [ALERTING]
+        self.assertEqual(self.phone().call_state(), ALERTING)
+
+    def test_dialing_over_a_call_already_up_is_busy(self):
+        self.adb.states = [ACTIVE]
+        self.assertEqual(self.phone().dial("+351912345678"), "BUSY")
+        self.assertFalse(any("CallAudio dial" in c for c in self.adb.shell_cmds()))
+
+    def test_ring_again_while_ringing_starts_no_second_ring(self):
+        phone = self.phone()
+        self.assertEqual(phone.play_sound(), "PLAYING")
+        self.assertEqual(phone.play_sound(), "ALREADY_PLAYING")
+        self.assertEqual(len(self.procs), 1)
+
+    def test_a_failed_ring_is_killed(self):
+        self.ring_line = "ERROR NullPointerException"
+        self.assertEqual(self.phone().play_sound(), "RING_FAILED")
+        self.assertTrue(self.procs[-1].killed)
 
 
 if __name__ == "__main__":

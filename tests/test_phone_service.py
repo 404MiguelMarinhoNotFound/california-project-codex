@@ -40,15 +40,20 @@ class FakeDialer:
         return "ENDED"
 
     def audio(self, record_path=""):
-        self.audio_made = FakeAudio(record_path)
+        self.audio_made = FakeAudio(record_path, failed=getattr(self, "audio_failed", False))
         return self.audio_made
 
 
 class FakeAudio:
     """What AdbPhone.audio() hands PhoneService: the call's two faces + the answer signal."""
 
-    def __init__(self, record_path):
+    def __init__(self, record_path, failed=False):
         self.record_path = record_path
+        self.failed = failed
+        self.armed = False
+
+    def arm(self):
+        self.armed = True
 
     def capture(self):
         return "capture-face"
@@ -75,6 +80,7 @@ class FakeAgent:
             answered=None):
         self.prompts.append(prompt)
         self.answered = answered
+        self.still_connected = still_connected
         if self.raise_exc:
             raise self.raise_exc
         if dial is not None and not dial():
@@ -315,6 +321,7 @@ class CallLifecycleTests(_Base):
             "NO_INTERCEPTION": "call audio",
             "HELPER_MISMATCH": "isn't the one I installed",
             "NOT_PLACED": "never started",
+            "BUSY": "already on a call",
         }
         for status, words in reasons.items():
             with self.subTest(status=status):
@@ -350,6 +357,22 @@ class CallLifecycleTests(_Base):
         self._place(svc)
         self.assertEqual(self.agent.answered, self.dialer.audio_made.answered)
 
+    def test_the_bridge_is_armed_only_by_a_placed_call(self):
+        svc = self._svc()
+        self._place(svc)
+        self.assertTrue(self.dialer.audio_made.armed)
+        self.dialer = FakeDialer(dial_status="BUSY")
+        svc = self._svc()
+        self._place(svc)
+        self.assertFalse(self.dialer.audio_made.armed)
+
+    def test_a_failed_bridge_ends_the_call_and_says_why(self):
+        self.dialer.audio_failed = True
+        svc = self._svc()
+        self._place(svc)
+        self.assertFalse(self.agent.still_connected())
+        self.assertIn("call audio", svc.pop_report().result.error)
+
     def test_the_real_agent_is_wired_to_the_phone_audio(self):
         svc = self._svc()
         svc._agent_factory = None
@@ -360,6 +383,8 @@ class CallLifecycleTests(_Base):
         self.assertEqual(kwargs["capture_factory"](), "capture-face")
         self.assertEqual(kwargs["speaker_factory"](), "speaker-face")
         self.assertNotIn("cable_device", kwargs)
+        # The phone's call state is authoritative: no "they spoke recently" grace.
+        self.assertEqual(kwargs["live_if_heard_s"], 0)
 
     def test_a_dialer_that_fails_to_build_still_reports_and_frees_the_line(self):
         svc = self._svc()
@@ -524,6 +549,11 @@ class FindPhoneTests(_Base):
         self.assertIn("ringing", result.message)
         self.dialer.play_sound.assert_called_once_with()
         self.assertEqual(self.dialer.dialed, [])
+
+    def test_ring_again_while_it_rings_is_success(self):
+        result = self._find("ALREADY_PLAYING")
+        self.assertTrue(result)
+        self.assertIn("already", result.message)
 
     def test_each_failure_has_its_own_line(self):
         lines = set()

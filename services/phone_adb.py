@@ -12,10 +12,11 @@ needs a different fix and PhoneService speaks each one:
 
     OK               ready
     NO_PHONE         not found on ADB: Wireless debugging is off / phone away
+    BUSY             a call is already up on the phone; nothing dialled
     LOCKED_DOWN      HyperOS "USB debugging (Security settings)" is off
     NO_INTERCEPTION  the phone will not hand over call audio
     HELPER_MISMATCH  the helper on the phone is not this build; not run
-    DIALED / NOT_PLACED, ENDED / NO_CALL, PLAYING / RING_FAILED
+    DIALED / NOT_PLACED, ENDED / NO_CALL, PLAYING / ALREADY_PLAYING / RING_FAILED
 
 Construction runs nothing. Every adb call goes through `runner`, every
 long-running helper through `popen`, so tests never touch a real phone.
@@ -84,6 +85,7 @@ class AdbPhone:
         self._hash = ""
         self._interceptable: bool | None = None
         self._seen = False
+        self._ring: subprocess.Popen | None = None
 
     # ------------------------------------------------------------- adb
 
@@ -123,6 +125,20 @@ class AdbPhone:
         if not self.serial:
             self.serial = self._discover()
         return bool(self.serial)
+
+    def _still_attached(self) -> bool:
+        """
+        Is the cached serial still a live adb device? Wireless debugging takes
+        a new port on every reboot or toggle, and a shell to a stale serial
+        answers nothing (adb's "device not found" goes to stderr): that read as
+        an empty Security-settings property and spoke LOCKED_DOWN, the wrong
+        fix, until a restart (final review, 2026-10-13).
+        """
+        for line in self._adb("devices").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == self.serial and parts[1] == "device":
+                return True
+        return False
 
     # ------------------------------------------------------------- helper
 
@@ -172,6 +188,8 @@ class AdbPhone:
 
     def ready(self, need_interception: bool = True) -> str:
         """OK, or the first thing standing between us and the phone."""
+        if self.serial and not self._still_attached():
+            self.serial = ""  # moved port or gone: find it again
         if not self._ensure_serial():
             return "NO_PHONE"
         self._push_helper()
@@ -193,9 +211,14 @@ class AdbPhone:
     def call_state(self) -> int | None:
         if not self._ensure_serial():
             return None
-        out = self.sh("dumpsys telephony.registry | grep -m1 mPreciseCallState")
-        match = re.search(r"Foreground call state: (\d+)", out)
-        return int(match.group(1)) if match else None
+        # One block per modem: on a dual-SIM phone the live call can be in any
+        # of them, so the busiest foreground state wins, never just the first.
+        out = self.sh("dumpsys telephony.registry | grep mPreciseCallState")
+        states = [int(m) for m in re.findall(r"Foreground call state: (\d+)", out)]
+        if not states:
+            return None
+        live = [st for st in states if st in _LIVE]
+        return live[0] if live else states[0]
 
     def dial(self, number: str) -> str:
         if not re.fullmatch(r"\+?\d{3,15}", number or ""):
@@ -203,6 +226,10 @@ class AdbPhone:
         status = self.ready()
         if status != "OK":
             return status
+        # A call already up (his own, or one on hold) must not be dialled over:
+        # the bridge would open on it and the hang-up would end it.
+        if self.call_state() in _LIVE:
+            return "BUSY"
         self._seen = False
         out = self._run_helper("dial", number)
         if "HELPER_MISMATCH" in out:
@@ -216,6 +243,10 @@ class AdbPhone:
                 self._seen = True
                 return "DIALED"
             self._sleep(0.3)
+        # Telecom took the call but it never showed in the state (a SIM picker,
+        # a slow registration): it may still ring someone with nobody on the
+        # line, so end it before saying it was not placed.
+        self._run_helper("hangup")
         return "NOT_PLACED"
 
     def in_call(self) -> bool | None:
@@ -240,6 +271,11 @@ class AdbPhone:
 
     def play_sound(self, seconds: int = 20) -> str:
         """Find my phone. PLAYING once the beep started; it runs on for `seconds`."""
+        # "Again" while it still rings must not start a second ring: the second
+        # would read the max volume the first set and restore THAT, leaving
+        # his alarm at full volume (final review, 2026-10-13).
+        if self._ring is not None and self._ring.poll() is None:
+            return "ALREADY_PLAYING"
         status = self.ready(need_interception=False)
         if status != "OK":
             return status
@@ -255,8 +291,13 @@ class AdbPhone:
         except queue.Empty:
             line = ""
         if line == "RINGING":
+            self._ring = proc
             return "PLAYING"
         logger.warning("Ring did not start: %r", line[:200])
+        try:
+            proc.kill()  # a slow start must not ring later anyway
+        except OSError:
+            pass
         return "RING_FAILED"
 
     def audio(self, record_path: str = ""):

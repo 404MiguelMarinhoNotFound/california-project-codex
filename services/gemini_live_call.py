@@ -217,6 +217,7 @@ class GeminiLiveAgent:
         speaker_factory: Callable,
         client_factory: Callable | None = None,
         on_line: Callable | None = None,
+        live_if_heard_s: float | None = None,
     ):
         self.client_kwargs = dict(client_kwargs)
         # Called with (index, who, text, at) as each piece of transcript
@@ -230,6 +231,10 @@ class GeminiLiveAgent:
         # Her ears and mouth: PhoneCallAudio's capture() and speaker() faces.
         self.capture_factory = capture_factory
         self.speaker_factory = speaker_factory
+        # How long a "they hung up" reading is doubted after they last spoke.
+        # Phone Link's End button vanished mid-call; the phone's own call state
+        # does not, so PhoneService passes 0 and a hang-up lands at once.
+        self.live_if_heard_s = _LIVE_IF_HEARD_S if live_if_heard_s is None else float(live_if_heard_s)
 
     def _config(self, prompt: str):
         from google.genai import types
@@ -389,7 +394,7 @@ class GeminiLiveAgent:
                         elif still_connected is not None:
                             connected = await asyncio.to_thread(still_connected)
                             them_at = clock.get("them_at")
-                            heard_recently = them_at is not None and time.monotonic() - them_at < _LIVE_IF_HEARD_S
+                            heard_recently = them_at is not None and time.monotonic() - them_at < self.live_if_heard_s
                             if connected is False and heard_recently:
                                 # 2026-10-08: Phone Link's End button vanished
                                 # 20s into a live call. Someone talking means
