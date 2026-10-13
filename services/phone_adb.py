@@ -59,6 +59,65 @@ def _popen(argv: list[str], **kw) -> subprocess.Popen:
                             encoding="utf-8", errors="replace", **kw)
 
 
+_ROW = re.compile(r"Row: \d+ ")
+_NO_RESULT = "No result found."
+_SAFE_URI = re.compile(r"[\w:/.]+")
+_SAFE_KEY = re.compile(r"\w+")
+
+
+def parse_content_rows(text: str, keys: list[str]) -> tuple[list[dict[str, str | None]], int]:
+    """
+    Rows of `adb shell content query --projection a:b:c` as dicts, plus how
+    many `Row:` lines could not be parsed.
+
+    The tool prints `Row: N a=1, b=2, c=3` with nothing escaped, so a value
+    can hold ", " or "=" or even a newline. Each value therefore runs up to
+    the FIRST `, <next key>=` after it, and the last key takes the rest of the
+    line plus any continuation lines. That is only safe with **at most one
+    free-text column, and it goes last** in `keys`: a free-text value in the
+    middle could contain the next key's separator. `NULL` becomes None.
+    """
+    rows: list[dict[str, str | None]] = []
+    unparsed = 0
+    current: dict[str, str | None] | None = None
+    lines = (text or "").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()  # the output's own final newline, not an empty line of a value
+    for line in lines:
+        line = line[:-1] if line.endswith("\r") else line
+        start = _ROW.match(line)
+        if not start:
+            # A newline inside the last value. Before any row (or after one
+            # that could not be parsed) there is nothing to continue.
+            if current is not None:
+                last = keys[-1]
+                current[last] = (current[last] or "") + "\n" + line
+            continue
+        current = None
+        rest = line[start.end():]
+        if not rest.startswith(keys[0] + "="):
+            unparsed += 1
+            continue
+        row: dict[str, str] = {}
+        pos = len(keys[0]) + 1
+        for i, key in enumerate(keys):
+            if i == len(keys) - 1:
+                row[key] = rest[pos:]
+                break
+            sep = f", {keys[i + 1]}="
+            end = rest.find(sep, pos)
+            if end < 0:
+                break
+            row[key] = rest[pos:end]
+            pos = end + len(sep)
+        if len(row) != len(keys):
+            unparsed += 1
+            continue
+        current = {k: (None if v == "NULL" else v) for k, v in row.items()}
+        rows.append(current)
+    return rows, unparsed
+
+
 class AdbPhone:
     def __init__(
         self,
@@ -86,6 +145,19 @@ class AdbPhone:
         self._interceptable: bool | None = None
         self._seen = False
         self._ring: subprocess.Popen | None = None
+        self.last_status = ""  # query()'s ready() status, or UNREADABLE
+
+    @classmethod
+    def from_config(cls, config: dict, **kw) -> "AdbPhone":
+        """Built from `phone.adb` in config.yaml; `kw` (runner=, popen=, ...) passes through."""
+        adb_cfg = ((config or {}).get("phone", {}) or {}).get("adb", {}) or {}
+        return cls(
+            adb_path=str(adb_cfg.get("path") or "adb"),
+            serial=str(adb_cfg.get("serial") or ""),
+            port=int(adb_cfg.get("port") or 27183),
+            mute_phone_mic=adb_cfg.get("mute_phone_mic", True) is not False,
+            **kw,
+        )
 
     # ------------------------------------------------------------- adb
 
@@ -186,13 +258,14 @@ class AdbPhone:
 
     # ------------------------------------------------------------- readiness
 
-    def ready(self, need_interception: bool = True) -> str:
+    def ready(self, need_interception: bool = True, need_helper: bool = True) -> str:
         """OK, or the first thing standing between us and the phone."""
         if self.serial and not self._still_attached():
             self.serial = ""  # moved port or gone: find it again
         if not self._ensure_serial():
             return "NO_PHONE"
-        self._push_helper()
+        if need_helper:
+            self._push_helper()
         if self.sh("getprop persist.security.adbinput").strip() != "1":
             return "LOCKED_DOWN"
         if need_interception:
@@ -205,6 +278,38 @@ class AdbPhone:
             if self._interceptable is not True:
                 return "NO_INTERCEPTION"
         return "OK"
+
+    # ------------------------------------------------------------- reading
+
+    def query(self, uri: str, projection: list[str], timeout: float = 30.0) -> list[dict[str, str | None]] | None:
+        """
+        Read-only `content query` against one of the phone's providers.
+
+        A list of rows (`[]` when the provider says "No result found."), or
+        None when the phone could not be read; `last_status` then says why
+        (NO_PHONE, LOCKED_DOWN, or UNREADABLE for output with neither rows nor
+        the no-result line, e.g. a provider error). Needs no helper and pushes
+        nothing. The URI and keys are checked so nothing reaches the shell but
+        a query; see `parse_content_rows` for the one-free-text-column rule.
+        """
+        if not _SAFE_URI.fullmatch(uri or ""):
+            raise ValueError(f"unsafe content URI: {uri!r}")
+        if not projection or not all(_SAFE_KEY.fullmatch(k or "") for k in projection):
+            raise ValueError(f"unsafe projection: {projection!r}")
+        self.last_status = self.ready(need_interception=False, need_helper=False)
+        if self.last_status != "OK":
+            return None
+        out = self.sh(f"content query --uri {uri} --projection {':'.join(projection)}", timeout=timeout)
+        rows, unparsed = parse_content_rows(out, projection)
+        if unparsed:
+            logger.warning("content query: %d row(s) could not be parsed", unparsed)
+        if rows:
+            return rows
+        if any(line.strip() == _NO_RESULT for line in out.splitlines()):
+            return []
+        self.last_status = "UNREADABLE"
+        logger.warning("content query: unreadable output (%d chars)", len(out))
+        return None
 
     # ------------------------------------------------------------- the dialer interface
 

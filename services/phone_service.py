@@ -381,10 +381,10 @@ class PhoneService:
         if self._dialer is None:
             from services.phone_adb import AdbPhone
 
-            self._dialer = AdbPhone(
-                adb_path=self.adb_path, serial=self.adb_serial, port=self.adb_port,
-                mute_phone_mic=self.mute_phone_mic,
-            )
+            self._dialer = AdbPhone.from_config({"phone": {"adb": {
+                "path": self.adb_path, "serial": self.adb_serial, "port": self.adb_port,
+                "mute_phone_mic": self.mute_phone_mic,
+            }}})
         return self._dialer
 
     def _make_agent(self, audio=None):

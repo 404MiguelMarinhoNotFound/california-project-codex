@@ -8,7 +8,8 @@ import unittest
 from unittest import mock
 
 from services import phone_adb
-from services.phone_adb import ACTIVE, ALERTING, DIALING, IDLE, AdbPhone
+from services.phone_adb import ACTIVE, ALERTING, DIALING, IDLE, AdbPhone, parse_content_rows
+from tests.config_fixture import config_for_tests
 
 PHONE = "192.168.1.101:38731"  # config-literal: adb devices/mdns output shape, not the deployment
 MDNS_NAME = "adb-4POJ4DWOJBXWIVLB-lmuzi2._adb-tls-connect._tcp"
@@ -27,6 +28,7 @@ class FakeAdb:
         self.states = [IDLE]
         self.replies = {"dial": "DIALED", "hangup": "ENDED=false", "check": "INTERCEPTABLE=true\nAUDIO_MODE=0\nTELEPHONY_TX=18/x/"}
         self.swapped = False
+        self.content = "No result found.\n"
         self.calls: list[list[str]] = []
 
     def __call__(self, argv, timeout):
@@ -56,6 +58,8 @@ class FakeAdb:
             if mode == "check":
                 return self.replies["check"].replace("true", self.interceptable)
             return self.replies.get(mode, "")
+        if cmd.startswith("content query"):
+            return self.content
         if "persist.security.adbinput" in cmd:
             return self.gate + "\n"
         if cmd.startswith("sha256sum"):
@@ -315,6 +319,155 @@ class FinalReviewTests(_Base):
         self.ring_line = "ERROR NullPointerException"
         self.assertEqual(self.phone().play_sound(), "RING_FAILED")
         self.assertTrue(self.procs[-1].killed)
+
+
+class ContentRowTests(unittest.TestCase):
+    KEYS = ["contact_id", "data2", "is_super_primary", "account_type", "data1", "display_name"]
+
+    def test_rows_parse_with_crlf_and_null(self):
+        text = ("Row: 0 contact_id=7, data2=2, is_super_primary=0, account_type=com.google, "
+                "data1=+351 912 000 001, display_name=Ana Exemplo\r\n"
+                "Row: 1 contact_id=8, data2=NULL, is_super_primary=1, account_type=NULL, "
+                "data1=912000002, display_name=Rui \U0001faf0\U0001f3fd\r\n")
+        rows, bad = parse_content_rows(text, self.KEYS)
+        self.assertEqual(bad, 0)
+        self.assertEqual(rows[0]["display_name"], "Ana Exemplo")
+        self.assertIsNone(rows[1]["data2"])
+        self.assertEqual(rows[1]["display_name"], "Rui \U0001faf0\U0001f3fd")
+
+    def test_a_name_with_commas_and_equals_is_kept_whole(self):
+        text = "Row: 0 contact_id=1, data2=2, is_super_primary=0, account_type=x, data1=1, display_name=Silva, Ana = chefe, data1=9\n"
+        rows, _ = parse_content_rows(text, self.KEYS)
+        self.assertEqual(rows[0]["display_name"], "Silva, Ana = chefe, data1=9")
+
+    def test_a_number_with_a_pause_comma_is_kept_whole(self):
+        text = "Row: 0 contact_id=1, data2=2, is_super_primary=0, account_type=x, data1=212000000,,12, display_name=Loja\n"
+        rows, _ = parse_content_rows(text, self.KEYS)
+        self.assertEqual(rows[0]["data1"], "212000000,,12")
+
+    def test_a_newline_in_the_last_value_continues_the_row(self):
+        text = "Row: 0 contact_id=1, data2=2, is_super_primary=0, account_type=x, data1=1, display_name=Ana\nda Praia\n"
+        rows, _ = parse_content_rows(text, self.KEYS)
+        self.assertEqual(rows[0]["display_name"], "Ana\nda Praia")
+
+    def test_a_malformed_row_is_counted_not_raised(self):
+        rows, bad = parse_content_rows("Row: 0 contact_id=1, display_name=x\n", self.KEYS)
+        self.assertEqual((rows, bad), ([], 1))
+
+    def test_an_empty_line_inside_the_last_value_is_kept(self):
+        text = "Row: 0 contact_id=1, data2=2, is_super_primary=0, account_type=x, data1=1, display_name=a\n\nb\n"
+        rows, _ = parse_content_rows(text, self.KEYS)
+        self.assertEqual(rows[0]["display_name"], "a\n\nb")
+
+    def test_text_before_the_first_row_is_ignored(self):
+        rows, bad = parse_content_rows("noise\nRow: 0 contact_id=1, data2=2, is_super_primary=0, "
+                                       "account_type=x, data1=1, display_name=Ana\n", self.KEYS)
+        self.assertEqual((len(rows), bad), (1, 0))
+
+
+class QueryTests(_Base):
+    URI = "content://com.android.contacts/data/phones"
+    KEYS = ["contact_id", "data1", "display_name"]
+    TWO_ROWS = ("Row: 0 contact_id=1, data1=912000001, display_name=Ana Exemplo\n"
+                "Row: 1 contact_id=2, data1=912000002, display_name=Rui Exemplo\n")
+
+    def test_query_returns_rows(self):
+        self.adb.content = self.TWO_ROWS
+        phone = self.phone()
+        rows = phone.query(self.URI, self.KEYS)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1]["display_name"], "Rui Exemplo")
+        self.assertEqual(phone.last_status, "OK")
+        self.assertIn(f"content query --uri {self.URI} --projection contact_id:data1:display_name",
+                      self.adb.shell_cmds())
+
+    def test_no_result_is_an_empty_list(self):
+        self.adb.content = "No result found.\n"
+        phone = self.phone()
+        self.assertEqual(phone.query(self.URI, self.KEYS), [])
+        self.assertEqual(phone.last_status, "OK")
+
+    def test_provider_error_is_none(self):
+        self.adb.content = ("Error while accessing provider:com.android.contacts\n"
+                            "java.lang.SecurityException: Permission Denial\n")
+        phone = self.phone()
+        with self.assertLogs("services.phone_adb", "WARNING") as logs:
+            self.assertIsNone(phone.query(self.URI, self.KEYS))
+        self.assertEqual(phone.last_status, "UNREADABLE")
+        self.assertNotIn("SecurityException", "".join(logs.output))  # a length, not the phone's text
+
+    def test_no_phone_is_none(self):
+        self.adb.devices = "List of devices attached\n192.168.1.200:5555\tdevice\n"
+        self.adb.mdns = "List of discovered mdns services\n"
+        phone = self.phone()
+        self.assertIsNone(phone.query(self.URI, self.KEYS))
+        self.assertEqual(phone.last_status, "NO_PHONE")
+        self.assertFalse(any(c.startswith("content") for c in self.adb.shell_cmds()))
+
+    def test_locked_down_is_none(self):
+        self.adb.gate = "0"
+        phone = self.phone()
+        self.assertIsNone(phone.query(self.URI, self.KEYS))
+        self.assertEqual(phone.last_status, "LOCKED_DOWN")
+        self.assertFalse(any(c.startswith("content") for c in self.adb.shell_cmds()))
+
+    def test_query_never_pushes_or_runs_the_helper(self):
+        self.adb.remote_hash = "0" * 64  # a stale helper must not be pushed by a read either
+        self.adb.content = self.TWO_ROWS
+        self.phone().query(self.URI, self.KEYS)
+        self.assertFalse(any("push" in a for a in self.adb.calls))
+        for cmd in self.adb.shell_cmds():
+            self.assertNotIn("CallAudio", cmd)
+            self.assertNotIn("sha256sum", cmd)
+
+    def test_query_is_read_only(self):
+        self.adb.content = self.TWO_ROWS
+        self.phone().query(self.URI, self.KEYS)
+        cmds = self.adb.shell_cmds()
+        self.assertTrue(cmds)
+        for cmd in cmds:
+            self.assertTrue(cmd.startswith(("getprop", "content query")), cmd)
+            for verb in ("insert", "update", "delete"):
+                self.assertNotIn(verb, cmd)
+
+    def test_query_after_a_port_change_rediscovers(self):
+        self.adb.content = self.TWO_ROWS
+        phone = self.phone()
+        phone.serial = "192.168.1.101:40000"  # config-literal: adb devices output shape, not the deployment
+        self.assertEqual(len(phone.query(self.URI, self.KEYS)), 2)
+        self.assertEqual(phone.serial, PHONE)
+        shells = [a for a in self.adb.calls if len(a) > 3 and a[3] == "shell"]
+        self.assertTrue(shells)
+        self.assertTrue(all(a[2] == PHONE for a in shells))
+
+    def test_a_uri_or_key_that_could_reach_the_shell_is_refused(self):
+        phone = self.phone()
+        for uri, keys in ((self.URI + "; reboot", self.KEYS), ("content://x y", self.KEYS),
+                          (self.URI, ["data1", "a;b"]), (self.URI, ["$(id)"]), (self.URI, [])):
+            with self.assertRaises(ValueError):
+                phone.query(uri, keys)
+        self.assertEqual(self.adb.calls, [])
+
+
+class FromConfigTests(unittest.TestCase):
+    def test_from_config_reads_phone_adb(self):
+        config = config_for_tests()
+        phone = AdbPhone.from_config(config)
+        self.assertEqual(phone.adb_path, config["phone"]["adb"]["path"])
+        self.assertEqual(phone.port, 27183)
+        self.assertEqual(phone.configured_serial, config["phone"]["adb"]["serial"])
+        self.assertIs(phone.mute_phone_mic, True)
+
+    def test_from_config_defaults_when_the_block_is_missing(self):
+        phone = AdbPhone.from_config({})
+        self.assertEqual((phone.adb_path, phone.serial, phone.port, phone.mute_phone_mic), ("adb", "", 27183, True))
+
+    def test_from_config_runs_nothing(self):
+        def runner(*args, **kw):
+            raise AssertionError("ran adb at construction")
+
+        phone = AdbPhone.from_config(config_for_tests(), runner=runner, popen=runner)
+        self.assertIs(phone._runner, runner)
 
 
 if __name__ == "__main__":
