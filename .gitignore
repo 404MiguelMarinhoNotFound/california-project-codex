@@ -57,3 +57,8 @@ logs/
 # Bench runs (tools/bench_tv_power.py --json). Local measurements of this
 # room, not source; the conclusions go into CLAUDE.md instead.
 bench/
+
+# Plan execution scratch (ledgers, briefs)
+.superpowers/
+tools/android_call_audio/build/
+android/callaudio/build/

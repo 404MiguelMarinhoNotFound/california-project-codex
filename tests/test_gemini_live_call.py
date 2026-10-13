@@ -295,6 +295,20 @@ class OpeningNudgeTests(_Base):
         self.agent(FakeSession([])).run("p", max_call_s=1.0, no_answer_s=30)
         self.assertEqual(self.session.nudges, [])
 
+    def test_an_answered_call_is_nudged_before_anyone_speaks(self):
+        # 2026-10-13: Marta said "Hola", the model reached for end_call three
+        # times and she hung up on 9 s of silence. A transport that knows the
+        # answer (the phone's call state) gets her talking without waiting.
+        with mock.patch.object(glc, "_ANSWERED_GRACE_S", 0.1):
+            self.agent(FakeSession([])).run("p", max_call_s=0.6, no_answer_s=30, answered=lambda: True)
+        self.assertGreaterEqual(len(self.session.nudges), 1)
+        self.assertIn("answered", self.session.nudges[0])
+
+    def test_a_call_not_yet_answered_is_not_nudged(self):
+        with mock.patch.object(glc, "_ANSWERED_GRACE_S", 0.1):
+            self.agent(FakeSession([])).run("p", max_call_s=0.6, no_answer_s=30, answered=lambda: False)
+        self.assertEqual(self.session.nudges, [])
+
     def test_a_failing_nudge_does_not_end_the_call(self):
         class Broken(FakeSession):
             async def send_client_content(self, **kw):

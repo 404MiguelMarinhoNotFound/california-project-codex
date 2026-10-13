@@ -1082,7 +1082,9 @@ phone:
     # GOOGLE_CLOUD_PROJECT. Credentials: GOOGLE_APPLICATION_CREDENTIALS (a
     # service account key file) in .env, or VERTEX_API_KEY for express mode.
     project: "project-65ef5b79-5402-4096-a93"
-    location: "us-central1"
+    # europe-west1, not us-central1: first audio 0.70s vs 0.95s from Lisbon
+    # (measured 2026-10-13, 3 runs each). europe-west4 answered only 1 of 3.
+    location: "europe-west1"
     model: "gemini-live-2.5-flash-native-audio"
   # backend: ai_studio only. The cheapest Live model there: the same audio
   # price as gemini-3.8-live ($3 in / $12 out per 1M tokens) and lower text

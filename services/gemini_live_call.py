@@ -57,6 +57,12 @@ _LIVE_IF_HEARD_S = 8.0
 # Loudest loopback block below this (0-1 RMS) means she heard nothing at all.
 _SILENT_PEAK = 0.002
 _NUDGE_MAX = 2
+# With a transport that knows the moment of the answer (the phone's own call
+# state, tools/phone_adb_call.py), she is nudged this long after it instead of
+# waiting to hear them and then _NUDGE_AFTER_S more. Live 2026-10-13: with only
+# the heard-them clock, Marta said "Hola", the model reached for end_call three
+# times, and she hung up on 9 s of silence.
+_ANSWERED_GRACE_S = 0.8
 _NUDGE_TEXT = (
     "[The call has been answered and they are waiting for you. Greet them and "
     "say why you are calling, now, in their language.]"
@@ -411,6 +417,7 @@ class GeminiLiveAgent:
         stop: threading.Event | None = None,
         dial: Callable[[], bool] | None = None,
         mute: Callable[[], bool] | None = None,
+        answered: Callable[[], bool] | None = None,
     ) -> CallResult:
         """
         Blocking: one call, start to finish. Never raises.
@@ -423,11 +430,15 @@ class GeminiLiveAgent:
         hears the laptop speakers, so without it her room voice reaches the
         call agent as if the callee said it (seen 2026-10-07: "looks like it
         didn't go through" transcribed as theirs). Muted blocks go as silence.
+
+        `answered` is True once the transport knows the call was picked up;
+        she is then nudged to open after _ANSWERED_GRACE_S rather than after
+        hearing them. Phone Link cannot tell, so it passes nothing.
         """
         result = CallResult()
         started = time.monotonic()
         try:
-            asyncio.run(self._run(prompt, max_call_s, no_answer_s, still_connected, stop or threading.Event(), dial, result, mute))
+            asyncio.run(self._run(prompt, max_call_s, no_answer_s, still_connected, stop or threading.Event(), dial, result, mute, answered))
         except Exception as exc:  # the call must always come back with a result
             logger.exception("Call agent failed")
             result.ended_by = result.ended_by or "error"
@@ -435,7 +446,7 @@ class GeminiLiveAgent:
         result.duration_s = round(time.monotonic() - started, 1)
         return result
 
-    async def _run(self, prompt, max_call_s, no_answer_s, still_connected, stop, dial, result: CallResult, mute=None) -> None:
+    async def _run(self, prompt, max_call_s, no_answer_s, still_connected, stop, dial, result: CallResult, mute=None, answered=None) -> None:
         loop = asyncio.get_running_loop()
         audio_in: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
         finished = asyncio.Event()
@@ -555,7 +566,16 @@ class GeminiLiveAgent:
                         if any(l.who == "california" and l.text.strip() for l in result.lines):
                             return
                         them_at = clock.get("them_at")
-                        if them_at is None or time.monotonic() - them_at < _NUDGE_AFTER_S:
+                        if answered is not None and nudges == 0 and "answered_at" not in clock:
+                            try:
+                                if await asyncio.to_thread(answered):
+                                    clock["answered_at"] = time.monotonic()
+                            except Exception:
+                                pass
+                        answered_at = clock.get("answered_at")
+                        due_answer = nudges == 0 and answered_at is not None and time.monotonic() - answered_at >= _ANSWERED_GRACE_S
+                        due_heard = them_at is not None and time.monotonic() - them_at >= _NUDGE_AFTER_S
+                        if not (due_answer or due_heard):
                             continue
                         nudges += 1
                         result._count("nudges")
