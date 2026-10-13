@@ -236,6 +236,7 @@ california/
 │   ├── turn_log.py              # Rotating log file + one timing record per turn (logs/)
 │   ├── event_bus.py             # Live events for the UI: never blocks, never raises; wake scores live-only
 │   ├── live_ui.py               # Read-only web page on the LAN: SSE stream, token in the path
+│   ├── live_ui_announce.py      # Each boot: WhatsApp him the page's link, open it in Firefox if no tab has it
 │   └── vad.py                   # Voice activity detection
 ├── services/
 │   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
@@ -349,6 +350,7 @@ california/
 │   ├── test_orchestrator_phone.py # control_phone dispatch, the labelled report, speaking it from the idle loop
 │   ├── test_event_bus.py        # Bus: replay, live-only wake scores, slow pages never block, TurnTimer publishes live
 │   ├── test_live_ui.py          # Token-in-path 404s, static whitelist, SSE replay then live, Last-Event-ID
+│   ├── test_live_ui_announce.py # mozlz4 tabs read, open-once in Firefox, link sent once, busy retried only
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -3572,6 +3574,18 @@ from the boot log (`Live UI: http://<laptop>:8765/<token>/`) on the phone.
 - **Watch-only on purpose.** Nothing on the page changes what she does. A typed turn and
   a device status card (`room_status()` costs an ADB ping, so on demand, not polled)
   are the next steps.
+- **Every boot announces the page (2026-10-13), in the background.**
+  `core/live_ui_announce.py` WhatsApps the URL to `CALIFORNIA_UI_NOTIFY_NUMBER`
+  (`.env`, never `config.yaml`: the repository is public) and opens it in Firefox
+  unless a tab already shows it. Open tabs are read from Firefox's own
+  `sessionstore-backups/recovery.jsonlz4` (every tab, not just the active one the
+  window title shows), decoded with a small pure-Python LZ4 reader, and only
+  trusted while `firefox.exe` runs, since the file outlives a quit. WhatsApp sends
+  only on the playwright backend (the keyboard one would grab the keyboard at
+  boot); the send queues behind the warm-up, and only a busy refusal is retried,
+  because a timed-out send may still go out. Without `CALIFORNIA_UI_TOKEN` the URL
+  is new each run, so a new tab opens each run too; set the token to keep one tab.
+  `ui.announce.open_firefox` / `ui.announce.whatsapp` switch either step off.
 - `tests/config_fixture.py` turns `ui.enabled` off, because the shipped value binds a
   LAN port. `tests/test_live_ui.py` turns it back on, bound to loopback on port 0.
 

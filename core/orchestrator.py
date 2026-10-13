@@ -1732,6 +1732,14 @@ class Orchestrator:
         # keyboard backend or with whatsapp.keep_warm off.
         self.whatsapp_service.start()
 
+        # Once per run: WhatsApp him the live page's link and open it in Firefox
+        # unless a tab already shows it. Background, and nothing waits on it; the
+        # send queues behind the warm-up above. See core/live_ui_announce.py.
+        if self.live_ui is not None:
+            from core.live_ui_announce import announce_in_background
+
+            announce_in_background(self.live_ui.url, self.whatsapp_service, config)
+
         # Phone calls. Names resolve through the WhatsApp contact book (its
         # resolver only reads the VCF and aliases, never the browser). The call
         # agent hears the laptop speakers, which is also where she talks to the

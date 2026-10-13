@@ -195,6 +195,13 @@ ui:
   port: 8765
   ring_size: 500              # events kept in memory so a page opened mid-turn is not blank
   wake_publish_hz: 10         # wake score updates per second (each carries the peak since the last)
+  # On every boot, in the background: open the page in Firefox (skipped when a
+  # Firefox tab already shows it) and WhatsApp the link to
+  # CALIFORNIA_UI_NOTIFY_NUMBER from .env (not here: the repository is public).
+  # WhatsApp needs the playwright backend.
+  announce:
+    open_firefox: true
+    whatsapp: true
 
 # --- Speech-to-Text ---
 stt:
