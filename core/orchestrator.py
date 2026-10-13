@@ -89,6 +89,99 @@ def _report_typed(result, result_type) -> None:
         _report(bool(result))
 
 
+# The tool asked him something (a read-back, "which one?", a volume past the
+# cap) and is parked until he answers. Kept apart from _TOOL_OUTCOME on
+# purpose: a question is neither a success nor a failure, so it moves no mood,
+# but the live UI shows the call waiting for him instead of showing nothing.
+_TOOL_AWAITING: contextvars.ContextVar = contextvars.ContextVar("tool_awaiting", default=False)
+
+
+def _await_answer() -> None:
+    """Mark the current tool call as a question back to Master Miguel."""
+    _TOOL_AWAITING.set(True)
+
+
+def _await_if_asked(result) -> None:
+    """A typed result that says it armed a read-back. `is True`: a Mock never asks."""
+    if getattr(result, "awaiting", False) is True:
+        _await_answer()
+
+
+def _tool_target(tool_name, tool_input) -> str | None:
+    """
+    A few words for the live UI's satellite label: what the tool is pointed at.
+
+    Never the message body, a call brief or a phone number -- the page can be
+    open on a phone across the room. TurnTimer drops it entirely when
+    `logging.include_transcripts` is false, and trims it to a glance. Never raises.
+    """
+    try:
+        if not isinstance(tool_input, dict):
+            return None
+        p = tool_input
+        action = p.get("action")
+
+        def text(key):
+            value = p.get(key)
+            return " ".join(str(value).split()) if isinstance(value, (str, int)) and str(value).strip() else ""
+
+        def who(key="to"):
+            name = text(key)
+            if not name:
+                return ""
+            return "a number" if looks_like_phone(name) else name
+
+        if tool_name == "control_tv":
+            if action in ("stremio_play", "stremio_continue", "stremio_get_progress"):
+                title = text("title")
+                if title and p.get("season") and p.get("episode"):
+                    return f"{title} S{p['season']}E{p['episode']}"
+                return title or None
+            if action == "youtube_playlist":
+                return text("playlist_name") or None
+            if action == "youtube_search":
+                return text("query") or None
+            if action == "volume_set" and p.get("volume_percent") is not None:
+                return f"volume {text('volume_percent')}"
+            if action == "switch_hdmi" and p.get("hdmi_port") is not None:
+                return f"HDMI {text('hdmi_port')}"
+            if action == "launch_app":
+                return text("app_name") or None
+            return None
+        if tool_name == "control_lights":
+            light = text("light") or "default light"
+            if action == "light_color" and text("color"):
+                return f"{light}, {text('color')}"
+            if action == "light_brightness" and p.get("brightness_percent") is not None:
+                return f"{light}, {text('brightness_percent')}%"
+            return light
+        if tool_name == "control_vacuum":
+            rooms = p.get("rooms")
+            if isinstance(rooms, list) and rooms:
+                return ", ".join(str(r) for r in rooms if str(r).strip()) or None
+            return "everywhere" if action == "vacuum_clean_all" else None
+        if tool_name == "control_whatsapp":
+            name = who()
+            if not name:
+                return None
+            if action == "whatsapp_send":
+                return f"to {name}"
+            if action in ("whatsapp_read", "whatsapp_unread"):
+                return f"{name}'s chat" if name != "a number" else "a chat"
+            return name
+        if tool_name == "control_phone":
+            if action == "phone_find":
+                return "your phone"
+            if action == "phone_call":
+                return who() or ("a number" if text("number") else None)
+            return None
+        if tool_name == "web_search":
+            return text("query") or None
+    except Exception:
+        return None
+    return None
+
+
 # Packages that more than one boot thread imports for the first time. Importing
 # them here, serially, before the pool starts is what keeps the pool safe.
 #
@@ -489,6 +582,8 @@ def _dispatch_tv_volume(action: str, params: dict, tv_volume) -> str:
 
     if isinstance(result, VolumeResult) and not result.needs_confirm:
         _report(bool(result))  # needs_confirm is a question back, not a failure
+    elif isinstance(result, VolumeResult):
+        _await_answer()
     if result:
         if result.capped:
             return (f"TV volume {result.level}, that's my cap. Ask for a number "
@@ -727,6 +822,7 @@ def _dispatch_tv(
             logger.warning("Stremio continue failed: %s", exc)
             return f"I couldn't find {title} in Stremio or TMDB."
         if result.requires_confirmation:
+            _await_answer()  # "want me to try the first source?" waits for him
             return result.message or AUTOPLAY_FALLBACK_LINE
         if result.success:
             if result.target_mode in ("episode", "movie_detail"):
@@ -767,6 +863,7 @@ def _dispatch_tv(
             return f"I couldn't find {title} in Stremio or TMDB."
 
         if result.requires_confirmation:
+            _await_answer()  # "want me to try the first source?" waits for him
             return result.message or AUTOPLAY_FALLBACK_LINE
         if result.success:
             if result.target_mode in ("episode", "movie_detail"):
@@ -1474,6 +1571,7 @@ def _dispatch_whatsapp_group(action: str, hint: str, params: dict, whatsapp_svc,
 
     found = _resolve_group(whatsapp_svc, hint, say_now)
     if found.candidates:
+        _await_answer()
         names = [speakable_group_title(t) for t in found.candidates]
         return f"A few groups sound like that: {_join_names(names)}. Which one?"
     if not found:
@@ -1498,6 +1596,7 @@ def _dispatch_whatsapp_group(action: str, hint: str, params: dict, whatsapp_svc,
         if confirm and say_now:
             say_now("Sending it to the group.")
         result = whatsapp_svc.send_group(found, message, confirm=confirm)
+        _await_if_asked(result)
         if result:
             return f"Sent to the group {spoken}."
         return result.message or _WHATSAPP_UNREACHABLE
@@ -1561,6 +1660,7 @@ def _dispatch_whatsapp(params: dict, whatsapp_svc, say_now=None) -> str:
 
     if action == "whatsapp_read":
         if match.candidates:
+            _await_answer()
             return f"I've got more than one {hint}: {_join_names(match.candidates)}. Which one?"
         if not match:
             return f"I don't have anyone called {hint} in the contact book."
@@ -1586,6 +1686,7 @@ def _dispatch_whatsapp(params: dict, whatsapp_svc, say_now=None) -> str:
             return "What do you want me to say?"
 
         if match.candidates:
+            _await_answer()
             return (
                 f"I've got more than one {hint}: {_join_names(match.candidates)}. Which one?"
             )
@@ -1597,6 +1698,7 @@ def _dispatch_whatsapp(params: dict, whatsapp_svc, say_now=None) -> str:
 
         if at:
             result = whatsapp_svc.schedule(match, message, at, confirm=confirm)
+            _await_if_asked(result)
             if result:
                 return f"Set. I'll send that to {match.key} at {at}."
             return result.message or _WHATSAPP_UNREACHABLE
@@ -1613,6 +1715,7 @@ def _dispatch_whatsapp(params: dict, whatsapp_svc, say_now=None) -> str:
                     say_now("Opening WhatsApp, hands off the keyboard for a few seconds.")
 
         result = whatsapp_svc.send(match, message, confirm=confirm)
+        _await_if_asked(result)
         if result:
             return f"Sent to {match.key}."
         return result.message or _WHATSAPP_UNREACHABLE
@@ -1654,6 +1757,7 @@ def _dispatch_phone(params: dict, phone_svc) -> str:
     result = phone_svc.call(
         brief, number=str(params.get("number") or ""), confirm=params.get("confirm") is True
     )
+    _await_if_asked(result)
     return result.message
 
 
@@ -1914,6 +2018,7 @@ class Orchestrator:
 
         # Register tool handler so LLM can dispatch control_tv / control_lights
         self.llm.tool_handler = self._handle_tool_call
+        self.llm.on_server_tool = self._on_server_tool
 
         # Tell the LLM which lights actually loaded, so the system prompt reflects
         # reality rather than raw config (lights missing a mac/sku are skipped).
@@ -2698,24 +2803,68 @@ class Orchestrator:
 
     def _handle_tool_call(self, tool_name: str, tool_input: dict) -> str:
         """Dispatch tool calls from the LLM, timing each one into the turn record."""
-        started = self._turn.now_ms()
         action = tool_input.get("action") if isinstance(tool_input, dict) else None
-        self._turn.tool_started(tool_name, action)
+        target = _tool_target(tool_name, tool_input)
+        started = self._turn.tool_started(tool_name, action, target=target)
+        if not isinstance(started, int):
+            started = self._turn.now_ms()
         result = None
         token = _TOOL_OUTCOME.set(None)
+        asked = _TOOL_AWAITING.set(False)
         try:
             result = self._dispatch_tool(tool_name, tool_input)
             return result
         finally:
             ok = _TOOL_OUTCOME.get()
+            awaiting = _TOOL_AWAITING.get() is True
             _TOOL_OUTCOME.reset(token)
+            _TOOL_AWAITING.reset(asked)
             if result is None:
                 ok = False  # the tool raised
             self._turn.tool(
                 tool_name, action, started,
                 result if result is not None else "<raised>", ok=ok,
+                target=target, awaiting=awaiting,
             )
             self._publish_mood_for_tool(tool_name, action, result, ok)
+
+    # Web search runs at Anthropic, inside the LLM stream, so it never comes
+    # through _handle_tool_call. LLMService reports its start and end through
+    # this hook; the call goes on the turn like any other tool, minus the mood
+    # (a search is not a device action).
+
+    def _on_server_tool(self, event: str, info: dict) -> None:
+        """LLMService.on_server_tool: "start", "input" or "end" of a server tool. Never raises."""
+        try:
+            tool_id = str(info.get("id") or "")
+            name = str(info.get("name") or "web_search")
+            # Server tool id -> (the turn it began in, its start_ms). Created
+            # lazily: tests build orchestrators with __new__.
+            starts = self.__dict__.setdefault("_server_tool_starts", {})
+            if event == "start":
+                for stale in [k for k, (t, _) in starts.items() if t is not self._turn]:
+                    del starts[stale]   # never answered, in a turn that has ended
+                starts[tool_id] = (self._turn, self._turn.tool_started(name, "search"))
+                return
+            turn, start_ms = starts.get(tool_id, (None, None))
+            if turn is not self._turn:
+                starts.pop(tool_id, None)   # from a turn that has ended
+                return
+            if event == "input":
+                if start_ms is not None:
+                    target = _tool_target(name, {"query": info.get("query")})
+                    if target:
+                        self._turn.tool_started(name, "search", target=target, start_ms=start_ms)
+            elif event == "end":
+                starts.pop(tool_id, None)
+                ok = info.get("ok")
+                target = _tool_target(name, {"query": info.get("query")})
+                self._turn.tool(
+                    name, "search", start_ms, str(info.get("result") or ""),
+                    ok=ok if ok is True or ok is False else None, target=target,
+                )
+        except Exception:
+            pass
 
     def _dispatch_tool(self, tool_name: str, tool_input: dict) -> str:
         if tool_name == "control_tv":

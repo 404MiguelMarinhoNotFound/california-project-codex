@@ -83,9 +83,14 @@ class LiveUITests(unittest.TestCase):
         self.bus.publish("state", {"state": "idle"})
         conn, resp = self._get("/s3cret-token/events")
         self.assertEqual(resp.getheader("Content-Type"), "text/event-stream")
-        hello, replayed = self._read_events(resp, 2)
+        hello, replayed, marker = self._read_events(resp, 3)
         self.assertEqual(hello["event"], "hello")
         self.assertEqual(replayed["event"], "state")
+        # The end of the backlog is marked, so the page can tell history from
+        # now and never animate a finished tool call as if it were new.
+        self.assertEqual(marker["event"], "replayed")
+        self.assertIn('"count": 1', marker["data"])
+        self.assertNotIn("id", marker)
         self.bus.publish("turn_mark", {"name": "stt_done", "ms": 812})
         (live,) = self._read_events(resp, 1)
         self.assertEqual(live["event"], "turn_mark")
@@ -97,9 +102,10 @@ class LiveUITests(unittest.TestCase):
             self.bus.publish("x", {"i": i})
         last = self.bus.subscribe()[0][1]["id"]
         conn, resp = self._get("/s3cret-token/events", {"Last-Event-ID": str(last)})
-        hello, only = self._read_events(resp, 2)
+        hello, only, marker = self._read_events(resp, 3)
         self.assertEqual(only["event"], "x")
         self.assertIn('"i": 2', only["data"])
+        self.assertEqual(marker["event"], "replayed")
         conn.close()
 
     def test_hello_carries_the_thresholds_the_page_draws(self):

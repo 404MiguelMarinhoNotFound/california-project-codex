@@ -785,3 +785,22 @@ Each step is a separate commit, and each leaves the app working.
 - A halo for the phone-call agent.
 - Typed turns and any write path from the page.
 - A JS unit-test runner (see §11).
+
+---
+
+## 17. Addendum: tool satellites (2026-10-13)
+
+Built after the halo, from the approved "tool satellites" draft: each tool call
+buds off the ring as a satellite (glyph, progress ring against the action's
+usual duration, real-seconds timer, label), with an ember tether and a ring hot
+spot; it docks on success, sinks on failure, parks on a read-back ("waiting for
+you"), and a phone call stays in orbit until it ends. The Now panel's tool list
+became the rail (bar, usual-duration tick, ms, outcome).
+
+New on the wire: `target` on `turn_tool_start` / `turn_tool` (short, never text
+or a number, dropped with `include_transcripts: false`); `awaiting: true` on
+`turn_tool`; web search as a `web_search.search` tool from the raw Claude
+stream; and a `replayed` marker after each connection's backlog. Details,
+measurements and what is still uncalibrated are in CLAUDE.md under "Tool
+satellites". Verified with `tools/demo_live_ui.py --check` (tool script at three
+sizes plus edge cases), not yet on the laptop or the phone.

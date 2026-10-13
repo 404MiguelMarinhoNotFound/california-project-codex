@@ -218,6 +218,11 @@ def _make_handler(ui: LiveUI):
                 self._send(None, "hello", ui._hello)
                 for event in backlog:
                     self._send_event(event)
+                # The end of the backlog. Everything before it already
+                # happened; the page draws only what is still going on (a
+                # tool still running, a read-back still waiting) instead of
+                # replaying every finished tool call as if it were new.
+                self._send(None, "replayed", {"ts": time.time(), "count": len(backlog)})
                 self.wfile.flush()
                 while not ui._stopping.is_set():
                     try:

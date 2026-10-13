@@ -38,8 +38,21 @@ sys.path.insert(0, ROOT)
 from core.audio_levels import envelope  # noqa: E402
 from core.event_bus import EventBus  # noqa: E402
 from core.live_ui import LiveUI  # noqa: E402
+from core.turn_log import _short_target  # noqa: E402
+
+
+def _min_gap(sats) -> float:
+    """The smallest centre-to-centre distance between visible satellites, px."""
+    pts = [(s["x"], s["y"]) for s in sats if s["alpha"] > 0.3]
+    best = 1e9
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            best = min(best, math.dist(pts[i], pts[j]))
+    return best
 
 TOKEN = "demo"
+# Turn ids are unique across every script played into one bus, like a real run.
+_TURN_IDS = iter(range(1, 1_000_000))
 HZ = 25
 DEFAULT_CHROMIUM = "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
 SHOTS = os.path.join(ROOT, "debug", "live_ui")
@@ -140,7 +153,7 @@ class Script:
         self.pub("clip_end", {"clip": payload["clip"], "stopped": False}, seconds + 0.15)
 
     def wake(self, said, chained=False):
-        self.turn += 1
+        self.turn = next(_TURN_IDS)
         if not chained:
             self.pub("wake", {"score": 0.93, "phase": "idle", "threshold": 0.81})
             self.pub("wake_hit", {"score": 0.93, "phase": "idle"})
@@ -167,6 +180,255 @@ class Script:
         self.at(seconds * 0.5, "snap", "thinking")
         self.pub("turn_tool", {"turn": self.turn, "name": name, "action": action, "start_ms": 3700,
                                "ms": int(seconds * 1000), "result": result, "ok": ok}, seconds * 0.5)
+
+    # A tool call in two halves, so others can run in between (a web search
+    # overlapping a local tool) and a test can drop the end on purpose.
+    _start_ms = 3700
+
+    def tool_start(self, name, action, target=None, start_ms=None, wait_s=0.0):
+        """Publish a start, the way TurnTimer.tool_started would (label trimmed). Returns the key."""
+        if start_ms is None:
+            self._start_ms += 137
+            start_ms = self._start_ms
+        data = {"turn": self.turn, "name": name, "action": action, "start_ms": start_ms}
+        label = _short_target(target) if self.v.include_text else None
+        if label:
+            data["target"] = label
+        self.pub("turn_tool_start", data, wait_s)
+        return (name, action, start_ms, target)
+
+    def tool_label(self, call, target, wait_s=0.0):
+        name, action, start_ms, _ = call
+        label = _short_target(target) if self.v.include_text else None
+        if label:
+            self.pub("turn_tool_start", {"turn": self.turn, "name": name, "action": action,
+                                         "start_ms": start_ms, "target": label}, wait_s)
+        return (name, action, start_ms, target)
+
+    def tool_end(self, call, result, ok=None, awaiting=False, ms=None, wait_s=0.0):
+        name, action, start_ms, target = call
+        entry = {"turn": self.turn, "name": name, "action": action, "start_ms": start_ms,
+                 "ms": int(ms if ms is not None else wait_s * 1000), "result": result}
+        if ok is True or ok is False:
+            entry["ok"] = ok
+        elif awaiting:
+            entry["awaiting"] = True
+        label = _short_target(target) if self.v.include_text else None
+        if label:
+            entry["target"] = label
+        self.pub("turn_tool", entry, wait_s)
+
+    def call_tool(self, name, action, target, result, ok=None, awaiting=False, seconds=1.0, ms=None, snap=None):
+        call = self.tool_start(name, action, target)
+        if snap:
+            self.at(seconds * 0.6, "snap", snap)
+            self.tool_end(call, result, ok, awaiting, ms if ms is not None else int(seconds * 1000), seconds * 0.4)
+        else:
+            self.tool_end(call, result, ok, awaiting, ms if ms is not None else int(seconds * 1000), seconds)
+        return call
+
+    def probe(self, label, js, predicate, message, wait_s=0.0):
+        """Evaluate `js` in the page here; fail the check with `message` when predicate(value) is false."""
+        self.at(wait_s, "probe", (label, js, predicate, message))
+
+    def reply(self, text, mood=None):
+        if mood:
+            self.pub("mood", {"mood": mood, "reason": "demo"})
+        self.pub("state", {"state": "speaking"})
+        self.say(text)
+
+    # ------------------------------------------------------------ the tools script
+    def build_tools(self):
+        """Every tool she can pick, and the edge cases. See check_tools()."""
+        sats = "window.__halo ? window.__halo.sats : []"
+        self.pub("state", {"state": "idle"})
+        self.idle_scores(1.0)
+
+        # 1. Dark room -> Fallout: a 33s deep wake (compressed), then Stremio.
+        self.wake("put on fallout")
+        self.pub("state", {"state": "speaking"})
+        self.say("Waking the TV, give me half a minute.")
+        self.pub("state", {"state": "thinking"})
+        wake = self.tool_start("control_tv", "turn_on")
+        self.at(2.5, "snap", "tv-turn-on-running")
+        self.probe("turn_on running", sats, lambda v: len(v) == 1 and v[0]["st"] == "run" and "/ ~33" in v[0]["note"],
+                   "turn_on should be one running satellite timed against ~33s")
+        self.tool_end(wake, "The TV and box are on.", ok=True, ms=33200, wait_s=2.0)
+        play = self.tool_start("control_tv", "stremio_play", "Fallout S2E9", wait_s=0.3)
+        self.at(1.5, "snap", "tv-stremio-running")
+        self.tool_end(play, "Fallout is playing.", ok=True, ms=19800, wait_s=1.0)
+        self.at(0.25, "snap", "tv-stremio-docking")
+        self.reply("Fallout's on. Season two, episode nine.", mood="happy")
+        self.end("reply", 41000)
+        self.probe("docked", sats, lambda v: len(v) == 0, "docked satellites should be gone", wait_s=1.5)
+
+        # 2. YouTube search, volume, and a status read (no mood) in one turn.
+        self.wake("search youtube for lofi and set the volume to thirty")
+        self.call_tool("control_tv", "youtube_search", "lofi beats to study to", "Playing it.", ok=True, seconds=2.2,
+                       ms=4800, snap="tv-youtube-running")
+        self.call_tool("control_tv", "volume_set", "volume 30", "TV volume 18 to 30", ok=True, seconds=0.35)
+        self.call_tool("control_tv", "get_status", None, "TV on, YouTube playing.", seconds=0.9, snap="tv-status-running")
+        self.at(0.1, "snap", "rail-three-tools")
+        self.reply("Lofi's on, volume thirty.", mood="happy")
+        self.end("reply", 12000)
+
+        # 3. Lights: one fails, then a status read.
+        self.wake("turn on the attic lights")
+        self.call_tool("control_lights", "light_on", "attic", "I couldn't reach your lights just now.", ok=False,
+                       seconds=2.4, ms=6200)
+        self.pub("mood", {"mood": "sheepish", "reason": "control_lights.light_on failed"})
+        self.at(0.6, "snap", "lights-failed")
+        self.probe("fail state", sats, lambda v: any(x["st"] == "fail" for x in v), "a failed light should show the fail state")
+        self.call_tool("control_lights", "light_status", "attic", "Last I set it: off.", seconds=0.5)
+        self.reply("The attic strip isn't answering. Probably out of Bluetooth range again.")
+        self.end("reply", 9000)
+        self.probe("fail gone", sats, lambda v: len(v) == 0, "a failed satellite should sink and go", wait_s=2.5)
+
+        # 4. Vacuum: the status guard, then the clean.
+        self.wake("vacuum the kitchen and the hall")
+        self.call_tool("control_vacuum", "vacuum_status", None, "Docked, 92%.", seconds=1.6, ms=2100)
+        self.call_tool("control_vacuum", "vacuum_clean_rooms", "kitchen, hall", "Cleaning kitchen and hall.", ok=True,
+                       seconds=2.0, ms=3100, snap="vacuum-cleaning")
+        self.reply("Sir Sucks-a-Lot is on it.", mood="happy")
+        self.end("reply", 9000)
+
+        # 5. WhatsApp: a read-back parks, his yes sends it.
+        self.wake("tell marta i'm running late")
+        self.call_tool("control_whatsapp", "whatsapp_send", "to Marta", "I've got Marta Zuka. Say send it.",
+                       awaiting=True, seconds=0.25, ms=60)
+        self.reply("Marta Zuka, that you're running late. Send it?")
+        self.end("reply", 6000)
+        self.at(0.6, "snap", "whatsapp-waiting")
+        self.probe("ask parked", sats, lambda v: len(v) == 1 and v[0]["st"] == "ask" and "waiting" in v[0]["note"],
+                   "a read-back should park as 'waiting for you' after the turn")
+        self.idle_scores(1.0)
+        self.wake("yes send it")
+        self.call_tool("control_whatsapp", "whatsapp_send", "to Marta", "Sent to Marta Zuka.", ok=True, seconds=1.8,
+                       ms=1900, snap="whatsapp-sending")
+        self.probe("ask retired", sats, lambda v: not any(x["st"] == "ask" for x in v),
+                   "the parked read-back should go once he answered")
+        self.reply("Sent.", mood="happy")
+        self.end("reply", 5000)
+
+        # 6. WhatsApp reads: unread (list only), then one chat.
+        self.wake("anything on whatsapp")
+        self.call_tool("control_whatsapp", "whatsapp_unread", None, "Unread from Rui.", seconds=1.4, ms=2600)
+        self.call_tool("control_whatsapp", "whatsapp_read", "Rui's chat", "The last 3 messages...", seconds=1.2, ms=1900,
+                       snap="whatsapp-read")
+        self.reply("Rui says the match moved to Sunday.")
+        self.end("reply", 9000)
+
+        # 7. A phone call: read back, go, then it orbits while she is idle.
+        self.wake("call taberna da praia for a table")
+        self.call_tool("control_phone", "phone_call", "Taberna da Praia", "Ready to call. Read it back.",
+                       awaiting=True, seconds=0.2, ms=40)
+        self.reply("Taberna da Praia, 912 345 678, a table for two at eight. Go?")
+        self.end("reply", 7000)
+        self.wake("go")
+        self.call_tool("control_phone", "phone_call", "Taberna da Praia", "Calling Taberna da Praia now.",
+                       ok=True, seconds=0.3, ms=120)
+        self.reply("Calling them now.", mood="happy")
+        self.end("reply", 4000)
+        self.pub("call_state", {"state": "starting", "label": "Taberna da Praia", "kind": "book_table",
+                                "started_at": "2026-10-13T20:00:00"})
+        self.pub("call_state", {"state": "dialing", "label": "Taberna da Praia"}, 0.8)
+        for i, (who, text) in enumerate([("them", "Taberna da Praia, boa noite."),
+                                         ("her", "Boa noite! Sou a assistente do Miguel."),
+                                         ("them", "Diga."), ("her", "Queria uma mesa para dois às oito.")]):
+            self.pub("call_line", {"index": i, "who": who, "text": text, "at": 2 + i * 2}, 0.9)
+        self.idle_scores(0.5)
+        self.at(0.0, "snap", "phone-call-idle")
+        self.probe("call orbits", sats, lambda v: len(v) == 1 and v[0]["st"] == "live",
+                   "the call should stay in orbit after the turn, while she is idle")
+        self.pub("call_state", {"state": "ended", "label": "Taberna da Praia", "ended_by": "end_call", "error": ""}, 1.0)
+        self.probe("call docked", sats, lambda v: len(v) == 0, "an ended call should dock and go", wait_s=2.0)
+
+        # 8. Find my phone.
+        self.wake("where is my phone")
+        self.call_tool("control_phone", "phone_find", "your phone", "It's ringing.", ok=True, seconds=1.3, ms=1500)
+        self.reply("Ringing it now.", mood="happy")
+        self.end("reply", 5000)
+
+        # 9. Web search: learns its query after it starts; then search + a local
+        #    tool in one response, the search answered after the tool.
+        self.wake("did benfica win last night")
+        web = self.tool_start("web_search", "search")
+        self.tool_label(web, "benfica result last night", wait_s=0.4)
+        self.at(1.0, "snap", "web-search-running")
+        self.probe("web sweeps", sats, lambda v: len(v) == 1 and v[0]["dev"] == "web" and "/ ~" not in v[0]["note"]
+                   and v[0]["label"] == "benfica result last night", "a web search should sweep with its query as the label")
+        self.tool_end(web, "3 results", ok=True, ms=2400, wait_s=1.0)
+        self.reply("They did. Two nil.")
+        self.end("reply", 8000)
+        self.wake("open stremio and find me something to watch")
+        web = self.tool_start("web_search", "search", "best new series october")
+        app = self.tool_start("control_tv", "launch_app", "stremio", wait_s=0.3)
+        self.at(0.8, "snap", "web-plus-local")
+        self.probe("two at once", sats, lambda v: len(v) == 2, "a search and a local tool should both show")
+        self.tool_end(app, "Opened Stremio.", ok=True, ms=2900, wait_s=0.6)
+        self.tool_end(web, "5 results", ok=True, ms=3400, wait_s=1.2)
+        self.reply("Stremio's open. Try Severance.", mood="happy")
+        self.end("reply", 9000)
+
+        # 10. Crowding: a call in orbit, a parked read-back, and three running.
+        self.wake("call mum")
+        self.call_tool("control_phone", "phone_call", "Mum", "Calling Mum now.", ok=True, seconds=0.2, ms=90)
+        self.pub("call_state", {"state": "dialing", "label": "Mum"}, 0.2)
+        self.end("reply", 3000)
+        self.wake("lights, tv, vacuum and message the group")
+        self.call_tool("control_whatsapp", "whatsapp_send", "🌊🏄 Surf crew de Carcavelos 🏄🌊", "NOT SENT YET.",
+                       awaiting=True, seconds=0.2, ms=50)
+        a = self.tool_start("control_lights", "light_color", "living room, warm white")
+        b = self.tool_start("control_tv", "turn_on", None, wait_s=0.15)
+        c = self.tool_start("control_vacuum", "vacuum_clean_all", "everywhere", wait_s=0.15)
+        d = self.tool_start("web_search", "search", "weather carcavelos tomorrow", wait_s=0.15)
+        self.at(1.2, "snap", "crowd-6")
+        self.at(0.0, "snap", "rail-crowd")
+        self.probe("crowd", sats, lambda v: 5 <= len(v) <= 6, "five or six satellites should share the ring")
+        self.probe("no overlap", sats, lambda v: _min_gap(v) >= 40,
+                   "crowded satellites must not sit on each other (min gap px)")
+        for call, ok in ((a, True), (b, False), (c, True), (d, True)):
+            self.tool_end(call, "ok", ok=ok, ms=1500, wait_s=0.35)
+        self.end("reply", 9000)
+        self.pub("call_state", {"state": "ended", "label": "Mum", "ended_by": "hung_up", "error": ""}, 1.0)
+
+        # 11. Labels that do not fit: long, emoji, right-to-left.
+        self.wake("labels")
+        for target in ("Fallout: The Complete Collection Director's Cut Extended Edition Remastered 4K HDR",
+                       "📺🔥🎬 Série nova 🎬🔥📺", "مرحبا بالعالم من كاركافيلوس", "שלום עולם, Carcavelos"):
+            self.tool_start("control_tv", "stremio_play", target, wait_s=0.05)
+        self.at(0.9, "snap", "labels")
+        self.probe("labels inside", "window.__labelBounds ? window.__labelBounds() : null",
+                   lambda v: v is not None and v["out"] == 0, "every label must stay inside the stage")
+        self.end("reply", 3000)
+
+        # 12. A tool whose end never arrives, and one cut off by a barge-in.
+        self.wake("never ends")
+        self.tool_start("control_tv", "turn_on")
+        self.at(0.8, "snap", "orphan-running")
+        self.end("reply", 3000)
+        self.probe("orphan lost", sats, lambda v: all(x["st"] == "lost" for x in v), "an unanswered tool should show as lost at turn end",
+                   wait_s=0.2)
+        self.probe("orphan gone", sats, lambda v: len(v) == 0, "a lost satellite should fade out", wait_s=1.2)
+        self.wake("play fallout")
+        self.tool_start("control_tv", "stremio_play", "Fallout")
+        self.pub("state", {"state": "speaking"})
+        self.say("Putting Fallout on, it might take a moment to find a good source for you.", stop_after=0.8)
+        self.pub("wake_hit", {"score": 0.62, "phase": "reply"})
+        self.at(0.3, "snap", "barge-in-mid-tool")
+        self.end("barged_in", 4000)
+        self.probe("barge lost", sats, lambda v: len(v) == 0, "a barged-in tool must not stay up", wait_s=1.5)
+
+        # 13. Rapid turns back to back.
+        for i in range(12):
+            self.wake(f"rapid {i}", chained=True)
+            self.call_tool("control_lights", "light_on" if i % 2 else "light_off", "attic", "ok", ok=True,
+                           seconds=0.12, ms=300)
+            self.end("reply", 2000)
+        self.probe("rapid bounded", sats, lambda v: len(v) <= 6, "rapid turns must not pile satellites up")
+        self.probe("rapid drained", sats, lambda v: len(v) == 0, "rapid turns should all dock and go", wait_s=2.5)
+        self.at(0.0, "snap", "end")
+        return self.steps
 
     def build(self):
         self.pub("state", {"state": "idle"})
@@ -209,7 +471,7 @@ class Script:
 
 
 # ------------------------------------------------------------------ server
-def start(port: int):
+def start(port: int, include_text: bool = True, bus=None):
     os.environ["CALIFORNIA_UI_TOKEN"] = TOKEN
     try:
         import yaml
@@ -221,14 +483,15 @@ def start(port: int):
     ui = dict(config.get("ui") or {})
     ui.update({"enabled": True, "host": "127.0.0.1", "port": port})
     config["ui"] = ui
-    bus = EventBus()
+    config["logging"] = {**(config.get("logging") or {}), "include_transcripts": include_text}
+    bus = bus or EventBus()
     live = LiveUI(config, bus)
     if not live.start():
         sys.exit(f"Could not listen on 127.0.0.1:{port}")
     return bus, live
 
 
-def run_steps(bus, steps, wait, on_snap=None, on_stop=None):
+def run_steps(bus, steps, wait, on_snap=None, on_stop=None, on_probe=None):
     for wait_s, kind, arg in steps:
         if wait_s:
             wait(wait_s)
@@ -239,6 +502,8 @@ def run_steps(bus, steps, wait, on_snap=None, on_stop=None):
             on_snap(arg)
         elif kind == "mark_stop" and on_stop:
             on_stop()
+        elif kind == "probe" and on_probe:
+            on_probe(*arg)
 
 
 # ------------------------------------------------------------------ check
@@ -314,6 +579,301 @@ def check(port: int, include_text: bool) -> int:
     return 0
 
 
+def _launch(pw):
+    executable = os.environ.get("CHROMIUM_PATH") or (DEFAULT_CHROMIUM if os.path.exists(DEFAULT_CHROMIUM) else None)
+    return pw.chromium.launch(
+        executable_path=executable,
+        args=["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
+    )
+
+
+def _open(browser, url, width, height, scheme="dark", reduced=False, block_three=False):
+    ctx = browser.new_context(viewport={"width": width, "height": height}, color_scheme=scheme,
+                              reduced_motion="reduce" if reduced else "no-preference")
+    page = ctx.new_page()
+    errors: list[str] = []
+    page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    if block_three:
+        page.route("**/vendor/three.min.js", lambda route: route.abort())
+    page.goto(url)
+    if block_three:
+        page.wait_for_timeout(800)
+    else:
+        _wait_for(page, "window.__halo !== undefined")
+        page.wait_for_timeout(500)
+    return ctx, page, errors
+
+
+def _wait_for(page, js, timeout_s=10.0):
+    """wait_for_function without its eval: the page's CSP has no 'unsafe-eval'."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if page.evaluate(js):
+            return
+        page.wait_for_timeout(100)
+    raise TimeoutError(js)
+
+
+def check_tools(port: int, only: str | None = None) -> int:
+    """
+    Every tool path and the edge cases, on the real page, with probes.
+
+    One bus and one server throughout; each context gets the tools script from
+    a fresh connection, so every run is also a page opened onto a session with
+    history in its replay ring.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("--check needs Playwright: uv run --no-project --with playwright python tools/demo_live_ui.py --check")
+        return 2
+    os.makedirs(SHOTS, exist_ok=True)
+    failures: list[str] = []
+    bus, live = start(port)
+    url = f"http://127.0.0.1:{live._server.server_address[1]}/{TOKEN}/?debug"
+
+    def play(page, name, script, include_text=True):
+        def snap(label):
+            page.screenshot(path=os.path.join(SHOTS, f"tools-{name}-{label}.png"), full_page=label.startswith("rail"))
+            scroll = page.evaluate("document.documentElement.scrollWidth - window.innerWidth")
+            if scroll > 0:
+                failures.append(f"{name}/{label}: horizontal scroll of {scroll}px")
+
+        def probe(label, js, predicate, message):
+            value = page.evaluate(js)
+            try:
+                good = predicate(value)
+            except Exception as exc:  # noqa: BLE001 - a probe that cannot read is a failure
+                good, value = False, f"{value!r} ({exc})"
+            if not good:
+                failures.append(f"{name}/{label}: {message}; got {value!r}"[:400])
+
+        steps = script(Script(Voice(include_text)))
+        run_steps(bus, steps, lambda sec: page.wait_for_timeout(int(sec * 1000)), snap, None, probe)
+
+    with sync_playwright() as pw:
+        browser = _launch(pw)
+        runs = [("390-dark", 390, 844, "dark"), ("1280-dark", 1280, 900, "dark"), ("1280-light", 1280, 900, "light")]
+        for name, w, h, scheme in runs:
+            if only and only not in name:
+                continue
+            ctx, page, errors = _open(browser, url, w, h, scheme)
+            play(page, name, lambda sc: sc.build_tools())
+            leftover = page.evaluate("({sats: window.__halo.satCount, dom: document.querySelectorAll('#halo-sats .sat').length,"
+                                     " tethers: window.__halo.tethers,"
+                                     " entries: window.__tools.entries})")
+            if any(leftover.values()):
+                failures.append(f"{name}: left behind after the script {leftover}")
+            if errors:
+                failures.append(f"{name}: console errors {errors[:3]}")
+            print(f"tools {name}: leftovers {leftover}, {len(errors)} console errors")
+            ctx.close()
+
+        if not only or only == "edge":
+            failures += _check_tool_edges(browser, bus, live, url, play)
+        browser.close()
+    live.stop()
+    if failures:
+        print("FAILED")
+        for f in failures:
+            print("  " + f)
+        return 1
+    print(f"OK: screenshots in {SHOTS}")
+    return 0
+
+
+def _short_turn(sc, tools, *, end=True, text="x"):
+    """A turn with the given (name, action, target, ok, seconds) tools."""
+    sc.wake(text, chained=True)
+    for name, action, target, ok, seconds in tools:
+        sc.call_tool(name, action, target, "ok", ok=ok, seconds=seconds, ms=int(seconds * 1000))
+    if end:
+        sc.end("reply", 3000)
+    return sc.steps
+
+
+def _check_tool_edges(browser, bus, live, url, play) -> list[str]:
+    failures: list[str] = []
+    sats_js = "window.__halo ? window.__halo.sats : []"
+
+    # Reduced motion: satellites still appear, show their state and go.
+    ctx, page, errors = _open(browser, url, 390, 844, reduced=True)
+
+    def reduced_script(sc):
+        sc.wake("reduced")
+        call = sc.tool_start("control_tv", "turn_on")
+        sc.at(1.2, "snap", "running")
+        sc.probe("reduced running", sats_js, lambda v: len(v) == 1 and v[0]["alpha"] > 0.9, "a satellite shows at once with reduced motion")
+        sc.tool_end(call, "on", ok=True, ms=5000, wait_s=0.2)
+        sc.at(0.6, "snap", "docked")
+        sc.end("reply", 3000)
+        sc.probe("reduced gone", sats_js, lambda v: len(v) == 0, "a docked satellite goes with reduced motion too", wait_s=1.5)
+        return sc.steps
+    play(page, "390-reduced", reduced_script)
+    failures += [f"reduced: {e}" for e in errors[:3]]
+    ctx.close()
+
+    # include_transcripts false: no label anywhere, even if one were sent.
+    live.stop()
+    bus2, live2 = start(live.port, include_text=False, bus=bus)
+    ctx, page, errors = _open(browser, url, 390, 844)
+
+    def notext_script(sc):
+        sc.wake("private")
+        call = sc.tool_start("control_whatsapp", "whatsapp_send", "to Marta")
+        # A target the server would never send with transcripts off: the page drops it anyway.
+        sc.pub("turn_tool_start", {"turn": sc.turn, "name": "control_tv", "action": "stremio_play",
+                                   "start_ms": 99, "target": "SECRET-LABEL"})
+        sc.at(0.8, "snap", "running")
+        sc.probe("no labels", "[...document.querySelectorAll('#halo-sats .tag b, #tools small')].map(n => n.textContent).join('|')",
+                 lambda v: "Marta" not in v and "SECRET" not in v, "no target text with include_transcripts false")
+        sc.tool_end(call, "sent", ok=True, ms=1000, wait_s=0.3)
+        sc.end("reply", 3000)
+        return sc.steps
+    play(page, "390-notext", notext_script, include_text=False)
+    failures += [f"notext: {e}" for e in errors[:3]]
+    ctx.close()
+    live2.stop()
+    bus, live = start(live.port, bus=bus)
+
+    # No WebGL (three.js blocked): the rail alone carries the tools, no errors.
+    ctx, page, errors = _open(browser, url, 390, 844, block_three=True)
+
+    def nogl_script(sc):
+        sc.wake("no gl")
+        call = sc.tool_start("control_tv", "stremio_play", "Fallout S2E9")
+        sc.at(0.8, "snap", "running")
+        sc.probe("rail row", "document.querySelectorAll('#tools li').length", lambda v: v == 1, "the rail shows the call without WebGL")
+        sc.tool_end(call, "playing", ok=True, ms=20000, wait_s=0.2)
+        sc.at(0.3, "snap", "done")
+        sc.probe("rail done", "document.querySelector('#tools li').dataset.st", lambda v: v == "ok", "the rail row ends ok")
+        sc.end("reply", 3000)
+        return sc.steps
+    play(page, "390-nogl", nogl_script)
+    failures += [f"nogl: {e}" for e in errors if "ERR_FAILED" not in e][:3]   # the block itself logs one
+    ctx.close()
+
+    # Ambient: the satellites are part of the halo, so they stay.
+    ctx, page, errors = _open(browser, url.replace("?debug", "?debug#ambient"), 390, 844)
+
+    def ambient_script(sc):
+        sc.wake("ambient")
+        sc.tool_start("control_tv", "turn_on")
+        sc.tool_start("control_lights", "light_on", "attic", wait_s=0.2)
+        sc.at(1.0, "snap", "two")
+        sc.probe("ambient sats", "document.querySelectorAll('#halo-sats .sat').length", lambda v: v == 2, "satellites show in ambient")
+        sc.end("reply", 3000)
+        return sc.steps
+    play(page, "390-ambient", ambient_script)
+    ctx.close()
+
+    # Opened mid-turn: a running tool from the replay ring comes up already aged,
+    # finished ones from earlier turns do not replay their docks.
+    sc = Script(Voice(True))
+    _short_turn(sc, [("control_lights", "light_on", "attic", True, 0.1)], text="earlier")
+    sc.wake("mid-turn")
+    running = sc.tool_start("control_tv", "turn_on")
+    run_steps(bus, sc.steps, time.sleep)
+    time.sleep(3.0)
+    ctx, page, errors = _open(browser, url, 1280, 900)
+    sats = page.evaluate(sats_js)
+    page.screenshot(path=os.path.join(SHOTS, "tools-1280-midturn-open.png"))
+    if not (len(sats) == 1 and sats[0]["st"] == "run"):
+        failures.append(f"mid-turn open: expected one running satellite, got {sats}")
+    else:
+        aged = sats[0]["note"].split(" ")[0]
+        if not aged.endswith("s") or float(aged[:-1]) < 2.5:
+            failures.append(f"mid-turn open: the replayed call should already be ~3s old, shows {sats[0]['note']}")
+
+    # Reconnect mid-tool: drop the server, end the tool while the page is away,
+    # bring it back on the same bus; Last-Event-ID resumes and the call ends.
+    live.stop()
+    sc.steps = []
+    sc.tool_end(running, "on", ok=True, ms=8000)
+    sc.end("reply", 9000)
+    run_steps(bus, sc.steps, time.sleep)
+    bus, live = start(live.port, bus=bus)
+    page.wait_for_timeout(6000)
+    after = page.evaluate(sats_js)
+    page.screenshot(path=os.path.join(SHOTS, "tools-1280-after-reconnect.png"))
+    if after:
+        failures.append(f"reconnect: the call ended while the page was away should not linger, got {after}")
+    entries = page.evaluate("window.__tools.entries")
+    if entries:
+        failures.append(f"reconnect: {entries} tool entries left behind")
+    failures += [f"midturn/reconnect: {e}" for e in errors if "events" not in e][:3]
+
+    # Performance: frame time with four running satellites on swiftshader.
+    def frame_stats(seconds=3.0):
+        return page.evaluate("""(ms) => new Promise((done) => {
+            const t = []; let last = performance.now(); const end = last + ms;
+            function f(now) { t.push(now - last); last = now; if (now < end) requestAnimationFrame(f); else {
+              t.sort((a, b) => a - b);
+              done({ n: t.length, mean: t.reduce((a, b) => a + b, 0) / t.length, p95: t[Math.floor(t.length * 0.95)] }); } }
+            requestAnimationFrame(f); })""", int(seconds * 1000))
+    sc.steps = []
+    sc.wake("perf")
+    run_steps(bus, sc.steps, time.sleep)
+    page.wait_for_timeout(800)
+    base = frame_stats()
+    sc.steps = []
+    for name, action, target in (("control_tv", "turn_on", None), ("control_lights", "light_on", "attic"),
+                                 ("control_vacuum", "vacuum_clean_all", "everywhere"), ("web_search", "search", "weather")):
+        sc.tool_start(name, action, target)
+    run_steps(bus, sc.steps, time.sleep)
+    page.wait_for_timeout(1000)
+    four = frame_stats()
+    print(f"frame time, swiftshader 1280x900: none {base['mean']:.1f}ms mean / {base['p95']:.1f}ms p95, "
+          f"four satellites {four['mean']:.1f}ms / {four['p95']:.1f}ms ({four['n']} frames)")
+    if four["mean"] > base["mean"] * 1.5 + 4:
+        failures.append(f"perf: four satellites cost too much ({base} -> {four})")
+    sc.steps = []
+    sc.end("reply", 5000)
+    run_steps(bus, sc.steps, time.sleep)
+    page.wait_for_timeout(1500)
+
+    # A long session, compressed: 180 turns (about 30 minutes of use) with
+    # tool calls of every outcome. Nothing may grow.
+    def census():
+        # The session feed (200 turns) and the log (300 lines) are capped lists
+        # that grow by design; everything else must stay flat.
+        return page.evaluate("""() => ({ dom: document.getElementsByTagName('*').length
+              - document.querySelectorAll('#turns *, #log-lines *, #hits *').length,
+            feed: document.getElementById('turns').children.length,
+            sats: window.__halo.satCount, entries: window.__tools.entries, rows: window.__tools.rows,
+            heap: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1e6) : -1 })""")
+    first = census()
+    kinds = [("control_lights", "light_on", "attic", True), ("control_tv", "get_status", None, None),
+             ("control_whatsapp", "whatsapp_send", "to Marta", None), ("control_vacuum", "vacuum_dock", None, False),
+             ("web_search", "search", "news", True)]
+    t0 = time.time()
+    for i in range(180):
+        sc.steps = []
+        sc.wake(f"turn {i}", chained=True)
+        name, action, target, ok = kinds[i % len(kinds)]
+        awaiting = name == "control_whatsapp"
+        call = sc.tool_start(name, action, target)
+        if i % 17 != 0:   # every 17th call never answers
+            sc.tool_end(call, "x", ok=ok, awaiting=awaiting, ms=500)
+        sc.end("reply", 2000)
+        run_steps(bus, sc.steps, lambda s: None)
+        page.wait_for_timeout(40)
+        if i == 90:
+            mid = census()
+    page.wait_for_timeout(3000)
+    last = census()
+    fps = frame_stats(2.0)
+    print(f"long session ({time.time() - t0:.0f}s, 180 turns): start {first}, mid {mid}, end {last}, "
+          f"frames {fps['mean']:.1f}ms mean")
+    if last["sats"] > 1 or last["entries"] > 1 or last["dom"] > first["dom"] + 40:
+        failures.append(f"long session: growth {first} -> {last}")
+    page.screenshot(path=os.path.join(SHOTS, "tools-1280-long-session-end.png"))
+    ctx.close()
+    live.stop()
+    return failures
+
+
 def _check_ambient_and_fallback(browser, url: str) -> list[str]:
     """Ambient mode shows only the halo; without three.js the page falls back to the pill."""
     failures = []
@@ -360,15 +920,25 @@ def main() -> int:
     parser.add_argument("--loop", action="store_true", help="play the turns again and again")
     parser.add_argument("--no-text", action="store_true", help="as with logging.include_transcripts: false")
     parser.add_argument("--check", action="store_true", help="headless Playwright pass over the page")
+    parser.add_argument("--only", choices=("halo", "tools", "edge", "390", "1280"),
+                        help="with --check: just the halo pass, the tools pass, its edge cases, or one width")
+    parser.add_argument("--tools", action="store_true", help="play the tool script instead of the three turns")
     args = parser.parse_args()
     if args.check:
-        return check(args.port, include_text=not args.no_text)
+        code = 0
+        if args.only in (None, "halo"):
+            code = check(args.port, include_text=not args.no_text)
+        if args.only != "halo":
+            only = None if args.only in (None, "tools") else args.only
+            code = check_tools(args.port + 1, only) or code
+        return code
 
     bus, live = start(args.port)
     print(f"Live UI demo: {live.url}   (Ctrl-C to stop)")
     try:
         while True:
-            steps = Script(Voice(include_text=not args.no_text)).build()
+            script = Script(Voice(include_text=not args.no_text))
+            steps = script.build_tools() if args.tools else script.build()
             run_steps(bus, steps, time.sleep)
             if not args.loop:
                 print("Done. The page stays up; Ctrl-C to stop.")

@@ -41,7 +41,7 @@ _FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)s] %(threadName)s %(name)s: %(me
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
 # Fields that carry what he said or what she answered. `include_transcripts:
 # false` keeps them out of turns.jsonl AND off the live bus.
-_TEXT_FIELDS = ("transcript", "reply")
+_TEXT_FIELDS = ("transcript", "reply", "target")
 _TURN_IDS = itertools.count(1)
 _CHATTY_LIBRARIES = (
     "anthropic", "groq", "openai", "asyncio", "PIL", "bleak",
@@ -178,24 +178,56 @@ class TurnTimer:
             self._fields.update(fields)
         self._publish("turn_set", {"fields": fields})
 
-    def tool_started(self, name: str, action: str | None) -> None:
-        """Live only: a tool call began. The record gets it from tool()."""
-        self._publish("turn_tool_start", {"name": name, "action": action, "start_ms": self.now_ms()})
+    def tool_started(self, name: str, action: str | None, target: str | None = None,
+                     start_ms: int | None = None) -> int:
+        """Live only: a tool call began. The record gets it from tool().
+
+        `target` is a short label for the live UI ("attic", "to Marta"), never
+        message text or a number; it is dropped with `include_transcripts:
+        false`. Calling again with the same `start_ms` updates the label of a
+        call already shown (web search learns its query after it starts).
+        Returns the start, for the matching tool() call. Never raises.
+        """
+        try:
+            update = start_ms is not None
+            if start_ms is None:
+                start_ms = self.now_ms()
+            data = {"name": name, "action": action, "start_ms": start_ms}
+            label = _short_target(target) if self._include_text else None
+            if label:
+                data["target"] = label
+            elif update:
+                return start_ms   # an update with nothing to say
+            self._publish("turn_tool_start", data)
+        except Exception:
+            pass
+        return start_ms if start_ms is not None else 0
 
     def tool(self, name: str, action: str | None, started_ms: int, result: str | None,
-             ok: bool | None = None) -> None:
+             ok: bool | None = None, target: str | None = None, awaiting: bool = False) -> None:
         """`ok`: did the device action happen (True/False), absent when the tool
-        had nothing to report -- a status read, or a question back."""
+        had nothing to report -- a status read, or a question back.
+        `awaiting`: the tool asked him something (a read-back, "which one?") and
+        is parked until he answers. Never set together with `ok`."""
         with self._lock:
             entry = {
                 "name": name,
                 "action": action,
                 "start_ms": started_ms,
                 "ms": self._ms() - started_ms,
-                "result": (result or "")[:160],
             }
+            # A result can quote what he asked for ("I've got Marta at +351...",
+            # a group read-back carries the message), so it goes with the
+            # transcripts: `include_transcripts: false` keeps only timings.
+            if self._include_text:
+                entry["result"] = (result or "")[:160]
             if ok is True or ok is False:
                 entry["ok"] = ok
+            elif awaiting is True:
+                entry["awaiting"] = True
+            label = _short_target(target) if self._include_text else None
+            if label:
+                entry["target"] = label
             self._tools.append(entry)
         self._publish("turn_tool", entry)
 
@@ -228,6 +260,22 @@ class TurnTimer:
         return record
 
 
+# A satellite label is a glance, not a sentence.
+_TARGET_MAX = 40
+
+
+def _short_target(target) -> str | None:
+    """One line, at most _TARGET_MAX characters, or None."""
+    if not isinstance(target, str):
+        return None
+    text = " ".join(target.split())
+    if not text:
+        return None
+    if len(text) > _TARGET_MAX:
+        text = text[: _TARGET_MAX - 1].rstrip() + "\u2026"
+    return text
+
+
 class _NullTurn:
     """Stand-in when no turn is active, so call sites never branch."""
 
@@ -241,7 +289,7 @@ class _NullTurn:
         pass
 
     def tool_started(self, *args, **kwargs):
-        pass
+        return 0
 
     def tool(self, *args, **kwargs):
         pass

@@ -59,8 +59,21 @@ class _FakeStream:
     @property
     def text_stream(self):
         for delta in self._deltas:
-            self._events.append(("delta", delta))
-            yield delta
+            if isinstance(delta, str):
+                self._events.append(("delta", delta))
+                yield delta
+
+    def __iter__(self):
+        """The SDK's MessageStream iterates raw events plus derived "text"
+        events; a string in `deltas` is a text event, anything else is passed
+        through as a raw event (a dict standing in for the SDK object)."""
+        for delta in self._deltas:
+            if isinstance(delta, str):
+                self._events.append(("delta", delta))
+                yield {"type": "text", "text": delta}
+            else:
+                self._events.append(("raw", delta.get("type")))
+                yield delta
 
     def get_final_message(self):
         self._events.append(("final", None))
@@ -576,6 +589,120 @@ class ClaudeStreamingTests(unittest.TestCase):
         self.assertEqual(next(gen), "")
         gen.close()
         self.assertEqual(svc.history[-1], {"role": "user", "content": "hi"})
+
+
+def _search_events(index, tool_id, query_parts):
+    """The raw events of one server_tool_use block, as the SDK streams them."""
+    events = [{"type": "content_block_start", "index": index,
+               "content_block": {"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": {}}}]
+    for part in query_parts:
+        events.append({"type": "content_block_delta", "index": index,
+                       "delta": {"type": "input_json_delta", "partial_json": part}})
+    events.append({"type": "content_block_stop", "index": index})
+    return events
+
+
+def _search_result(index, tool_id, content):
+    return {"type": "content_block_start", "index": index,
+            "content_block": {"type": "web_search_tool_result", "tool_use_id": tool_id, "content": content}}
+
+
+class WebSearchEventTests(unittest.TestCase):
+    """
+    Web search runs at Anthropic inside the stream, so the only way the live
+    UI can show it is from the raw stream events. These pin that the events
+    are read, that text still flows exactly as before, and that nothing the
+    hook does can reach the reply.
+    """
+
+    def _service(self, turns):
+        events = []
+        with mock.patch.dict("os.environ", {"ANTHROPIC_API_KEY": "x"}), \
+             mock.patch("anthropic.Anthropic"):
+            svc = LLMService(_config())
+        svc.client = _FakeClient(turns, events)
+        calls = []
+        svc.on_server_tool = lambda event, info: calls.append((event, dict(info)))
+        return svc, calls
+
+    def test_the_default_hook_is_a_no_op(self):
+        with mock.patch.dict("os.environ", {"ANTHROPIC_API_KEY": "x"}), \
+             mock.patch("anthropic.Anthropic"):
+            svc = LLMService(_config())
+        svc.client = _FakeClient([(["a", *_search_events(1, "s1", ['{"q'])], [], "end_turn")], [])
+        self.assertEqual(list(svc.stream_response("x")), ["a"])
+
+    def test_a_search_reports_start_query_and_end_while_text_flows(self):
+        deltas = [
+            "Let me check. ",
+            *_search_events(1, "srv_1", ['{"query": "benf', 'ica result"}']),
+            _search_result(2, "srv_1", [{"type": "web_search_result"}, {"type": "web_search_result"}]),
+            "They won.",
+        ]
+        svc, calls = self._service([(deltas, [], "end_turn")])
+        chunks = list(svc.stream_response("did benfica win"))
+
+        self.assertEqual(chunks, ["Let me check. ", "They won."])
+        self.assertEqual([c[0] for c in calls], ["start", "input", "end"])
+        self.assertEqual(calls[0][1], {"id": "srv_1", "name": "web_search"})
+        self.assertEqual(calls[1][1]["query"], "benfica result")
+        end = calls[2][1]
+        self.assertIs(end["ok"], True)
+        self.assertEqual(end["result"], "2 results")
+        self.assertEqual(end["query"], "benfica result")
+        self.assertEqual(svc.history[-1], {"role": "assistant", "content": "Let me check. They won."})
+
+    def test_an_error_result_ends_the_search_as_failed(self):
+        deltas = [
+            *_search_events(0, "srv_2", ['{"query": "x"}']),
+            _search_result(1, "srv_2", {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}),
+            "Couldn't look that up.",
+        ]
+        svc, calls = self._service([(deltas, [], "end_turn")])
+        list(svc.stream_response("x"))
+        end = [c for c in calls if c[0] == "end"][0][1]
+        self.assertIs(end["ok"], False)
+        self.assertIn("max_uses_exceeded", end["result"])
+
+    def test_a_hook_that_raises_never_reaches_the_reply(self):
+        deltas = ["one ", *_search_events(1, "s", ['{"query": "q"}']), _search_result(2, "s", []), "two"]
+        svc, _ = self._service([(deltas, [], "end_turn")])
+        svc.on_server_tool = mock.Mock(side_effect=RuntimeError("bus down"))
+        self.assertEqual(list(svc.stream_response("x")), ["one ", "two"])
+        self.assertEqual(svc.on_server_tool.call_count, 3)
+
+    def test_garbage_events_are_ignored(self):
+        deltas = ["a", {"type": "content_block_start"}, {"type": "content_block_delta", "index": 9},
+                  {"type": "content_block_stop", "index": None}, {"type": "mystery"}, "b"]
+        svc, calls = self._service([(deltas, [], "end_turn")])
+        self.assertEqual(list(svc.stream_response("x")), ["a", "b"])
+        self.assertEqual(calls, [])
+
+    def test_a_search_answered_on_the_next_request_still_ends(self):
+        """Search plus a local tool in one response: the search runs on the
+        request that answers the tool, so its result is in the NEXT stream."""
+        call = _Block("tool_use", name="control_tv", input={"action": "launch_app"}, id="t1")
+        server = _Block("server_tool_use", name="web_search", input={"query": "what to watch"}, id="srv_9")
+        turns = [
+            ([*_search_events(0, "srv_9", ['{"query": "what to watch"}'])], [server, call], "tool_use"),
+            ([_search_result(0, "srv_9", [{"type": "web_search_result"}]), "Try Severance."], [], "end_turn"),
+        ]
+        svc, calls = self._service(turns)
+        svc.tool_handler = lambda name, args: "Stremio open"
+        chunks = list(svc.stream_response("open stremio and find me something"))
+        self.assertIn("Try Severance.", chunks)
+        self.assertEqual([c[0] for c in calls], ["start", "input", "end"])
+        self.assertEqual(calls[2][1]["query"], "what to watch")
+        self.assertIs(calls[2][1]["ok"], True)
+
+    def test_a_barge_in_mid_search_keeps_the_partial_answer(self):
+        deltas = ["Checking ", "now. ", *_search_events(2, "s3", ['{"query": "q"}']), "Found it."]
+        svc, calls = self._service([(deltas, [], "end_turn")])
+        gen = svc.stream_response("look it up")
+        self.assertEqual(next(gen), "Checking ")
+        self.assertEqual(next(gen), "now. ")
+        gen.close()
+        self.assertEqual(svc.history[-1], {"role": "assistant", "content": "Checking now."})
 
 
 if __name__ == "__main__":
