@@ -257,5 +257,168 @@ class SpeakerSessionTests(unittest.TestCase):
         self.sd_play.assert_called_once()
 
 
+class _Hooks:
+    """Records on_clip_start / on_clip_end calls with their order."""
+
+    def __init__(self, pipe, stream_ref=None):
+        self.events: list[tuple] = []
+        self._ids = iter(range(1, 1000))
+        self._stream_ref = stream_ref
+        pipe.on_clip_start = self.start
+        pipe.on_clip_end = self.end
+
+    def _written(self):
+        return _FakeStream.instances[0].written_frames if _FakeStream.instances else None
+
+    def start(self, data, sr, text, kind):
+        clip = next(self._ids)
+        self.events.append(("start", clip, kind, text, len(data), sr, self._written()))
+        return clip
+
+    def end(self, clip, stopped):
+        self.events.append(("end", clip, stopped, self._written()))
+
+    @property
+    def ends(self):
+        return [e for e in self.events if e[0] == "end"]
+
+    @property
+    def starts(self):
+        return [e for e in self.events if e[0] == "start"]
+
+
+class ClipHookTests(unittest.TestCase):
+    """The live UI's halo animates her voice from these two hooks."""
+
+    def setUp(self):
+        _FakeStream.instances.clear()
+        patch("core.audio_pipeline.sd.OutputStream", _FakeStream).start()
+        self.sd_play = patch("core.audio_pipeline.sd.play").start()
+        self.addCleanup(patch.stopall)
+
+    def test_start_hook_fires_before_the_first_write_and_end_after_the_last(self):
+        pipe = _pipeline()
+        pipe.open_speaker(24000)
+        hooks = _Hooks(pipe)
+        pipe.play_audio(np.ones(24000, dtype=np.float32), 24000, blocking=True, text="Hi.", kind="reply")
+        start, end = hooks.events
+        self.assertEqual(start[:6], ("start", 1, "reply", "Hi.", 24000, 24000))
+        self.assertEqual(start[6], 0, "start fires before anything is written")
+        self.assertEqual(end, ("end", 1, False, 24000))
+
+    def test_stop_mid_clip_reports_stopped_true(self):
+        pipe = _pipeline()
+        with patch(
+            "core.audio_pipeline.sd.OutputStream",
+            lambda **kw: _FakeStream(write_delay=0.005, **kw),
+        ):
+            pipe.open_speaker(24000)
+        hooks = _Hooks(pipe)
+
+        def stop_soon():
+            time.sleep(0.03)
+            pipe.stop_playback()
+
+        threading.Thread(target=stop_soon).start()
+        pipe.play_audio(np.ones(48000, dtype=np.float32), 24000, blocking=True)
+        self.assertEqual(len(hooks.ends), 1)
+        self.assertTrue(hooks.ends[0][2])
+
+    def test_clip_refused_by_an_existing_stop_fires_no_hooks(self):
+        pipe = _pipeline()
+        pipe.open_speaker(24000)
+        hooks = _Hooks(pipe)
+        pipe.stop_playback()
+        pipe.play_audio(np.ones(2400, dtype=np.float32), 24000, blocking=True)
+        self.assertEqual(hooks.events, [])
+
+    def test_raising_hook_never_stops_playback(self):
+        pipe = _pipeline()
+        pipe.open_speaker(24000)
+
+        def boom(*args):
+            raise RuntimeError("ui broke")
+
+        pipe.on_clip_start = boom
+        pipe.on_clip_end = boom
+        pipe.play_audio(np.ones(2400, dtype=np.float32), 24000, blocking=True)
+        self.assertEqual(_FakeStream.instances[0].written_frames, 2400)
+
+        ends = []
+        pipe.on_clip_start = lambda *a: 7
+        pipe.on_clip_end = lambda clip, stopped: (ends.append(clip), boom())
+        pipe.play_audio(np.ones(2400, dtype=np.float32), 24000, blocking=True)
+        self.assertEqual(ends, [7])
+        self.assertEqual(_FakeStream.instances[0].written_frames, 4800)
+
+    def test_sd_play_fallback_fires_both_hooks(self):
+        pipe = _pipeline()  # no session: sd.play
+        hooks = _Hooks(pipe)
+        pipe.play_audio(np.zeros(100, dtype=np.float32), 22050, blocking=True, kind="error")
+        self.sd_play.assert_called_once()
+        self.assertEqual([e[0] for e in hooks.events], ["start", "end"])
+        self.assertEqual(hooks.starts[0][2], "error")
+        self.assertFalse(hooks.ends[0][2])
+
+    def test_nonblocking_activation_fires_start_only(self):
+        pipe = _pipeline()
+        pipe._activation_pools = {"warm": [("sup", "Sup.", np.ones(2400, dtype=np.float32), 24000)]}
+        pipe._chime_data = None
+        pipe._activation_blocking = False
+        hooks = _Hooks(pipe)
+        pipe.play_activation_sound("warm")
+        self.assertEqual([e[0] for e in hooks.events], ["start"])
+        self.assertEqual(hooks.starts[0][2:4], ("ack", "Sup."))
+
+    def test_blocking_activation_is_an_ack_clip_with_its_line(self):
+        pipe = _pipeline()
+        pipe._activation_pools = {"warm": [("sup", "Sup.", np.ones(2400, dtype=np.float32), 24000)]}
+        pipe._chime_data = None
+        pipe._activation_blocking = True
+        pipe.open_speaker(24000)
+        hooks = _Hooks(pipe)
+        pipe.play_activation_sound("warm")
+        self.assertEqual([e[0] for e in hooks.events], ["start", "end"])
+        self.assertEqual(hooks.starts[0][2:4], ("ack", "Sup."))
+
+    def test_each_clip_reports_end_exactly_once(self):
+        # Normal, stopped-before-write, write failure + sd.play fallback, a
+        # failed reopen, and an empty clip (which never starts).
+        pipe = _pipeline()
+        pipe.open_speaker(24000)
+        hooks = _Hooks(pipe)
+        pipe.play_audio(np.ones(960, dtype=np.float32), 24000, blocking=True)
+
+        stream = _FakeStream.instances[0]
+
+        def broken_write(data):
+            raise RuntimeError("device gone")
+
+        stream.write = broken_write
+        pipe.play_audio(np.ones(960, dtype=np.float32), 24000, blocking=True)
+        self.sd_play.assert_called_once()
+
+        pipe.play_audio(np.zeros(0, dtype=np.float32), 24000, blocking=True)
+
+        def no_device(**kw):
+            raise RuntimeError("no device")
+
+        with patch("core.audio_pipeline.sd.OutputStream", no_device):
+            pipe.play_audio(np.ones(441, dtype=np.float32), 22050, blocking=True)
+
+        starts = [e[1] for e in hooks.starts]
+        ends = [e[1] for e in hooks.ends]
+        self.assertEqual(starts, [1, 2, 3])
+        self.assertEqual(ends, [1, 2, 3])
+        self.assertEqual(self.sd_play.call_count, 2)
+
+    def test_without_hooks_playback_is_unchanged(self):
+        pipe = _pipeline()
+        pipe.open_speaker(24000)
+        self.assertIsNone(pipe.on_clip_start)
+        pipe.play_audio(np.ones(2400, dtype=np.float32), 24000, blocking=True)
+        self.assertEqual(_FakeStream.instances[0].written_frames, 2400)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38,6 +38,12 @@ class ActivationPlayback(NamedTuple):
 
 
 class AudioPipeline:
+    # Called for every clip that actually starts playing, so the live UI can
+    # animate her voice. Set by the orchestrator; None means nobody is watching.
+    # Class-level so a pipeline built with __new__ (as the tests do) has them.
+    on_clip_start = None   # (data, sample_rate, text, kind) -> clip_id | None
+    on_clip_end = None     # (clip_id, stopped: bool) -> None
+
     def __init__(self, config: dict):
         audio_cfg = config["audio"]
         self.sample_rate = audio_cfg["sample_rate"]
@@ -63,6 +69,9 @@ class AudioPipeline:
         self._speaker_tail_s = float(sounds_cfg.get("speaker_tail_ms", 500)) / 1000.0
         self._abort = threading.Event()
         self._speaker_lock = threading.Lock()
+
+        self.on_clip_start = None
+        self.on_clip_end = None
 
     def _load_sounds(self, sounds_cfg: dict):
         """Load or generate activation/error sounds."""
@@ -271,8 +280,11 @@ class AudioPipeline:
             # Through the turn's speaker session when one is open, so the
             # clip's 20ms lead-in is not the first thing a freshly opened
             # device hears.
-            self.play_audio(data, sr, blocking=True)
+            self.play_audio(data, sr, blocking=True, text=text, kind="ack")
         else:
+            # Nothing waits for a non-blocking line to finish, so it reports a
+            # start and no end; the page ends it by its duration.
+            self._clip_started(data, sr, text, "ack")
             sd.play(data, sr, blocking=False)
         # A blocking call has already finished by the time we return, so it
         # leaves no overlap for the caller to gate against.
@@ -282,7 +294,7 @@ class AudioPipeline:
     def play_error_sound(self):
         """Play error indication sound."""
         if self._error_data is not None:
-            self.play_audio(self._error_data, self._error_sr, blocking=True)
+            self.play_audio(self._error_data, self._error_sr, blocking=True, kind="error")
 
     # ─── Speaker session ─────────────────────────────────────────────
 
@@ -383,7 +395,15 @@ class AudioPipeline:
     def speaker_open(self) -> bool:
         return self._speaker is not None
 
-    def play_audio(self, audio_data: np.ndarray, sample_rate: int, blocking: bool = True):
+    def play_audio(
+        self,
+        audio_data: np.ndarray,
+        sample_rate: int,
+        blocking: bool = True,
+        *,
+        text: str = "",
+        kind: str = "reply",
+    ):
         """
         Play arbitrary audio data through speakers.
 
@@ -391,9 +411,21 @@ class AudioPipeline:
         it in `SPEAKER_BLOCK_MS` blocks, checking for `stop_playback` between
         blocks. Otherwise it is one `sd.play`, as before — the manual test
         modes in main.py never open a session.
+
+        `text` and `kind` only label the clip for `on_clip_start` (the live
+        UI's halo). Every clip that starts reports one start and, when this
+        call waits for it, exactly one end; a clip refused by a stop already
+        in force reports nothing, because it never plays.
         """
         if not blocking or self._speaker is None:
-            sd.play(audio_data, sample_rate, blocking=blocking)
+            clip = self._clip_started(audio_data, sample_rate, text, kind)
+            if not blocking:
+                sd.play(audio_data, sample_rate, blocking=False)
+                return
+            try:
+                sd.play(audio_data, sample_rate, blocking=True)
+            finally:
+                self._clip_ended(clip, self._abort.is_set())
             return
 
         # The abort flag is NOT cleared here. Once a stop lands it stays in
@@ -408,7 +440,11 @@ class AudioPipeline:
             # one is ~200ms, paid once per interrupt.
             self.open_speaker(sample_rate)
             if self._speaker is None:
-                sd.play(audio_data, sample_rate, blocking=True)
+                clip = self._clip_started(audio_data, sample_rate, text, kind)
+                try:
+                    sd.play(audio_data, sample_rate, blocking=True)
+                finally:
+                    self._clip_ended(clip, self._abort.is_set())
                 return
 
         stream = self._speaker
@@ -416,19 +452,49 @@ class AudioPipeline:
         if data.size == 0:
             return
 
+        clip = self._clip_started(data, sample_rate, text, kind)
+        # One finally reports the end exactly once, whichever way this exits.
+        stopped = False
         try:
-            block = max(1, sample_rate * self.SPEAKER_BLOCK_MS // 1000)
-            for start in range(0, data.size, block):
+            try:
+                block = max(1, sample_rate * self.SPEAKER_BLOCK_MS // 1000)
+                for start in range(0, data.size, block):
+                    if self._abort.is_set():
+                        logger.debug("Playback stopped %.2fs in", start / sample_rate)
+                        stopped = True
+                        return
+                    stream.write(data[start : start + block])
+            except Exception:
                 if self._abort.is_set():
-                    logger.debug("Playback stopped %.2fs in", start / sample_rate)
+                    # The stop aborted the stream mid-write. Expected.
+                    stopped = True
                     return
-                stream.write(data[start : start + block])
+                logger.exception("Speaker write failed; falling back to sd.play")
+                sd.play(audio_data, sample_rate, blocking=True)
+                stopped = self._abort.is_set()
+        finally:
+            self._clip_ended(clip, stopped)
+
+    def _clip_started(self, data, sample_rate, text, kind):
+        """Tell the live UI a clip is starting. Never raises; None when unwatched."""
+        hook = self.on_clip_start
+        if hook is None:
+            return None
+        try:
+            return hook(data, sample_rate, text, kind)
         except Exception:
-            if self._abort.is_set():
-                # The stop aborted the stream mid-write. Expected.
-                return
-            logger.exception("Speaker write failed; falling back to sd.play")
-            sd.play(audio_data, sample_rate, blocking=True)
+            logger.debug("on_clip_start failed", exc_info=True)
+            return None
+
+    def _clip_ended(self, clip_id, stopped) -> None:
+        """Tell the live UI a clip ended. Never raises; no-op for an unwatched clip."""
+        hook = self.on_clip_end
+        if hook is None or clip_id is None:
+            return
+        try:
+            hook(clip_id, bool(stopped))
+        except Exception:
+            logger.debug("on_clip_end failed", exc_info=True)
 
     @staticmethod
     def _as_mono_float32(audio_data: np.ndarray) -> np.ndarray:
