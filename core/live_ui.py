@@ -72,7 +72,9 @@ class LiveUI:
         self.enabled = cfg.get("enabled", False) is not False
         self.host = str(cfg.get("host", "0.0.0.0"))
         self.port = int(cfg.get("port", 8765))
-        self.token = os.environ.get("CALIFORNIA_UI_TOKEN") or secrets.token_urlsafe(16)
+        # Hex, not urlsafe: a "-" or "_" in the path stopped WhatsApp turning the
+        # boot message's URL into a link (2026-10-13). 64 bits is plenty on a LAN.
+        self.token = os.environ.get("CALIFORNIA_UI_TOKEN") or secrets.token_hex(8)
         self.bus = bus
         self.ui_dir = ui_dir
         self._server: ThreadingHTTPServer | None = None

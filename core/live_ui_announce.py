@@ -176,7 +176,8 @@ def send_link(whatsapp_service, number: str, url: str) -> bool:
         logger.warning("Live UI: CALIFORNIA_UI_NOTIFY_NUMBER is not a usable phone number")
         return False
 
-    message = f"California is up ({datetime.now():%H:%M}). Live UI: {url}"
+    # The URL alone on the last line, nothing touching it, so WhatsApp links it.
+    message = f"California is up ({datetime.now():%H:%M}). Live UI:\n{url}"
     from services.whatsapp_service import _MSG_BUSY
 
     for attempt in range(_BUSY_RETRIES):

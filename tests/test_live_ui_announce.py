@@ -113,7 +113,8 @@ class SendLinkTests(unittest.TestCase):
         svc = _wa()
         self.assertTrue(a.send_link(svc, "933852719", URL))
         svc.resolve_contact.assert_called_once_with("933852719")
-        self.assertIn(URL, svc.send.call_args.args[1])
+        # Alone on its own line, so WhatsApp makes it a link.
+        self.assertEqual(svc.send.call_args.args[1].splitlines()[-1], URL)
 
     def test_the_keyboard_backend_never_sends_at_boot(self):
         svc = _wa(backend="keyboard")
