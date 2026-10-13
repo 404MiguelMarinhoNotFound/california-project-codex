@@ -257,24 +257,16 @@ class HangUpCrossCheckTests(_Base):
         self.assertEqual(result.ended_by, "hung_up")
 
 
-class LoopbackDeviceTests(unittest.TestCase):
-    """She must listen to the speaker the call plays on, not whatever is default."""
+class AudioFactoryTests(unittest.TestCase):
+    """The call's audio is the phone's (services/phone_call_audio.py); there is no laptop default."""
 
-    def _sc(self):
-        realtek, headphones = NS(name="Speakers (Realtek High Definition Audio)"), NS(name="Headphones (Black Diamond)")
-        return NS(all_speakers=lambda: [headphones, realtek], default_speaker=lambda: headphones)
+    def test_the_agent_needs_its_audio_factories(self):
+        with self.assertRaises(TypeError):
+            GeminiLiveAgent(client_kwargs={}, model="m")
 
-    def test_the_named_speaker_is_used_over_the_default(self):
-        cap = glc.LoopbackCapture(device="Speakers (Realtek")
-        self.assertEqual(cap._speaker(self._sc()).name, "Speakers (Realtek High Definition Audio)")
-
-    def test_no_name_or_a_missing_one_falls_back_to_the_default(self):
-        self.assertEqual(glc.LoopbackCapture()._speaker(self._sc()).name, "Headphones (Black Diamond)")
-        self.assertEqual(glc.LoopbackCapture(device="Nope")._speaker(self._sc()).name, "Headphones (Black Diamond)")
-
-    def test_the_agent_hands_its_listen_device_to_the_capture(self):
-        agent = GeminiLiveAgent(client_kwargs={}, model="m", listen_device="Speakers (Realtek")
-        self.assertEqual(agent.capture_factory().device, "Speakers (Realtek")
+    def test_the_old_laptop_devices_are_gone(self):
+        self.assertFalse(hasattr(glc, "LoopbackCapture"))
+        self.assertFalse(hasattr(glc, "CableSpeaker"))
 
 
 class OpeningNudgeTests(_Base):

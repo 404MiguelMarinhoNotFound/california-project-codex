@@ -170,3 +170,26 @@ class RepairCallingLinkTests(unittest.TestCase):
         ready, steps, calls = self._run(["BROKEN"], radio=("Off", "Off"))
         self.assertFalse(ready)
         self.assertEqual(calls["radio"], ["Off", "On"])
+
+
+# From tests/test_gemini_live_call.py (glc = services.gemini_live_call then).
+class LoopbackDeviceTests(unittest.TestCase):
+    """She must listen to the speaker the call plays on, not whatever is default."""
+
+    def _sc(self):
+        realtek, headphones = NS(name="Speakers (Realtek High Definition Audio)"), NS(name="Headphones (Black Diamond)")
+        return NS(all_speakers=lambda: [headphones, realtek], default_speaker=lambda: headphones)
+
+    def test_the_named_speaker_is_used_over_the_default(self):
+        cap = glc.LoopbackCapture(device="Speakers (Realtek")
+        self.assertEqual(cap._speaker(self._sc()).name, "Speakers (Realtek High Definition Audio)")
+
+    def test_no_name_or_a_missing_one_falls_back_to_the_default(self):
+        self.assertEqual(glc.LoopbackCapture()._speaker(self._sc()).name, "Headphones (Black Diamond)")
+        self.assertEqual(glc.LoopbackCapture(device="Nope")._speaker(self._sc()).name, "Headphones (Black Diamond)")
+
+    def test_the_agent_hands_its_listen_device_to_the_capture(self):
+        agent = GeminiLiveAgent(client_kwargs={}, model="m", listen_device="Speakers (Realtek")
+        self.assertEqual(agent.capture_factory().device, "Speakers (Realtek")
+
+

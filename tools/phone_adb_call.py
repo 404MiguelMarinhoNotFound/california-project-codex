@@ -149,7 +149,7 @@ class PhoneAdb:
 class PhoneCallAudio:
     """
     The call's audio, from the phone. One object, two faces: `capture()` looks
-    like LoopbackCapture (her ears) and `speaker()` like CableSpeaker (her
+    like the old loopback (her ears) and `speaker()` like the old cable (her
     mouth), so GeminiLiveAgent takes it through its factories unchanged.
 
     The helper can only open its streams during a call, so `start` waits on a
