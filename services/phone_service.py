@@ -256,8 +256,14 @@ class PhoneService:
         speaker_route_factory: Callable | None = None,
         room_speaking: Callable[[], bool] | None = None,
         summarize: Callable | None = None,
+        publish: Callable | None = None,
     ):
         cfg = config.get("phone", {}) or {}
+        # The live UI's EventBus.publish, or None. Call lines go out as they
+        # are heard; with logging.include_transcripts off, only the call's
+        # state does.
+        self._publish_event = publish
+        self._publish_text = ((config.get("logging") or {}).get("include_transcripts", True)) is not False
         self.owner = str(cfg.get("owner_name") or "Miguel")
         self.callback_number = str(cfg.get("callback_number") or "")
         # Which Gemini endpoint runs the call. "vertex" bills the Google Cloud
@@ -399,7 +405,20 @@ class PhoneService:
             silence_ms=self.silence_ms,
             cable_device=self.cable_output,
             listen_device=self.call_speaker_endpoint,
+            on_line=self._on_call_line,
         )
+
+    def _publish(self, kind: str, data: dict) -> None:
+        if self._publish_event is None:
+            return
+        try:
+            self._publish_event(kind, data)
+        except Exception:
+            pass
+
+    def _on_call_line(self, index: int, who: str, text: str, at: float) -> None:
+        if self._publish_text:
+            self._publish("call_line", {"index": index, "who": who, "text": text, "at": at})
 
     def _mic_route(self):
         if self._mic_route_factory is not None:
@@ -592,10 +611,14 @@ class PhoneService:
             dialer = self._get_dialer()
 
             def dial() -> bool:
+                self._publish("call_state", {"state": "dialing", "label": label})
                 dial_status.append(dialer.dial(number))
                 return dial_status[-1] in _DIALED
 
             prompt = build_call_prompt(brief, owner=self.owner, callback_number=self.callback_number)
+            self._publish("call_state", {
+                "state": "starting", "label": label, "kind": brief.kind, "started_at": started_at,
+            })
             with self._mic_route(), self._speaker_route():
                 agent = self._make_agent()
                 result = agent.run(
@@ -634,6 +657,10 @@ class PhoneService:
             logger.exception("Phone call to %s failed", label)
             result.ended_by = result.ended_by or "error"
             result.error = str(exc)[:300]
+        self._publish("call_state", {
+            "state": "ended", "label": label, "ended_by": result.ended_by or "",
+            "error": result.error or "",
+        })
         if result.outcome is None and result.lines:
             result.outcome = self._read_outcome(brief, result)
         report = CallReport(

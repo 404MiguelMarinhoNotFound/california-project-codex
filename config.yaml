@@ -182,6 +182,20 @@ logging:
   turns: true
   include_transcripts: true
 
+# --- Live UI (core/live_ui.py) ---
+# A read-only web page that shows what she is doing right now: state, the live
+# wake score against the threshold, each turn's stages as they happen, a phone
+# call's transcript while it is on, and the log tail. Open it from a phone on
+# the home Wi-Fi at the URL logged at boot (http://<this machine>:8765/<token>/).
+# The token comes from CALIFORNIA_UI_TOKEN in .env; set it, or the URL changes
+# every run. logging.include_transcripts: false keeps what he said off the page too.
+ui:
+  enabled: true
+  host: "0.0.0.0"             # LAN. "127.0.0.1" for this machine only
+  port: 8765
+  ring_size: 500              # events kept in memory so a page opened mid-turn is not blank
+  wake_publish_hz: 10         # wake score updates per second (each carries the peak since the last)
+
 # --- Speech-to-Text ---
 stt:
   provider: "groq"            # "groq" (cloud, fast, free) | "local" (whisper.cpp, slow)

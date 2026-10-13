@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="referrer" content="no-referrer">
+  <title>California Live</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">California</div>
+    <div class="state" id="state" data-state="unknown" aria-live="polite">
+      <span class="state-dot" aria-hidden="true"></span>
+      <span class="state-label" id="state-label">Connecting</span>
+    </div>
+    <div class="link" id="link" data-link="connecting" title="Connection to California">
+      <span id="link-label">connecting</span>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <main class="grid">
+    <section class="panel wake" aria-labelledby="wake-h">
+      <div class="panel-head">
+        <h2 id="wake-h">Wake word</h2>
+        <span class="mono muted" id="wake-phase">idle</span>
+      </div>
+      <div class="wake-row">
+        <div class="wake-score mono" id="wake-score">0.000</div>
+        <div class="wake-meta mono muted">
+          <div>peak 30s <span id="wake-peak">0.000</span></div>
+          <div>threshold <span id="wake-threshold">-</span></div>
+        </div>
+      </div>
+      <div class="meter" id="meter" aria-hidden="true">
+        <div class="meter-fill" id="meter-fill"></div>
+        <div class="meter-tick" id="tick-idle" title="Wake threshold"></div>
+        <div class="meter-tick tick-barge" id="tick-barge" title="Barge-in threshold"></div>
+      </div>
+      <canvas class="spark" id="spark" height="72" aria-label="Wake score over the last 30 seconds"></canvas>
+      <ol class="hits mono" id="hits"></ol>
+    </section>
+
+    <section class="panel now" aria-labelledby="now-h">
+      <div class="panel-head">
+        <h2 id="now-h">Now</h2>
+        <span class="mono muted" id="now-clock"></span>
+      </div>
+      <div class="empty" id="now-empty">Waiting for the wake word. Say "California".</div>
+      <div id="now-body" hidden>
+        <ol class="stages" id="stages"></ol>
+        <div class="said" id="said" hidden>
+          <div class="label">He said</div>
+          <p id="said-text"></p>
+        </div>
+        <div class="reply" id="reply" hidden>
+          <div class="label">She is saying</div>
+          <p id="reply-text"></p>
+        </div>
+        <ol class="tools" id="tools"></ol>
+      </div>
+    </section>
+
+    <section class="panel call" id="call" aria-labelledby="call-h" hidden>
+      <div class="panel-head">
+        <h2 id="call-h">On a call</h2>
+        <span class="mono" id="call-clock">0:00</span>
+      </div>
+      <div class="muted" id="call-who"></div>
+      <ol class="call-lines" id="call-lines"></ol>
+    </section>
+
+    <section class="panel feed" aria-labelledby="feed-h">
+      <div class="panel-head">
+        <h2 id="feed-h">This session</h2>
+        <span class="legend mono muted">
+          <i class="seg seg-listen"></i>listen
+          <i class="seg seg-stt"></i>stt
+          <i class="seg seg-llm"></i>think
+          <i class="seg seg-tts"></i>voice
+          <i class="seg seg-speak"></i>speak
+        </span>
+      </div>
+      <div class="empty" id="feed-empty">No turns yet in this run.</div>
+      <ol class="turns" id="turns"></ol>
+    </section>
+
+    <section class="panel log" aria-labelledby="log-h">
+      <div class="panel-head">
+        <h2 id="log-h">Log</h2>
+        <div class="chips" role="group" aria-label="Log level">
+          <button class="chip" data-level="INFO" aria-pressed="true">info</button>
+          <button class="chip" data-level="WARNING" aria-pressed="false">warn</button>
+          <button class="chip" data-level="ERROR" aria-pressed="false">error</button>
+        </div>
+      </div>
+      <ol class="log-lines mono" id="log-lines"></ol>
+      <button class="follow" id="follow" hidden>Jump to latest</button>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
