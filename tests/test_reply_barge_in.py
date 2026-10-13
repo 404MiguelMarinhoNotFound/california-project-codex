@@ -77,12 +77,22 @@ class _FakeAudio:
     def numpy_to_wav_bytes(self, audio):
         return audio.tobytes()
 
-    def play_audio(self, audio, sr, blocking=True):
+    # The live UI's hooks, honoured like AudioPipeline does: one start before
+    # the clip, one end after it, stopped=True when a stop cut it.
+    on_clip_start = None
+    on_clip_end = None
+
+    def play_audio(self, audio, sr, blocking=True, *, text="", kind="reply"):
         # `audio` is the sentence encoded as bytes by the fake TTS.
-        text = audio.tobytes().decode()
-        self.played.append(text)
+        if self.stopped.is_set():
+            return  # a stop in force refuses the clip, as the real pipeline does
+        spoken = audio.tobytes().decode()
+        self.played.append(spoken)
+        clip = self.on_clip_start(audio, sr, text, kind) if self.on_clip_start else None
         # ~50ms per sentence unless stopped.
         self.stopped.wait(0.05)
+        if self.on_clip_end and clip is not None:
+            self.on_clip_end(clip, self.stopped.is_set())
 
     def stop_playback(self):
         self.stop_calls += 1
@@ -241,6 +251,36 @@ class ReplyBargeInTests(unittest.TestCase):
         barged = orch._stream_response("hi", _FakeMic())
         self.assertFalse(barged)
         self.assertIn(SENTENCES[0], " ".join(orch.audio.played))
+
+
+    def test_barge_in_publishes_stopped_clip_end_for_the_clip_playing(self):
+        """The halo must settle the moment she is cut off, not ride out the clip."""
+        from core.event_bus import EventBus
+
+        orch = _orchestrator(fire_on=None, sentences=SENTENCES)
+        orch.bus = EventBus()
+        _, q = orch.bus.subscribe()  # clip events are live-only, never replayed
+        orch.live_ui = Mock()
+        orch._attach_live_ui({"ui": {}})
+        fired = []
+
+        def fire_while_speaking(chunk, threshold=None):
+            if orch._speaking_text and not fired:
+                fired.append(orch._speaking_text)
+                return True
+            return False
+
+        orch.wake_word.process_audio = fire_while_speaking
+        self.assertTrue(orch._stream_response("hi", _FakeMic()))
+
+        live = []
+        while not q.empty():
+            live.append(q.get_nowait())
+        starts = [e["data"] for e in live if e["kind"] == "clip_start"]
+        ends = [e["data"] for e in live if e["kind"] == "clip_end"]
+        playing = next(s for s in starts if s.get("text") == fired[0])
+        self.assertIn({"clip": playing["clip"], "stopped": True}, ends)
+        self.assertEqual(len(ends), len(starts), "every clip that started reports one end")
 
 
 class IdleLoopChainingTests(unittest.TestCase):

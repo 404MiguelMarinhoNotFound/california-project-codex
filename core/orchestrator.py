@@ -11,6 +11,7 @@ the first sentence while the LLM is still generating.
 
 import collections
 import glob
+import itertools
 import os
 import random
 import re
@@ -37,7 +38,8 @@ from services.surfshark_service import SurfsharkService
 from services.tv_volume import TvVolume
 from services.youtube_playlist_resolver import resolve_playlist_choice
 from services.youtube_search import speakable_title, top_video
-from core.event_bus import NULL_BUS, BusLogHandler, EventBus, WakeScorePublisher
+from core.audio_levels import envelope, level
+from core.event_bus import NULL_BUS, BusLogHandler, EventBus, MicLevelPublisher, WakeScorePublisher
 from core.turn_log import NULL_TURN, TurnLogWriter, TurnTimer
 
 logger = logging.getLogger(__name__)
@@ -1661,6 +1663,11 @@ class Orchestrator:
     # orchestrators publish into nothing.
     bus = NULL_BUS
     _wake_meter = None
+    # The halo's inputs (see _attach_live_ui). None until a live UI is running,
+    # so a test orchestrator offers mic levels into nothing.
+    _mic_meter = None
+    _clip_ids = itertools.count(1)
+    _include_text = True
     # Which activation the last WhatsApp send belonged to, and whether it went
     # anywhere. See _guard_whatsapp_send.
     _activation_seq = 0
@@ -1912,6 +1919,9 @@ class Orchestrator:
 
         logger.info("All components initialized in %.1fs", time.monotonic() - boot_start)
 
+        # Last, because the hooks go on self.audio, which phase 1 built.
+        self._attach_live_ui(config)
+
     def _play_bootup_sound(self):
         """Pick a random WAV from `sounds.bootup_dir` and play it."""
         import soundfile as sf
@@ -1928,7 +1938,7 @@ class Orchestrator:
         logger.info("Bootup sound: %s", os.path.basename(chosen))
         try:
             audio, sr = sf.read(chosen, dtype="float32")
-            self.audio.play_audio(audio, sr, blocking=True)
+            self.audio.play_audio(audio, sr, blocking=True, kind="boot")
         except Exception:
             logger.exception("Failed to play bootup sound %s", chosen)
 
@@ -2006,6 +2016,7 @@ class Orchestrator:
             logger.warning("Audio buffer overflow")
 
         audio_chunk = self.audio.bytes_to_numpy(audio_bytes)
+        self._offer_mic(audio_chunk, "idle")
 
         # Keep the last couple of seconds so a capture can show what she
         # actually heard, including the audio *before* the wake fired.
@@ -2285,6 +2296,7 @@ class Orchestrator:
             audio_bytes, overflowed = mic_stream.read(self.audio.chunk_samples)
             audio_chunk = self.audio.bytes_to_numpy(audio_bytes)
             chunks.append(audio_chunk)
+            self._offer_mic(audio_chunk, "recording")
 
             if not gate.armed:
                 if not gate.update(time.monotonic() - started, _chunk_rms(audio_chunk)):
@@ -2483,6 +2495,7 @@ class Orchestrator:
             while not stop.is_set():
                 audio_bytes, _ = mic_stream.read(self.audio.chunk_samples)
                 chunk = self.audio.bytes_to_numpy(audio_bytes)
+                self._offer_mic(chunk, "reply")
                 hit = self.wake_word.process_audio(chunk, threshold=self._barge_in_threshold)
                 score = float(getattr(self.wake_word, "last_score", 0.0) or 0.0)
                 peak = max(peak, score)
@@ -2578,7 +2591,7 @@ class Orchestrator:
             if self._turn_writer is None or self._turn_writer.include_text:
                 self.bus.publish("sentence", {"text": text})
             try:
-                self.audio.play_audio(audio_data, sample_rate, blocking=True)
+                self.audio.play_audio(audio_data, sample_rate, blocking=True, text=text)
             except Exception as e:
                 logger.error(f"TTS playback error: {e}")
             finally:
@@ -2728,7 +2741,7 @@ class Orchestrator:
         try:
             audio, sr = self.tts.synthesize(text)
             if len(audio) > 0:
-                self.audio.play_audio(audio, sr, blocking=True)
+                self.audio.play_audio(audio, sr, blocking=True, text=text)
         except Exception as e:
             logger.error(f"Direct speak error: {e}")
 
@@ -2753,6 +2766,62 @@ class Orchestrator:
         except Exception:
             logger.exception("Live UI failed to start; carrying on without it")
             self.live_ui = None
+
+    # Envelope rate for clip_start. The page reads `hz` from each event, so this
+    # can change without touching it.
+    _ENVELOPE_HZ = 25
+
+    def _attach_live_ui(self, config: dict) -> None:
+        """
+        Feed the halo: her voice per clip, the mic level, and nothing else.
+
+        Runs at the end of __init__, after phase 1 has built self.audio. With
+        no live UI running it does nothing at all: the hooks stay None and the
+        mic meter stays None, so playback and recording pay nothing.
+        """
+        if getattr(self, "live_ui", None) is None:
+            return
+        try:
+            ui_cfg = config.get("ui") or {}
+            self._mic_meter = MicLevelPublisher(
+                self.bus, hz=float(ui_cfg.get("mic_publish_hz", 15))
+            )
+            self._clip_ids = itertools.count(1)
+            self._include_text = (
+                (config.get("logging") or {}).get("include_transcripts", True) is not False
+            )
+            self.audio.on_clip_start = self._on_clip_start
+            self.audio.on_clip_end = self._on_clip_end
+        except Exception:
+            logger.exception("Live UI halo hooks failed to attach; carrying on without them")
+
+    def _on_clip_start(self, data, sample_rate, text, kind) -> int:
+        """A clip is about to play: publish its loudness envelope for the halo."""
+        clip = next(self._clip_ids)
+        try:
+            samples = len(data)
+        except TypeError:
+            samples = 0
+        payload = {
+            "clip": clip,
+            "kind": kind,
+            "hz": self._ENVELOPE_HZ,
+            "ms": int(round(samples / sample_rate * 1000)) if sample_rate else 0,
+            "env": envelope(data, sample_rate, self._ENVELOPE_HZ),
+        }
+        if text and self._include_text:
+            payload["text"] = text
+        self.bus.publish("clip_start", payload)
+        return clip
+
+    def _on_clip_end(self, clip, stopped) -> None:
+        self.bus.publish("clip_end", {"clip": clip, "stopped": bool(stopped)})
+
+    def _offer_mic(self, chunk, phase: str) -> None:
+        """One mic chunk's level to the halo. ~10us, and nothing without a UI."""
+        meter = self._mic_meter
+        if meter is not None:
+            meter.offer(level(chunk), phase=phase)
 
     def _stop_live_ui(self) -> None:
         live_ui = getattr(self, "live_ui", None)
