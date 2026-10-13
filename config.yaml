@@ -164,7 +164,11 @@ audio:
   sample_rate: 16000          # 16kHz mono — what Whisper expects
   channels: 1
   chunk_duration_ms: 40
-  device: null                # null = system default mic, or device index/name
+  # Pinned, not null (the Windows default): on 2026-10-13 the default input
+  # switched itself to "CABLE Output (VB-Audio Virtual Cable)" and she went
+  # deaf -- no wake word, nothing logged. A sounddevice query: every word must
+  # match, and "MME" picks the one host API (the bare name matches four).
+  device: "Microphone Array MME"
 
 # --- Runtime logs (core/turn_log.py) ---
 # Everything the console shows, and DEBUG besides, goes to logs/california.log
