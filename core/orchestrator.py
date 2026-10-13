@@ -37,6 +37,7 @@ from services.surfshark_service import SurfsharkService
 from services.tv_volume import TvVolume
 from services.youtube_playlist_resolver import resolve_playlist_choice
 from services.youtube_search import speakable_title, top_video
+from core.event_bus import NULL_BUS, BusLogHandler, EventBus, WakeScorePublisher
 from core.turn_log import NULL_TURN, TurnLogWriter, TurnTimer
 
 logger = logging.getLogger(__name__)
@@ -1656,6 +1657,10 @@ class Orchestrator:
     # do) still has a turn to mark: the null turn records nothing.
     _turn = NULL_TURN
     _turn_writer = None
+    # The live UI's event stream. A null bus by default, so __new__-built test
+    # orchestrators publish into nothing.
+    bus = NULL_BUS
+    _wake_meter = None
     # Which activation the last WhatsApp send belonged to, and whether it went
     # anywhere. See _guard_whatsapp_send.
     _activation_seq = 0
@@ -1664,6 +1669,10 @@ class Orchestrator:
 
     def __init__(self, config: dict):
         self.config = config
+
+        # The live UI first, so the boot log is on the page too. Never raises:
+        # a port that is taken leaves the UI off and California running.
+        self._start_live_ui(config)
 
         from core.audio_pipeline import AudioPipeline
         from core.wake_word import WakeWordDetector
@@ -1731,6 +1740,7 @@ class Orchestrator:
             config,
             resolve_contact=getattr(self.whatsapp_service, "resolve_contact", None),
             room_speaking=getattr(self.audio, "speaker_open", None),
+            publish=self.bus.publish,
         )
 
         if media_enabled:
@@ -1901,7 +1911,7 @@ class Orchestrator:
     def run(self):
         """Main loop. Blocks until interrupted."""
         self._running = True
-        self.leds.set_state("idle")
+        self._set_state("idle")
 
         print("\n" + "=" * 50)
         print("  🌴 Project California is running!")
@@ -1932,6 +1942,7 @@ class Orchestrator:
             print("\n\n  Shutting down...")
         finally:
             self._background_stop.set()
+            self._stop_live_ui()
             if self._stremio_sync_thread:
                 self._stremio_sync_thread.join(timeout=2)
             self.deebot_service.close()
@@ -1955,7 +1966,7 @@ class Orchestrator:
         IDLE state: Feed audio to wake word detector.
         Transitions to LISTENING when wake word is detected.
         """
-        self.leds.set_state("idle")
+        self._set_state("idle")
 
         # A call that finished in the background is reported between mic reads,
         # on this thread, so the mic still has exactly one reader.
@@ -1978,8 +1989,14 @@ class Orchestrator:
             self._capture_ring.append(audio_chunk)
 
         # Feed to wake word detector
-        if self.wake_word.process_audio(audio_chunk):
+        hit = self.wake_word.process_audio(audio_chunk)
+        self._offer_wake_score("idle")
+        if hit:
             # Wake word detected!
+            self.bus.publish("wake_hit", {
+                "score": round(float(getattr(self.wake_word, "last_score", 0.0) or 0.0), 4),
+                "phase": "idle",
+            })
             pre_roll = list(self._capture_ring) if self._capture_ring is not None else []
 
             # The speaker is opened once here and held through the whole
@@ -2025,7 +2042,7 @@ class Orchestrator:
 
     def _report_turn(self, report, mic_stream) -> bool:
         """One timed turn whose input is the call report instead of his speech."""
-        self._turn = TurnTimer(self._turn_writer, chained=False)
+        self._turn = TurnTimer(self._turn_writer, chained=False, bus=self.bus)
         self._activation_seq += 1
         barged_in = False
         try:
@@ -2049,7 +2066,7 @@ class Orchestrator:
         reply, barge-in, exception -- leaves one record in logs/turns.jsonl.
         A chained turn (after a barge-in) has no pre-roll and is flagged.
         """
-        self._turn = TurnTimer(self._turn_writer, chained=pre_roll is None)
+        self._turn = TurnTimer(self._turn_writer, chained=pre_roll is None, bus=self.bus)
         self._activation_seq += 1
         barged_in = False
         try:
@@ -2102,7 +2119,7 @@ class Orchestrator:
         )
 
         # --- LISTENING: Record until silence ---
-        self.leds.set_state("listening")
+        self._set_state("listening")
         audio_data = self._record_speech(mic_stream, playback)
         self._turn.mark("speech_end")
         rate = getattr(self.audio, "sample_rate", None)
@@ -2119,13 +2136,13 @@ class Orchestrator:
             self.wake_word.reset()
             # Do not let a false positive burn the one long cold-open line.
             self._wake_count = max(0, self._wake_count - 1)
-            self.leds.set_state("idle")
+            self._set_state("idle")
             return False
 
         self._capture_activation(pre_roll, audio_data, self._last_record_outcome)
 
         # --- PROCESSING: STT → LLM ---
-        self.leds.set_state("thinking")
+        self._set_state("thinking")
 
         # Convert to WAV and transcribe
         wav_bytes = self.audio.numpy_to_wav_bytes(audio_data)
@@ -2156,7 +2173,7 @@ class Orchestrator:
             return False
 
         # --- STREAMING: LLM → Sentence Chunker → TTS ---
-        self.leds.set_state("thinking")
+        self._set_state("thinking")
         self._turn.set(outcome="reply")
         return self._stream_response(transcript, mic_stream)
 
@@ -2387,7 +2404,7 @@ class Orchestrator:
                 full_response_parts.append(sentence)
 
                 if first_sentence:
-                    self.leds.set_state("speaking")
+                    self._set_state("speaking")
                     self._turn.mark("first_sentence")
                     first_sentence = False
 
@@ -2443,12 +2460,16 @@ class Orchestrator:
                 audio_bytes, _ = mic_stream.read(self.audio.chunk_samples)
                 chunk = self.audio.bytes_to_numpy(audio_bytes)
                 hit = self.wake_word.process_audio(chunk, threshold=self._barge_in_threshold)
-                peak = max(peak, float(getattr(self.wake_word, "last_score", 0.0) or 0.0))
+                score = float(getattr(self.wake_word, "last_score", 0.0) or 0.0)
+                peak = max(peak, score)
+                self._offer_wake_score("reply")
                 if not hit:
                     continue
                 if "california" in (self._speaking_text or "").lower():
                     logger.info("Wake word scored while she was saying her own name — ignored")
+                    self.bus.publish("wake_hit", {"score": round(score, 4), "phase": "reply", "ignored": True})
                     continue
+                self.bus.publish("wake_hit", {"score": round(score, 4), "phase": "reply"})
                 logger.info("Barge-in: wake word during reply")
                 self._interrupted.set()
                 self.audio.stop_playback()
@@ -2530,6 +2551,8 @@ class Orchestrator:
             self._turn.mark_once("first_audio")
             # Published for the reply listener's own-name guard.
             self._speaking_text = text
+            if self._turn_writer is None or self._turn_writer.include_text:
+                self.bus.publish("sentence", {"text": text})
             try:
                 self.audio.play_audio(audio_data, sample_rate, blocking=True)
             except Exception as e:
@@ -2556,12 +2579,13 @@ class Orchestrator:
     def _handle_tool_call(self, tool_name: str, tool_input: dict) -> str:
         """Dispatch tool calls from the LLM, timing each one into the turn record."""
         started = self._turn.now_ms()
+        action = tool_input.get("action") if isinstance(tool_input, dict) else None
+        self._turn.tool_started(tool_name, action)
         result = None
         try:
             result = self._dispatch_tool(tool_name, tool_input)
             return result
         finally:
-            action = tool_input.get("action") if isinstance(tool_input, dict) else None
             self._turn.tool(tool_name, action, started, result if result is not None else "<raised>")
 
     def _dispatch_tool(self, tool_name: str, tool_input: dict) -> str:
@@ -2661,7 +2685,7 @@ class Orchestrator:
 
     def _speak_direct(self, text: str):
         """Speak a message directly (not streamed through LLM)."""
-        self.leds.set_state("speaking")
+        self._set_state("speaking")
         print(f"  🌴 California: {text}")
         try:
             audio, sr = self.tts.synthesize(text)
@@ -2669,6 +2693,48 @@ class Orchestrator:
                 self.audio.play_audio(audio, sr, blocking=True)
         except Exception as e:
             logger.error(f"Direct speak error: {e}")
+
+    def _start_live_ui(self, config: dict) -> None:
+        self.live_ui = None
+        ui_cfg = config.get("ui") or {}
+        if not ui_cfg.get("enabled", False):
+            return
+        try:
+            from core.live_ui import LiveUI
+
+            self.bus = EventBus(ring_size=int(ui_cfg.get("ring_size", 500)))
+            log_handler = BusLogHandler(self.bus)
+            logging.getLogger().addHandler(log_handler)
+            self._bus_log_handler = log_handler
+            self._wake_meter = WakeScorePublisher(
+                self.bus, hz=float(ui_cfg.get("wake_publish_hz", 10))
+            )
+            self.live_ui = LiveUI(config, self.bus)
+            if not self.live_ui.start():
+                self.live_ui = None
+        except Exception:
+            logger.exception("Live UI failed to start; carrying on without it")
+            self.live_ui = None
+
+    def _stop_live_ui(self) -> None:
+        live_ui = getattr(self, "live_ui", None)
+        if live_ui is not None:
+            live_ui.stop()
+        handler = getattr(self, "_bus_log_handler", None)
+        if handler is not None:
+            logging.getLogger().removeHandler(handler)
+
+    def _set_state(self, state: str) -> None:
+        """Drive the LEDs and tell the live UI. The UI can never block the LEDs."""
+        self.leds.set_state(state)
+        self.bus.publish("state", {"state": state})
+
+    def _offer_wake_score(self, phase: str) -> None:
+        meter = self._wake_meter
+        if meter is None:
+            return
+        threshold = self._barge_in_threshold if phase == "reply" else self.wake_word.threshold
+        meter.offer(getattr(self.wake_word, "last_score", 0.0), phase, threshold=threshold)
 
     def stop(self):
         """Stop the orchestrator."""

@@ -234,6 +234,8 @@ california/
 │   ├── audio_pipeline.py        # Microphone capture and playback
 │   ├── wake_word.py             # Wake-word detection
 │   ├── turn_log.py              # Rotating log file + one timing record per turn (logs/)
+│   ├── event_bus.py             # Live events for the UI: never blocks, never raises; wake scores live-only
+│   ├── live_ui.py               # Read-only web page on the LAN: SSE stream, token in the path
 │   └── vad.py                   # Voice activity detection
 ├── services/
 │   ├── activation_phrases.py    # Wake-acknowledgement tiers + speaker-bleed echo gating
@@ -268,6 +270,7 @@ california/
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
+├── ui/                          # The live page: index.html, app.css, app.js (no build step)
 ├── training/                    # Wake-word training, runs on Modal, see training/README.md
 │   ├── modal_train.py           # Modal app: setup / smoke / train entrypoints
 │   ├── california.yaml          # Run 1 config, kept for comparison
@@ -344,6 +347,8 @@ california/
 │   ├── test_gemini_live_call.py # Fake Live session: transcript, hang-up guard, silent tool replies, every way a call ends
 │   ├── test_call_outcome.py     # Reading the outcome from a transcript: statuses, never raises, their words as data
 │   ├── test_orchestrator_phone.py # control_phone dispatch, the labelled report, speaking it from the idle loop
+│   ├── test_event_bus.py        # Bus: replay, live-only wake scores, slow pages never block, TurnTimer publishes live
+│   ├── test_live_ui.py          # Token-in-path 404s, static whitelist, SSE replay then live, Last-Event-ID
 │   └── test_youtube_validator.py # Playlist existence classification (oembed + dead-page markers)
 ├── sounds/                      # Wake-word and activation audio assets
 ├── models/                      # Wake-word and other local models
@@ -3508,6 +3513,52 @@ Current automated coverage exists for:
   not end the turn; `_idle_loop` chains a barged-in turn into another activation
   on one speaker session; and a closed LLM generator keeps the partial answer
   in history
+
+### Live UI: watch her from the sofa (2026-10-13)
+
+`core/live_ui.py` serves a read-only page on the home Wi-Fi that shows what she is
+doing **right now**: the state (idle, listening, thinking, speaking), the live wake
+score against `threshold` and `barge_in_threshold`, each turn's stages filling in as
+they happen (speech end, heard, first token, first sentence, first audio, done), what
+he said, what she is saying sentence by sentence, tool calls running and finished, a
+phone call's transcript while the call is on, and the INFO+ log tail. Open the URL
+from the boot log (`Live UI: http://<laptop>:8765/<token>/`) on the phone.
+
+- **Live, not historical.** `core/event_bus.py` is published to from the thread where
+  each thing happens: `TurnTimer` publishes every `mark`/`set`/`tool` as it is made
+  (before, the turn only existed once `finish()` wrote `turns.jsonl`),
+  `Orchestrator._set_state` replaces every direct `leds.set_state`, the idle loop and
+  the reply listener offer `wake_word.last_score`, `_audio_player_worker` publishes
+  the sentence it is playing, `GeminiLiveAgent(on_line=...)` publishes each piece of a
+  call transcript, and `BusLogHandler` publishes log records. Nothing is read from disk.
+- **The bus can never slow a turn down or raise.** `publish` is a lock, an append and a
+  `put_nowait` per page; a phone that falls behind loses events, not her time. A
+  broken bus inside `TurnTimer` is swallowed like a broken writer.
+  `test_a_slow_subscriber_drops_events_and_never_blocks_publish` pins it.
+- **Wake scores are streamed, never replayed.** They arrive ~10 a second (throttled by
+  `WakeScorePublisher`, which keeps the *peak* between publishes so a one-frame spike
+  is never lost). In the 500-event replay ring they evicted every turn within a
+  minute, found on the first screenshot. Logs replay from their own 300-line ring for
+  the same reason.
+- **SSE on the standard library**, so there is no new dependency and it runs the same on
+  the Pi. The page is vanilla JS in `ui/` with no build step. `EventSource` reconnects
+  by itself with `Last-Event-ID`. A server `ping` every 15s means 40s of silence reads
+  as "stalled", and a reconnecting page shows the state as unknown: a frozen page
+  must never pass for a quiet room. A new `hello.started` (California restarted)
+  clears the page rather than mixing two runs.
+- **The token is in the path**, so the page's relative `app.js`, `app.css` and `events`
+  carry it with no JavaScript, and everything else, `/` included, is a 404. Set
+  `CALIFORNIA_UI_TOKEN` in `.env` so a bookmark survives restarts; unset, a new one is
+  generated each run. Only three whitelisted files are ever served. Everything on the
+  page is written with `textContent`, never as HTML, because other people's WhatsApp
+  text reaches it through tool results and logs.
+- **`logging.include_transcripts: false` governs the page too**: transcript, reply,
+  spoken sentences and call lines stay off the bus.
+- **Watch-only on purpose.** Nothing on the page changes what she does. A typed turn and
+  a device status card (`room_status()` costs an ADB ping, so on demand, not polled)
+  are the next steps.
+- `tests/config_fixture.py` turns `ui.enabled` off, because the shipped value binds a
+  LAN port. `tests/test_live_ui.py` turns it back on, bound to loopback on port 0.
 
 ### Runtime logs: read these before guessing at latency
 

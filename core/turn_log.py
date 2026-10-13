@@ -26,6 +26,7 @@ through a lock and `mark_once` keeps the first write. Nothing in here may ever
 break a turn: every public method swallows its own errors.
 """
 
+import itertools
 import json
 import logging
 import logging.handlers
@@ -38,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 _FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)s] %(threadName)s %(name)s: %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
+# Fields that carry what he said or what she answered. `include_transcripts:
+# false` keeps them out of turns.jsonl AND off the live bus.
+_TEXT_FIELDS = ("transcript", "reply")
+_TURN_IDS = itertools.count(1)
 _CHATTY_LIBRARIES = (
     "anthropic", "groq", "openai", "asyncio", "PIL", "bleak",
     "playwright", "websocket", "numba", "matplotlib", "filelock",
@@ -103,7 +108,7 @@ class TurnLogWriter:
             return
         try:
             if not self.include_text:
-                record = {k: v for k, v in record.items() if k not in ("transcript", "reply")}
+                record = {k: v for k, v in record.items() if k not in _TEXT_FIELDS}
             line = json.dumps(record, ensure_ascii=False)
             with self._lock:
                 os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -114,10 +119,19 @@ class TurnLogWriter:
 
 
 class TurnTimer:
-    """Timestamps for one activation, relative to the wake word."""
+    """
+    Timestamps for one activation, relative to the wake word.
 
-    def __init__(self, writer: TurnLogWriter | None = None, chained: bool = False):
+    With a `bus`, every mark, field and tool call is also published the moment
+    it is made, so the live UI watches the turn build rather than reading it
+    afterwards. Publishing happens outside the lock and cannot raise.
+    """
+
+    def __init__(self, writer: TurnLogWriter | None = None, chained: bool = False, bus=None):
         self._writer = writer
+        self._bus = bus
+        self._include_text = writer.include_text if writer is not None else True
+        self._turn_id = next(_TURN_IDS)
         self._lock = threading.Lock()
         self._t0 = time.monotonic()
         self._marks: dict[str, int] = {}
@@ -127,31 +141,58 @@ class TurnTimer:
             "chained": chained,
         }
         self._done = False
+        self._publish("turn_start", {"chained": chained, "ts": self._fields["ts"]})
+
+    def _publish(self, kind: str, data: dict) -> None:
+        if self._bus is None:
+            return
+        try:
+            data = {"turn": self._turn_id, **data}
+            if not self._include_text:
+                data = {k: v for k, v in data.items() if k not in _TEXT_FIELDS}
+                if "fields" in data:
+                    data["fields"] = {k: v for k, v in data["fields"].items() if k not in _TEXT_FIELDS}
+                if "record" in data:
+                    data["record"] = {k: v for k, v in data["record"].items() if k not in _TEXT_FIELDS}
+            self._bus.publish(kind, data)
+        except Exception:
+            pass
 
     def _ms(self) -> int:
         return int(round((time.monotonic() - self._t0) * 1000))
 
     def mark(self, name: str) -> None:
         with self._lock:
-            self._marks[name] = self._ms()
+            ms = self._marks[name] = self._ms()
+        self._publish("turn_mark", {"name": name, "ms": ms})
 
     def mark_once(self, name: str) -> None:
         with self._lock:
-            self._marks.setdefault(name, self._ms())
+            if name in self._marks:
+                return
+            ms = self._marks[name] = self._ms()
+        self._publish("turn_mark", {"name": name, "ms": ms})
 
     def set(self, **fields) -> None:
         with self._lock:
             self._fields.update(fields)
+        self._publish("turn_set", {"fields": fields})
+
+    def tool_started(self, name: str, action: str | None) -> None:
+        """Live only: a tool call began. The record gets it from tool()."""
+        self._publish("turn_tool_start", {"name": name, "action": action, "start_ms": self.now_ms()})
 
     def tool(self, name: str, action: str | None, started_ms: int, result: str | None) -> None:
         with self._lock:
-            self._tools.append({
+            entry = {
                 "name": name,
                 "action": action,
                 "start_ms": started_ms,
                 "ms": self._ms() - started_ms,
                 "result": (result or "")[:160],
-            })
+            }
+            self._tools.append(entry)
+        self._publish("turn_tool", entry)
 
     def now_ms(self) -> int:
         return self._ms()
@@ -178,6 +219,7 @@ class TurnTimer:
             pass
         if self._writer is not None:
             self._writer.write(record)
+        self._publish("turn_end", {"record": record})
         return record
 
 
@@ -191,6 +233,9 @@ class _NullTurn:
         pass
 
     def set(self, **fields):
+        pass
+
+    def tool_started(self, *args, **kwargs):
         pass
 
     def tool(self, *args, **kwargs):

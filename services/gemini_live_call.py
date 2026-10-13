@@ -370,8 +370,12 @@ class GeminiLiveAgent:
         client_factory: Callable | None = None,
         capture_factory: Callable | None = None,
         speaker_factory: Callable | None = None,
+        on_line: Callable | None = None,
     ):
         self.client_kwargs = dict(client_kwargs)
+        # Called with (index, who, text, at) as each piece of transcript
+        # arrives, for the live UI. Never allowed to break the call.
+        self.on_line = on_line
         self.model = model
         self.voice = voice
         self.language_code = language_code
@@ -457,6 +461,14 @@ class GeminiLiveAgent:
 
             loop.call_soon_threadsafe(put)
 
+        def _tell(index: int, who: str, text: str, at: float) -> None:
+            if self.on_line is None:
+                return
+            try:
+                self.on_line(index, who, text, at)
+            except Exception:
+                pass
+
         def add_line(who: str, text: str) -> None:
             if not text:
                 return
@@ -464,9 +476,11 @@ class GeminiLiveAgent:
                 clock["them_at"] = time.monotonic()
             if result.lines and result.lines[-1].who == who:
                 result.lines[-1].text += text
+                _tell(len(result.lines) - 1, who, text, result.lines[-1].at)
                 return
             at = round(max(0.0, time.monotonic() - clock["started"]), 1)
             result.lines.append(CallLine(who, text, at))
+            _tell(len(result.lines) - 1, who, text, at)
             if text.strip():
                 key = "answered_at_s" if who == "them" else "first_spoke_at_s"
                 result.stats.setdefault(key, at)
