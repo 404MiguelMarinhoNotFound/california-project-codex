@@ -18,6 +18,8 @@ NOTIFICATION_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "phon
 SCREEN_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "dialer_incall_screen.xml")
 with open(SCREEN_FIXTURE, encoding="utf-8") as _f:
     INCALL_SCREEN = _f.read()
+# The same screen a frame earlier, the Speaker button still sliding into place.
+MOVED_SCREEN = INCALL_SCREEN.replace('bounds="[643,1981][907,2261]"', 'bounds="[643,1681][907,1961]"')
 # The phone-missed-digest plan's Global Constraints: nothing this file drives may write.
 FORBIDDEN = ("content update", "content delete", "content insert", "cmd notification", "service call")
 PHONE = "192.168.1.101:38731"  # config-literal: adb devices/mdns output shape, not the deployment
@@ -828,11 +830,20 @@ class AnswerIncomingTests(_Base):
         self.assertEqual(len(self.adb.accepts()), 1)  # one acceptance, never a second
         self.assertEqual(self.adb.taps(), [])
 
-    def test_caller_hanging_up_is_stale(self):
-        for after in (telecom_dump(), telecom_dump((KEY, "DISCONNECTED"))):
+    def test_caller_hanging_up_right_after_the_accept_is_hung_up(self):
+        for after in (telecom_dump(), telecom_dump((KEY, "DISCONNECTED")),
+                      telecom_dump((KEY, "DISCONNECTED"), ("TC@1", "DISCONNECTED"))):
             self.adb.telecom = [telecom_dump((KEY, "RINGING")), after]
             result = self.phone().answer_incoming(KEY)
-            self.assertEqual((result.status, result.accepted), ("STALE_RING", False))
+            self.assertEqual((result.status, result.accepted), ("HUNG_UP", False))
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_caller_hanging_up_after_active_is_hung_up_and_accepted(self):
+        # ACTIVE read back, then the call is gone before the speaker tap.
+        self.adb.telecom = [telecom_dump((KEY, "RINGING")), telecom_dump((KEY, "ACTIVE")),
+                            telecom_dump((KEY, "DISCONNECTED"))]
+        result = self.phone().answer_incoming(KEY)
+        self.assertEqual((result.status, result.accepted, result.speaker_verified), ("HUNG_UP", True, False))
         self.assertEqual(self.adb.taps(), [])
 
     def test_unreadable_after_accept_is_uncertain(self):
@@ -969,6 +980,46 @@ class SetSpeakerTests(_Base):
         self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("ROUTE_FAILED", False))
         self.assertEqual(self.adb.taps(), [])
 
+    def test_a_lingering_ended_leg_does_not_block_the_tap(self):
+        self.adb.telecom = [telecom_dump(("TC@1", "DISCONNECTED"), (KEY, "ACTIVE"))]
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("SPEAKER_ON", True))
+        self.assertEqual(self.adb.taps(), ["input tap 775 2121"])
+
+    def test_two_agreeing_screen_reads_before_a_tap(self):
+        # R14: the in-call grid may still be moving; a tap needs two reads that agree.
+        self.adb.screens = [MOVED_SCREEN, INCALL_SCREEN, INCALL_SCREEN]
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("SPEAKER_ON", True))
+        self.assertEqual(self.adb.taps(), ["input tap 775 2121"])
+        self.assertEqual(len([a for a in self.adb.calls if "exec-out" in a]), 3)
+
+    def test_screen_reads_that_never_agree_are_no_button(self):
+        self.adb.screens = [INCALL_SCREEN, MOVED_SCREEN, INCALL_SCREEN]
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("NO_BUTTON", False))
+        self.assertEqual(self.adb.taps(), [])
+        self.assertEqual(len([a for a in self.adb.calls if "exec-out" in a]), 3)  # never a fourth read
+
+    def test_a_checked_state_that_flips_between_reads_needs_a_third(self):
+        self.adb.screens = [_checked(INCALL_SCREEN, "true"), INCALL_SCREEN, INCALL_SCREEN]
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("SPEAKER_ON", True))
+        self.assertEqual(len(self.adb.taps()), 1)
+
+    def test_the_verification_window_runs_from_the_tap(self):
+        # Slow screen reads must not eat the 8 s the route gets after the tap.
+        phone = self.phone()
+        reads = []
+
+        def slow_screen():
+            reads.append(1)
+            self.now[0] += 2.5
+            return INCALL_SCREEN
+
+        phone._read_screen = slow_screen
+        audio = iter([audio_dump("earpiece")] * 12 + [audio_dump("speaker")])
+        phone._read_audio = lambda: next(audio)
+        self.adb.tap_routes = None
+        self.assertEqual(phone.set_speaker(KEY, True), SpeakerResult("SPEAKER_ON", True))
+        self.assertEqual(len(reads), 2)
+
     def test_only_the_same_sole_active_call(self):
         for rows in (((OTHER, "ACTIVE"),), ((KEY, "RINGING"),), ((KEY, "ACTIVE"), (OTHER, "RINGING")), ()):
             self.adb.telecom = [telecom_dump(*rows)]
@@ -991,7 +1042,7 @@ class SetSpeakerTests(_Base):
         self.adb.screens = [""]
         self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("UNREADABLE", False))
         reads = [a for a in self.adb.calls if "exec-out" in a]
-        self.assertEqual(len(reads), 3 + 3)  # three tries each time, no more
+        self.assertEqual(len(reads), 3 + 1 + 3)  # three tries, one agreeing read; then three tries, no more
         self.assertEqual(len(self.adb.taps()), 1)
 
     def test_no_button(self):

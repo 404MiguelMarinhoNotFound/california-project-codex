@@ -2659,8 +2659,9 @@ private number is calling." Plan:
   barge-in, `play_audio` would refuse the clip and the announcement would silently
   play nothing.
 - **Where it sits in the idle loop.** After the phone report, before the mic read, so
-  the mic keeps one reader. During one of her own calls (`PhoneService.busy()`) the
-  ring is dropped, not kept for later. During a reply it waits: the next idle pass
+  the mic keeps one reader. During one of her own calls (`PhoneService.busy()`), or one
+  of his she answered natively (`PhoneService.human_call_active()`, R13), the ring is
+  dropped, not kept for later. During a reply it waits: the next idle pass
   announces it if the phone is still ringing.
 - **Read-only.** A `dumpsys` and a `grep`; nothing on the phone is answered, rejected,
   silenced or written.
@@ -2695,7 +2696,12 @@ afterwards: it is his call, not hers. Plan:
   `acceptRingingCall` (`AdbPhone.answer_incoming`). The speaker is one tap on Google
   Phone's own Speaker button (`AdbPhone.set_speaker`): `uiautomator dump`, the nearest
   clickable ancestor of the "Speaker"/"Altifalante"/"Alta-voz" label, the centre of its
-  bounds computed on every read, tapped only when its `checked` disagrees. **The two
+  bounds computed on every read, tapped only when its `checked` disagrees and only once
+  two back-to-back screen reads agree on its centre and `checked` (R14: right after an
+  answer the in-call grid can still be sliding into place, and a tap on a moving button
+  can land on Mute). One disagreement earns a third read that must match the second,
+  else `NO_BUTTON` and no tap; never more than one tap. The 8 s route check runs from
+  the tap, not from the first read (~2.5 s per screen read). **The two
   AudioManager setters are UNSUPPORTED from the shell**: `setCommunicationDevice`
   returned true and `setSpeakerphoneOn` returned quietly, and in both live tests the
   route stayed `earpiece`. The default dialer owns call audio, so asking it (its button)
@@ -2718,20 +2724,45 @@ afterwards: it is his call, not hers. Plan:
   `speaker_verified`), where anything she said would go straight into his speakerphone
   call; a partial answer and every not-answered outcome re-arm it (`reset_playback`) so
   the line is spoken. Only full success counts as "worked" for the halo's mood.
-- **Flag.** `phone.incoming.answer_speaker_enabled` (needs `phone.incoming.enabled` for
-  the ring) ships **false** until the live test passes. Off, both actions say "I can't
-  answer calls for you yet; that's switched off." Both sit before the Gemini gate, like
-  `phone_sync_contacts`: they need adb, not credentials.
+- **Topology is read the same way in both layers.** A lingering DISCONNECTED row is not
+  a call: `AdbPhone._sole_active`, `PhoneService._sole_active_call` and `bind_incoming`
+  all drop `ended` legs first, so a ring or active call next to one still binds/taps.
+- **No room announcement during his native call (R13).** While a call she answered
+  natively holds the slot (owner `human`, any state, `unknown` included),
+  `PhoneService.human_call_active()` is True and `_idle_loop` drops an incoming ring
+  instead of announcing it, exactly like during her own call: on speakerphone the first
+  caller would hear the second caller's name. The phone's own call-waiting tone still
+  plays. Outgoing behaviour is unchanged (`busy()` still means her calls only).
+- **Flag.** `phone.incoming.answer_speaker_enabled` ships **false** until the live test
+  passes, and **also needs `phone.incoming.enabled`**: without the watcher there is never
+  a trusted ring to bind, so `native_answer_enabled` is false and the feature is off, not
+  half on. Off, both actions say "I can't answer calls for you yet; that's switched
+  off." Both sit before the Gemini gate, like `phone_sync_contacts`: they need adb, not
+  credentials. The ring watcher is now built before `PhoneService` (so its `current()`
+  can be handed in); it is still started where it always was.
 - **Spoken lines** (from `services/phone_service.py`): "Answered on your phone's
   speakerphone."; answered but not on speaker: "The call is answered, but I couldn't
   switch it to speakerphone. Use the phone's speaker button."; "Your phone isn't ringing
-  now."; "That call stopped ringing. I haven't answered the new one."; call waiting:
-  "There's already another call on your phone. Answer this one on the phone.";
-  "Looks like it's already been answered."; "I couldn't confirm whether the call
-  answered. Check your phone."; for the speaker: "Speaker's on." / "Speaker's off.",
-  "It's already on speaker.", "Your phone is still ringing. Answer it first.",
-  "There's no call on your phone right now.", and "I couldn't switch the speaker. Use
-  the phone's speaker button." A `phone_speaker` without `on` asks which.
+  now." (only when telecom shows nothing ringing); "It's ringing, but I couldn't lock
+  onto that call. Ask me again or answer it on the phone." (it rings alone, but no ring
+  was bound for this turn or the watcher lost it); "That call stopped ringing. I haven't
+  answered the new one."; "They hung up as I answered." (`HUNG_UP`: the call ended or
+  every call vanished right after the acceptance, before or after ACTIVE was read --
+  never the stale-ring line, since no new call exists); call waiting: "There's already
+  another call on your phone. Answer this one on the phone."; "Looks like it's already
+  been answered."; "I couldn't confirm whether the call answered. Check your phone.";
+  for the speaker: "Speaker's on." / "Speaker's off.", "It's already on speaker.",
+  "Your phone is still ringing. Answer it first.", "There's no call on your phone right
+  now.", "I can only switch the speaker once the call is connected and it's the only
+  one. Use the phone's speaker button." (a sole call dialing, held or answering, or a
+  call that changed before the tap; the call-waiting line is kept for a genuine second
+  live call), and "I couldn't switch the speaker. Use the phone's speaker button." A
+  `phone_speaker` without `on` asks which. While his native call holds the slot,
+  `phone_status` says "You're on a call on your phone, NmSSs since I answered it." (or
+  "You may still be on a call on your phone; I can't read it right now." when its state
+  is unknown) and `phone_find` refuses with "You're on a call on your phone, so I won't
+  ring it." (or "I can't tell yet whether the call on your phone has ended, so I won't
+  ring it.").
 - **Not yet verified live:** helper acceptance followed directly by the tap (each half
   passed on its own), a connected Bluetooth headset (the button may become a route
   menu), a non-English dialer locale, and the full voice path through the room.
@@ -3913,7 +3944,15 @@ Current automated coverage exists for:
   not when nothing can be accepted, kept stopped only on full success and re-armed for a
   partial or failed answer; `answered`/`speaker_verified` following the transport; `phone_speaker` needing a real boolean and never
   answering; no agent, dial, log line or call report for a native call; satellite
-  labels that never name the caller; one `on` boolean and no caller field in the schema
+  labels that never name the caller; one `on` boolean and no caller field in the schema;
+  ended legs ignored by both layers (bind and tap); a sole non-active call or a call
+  that changed before the tap never given the call-waiting line; never "isn't ringing"
+  while it rings alone; a hang-up right after the acceptance spoken as such (accepted or
+  not), never as a stale ring; the gate off without `phone.incoming.enabled`; no room
+  announcement while his native call holds the slot (any state) and one again after;
+  the tap only after two agreeing screen reads (a third on disagreement, never a fourth,
+  else no tap) and the route window measured from the tap; `phone_find`'s unknown-state
+  line
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection

@@ -814,6 +814,9 @@ _OFFER = RingOffer(7, IncomingCall("incoming", "+351910000001", "Example Caller"
 _BUSY_LINE = "There's already another call on your phone. Answer this one on the phone."
 _UNCERTAIN_LINE = "I couldn't confirm whether the call answered. Check your phone."
 _STALE_LINE = "That call stopped ringing. I haven't answered the new one."
+_LOCK_LINE = "It's ringing, but I couldn't lock onto that call. Ask me again or answer it on the phone."
+_NOT_CONNECTED_LINE = ("I can only switch the speaker once the call is connected and it's the only one. "
+                       "Use the phone's speaker button.")
 
 
 def _topology(*legs):
@@ -876,11 +879,12 @@ class _NativeBase(_Base):
         self.ring = _OFFER
         self.agents_built = 0
 
-    def _native(self, enabled=True, **phone):
+    def _native(self, enabled=True, watcher=True, **phone):
         cfg = config_for_tests(
-            # paths: never the real logs/calls.jsonl; the flag is what these tests exercise
+            # paths: never the real logs/calls.jsonl; the flags are what these tests exercise
+            # (no watcher is built here: current_ring is injected)
             phone={"enabled": True, "log_path": self.log_path,
-                   "incoming": {"answer_speaker_enabled": enabled}, **phone},
+                   "incoming": {"answer_speaker_enabled": enabled, "enabled": watcher}, **phone},
         )
 
         def agent():
@@ -915,10 +919,11 @@ class NativeAnswerTests(_NativeBase):
         # google.genai unimportable: the native path must never reach for it.
         with mock.patch.dict(os.environ, no_creds), \
                 mock.patch.dict(sys.modules, {"google.genai": None}), \
-                mock.patch("services.phone_service._user_adc_path", return_value=""),                 self.assertLogs("services.phone_service", "WARNING"):
+                mock.patch("services.phone_service._user_adc_path", return_value=""), \
+                self.assertLogs("services.phone_service", "WARNING"):
             svc = PhoneService(
                 config_for_tests(phone={"enabled": True, "log_path": self.log_path,
-                                        "incoming": {"answer_speaker_enabled": True}}),
+                                        "incoming": {"answer_speaker_enabled": True, "enabled": True}}),
                 control_phone=self.control, current_ring=lambda: self.ring,
             )
             svc._native_poll_s = 3600
@@ -1018,6 +1023,62 @@ class NativeAnswerTests(_NativeBase):
         self.assertEqual(svc.answer_speaker(None).message, _BUSY_LINE)
         self.assertEqual(self.control.answers, [])
         self.assertIsNone(svc._active)
+
+    def test_never_says_not_ringing_while_it_rings(self):
+        svc = self._native()
+        # Nothing was bound at the start of the turn, yet the phone rings now.
+        for topology in (_topology(("TC@6", "ringing")),
+                         _topology(("TC@1", "ended"), ("TC@6", "ringing"))):
+            self.control.topology = topology
+            self.assertEqual(svc.answer_speaker(None).message, _LOCK_LINE, topology)
+        # Bound, but the watcher has since lost the ring while telecom still shows it.
+        self.control.topology = _topology((_KEY, "ringing"))
+        target = svc.bind_incoming(_OFFER)
+        self.ring = None
+        self.assertEqual(svc.answer_speaker(target).message, _LOCK_LINE)
+        self.assertEqual(self.control.answers, [])
+        self.assertIsNone(svc._active)
+
+    def test_a_lingering_ended_leg_does_not_stop_the_bind(self):
+        svc = self._native()
+        self.control.topology = _topology(("TC@1", "ended"), (_KEY, "ringing"))
+        target = svc.bind_incoming(_OFFER)
+        self.assertIsNotNone(target)
+        self.assertEqual(target.call_key, _KEY)
+
+    def test_they_hung_up_as_i_answered(self):
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                self.control = FakeControl(topology=_topology((_KEY, "ringing")),
+                                           answer=AnswerResult("HUNG_UP", _KEY, accepted=accepted))
+                svc = self._native()
+                target = svc.bind_incoming(_OFFER)
+                self.control.topology = _topology()   # the stale-ring check must not run
+                result = svc.answer_speaker(target)
+                self.assertFalse(result)
+                self.assertEqual(result.message, "They hung up as I answered.")
+                self.assertIs(result.speaker_verified, False)
+                self.assertIsNone(svc._active)   # nothing left to own
+                self.assertNothingElseTouched(svc)
+
+    def test_human_call_active_follows_the_slot(self):
+        svc = self._native()
+        self.assertIs(svc.human_call_active(), False)
+        self._answered(svc)
+        self.assertIs(svc.human_call_active(), True)
+        svc._active["state"] = "unknown"
+        self.assertIs(svc.human_call_active(), True)    # any state while he holds it
+        svc._active = {"owner": "outgoing", "label": "x", "number": "+351900000000", "since": 0.0}
+        self.assertIs(svc.human_call_active(), False)   # her own call is busy(), not this
+
+    def test_find_phone_while_his_call_is_unknown(self):
+        svc = self._native()
+        self._answered(svc)
+        svc._active["state"] = "unknown"
+        result = svc.find_phone()
+        self.assertFalse(result)
+        self.assertEqual(result.message,
+                         "I can't tell yet whether the call on your phone has ended, so I won't ring it.")
 
     def test_each_refusal_has_its_own_line(self):
         cases = {
@@ -1192,11 +1253,13 @@ class NativeAnswerTests(_NativeBase):
 
 
 class NativeGateTests(unittest.TestCase):
-    def _gate(self, enabled=True, platform="win32", adb=True):
-        cfg = config_for_tests(phone={"enabled": False, "incoming": {"answer_speaker_enabled": enabled},
+    def _gate(self, enabled=True, platform="win32", adb=True, watcher=True):
+        cfg = config_for_tests(phone={"enabled": False,
+                                      "incoming": {"answer_speaker_enabled": enabled, "enabled": watcher},
                                       "adb": {"path": "Z:/nowhere/adb.exe"}})
         with mock.patch("services.phone_service.sys.platform", platform), \
-                mock.patch("services.phone_service.shutil.which", return_value="C:/adb.exe" if adb else None),                 mock.patch("services.phone_service.logger"):
+                mock.patch("services.phone_service.shutil.which", return_value="C:/adb.exe" if adb else None), \
+                mock.patch("services.phone_service.logger"):
             return PhoneService(cfg).native_answer_enabled
 
     def test_gate_needs_flag_windows_and_adb(self):
@@ -1204,6 +1267,10 @@ class NativeGateTests(unittest.TestCase):
         self.assertIs(self._gate(enabled=False), False)
         self.assertIs(self._gate(platform="linux"), False)
         self.assertIs(self._gate(adb=False), False)
+
+    def test_gate_needs_the_ring_watcher(self):
+        # No watcher -> no trusted ring to bind -> the feature is off, not half on.
+        self.assertIs(self._gate(watcher=False), False)
 
     def test_shipped_config_keeps_it_off(self):
         import yaml
@@ -1246,7 +1313,7 @@ class NativeSpeakerTests(_NativeBase):
             (SpeakerResult("ROUTE_FAILED", False), True, failed, False),
             (SpeakerResult("NO_BUTTON", False), True, failed, False),
             (SpeakerResult("UNREADABLE", False), True, failed, False),
-            (SpeakerResult("STALE_CALL", False), True, _BUSY_LINE, False),
+            (SpeakerResult("STALE_CALL", False), True, _NOT_CONNECTED_LINE, False),
             (SpeakerResult("NO_PHONE", False), True,
              "I can't reach your phone over Wi-Fi. Turn Wireless debugging back on in Developer options.", False),
         ]
@@ -1263,6 +1330,11 @@ class NativeSpeakerTests(_NativeBase):
             (_topology(("TC@4", "ringing")), "Your phone is still ringing. Answer it first."),
             (_topology(("TC@4", "active"), ("TC@6", "ringing")), _BUSY_LINE),
             (_topology(("TC@4", "active"), ("TC@6", "holding")), _BUSY_LINE),
+            # A sole call that is not connected yet is not "another call".
+            (_topology(("TC@4", "dialing")), _NOT_CONNECTED_LINE),
+            (_topology(("TC@4", "holding")), _NOT_CONNECTED_LINE),
+            (_topology(("TC@4", "answered")), _NOT_CONNECTED_LINE),
+            (_topology(("TC@1", "ended"), ("TC@4", "holding")), _NOT_CONNECTED_LINE),
             (_topology(("TC@4", "unknown")),
              "I couldn't read your phone's calls just now. Use the phone's speaker button."),
             (None, "I couldn't read your phone's calls just now. Use the phone's speaker button."),

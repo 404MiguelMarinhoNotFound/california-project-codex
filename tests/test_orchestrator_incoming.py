@@ -33,7 +33,7 @@ class _Watcher:
         return call
 
 
-def _orch(call=None, busy=False):
+def _orch(call=None, busy=False, human=None):
     orch = Orchestrator.__new__(Orchestrator)
     orch.audio = mock.Mock()
     orch.audio.chunk_samples = 640
@@ -49,6 +49,8 @@ def _orch(call=None, busy=False):
     orch.phone_service = mock.Mock()
     orch.phone_service.pop_report.return_value = None
     orch.phone_service.busy.return_value = busy
+    if human is not None:   # otherwise a bare Mock: never read as "his call"
+        orch.phone_service.human_call_active.return_value = human
     orch.incoming_calls = _Watcher(call)
     return orch
 
@@ -125,6 +127,21 @@ class AnnounceTests(unittest.TestCase):
         orch.audio.play_audio.assert_not_called()
         # Dropped, not kept for later.
         self.assertIsNone(orch.incoming_calls.call)
+
+    def test_no_announcement_during_his_native_call(self):
+        # R13: on speakerphone the first caller would hear the second one's name.
+        orch = _orch(_call(), human=True)
+        mic = _mic()
+        orch._idle_loop(mic)
+        orch.tts.synthesize.assert_not_called()
+        orch.audio.play_audio.assert_not_called()
+        self.assertIsNone(orch.incoming_calls.call)   # dropped, not kept for later
+        mic.read.assert_called_once()                 # and listening carries on
+
+    def test_announced_when_his_call_is_over(self):
+        orch = _orch(_call(), human=False)
+        orch._idle_loop(_mic())
+        orch.tts.synthesize.assert_called_once()
 
     def test_nothing_queued_reads_the_mic_as_usual(self):
         orch = _orch(None)

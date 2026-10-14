@@ -179,6 +179,16 @@ def parse_call_topology(text: str) -> CallTopology | None:
     return CallTopology(tuple(legs))
 
 
+def _live(topology: CallTopology) -> list[CallLeg]:
+    """The legs that are still calls: a DISCONNECTED row can linger a moment."""
+    return [leg for leg in topology.legs if leg.state != "ended"]
+
+
+def _hung_up(topology: CallTopology | None) -> bool:
+    """Every call ended or vanished (read, not unreadable): the caller hung up."""
+    return topology is not None and not _live(topology)
+
+
 # ------------------------------------------------------------- the speaker button
 
 _DIALER = "com.google.android.dialer"
@@ -702,6 +712,10 @@ class AdbPhone:
         route = self.set_speaker(expected_key, True)
         if route.speaker_verified:
             return AnswerResult("ANSWERED_SPEAKER", expected_key, accepted=True, speaker_verified=True)
+        if route.status == "STALE_CALL" and _hung_up(self._read_topology()):
+            # Answered (ACTIVE was read), then they hung up before the speaker.
+            logger.warning("Phone answer: answered, then the call ended")
+            return AnswerResult("HUNG_UP", expected_key, accepted=True)
         logger.warning("Phone answer: answered, speaker %s", route.status)
         return AnswerResult("ANSWERED_ROUTE_FAILED", expected_key, accepted=True)
 
@@ -709,18 +723,19 @@ class AdbPhone:
         """
         ACTIVE once `key` is the sole call and active, read-only polling up to
         5 s. Ringing/answered/unknown on the same sole key may still become
-        active; the call ending is STALE_RING (they hung up); anything else --
-        another key, an extra call, an unreadable read, the deadline -- is
-        ANSWER_UNCERTAIN, because the acceptance was global.
+        active; the call ending, or every call vanishing, is HUNG_UP (they hung
+        up as it was answered -- never a stale ring: no new call exists);
+        anything else -- another key, an extra call, an unreadable read, the
+        deadline -- is ANSWER_UNCERTAIN, because the acceptance was global.
         """
         deadline = self._clock() + _ACCEPT_ACTIVE_S
         while True:
             topology = self._read_topology()
             if topology is None:
                 return "ANSWER_UNCERTAIN"
-            legs = topology.legs
-            if not legs or (len(legs) == 1 and legs[0].key == key and legs[0].state == "ended"):
-                return "STALE_RING"
+            if _hung_up(topology):
+                return "HUNG_UP"
+            legs = _live(topology)
             if len(legs) != 1 or legs[0].key != key:
                 return "ANSWER_UNCERTAIN"
             if legs[0].state == "active":
@@ -733,7 +748,8 @@ class AdbPhone:
         topology = self._read_topology()
         if topology is None:
             return "UNREADABLE"
-        return "OK" if topology.legs == (CallLeg(key, "active"),) else "STALE_CALL"
+        # A lingering ended leg is not a call: the same filter PhoneService uses.
+        return "OK" if _live(topology) == [CallLeg(key, "active")] else "STALE_CALL"
 
     def set_speaker(self, expected_key: str, on: bool) -> SpeakerResult:
         """
@@ -742,9 +758,11 @@ class AdbPhone:
         audio route, and AudioManager's setters from the shell do not move it
         (probe, 2026-10-14). The tap goes out only for the same sole ACTIVE
         call, re-read right before it, and only when the button's `checked`
-        disagrees with `on`; never a second tap, which would toggle it back.
-        Success is the phone's audio route read back (speaker / earpiece) with
-        the mic unmuted, within 8 s; a tap alone proves nothing.
+        disagrees with `on`, and only once two screen reads agree on where the
+        button is (see _settled_button); never a second tap, which would
+        toggle it back. Success is the phone's audio route read back (speaker
+        / earpiece) with the mic unmuted, within 8 s of the tap; a tap alone
+        proves nothing.
         """
         if not _CALL_KEY.fullmatch(expected_key or ""):
             return SpeakerResult("STALE_CALL", False)
@@ -763,7 +781,7 @@ class AdbPhone:
                 self._sleep(0.7)
         if "</hierarchy>" not in screen:
             return SpeakerResult("UNREADABLE", False)
-        button = parse_speaker_button(screen)
+        button = self._settled_button(parse_speaker_button(screen))
         if button is None:
             return SpeakerResult("NO_BUTTON", False)
         if button.checked == on:
@@ -774,6 +792,8 @@ class AdbPhone:
                 return SpeakerResult(status, False)
             self.sh(f"input tap {button.center[0]} {button.center[1]}")
             done = "SPEAKER_ON" if on else "SPEAKER_OFF"
+        # The route gets its full window from the tap, however long the reads took.
+        deadline = self._clock() + _SPEAKER_WINDOW_S
         wanted = "speaker" if on else "earpiece"
         while True:
             if parse_audio_route(self._read_audio()) == (wanted, False):
@@ -781,6 +801,20 @@ class AdbPhone:
             if self._clock() >= deadline:
                 return SpeakerResult("ROUTE_FAILED", False)
             self._sleep(0.5)
+
+    def _settled_button(self, first: SpeakerButton | None) -> SpeakerButton | None:
+        """
+        The Speaker button only once two back-to-back screen reads agree on its
+        centre and checked state (R14): right after an answer the in-call grid
+        can still be sliding into place, and a tap on a moving button can land
+        on Mute. One disagreement earns a third read, which must match the
+        second; otherwise None. At most two reads after the first readable one.
+        """
+        second = parse_speaker_button(self._read_screen())
+        if first is not None and first == second:
+            return first
+        third = parse_speaker_button(self._read_screen())
+        return second if second is not None and second == third else None
 
     def audio(self, record_path: str = ""):
         from services.phone_call_audio import PhoneCallAudio

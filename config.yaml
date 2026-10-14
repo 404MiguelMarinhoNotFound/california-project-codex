@@ -1131,8 +1131,9 @@ phone:
   incoming:
     enabled: true      # announce who is calling, once per ring
     # "Answer it on speakerphone" / "speaker off": the phone answers its own ring and
-    # taps its own Speaker button over adb. No Gemini, no call audio. Off until the
-    # live answer test passes.
+    # taps its own Speaker button over adb. No Gemini, no call audio. Needs
+    # `enabled: true` above (the watcher is what names the ring to answer).
+    # Off until the live answer test passes.
     answer_speaker_enabled: false
   # "What did I miss on my phone?" -- read-only (call log + notification shade).
   # Nothing is dismissed or marked seen, and nothing is announced unprompted.

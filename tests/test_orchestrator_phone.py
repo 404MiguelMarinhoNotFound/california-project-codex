@@ -153,8 +153,9 @@ class NativeAnswerDispatchTests(unittest.TestCase):
         self.assertEqual(line, "Answered on your phone's speakerphone.")
         service.answer_speaker.assert_called_once_with(_TARGET)
         self.assertIs(mood, True)
+        service.set_speaker.return_value = PhoneCommandResult(True, "Speaker's off.")
         line = _dispatch_phone({"action": "phone_speaker", "on": False}, service)
-        self.assertEqual(line, "Speaker's on.")
+        self.assertEqual(line, "Speaker's off.")
         service.set_speaker.assert_called_once_with(False)
         service.call.assert_not_called()
 
@@ -302,7 +303,7 @@ class NativeAnswerDispatchTests(unittest.TestCase):
         svc = PhoneService(
             # paths: never the real logs/calls.jsonl; the flag is what this test exercises
             config_for_tests(phone={"enabled": True, "log_path": log_path,
-                                    "incoming": {"answer_speaker_enabled": True}}),
+                                    "incoming": {"answer_speaker_enabled": True, "enabled": True}}),
             dialer=dialer, agent_factory=lambda: agents.append(1) or FakeAgent(),
             control_phone=control, current_ring=lambda: _RING,
         )

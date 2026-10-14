@@ -64,12 +64,14 @@ _MSG_BLOCKED = "I won't call that number myself."
 _MSG_HUMAN_DIAL = "You're on a call on your phone, so I won't dial over it."
 _MSG_HUMAN_UNKNOWN = "I can't tell yet whether the call on your phone has ended, so I won't dial over it."
 _MSG_HUMAN_FIND = "You're on a call on your phone, so I won't ring it."
+_MSG_HUMAN_FIND_UNKNOWN = "I can't tell yet whether the call on your phone has ended, so I won't ring it."
 
 # "Answer it on speakerphone": the phone answers its own ring and taps its own
 # Speaker button. No Gemini, no call audio, no recording, no report.
 _MSG_NATIVE_DISABLED = "Answering calls on your phone isn't set up right now."
 _MSG_NATIVE_BUSY = "There's already another call on your phone. Answer this one on the phone."
 _MSG_ALREADY_ANSWERED = "Looks like it's already been answered."
+_MSG_RINGING_UNBOUND = "It's ringing, but I couldn't lock onto that call. Ask me again or answer it on the phone."
 _MSG_PARTIAL = "The call is answered, but I couldn't switch it to speakerphone. Use the phone's speaker button."
 _ANSWER_LINES = {
     "ANSWERED_SPEAKER": "Answered on your phone's speakerphone.",
@@ -78,6 +80,8 @@ _ANSWER_LINES = {
     "ANSWERED_ROUTE_FAILED": _MSG_PARTIAL,
     "NO_RING": "Your phone isn't ringing now.",
     "STALE_RING": "That call stopped ringing. I haven't answered the new one.",
+    # They hung up as it was answered: there is no new call, so never the line above.
+    "HUNG_UP": "They hung up as I answered.",
     "BUSY": _MSG_NATIVE_BUSY,
     "ANSWER_UNCERTAIN": "I couldn't confirm whether the call answered. Check your phone.",
     "UNREADABLE": "I couldn't read your phone's calls just now, so I didn't answer it. Answer it on the phone.",
@@ -92,6 +96,8 @@ _ANSWER_LINES = {
 _ANSWERED = ("ANSWERED_SPEAKER", "ANSWERED", "ANSWERED_ROUTE_FAILED")
 
 _SPEAKER_FAILED = "I couldn't switch the speaker. Use the phone's speaker button."
+_MSG_NOT_CONNECTED = ("I can only switch the speaker once the call is connected and it's the only one. "
+                      "Use the phone's speaker button.")
 _SPEAKER_LINES = {
     "NO_PHONE": _ANSWER_LINES["NO_PHONE"],
     "LOCKED_DOWN": "Your phone is blocking me from switching the speaker. Turn on USB debugging "
@@ -99,7 +105,11 @@ _SPEAKER_LINES = {
     "NO_CALL": "There's no call on your phone right now.",
     "RINGING": "Your phone is still ringing. Answer it first.",
     "UNREADABLE": "I couldn't read your phone's calls just now. Use the phone's speaker button.",
-    "STALE_CALL": _MSG_NATIVE_BUSY,
+    # Only a genuine second live call is "another call". A sole call not
+    # connected yet, or one that changed before the tap, is neither.
+    "OTHER_CALL": _MSG_NATIVE_BUSY,
+    "NOT_CONNECTED": _MSG_NOT_CONNECTED,
+    "STALE_CALL": _MSG_NOT_CONNECTED,
 }
 
 # Find my phone, one line per way it can end. The fixes differ, so none is
@@ -316,21 +326,32 @@ def _is_human(active: dict) -> bool:
     return active.get("owner") == "human"
 
 
+def _live_legs(topology) -> list:
+    """The legs still calls: a DISCONNECTED row can linger a moment after a hang-up."""
+    return [leg for leg in topology.legs if leg.state != "ended"]
+
+
+def _rings_alone(topology) -> bool:
+    """Exactly one live call, and it is ringing."""
+    live = _live_legs(topology)
+    return len(live) == 1 and live[0].state == "ringing"
+
+
 def _sole_active_call(topology) -> tuple[str, str]:
     """("OK", key) for exactly one live call and it active, else (why, "")."""
     if topology is None:
         return "UNREADABLE", ""
-    live = [leg for leg in topology.legs if leg.state != "ended"]
+    live = _live_legs(topology)
     if any(leg.state == "unknown" for leg in live):
         return "UNREADABLE", ""
     if not live:
         return "NO_CALL", ""
     if len(live) > 1:
-        return "STALE_CALL", ""
+        return "OTHER_CALL", ""
     if live[0].state == "ringing":
         return "RINGING", ""
     if live[0].state != "active":
-        return "STALE_CALL", ""
+        return "NOT_CONNECTED", ""   # dialing, holding, answered
     return "OK", live[0].key
 
 
@@ -442,8 +463,12 @@ class PhoneService:
         configured = bool(cfg.get("enabled", False))
         self.enabled = configured and self._probe()
         incoming_cfg = cfg.get("incoming", {}) or {}
+        # The ring watcher is the only trusted source of a ring to answer: with
+        # it off there is never a target, so the feature is off, not half on.
         self.native_answer_enabled = (
-            incoming_cfg.get("answer_speaker_enabled", False) is True and self._probe_native()
+            incoming_cfg.get("answer_speaker_enabled", False) is True
+            and incoming_cfg.get("enabled", False) is True
+            and self._probe_native()
         )
 
     # ------------------------------------------------------------- setup
@@ -699,7 +724,12 @@ class PhoneService:
         with self._lock:
             active = self._active
         if active is not None:
-            return PhoneCommandResult(False, _MSG_HUMAN_FIND if _is_human(active) else _MSG_BUSY)
+            if not _is_human(active):
+                return PhoneCommandResult(False, _MSG_BUSY)
+            # Same split as a dial: "you're on a call" only when a read says so.
+            return PhoneCommandResult(
+                False, _MSG_HUMAN_FIND if active.get("state") == "connected" else _MSG_HUMAN_FIND_UNKNOWN
+            )
         try:
             status = self._get_dialer().play_sound()
         except Exception:
@@ -799,6 +829,13 @@ class PhoneService:
         with self._lock:
             return self._active is not None and not _is_human(self._active)
 
+    def human_call_active(self) -> bool:
+        """True while a call he had her answer holds the slot, in any state
+        (unknown included). Read-only. The room keeps quiet about a second
+        ring then: on speakerphone the first caller would hear the name."""
+        with self._lock:
+            return self._active is not None and _is_human(self._active)
+
     def status_line(self) -> str:
         with self._lock:
             active, last = self._active, self._last
@@ -894,11 +931,14 @@ class PhoneService:
         if not self._same_ring(offer):
             return None
         topology = self._read_control_topology()
-        if topology is None or len(topology.legs) != 1 or topology.legs[0].state != "ringing":
+        if topology is None:
+            return None
+        live = _live_legs(topology)   # a lingering ended leg is not a second call
+        if len(live) != 1 or live[0].state != "ringing":
             return None
         if not self._same_ring(offer):
             return None
-        return IncomingTarget(offer, topology.legs[0].key)
+        return IncomingTarget(offer, live[0].key)
 
     def answer_speaker(self, target: IncomingTarget | None) -> PhoneCommandResult:
         """
@@ -970,6 +1010,9 @@ class PhoneService:
             leg.key == target.call_key and leg.state in ("active", "holding", "answered") for leg in topology.legs
         ):
             return PhoneCommandResult(False, _MSG_ALREADY_ANSWERED)
+        if status == "NO_RING" and topology is not None and _rings_alone(topology):
+            # The watcher lost it, telecom still shows it: never "isn't ringing".
+            return PhoneCommandResult(False, _MSG_RINGING_UNBOUND)
         return PhoneCommandResult(False, _ANSWER_LINES[status])
 
     def _why_no_target(self) -> PhoneCommandResult:
@@ -977,9 +1020,11 @@ class PhoneService:
         topology = self._read_control_topology()
         if topology is None:
             return PhoneCommandResult(False, _ANSWER_LINES["UNREADABLE"])
-        live = [leg for leg in topology.legs if leg.state != "ended"]
+        live = _live_legs(topology)
         if any(leg.state == "ringing" for leg in live) and len(live) > 1:
             return PhoneCommandResult(False, _MSG_NATIVE_BUSY)
+        if _rings_alone(topology):
+            return PhoneCommandResult(False, _MSG_RINGING_UNBOUND)
         return PhoneCommandResult(False, _ANSWER_LINES["NO_RING"])
 
     def _start_monitor(self) -> None:

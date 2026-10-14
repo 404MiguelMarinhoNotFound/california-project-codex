@@ -2396,10 +2396,14 @@ class Orchestrator:
             return
 
         # The phone is ringing: say who, once per ring, unless she is on one of
-        # her own calls (then the ring is dropped, not kept for later).
+        # her own calls, or he is on one she answered natively (R13: on
+        # speakerphone the first caller would hear the second one's name; the
+        # phone's own call-waiting tone still tells him). Either way the ring
+        # is dropped, not kept for later.
         watcher = getattr(self, "incoming_calls", None)
         call = watcher.pop() if watcher is not None else None
-        if call is not None and not (phone is not None and phone.busy() is True):
+        on_a_call = phone is not None and (phone.busy() is True or phone.human_call_active() is True)
+        if call is not None and not on_a_call:
             who = caller_phrase(call.name, call.number) if (call.name or call.number).strip() else ""
             self._announce(incoming_line(call), mic_stream, kind=call.kind, who=who)
             return
