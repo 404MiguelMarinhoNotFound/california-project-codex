@@ -593,6 +593,122 @@ class FindPhoneTests(_Base):
         self.dialer.play_sound.assert_not_called()
 
 
+_FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
+_CALL_ROWS = (
+    "Row: 0 number=+351910000001, date=1791900000000, new=1, name=Rita\n"
+    "Row: 1 number=+351910000002, date=1791890000000, new=0, name=NULL\n"
+)
+
+
+def _notification_dump() -> str:
+    with open(os.path.join(_FIXTURES, "phone_notification_dump.txt"), encoding="utf-8") as handle:
+        return handle.read()
+
+
+class DigestTests(_Base):
+    """phone_missed / phone_digest: read-only, and an unreadable phone is never "nothing new"."""
+
+    def setUp(self):
+        super().setUp()
+        self.dialer.reachable = mock.Mock(return_value="OK")
+        self.dialer.missed_calls_raw = mock.Mock(return_value=_CALL_ROWS)
+        self.dialer.notifications_raw = mock.Mock(return_value=_notification_dump())
+
+    def test_missed_calls_reads_the_configured_window(self):
+        now = 1791910000.0
+        with mock.patch("services.phone_service.time.time", return_value=now):
+            result = self._svc().missed_calls()
+        self.assertTrue(result)
+        self.dialer.missed_calls_raw.assert_called_once_with(int((now - 24 * 3600) * 1000))
+        self.assertIn("2 missed calls", result.message)
+        self.assertIn("Rita", result.message)
+
+    def test_unreachable_phone_is_not_nothing_new(self):
+        self.dialer.reachable.return_value = "NO_PHONE"
+        for method in ("missed_calls", "digest"):
+            with self.subTest(method=method):
+                result = getattr(self._svc(), method)()
+                self.assertIs(result.success, False)
+                self.assertEqual(result.message, (
+                    "I can't reach his phone over Wi-Fi, so I can't see what he missed. "
+                    "Wireless debugging may be off on it."
+                ))
+
+    def test_a_failed_raw_read_is_not_nothing_new(self):
+        didnt_answer = "His phone didn't answer just now, so I can't say what he missed."
+        cases = (
+            ("missed_calls", "missed_calls_raw", ()),
+            ("digest", "missed_calls_raw", ()),
+            ("digest", "notifications_raw", ()),
+            ("digest", "notifications_raw", ("WhatsApp",)),
+        )
+        for method, raw, args in cases:
+            with self.subTest(method=method, raw=raw, args=args):
+                self.setUp()
+                getattr(self.dialer, raw).return_value = None
+                result = getattr(self._svc(), method)(*args)
+                self.assertIs(result.success, False)
+                self.assertEqual(result.message, didnt_answer)
+
+    def test_a_read_that_raises_is_the_didnt_answer_line(self):
+        self.dialer.notifications_raw.side_effect = OSError("boom")
+        with self.assertLogs("services.phone_service", level="ERROR"):
+            result = self._svc().digest()
+        self.assertIs(result.success, False)
+        self.assertIn("didn't answer", result.message)
+
+    def test_nothing_new_is_still_success(self):
+        self.dialer.missed_calls_raw.return_value = "No result found.\n"
+        self.dialer.notifications_raw.return_value = "  Notification List:\n"
+        result = self._svc().digest()
+        self.assertIs(result.success, True)
+        self.assertIn("Nothing new", result.message)
+
+    def test_ignored_packages_are_dropped(self):
+        dump = _notification_dump().replace("pkg=com.google.android.gm", "pkg=com.miui.securitycenter")
+        self.dialer.notifications_raw.return_value = dump
+        message = self._svc().digest().message
+        self.assertNotIn("Booking.com", message)
+        self.assertNotIn("Securitycenter", message)
+        self.assertIn("WhatsApp", message)
+
+    def test_digest_names_apps_and_senders_but_no_text(self):
+        message = self._svc().digest().message
+        self.assertIn("WhatsApp", message)
+        self.assertIn("Gmail", message)
+        self.assertNotIn("Já cheguei", message)
+
+    def test_digest_with_app_gives_texts(self):
+        result = self._svc().digest("WhatsApp")
+        self.assertTrue(result)
+        self.assertIn("Já cheguei", result.message)
+        self.dialer.missed_calls_raw.assert_not_called()
+
+    def test_digest_respects_the_configured_caps(self):
+        message = self._svc(digest={"max_apps": 1}).digest().message
+        self.assertIn("and 1 more app", message)
+
+    def test_disabled_service(self):
+        svc = self._svc()
+        svc.enabled = False
+        self.assertEqual(svc.missed_calls().message, "Phone calls aren't set up right now.")
+        self.assertEqual(svc.digest().message, "Phone calls aren't set up right now.")
+        self.dialer.reachable.assert_not_called()
+
+    def test_reads_allowed_during_a_call(self):
+        svc = self._svc()
+        svc._active = {"label": "X", "number": "+351912345678", "since": 0.0}
+        result = svc.digest()
+        self.assertTrue(result)
+        self.dialer.notifications_raw.assert_called_once_with()
+
+    def test_shipped_config_has_the_digest_block(self):
+        svc = self._svc()
+        self.assertEqual(svc.digest_window_hours, 24)
+        self.assertIn("com.miui.securitycenter", svc.digest_ignore_packages)
+        self.assertEqual(svc.digest_app_names.get("com.whatsapp"), "WhatsApp")
+
+
 class NoRealPhoneTests(unittest.TestCase):
     """Constructing the shipped service must never reach the phone."""
 

@@ -37,6 +37,13 @@ from datetime import datetime
 from typing import Callable
 
 from services.gemini_live_call import CallResult
+from services.phone_digest import (
+    app_texts_line,
+    digest_line,
+    missed_calls_line,
+    parse_call_log,
+    parse_notifications,
+)
 from services.phone_prompts import CallBrief, build_call_prompt
 from services.whatsapp_service import looks_like_phone, normalize_phone
 
@@ -61,6 +68,19 @@ _FIND_LINES = {
     "RING_FAILED": "His phone didn't start the sound. Try again in a moment.",
 }
 _MSG_FIND_FAILED = "I couldn't ring the phone, it didn't answer."
+
+# "What did I miss?" when the phone could not be read. Never "nothing new":
+# an unreadable phone and a quiet one need opposite answers.
+_READ_FAILURES = {
+    "NO_PHONE": "I can't reach his phone over Wi-Fi, so I can't see what he missed. "
+                "Wireless debugging may be off on it.",
+    "": "His phone didn't answer just now, so I can't say what he missed.",
+}
+
+_DEFAULT_DIGEST_IGNORE = [
+    "android", "com.android.systemui", "com.miui.securitycenter", "com.xiaomi.mirror",
+    "com.xiaomi.aicr", "com.miui.misound", "com.microsoft.appmanager",
+]
 
 _DIALED = ("DIALED",)
 
@@ -284,6 +304,16 @@ class PhoneService:
         self.adb_port = int(adb_cfg.get("port") or 27183)
         # The phone's own mic stays out of the call, or the room goes in under her voice.
         self.mute_phone_mic = adb_cfg.get("mute_phone_mic", True) is not False
+        # "What did I miss?": read-only, see missed_calls() and digest().
+        digest_cfg = cfg.get("digest", {}) or {}
+        self.digest_window_hours = int(digest_cfg.get("missed_window_hours") or 24)
+        self.digest_max_apps = int(digest_cfg.get("max_apps") or 8)
+        self.digest_max_senders = int(digest_cfg.get("max_senders_per_app") or 5)
+        ignore = digest_cfg.get("ignore_packages")
+        self.digest_ignore_packages = frozenset(
+            str(p) for p in (_DEFAULT_DIGEST_IGNORE if ignore is None else ignore)
+        )
+        self.digest_app_names = {str(k): str(v) for k, v in (digest_cfg.get("app_names") or {}).items()}
         self.default_country = str(cfg.get("default_country") or "351")
         self.allowed_country_codes = [str(c) for c in (cfg.get("allowed_country_codes") or [self.default_country])]
         self.blocked_prefixes = [str(p) for p in (cfg.get("blocked_prefixes") or _DEFAULT_BLOCKED_PREFIXES)]
@@ -542,6 +572,88 @@ class PhoneService:
         if line is None:
             return PhoneCommandResult(False, _MSG_FIND_FAILED)
         return PhoneCommandResult(status in ("PLAYING", "ALREADY_PLAYING"), line)
+
+    # ------------------------------------------------------------- what he missed
+
+    def missed_calls(self) -> PhoneCommandResult:
+        """
+        Missed calls in the last `phone.digest.missed_window_hours`, from the
+        phone's call log. Read-only. success=True even when there are none;
+        False only when the phone could not be read.
+        """
+        if not self.enabled:
+            return PhoneCommandResult(False, _MSG_DISABLED)
+        now = time.time()
+        failure = self._unreachable()
+        if failure is None:
+            calls, failure = self._read_missed(now)
+        if failure is not None:
+            return failure
+        return PhoneCommandResult(True, missed_calls_line(calls, now, self.digest_window_hours))
+
+    def digest(self, app: str = "") -> PhoneCommandResult:
+        """
+        Missed calls plus who is waiting in which app -- no message text. With
+        `app`, that app's waiting texts instead, each quoted as the sender's
+        words. Read-only, so allowed during a call (unlike find_phone).
+        """
+        if not self.enabled:
+            return PhoneCommandResult(False, _MSG_DISABLED)
+        now = time.time()
+        app = (app or "").strip()
+        failure = self._unreachable()
+        if failure is not None:
+            return failure
+        calls = []
+        if not app:
+            calls, failure = self._read_missed(now)
+            if failure is not None:
+                return failure
+        notes, failure = self._read_notifications()
+        if failure is not None:
+            return failure
+        if app:
+            line = app_texts_line(app, notes, self.digest_app_names, now, max_items=self.digest_max_senders)
+        else:
+            line = digest_line(
+                calls, notes, self.digest_app_names, now, self.digest_window_hours,
+                max_apps=self.digest_max_apps, max_senders=self.digest_max_senders,
+            )
+        return PhoneCommandResult(True, line)
+
+    def _unreachable(self) -> PhoneCommandResult | None:
+        """The NO_PHONE line when the phone is not on adb, else None. Never raises."""
+        try:
+            status = self._get_dialer().reachable()
+        except Exception:
+            logger.exception("Checking the phone over adb failed")
+            return PhoneCommandResult(False, _READ_FAILURES[""])
+        if status != "OK":
+            return PhoneCommandResult(False, _READ_FAILURES["NO_PHONE"])
+        return None
+
+    def _read_missed(self, now: float) -> tuple[list, PhoneCommandResult | None]:
+        """(calls, None), or ([], the failure line). Never raises."""
+        try:
+            raw = self._get_dialer().missed_calls_raw(int((now - self.digest_window_hours * 3600) * 1000))
+        except Exception:
+            logger.exception("Reading the phone's call log failed")
+            raw = None
+        if raw is None:
+            return [], PhoneCommandResult(False, _READ_FAILURES[""])
+        return parse_call_log(raw), None
+
+    def _read_notifications(self) -> tuple[list, PhoneCommandResult | None]:
+        """(notifications without the ignored packages, None), or ([], the failure line). Never raises."""
+        try:
+            raw = self._get_dialer().notifications_raw()
+        except Exception:
+            logger.exception("Reading the phone's notifications failed")
+            raw = None
+        if raw is None:
+            return [], PhoneCommandResult(False, _READ_FAILURES[""])
+        notes = [n for n in parse_notifications(raw) if n.package not in self.digest_ignore_packages]
+        return notes, None
 
     def status_line(self) -> str:
         with self._lock:
