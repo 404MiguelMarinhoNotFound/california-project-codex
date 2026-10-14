@@ -846,16 +846,17 @@ class SnapshotBookTests(unittest.TestCase):
         self.assertEqual([c.name for c in old], ["Ana Exemplo"])
 
     def test_a_reload_between_read_back_and_go_keeps_the_confirmation(self):
-        snap = _snapshot([("Marta Zuka", "+351933852719")])
+        snap = _snapshot([("Lara Exemplo", "+351910000789")])
         service = _snap_service(snap, _book(_RUI_VCF))
         transport = _drive(service)
-        match = service.resolve_contact("Martah")
+        match = service.resolve_contact("Larah Exemplo")
+        self.assertTrue(match)
         self.assertFalse(match.certain)
         self.assertFalse(service.send(match, "hello"))
         service.reload_contacts()
-        again = service.resolve_contact("Martah")
+        again = service.resolve_contact("Larah Exemplo")
         self.assertTrue(service.send(again, "hello", confirm=True))
-        self.assertEqual(transport.sent, [("+351933852719", "hello")])
+        self.assertEqual(transport.sent, [("+351910000789", "hello")])
 
     def test_the_fixture_never_reads_the_real_snapshot(self):
         self.assertEqual(

@@ -270,6 +270,7 @@ class PhoneService:
         agent_factory: Callable | None = None,
         summarize: Callable | None = None,
         publish: Callable | None = None,
+        read_phone=None,
     ):
         cfg = config.get("phone", {}) or {}
         # The live UI's EventBus.publish, or None. Call lines go out as they
@@ -323,6 +324,8 @@ class PhoneService:
 
         self.resolve_contact = resolve_contact
         self._dialer = dialer
+        self._read_phone = read_phone
+        self._read_lock = threading.Lock()
         self._agent_factory = agent_factory
         # What the call achieved is read from the transcript after it ends
         # (services/call_outcome.py), with the same Claude model the room
@@ -416,6 +419,17 @@ class PhoneService:
                 "mute_phone_mic": self.mute_phone_mic,
             }}})
         return self._dialer
+
+    def _get_read_phone(self):
+        """A separate transport; callers hold _read_lock through discovery and reads."""
+        if self._read_phone is None:
+            from services.phone_adb import AdbPhone
+
+            self._read_phone = AdbPhone.from_config({"phone": {"adb": {
+                "path": self.adb_path, "serial": self.adb_serial, "port": self.adb_port,
+                "mute_phone_mic": self.mute_phone_mic,
+            }}})
+        return self._read_phone
 
     def _make_agent(self, audio=None):
         if self._agent_factory is not None:
@@ -584,9 +598,10 @@ class PhoneService:
         if not self.enabled:
             return PhoneCommandResult(False, _MSG_DISABLED)
         now = time.time()
-        failure = self._unreachable()
-        if failure is None:
-            calls, failure = self._read_missed(now)
+        with self._read_lock:
+            failure = self._unreachable()
+            if failure is None:
+                calls, failure = self._read_missed(now)
         if failure is not None:
             return failure
         return PhoneCommandResult(True, missed_calls_line(calls, now, self.digest_window_hours))
@@ -601,17 +616,18 @@ class PhoneService:
             return PhoneCommandResult(False, _MSG_DISABLED)
         now = time.time()
         app = (app or "").strip()
-        failure = self._unreachable()
-        if failure is not None:
-            return failure
-        calls = []
-        if not app:
-            calls, failure = self._read_missed(now)
+        with self._read_lock:
+            failure = self._unreachable()
             if failure is not None:
                 return failure
-        notes, failure = self._read_notifications()
-        if failure is not None:
-            return failure
+            calls = []
+            if not app:
+                calls, failure = self._read_missed(now)
+                if failure is not None:
+                    return failure
+            notes, failure = self._read_notifications()
+            if failure is not None:
+                return failure
         if app:
             line = app_texts_line(app, notes, self.digest_app_names, now, max_items=self.digest_max_senders)
         else:
@@ -624,7 +640,7 @@ class PhoneService:
     def _unreachable(self) -> PhoneCommandResult | None:
         """The NO_PHONE line when the phone is not on adb, else None. Never raises."""
         try:
-            status = self._get_dialer().reachable()
+            status = self._get_read_phone().reachable()
         except Exception:
             logger.exception("Checking the phone over adb failed")
             return PhoneCommandResult(False, _READ_FAILURES[""])
@@ -635,7 +651,7 @@ class PhoneService:
     def _read_missed(self, now: float) -> tuple[list, PhoneCommandResult | None]:
         """(calls, None), or ([], the failure line). Never raises."""
         try:
-            raw = self._get_dialer().missed_calls_raw(int((now - self.digest_window_hours * 3600) * 1000))
+            raw = self._get_read_phone().missed_calls_raw(int((now - self.digest_window_hours * 3600) * 1000))
         except Exception:
             logger.exception("Reading the phone's call log failed")
             raw = None
@@ -646,7 +662,7 @@ class PhoneService:
     def _read_notifications(self) -> tuple[list, PhoneCommandResult | None]:
         """(notifications without the ignored packages, None), or ([], the failure line). Never raises."""
         try:
-            raw = self._get_dialer().notifications_raw()
+            raw = self._get_read_phone().notifications_raw()
         except Exception:
             logger.exception("Reading the phone's notifications failed")
             raw = None

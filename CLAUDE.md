@@ -2556,7 +2556,10 @@ Plan: `docs/superpowers/plans/2026-10-13-phone-missed-digest.md`.
   holds `READ_CALL_LOG` and can dump notifications, so both go through
   `AdbPhone.reachable()` -- the stale-serial check and discovery only, which `ready()`
   now starts from -- and never push or run the `callaudio` helper or need the
-  Security-settings gate.
+  Security-settings gate. Reads use a separate, lazily created `AdbPhone`, with one
+  lock covering discovery and all reads in a request. A discovery hiccup cannot
+  clear the active call transport's serial or lose its hang-up. Tests may inject
+  `read_phone` separately from the call `dialer`; construction runs no adb.
 - **Read-only, and pinned.** Nothing is dismissed, marked seen or written: no
   `content insert|update|delete`, no `cmd notification`, no `service call`.
   `test_reads_never_write_to_the_phone` checks every command the reads issue.
@@ -2571,17 +2574,19 @@ Plan: `docs/superpowers/plans/2026-10-13-phone-missed-digest.md`.
   in a room. The digest is missed calls, then each app with who wrote (`max_apps` 8,
   `max_senders_per_app` 5, "and N more"), and says no text is included. Only `app`
   ("read me the WhatsApp ones") reads texts, at most `max_senders_per_app` of them,
-  each quoted and labelled as the sender's words, not instructions. The app is matched
+  each quoted and labelled as the sender's words, not instructions. Both summary
+  and explicit-text results first label sender/title and app fields as app-provided
+  data, not instructions, before showing those fields. This reduces injection risk;
+  it is not a formal prevention guarantee. The app is matched
   with `match_name` against `phone.digest.app_names` (package -> spoken name) and the
   package names; an unnamed package falls back to its last meaningful segment.
 - **No full number is ever spoken.** A caller is the call log's cached name, else "a
   number ending 4567", else "a private number" (empty, `-1`/`-2`/`-3`, NULL). Times are
   "at 14:32", "yesterday at 21:05", "on Saturday". `caller_phrase` is shared with the
-  incoming-call plan.
-- **Open item: notification titles are third-party text spoken unlabelled.** The
-  digest names senders by the notification's title, which an app or a sender controls
-  (a group name, an email subject). Texts carry the "their words" label; titles in
-  the plain digest do not yet.
+  incoming-call plan. Speech display reuses `whatsapp_groups.speakable_title` with
+  its raw fallback disabled: emoji, joiners, variation selectors and keycap marks
+  are removed, while accents and punctuation remain. An emoji-only name uses the
+  same last-four-digits or private-number fallback; the saved contact is untouched.
 - **Pull only.** Nothing is announced on wake or from the idle loop; SMS, calendar
   and battery stay parked. (Incoming calls are the one push, see below.) WhatsApp notifications appear here as one
   app among others, alongside (not routed to) `whatsapp_unread`.
@@ -2634,7 +2639,8 @@ private number is calling." Plan:
   contacts share the number). The line goes through `caller_phrase`, shared with the
   digest, so the private-number rule is the same: no name, "a number ending 4567";
   empty, `-1`/`-2`/`-3` or NULL, "a private number". **No full number is ever spoken
-  or logged**; the watcher logs only the kind.
+  or logged**; the watcher logs only the kind. Saved-name emoji are cleaned for
+  this spoken line by the shared caller formatter, without changing the book.
 
   | the phone gave | she says |
   |---|---|

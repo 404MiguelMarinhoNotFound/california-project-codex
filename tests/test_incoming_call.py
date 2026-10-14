@@ -382,6 +382,18 @@ class IncomingLineTests(unittest.TestCase):
         self.assertEqual(incoming_line(_call("+351910004567", "Mama")), "Mama is calling.")
         self.assertEqual(incoming_line(_call("", "Mama")), "Mama is calling.")
 
+    def test_saved_emoji_names_are_cleaned_without_changing_the_record(self):
+        for saved, expected in (
+            ('João 🫰🏽❤️👩‍💻', 'João is calling.'),
+            ('Inês ✈️', 'Inês is calling.'),
+            ('🫰🏽❤️👩‍💻', 'A number ending 4567 is calling.'),
+        ):
+            with self.subTest(saved=saved):
+                call = _call('+351910004567', saved)
+                self.assertEqual(incoming_line(call), expected)
+                self.assertEqual(call.name, saved)
+                self.assertNotIn('910004567', incoming_line(call))
+
     def test_unknown_and_private_callers(self):
         line = incoming_line(_call("+351910004567"))
         self.assertEqual(line, "A number ending 4567 is calling.")

@@ -141,6 +141,25 @@ class LineTests(unittest.TestCase):
             for bad in ("null", "None", "+351"):
                 self.assertNotIn(bad, out)
 
+    def test_caller_names_clean_emoji_only_for_speech(self):
+        cases = (
+            ('João 🫰🏽', 'João'),
+            ('Inês ❤️', 'Inês'),
+            ('👩🏽‍💻 Ana', 'Ana'),
+            ('Ana👩‍💻Silva', 'Ana Silva'),
+            ("José D'Ávila-Sá, Jr.", "José D'Ávila-Sá, Jr."),
+            ('Ame\u0301lie ✈️', 'Ame\u0301lie'),
+            ('Ana\U000e0100', 'Ana'),
+            ('🫰🏽❤️👩‍💻', 'a number ending 4567'),
+            ('1️⃣', '1'),
+        )
+        for saved, expected in cases:
+            with self.subTest(saved=saved):
+                phrase = caller_phrase(saved, '+351910004567')
+                self.assertEqual(phrase, expected)
+                self.assertNotIn('910004567', phrase)
+        self.assertEqual(caller_phrase('🫰🏽❤️👩‍💻', ''), 'a private number')
+
     def test_when_phrase(self):
         self.assertEqual(when_phrase(_local_ms(2026, 10, 14, 9, 5), NOW), "at 09:05")
         self.assertEqual(when_phrase(_local_ms(2026, 10, 13, 21, 5), NOW), "yesterday at 21:05")
