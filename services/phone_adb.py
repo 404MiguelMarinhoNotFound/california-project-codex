@@ -258,12 +258,22 @@ class AdbPhone:
 
     # ------------------------------------------------------------- readiness
 
-    def ready(self, need_interception: bool = True, need_helper: bool = True) -> str:
-        """OK, or the first thing standing between us and the phone."""
+    def reachable(self) -> str:
+        """
+        OK or NO_PHONE: is the phone on adb right now? The stale-serial check
+        and discovery only -- no helper push, no Security-settings gate, no
+        interception check -- so the plain reads below need nothing else, and
+        `ready()` starts here so discovery lives in one place.
+        """
         if self.serial and not self._still_attached():
             self.serial = ""  # moved port or gone: find it again
-        if not self._ensure_serial():
-            return "NO_PHONE"
+        return "OK" if self._ensure_serial() else "NO_PHONE"
+
+    def ready(self, need_interception: bool = True, need_helper: bool = True) -> str:
+        """OK, or the first thing standing between us and the phone."""
+        status = self.reachable()
+        if status != "OK":
+            return status
         if need_helper:
             self._push_helper()
         if self.sh("getprop persist.security.adbinput").strip() != "1":
@@ -310,6 +320,46 @@ class AdbPhone:
         self.last_status = "UNREADABLE"
         logger.warning("content query: unreadable output (%d chars)", len(out))
         return None
+
+    # `_adb()` answers "" on any adb failure, so the raw reads below return
+    # None for output that is not recognisably theirs: an unreachable phone
+    # must never read as "no missed calls" or "no notifications".
+
+    def missed_calls_raw(self, since_ms: int) -> str | None:
+        """
+        The call log's missed calls since `since_ms`, newest first, as raw
+        `content query` text for `services.phone_digest.parse_call_log`, or
+        None when the phone could not be read. Read-only, no helper.
+        """
+        # Imported here: phone_digest imports parse_content_rows from this module.
+        from services.phone_digest import CALL_LOG_PROJECTION
+
+        if self.reachable() != "OK":
+            return None
+        out = self.sh(
+            "content query --uri content://call_log/calls"
+            f" --projection {':'.join(CALL_LOG_PROJECTION)}"
+            f' --where "type=3 AND date>={int(since_ms)}" --sort "date DESC"',
+            timeout=30.0,
+        )
+        if "Row:" not in out and _NO_RESULT not in out:
+            logger.warning("call log: unreadable output (%d chars)", len(out))
+            return None
+        return out
+
+    def notifications_raw(self) -> str | None:
+        """
+        `dumpsys notification --noredact` for `services.phone_digest.parse_notifications`,
+        or None when the phone could not be read. Read-only: nothing is
+        dismissed or marked seen.
+        """
+        if self.reachable() != "OK":
+            return None
+        out = self.sh("dumpsys notification --noredact", timeout=20.0)
+        if "Notification List:" not in out:
+            logger.warning("notifications: unreadable output (%d chars)", len(out))
+            return None
+        return out
 
     # ------------------------------------------------------------- the dialer interface
 

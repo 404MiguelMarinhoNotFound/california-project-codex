@@ -11,6 +11,9 @@ from services import phone_adb
 from services.phone_adb import ACTIVE, ALERTING, DIALING, IDLE, AdbPhone, parse_content_rows
 from tests.config_fixture import config_for_tests
 
+NOTIFICATION_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "phone_notification_dump.txt")
+# The phone-missed-digest plan's Global Constraints: nothing this file drives may write.
+FORBIDDEN = ("content update", "content delete", "content insert", "cmd notification", "service call")
 PHONE = "192.168.1.101:38731"  # config-literal: adb devices/mdns output shape, not the deployment
 MDNS_NAME = "adb-4POJ4DWOJBXWIVLB-lmuzi2._adb-tls-connect._tcp"
 
@@ -29,6 +32,9 @@ class FakeAdb:
         self.replies = {"dial": "DIALED", "hangup": "ENDED=false", "check": "INTERCEPTABLE=true\nAUDIO_MODE=0\nTELEPHONY_TX=18/x/"}
         self.swapped = False
         self.content = "No result found.\n"
+        self.call_log = "No result found.\n"
+        with open(NOTIFICATION_FIXTURE, encoding="utf-8") as f:
+            self.notifications = f.read()
         self.calls: list[list[str]] = []
 
     def __call__(self, argv, timeout):
@@ -58,8 +64,12 @@ class FakeAdb:
             if mode == "check":
                 return self.replies["check"].replace("true", self.interceptable)
             return self.replies.get(mode, "")
+        if cmd.startswith("content query --uri content://call_log/calls "):
+            return self.call_log
         if cmd.startswith("content query"):
             return self.content
+        if cmd.startswith("dumpsys notification"):
+            return self.notifications
         if "persist.security.adbinput" in cmd:
             return self.gate + "\n"
         if cmd.startswith("sha256sum"):
@@ -446,6 +456,115 @@ class QueryTests(_Base):
                           (self.URI, ["data1", "a;b"]), (self.URI, ["$(id)"]), (self.URI, [])):
             with self.assertRaises(ValueError):
                 phone.query(uri, keys)
+        self.assertEqual(self.adb.calls, [])
+
+
+class ReadOnlyReadTests(_Base):
+    """reachable(), missed_calls_raw() and notifications_raw(): reads that need no helper."""
+
+    CALL_ROWS = ("Row: 0 number=912000001, date=1791800100000, new=1, name=Ana Exemplo\n"
+                 "Row: 1 number=-2, date=1791800200000, new=1, name=NULL\n")
+
+    def test_reachable_is_ok_and_finds_the_phone(self):
+        phone = self.phone()
+        self.assertEqual(phone.reachable(), "OK")
+        self.assertEqual(phone.serial, PHONE)
+
+    def test_reads_return_the_raw_text(self):
+        self.adb.call_log = self.CALL_ROWS
+        phone = self.phone()
+        self.assertEqual(phone.missed_calls_raw(1791800000000), self.CALL_ROWS)
+        self.assertIn("Notification List:", phone.notifications_raw())
+
+    def test_missed_calls_raw_feeds_the_digest_parser(self):
+        from services.phone_digest import parse_call_log
+
+        self.adb.call_log = self.CALL_ROWS
+        calls = parse_call_log(self.phone().missed_calls_raw(0))
+        self.assertEqual([c.name for c in calls], ["Ana Exemplo", ""])
+
+    def test_no_missed_calls_is_the_no_result_text_not_none(self):
+        self.assertEqual(self.phone().missed_calls_raw(0), "No result found.\n")
+
+    def test_reads_need_no_helper(self):
+        self.adb.remote_hash = "0" * 64  # a stale helper must not be pushed by a read either
+        phone = self.phone()
+        phone.reachable()
+        phone.missed_calls_raw(1791800000000)
+        phone.notifications_raw()
+        self.assertFalse(any("push" in a for a in self.adb.calls))
+        for cmd in self.adb.shell_cmds():
+            self.assertNotIn("CallAudio", cmd)
+            self.assertNotIn("adbinput", cmd)
+
+    def test_failed_reads_are_none_not_empty(self):
+        self.adb.devices = "List of devices attached\n192.168.1.200:5555\tdevice\n"
+        self.adb.mdns = "List of discovered mdns services\n"
+        phone = self.phone()
+        self.assertEqual(phone.reachable(), "NO_PHONE")
+        self.assertIsNone(phone.missed_calls_raw(0))
+        self.assertIsNone(phone.notifications_raw())
+
+        # A serial set but the shell answers "" (adb failed): never "nothing new".
+        self.adb.devices = f"List of devices attached\n{PHONE}\tdevice\n"
+        phone = self.phone(serial=PHONE)
+        with mock.patch.object(self.adb, "_answer",
+                               side_effect=lambda args: self.adb.devices if args[:1] == ["devices"] else ""):
+            self.assertEqual(phone.reachable(), "OK")
+            with self.assertLogs("services.phone_adb", "WARNING"):
+                self.assertIsNone(phone.missed_calls_raw(0))
+                self.assertIsNone(phone.notifications_raw())
+
+    def test_unreadable_output_is_none(self):
+        self.adb.call_log = "Error while accessing provider:call_log\njava.lang.SecurityException\n"
+        self.adb.notifications = "Can't find service: notification\n"
+        phone = self.phone()
+        with self.assertLogs("services.phone_adb", "WARNING") as logs:
+            self.assertIsNone(phone.missed_calls_raw(0))
+            self.assertIsNone(phone.notifications_raw())
+        self.assertNotIn("SecurityException", "".join(logs.output))  # a length, not the phone's text
+
+    def test_missed_query_filters_missed_and_window(self):
+        self.phone().missed_calls_raw(1791800000000)
+        queries = [c for c in self.adb.shell_cmds() if c.startswith("content query")]
+        self.assertEqual(len(queries), 1)
+        self.assertIn("--uri content://call_log/calls", queries[0])
+        self.assertIn("--projection number:date:new:name", queries[0])
+        self.assertIn("type=3 AND date>=1791800000000", queries[0])
+        self.assertIn('--sort "date DESC"', queries[0])
+
+    def test_notifications_raw_uses_noredact_with_a_20s_timeout(self):
+        seen = []
+
+        def runner(argv, timeout):
+            seen.append((argv, timeout))
+            return self.adb(argv, timeout)
+
+        AdbPhone(helper_dex=self.dex, runner=runner, popen=self.popen).notifications_raw()
+        dumps = [(a, t) for a, t in seen if len(a) > 4 and a[4].startswith("dumpsys notification")]
+        self.assertEqual([(a[4], t) for a, t in dumps], [("dumpsys notification --noredact", 20.0)])
+
+    def test_reads_never_write_to_the_phone(self):
+        self.adb.states = [IDLE, DIALING]
+        self.adb.call_log = self.CALL_ROWS
+        phone = self.phone()
+        phone.reachable()
+        phone.missed_calls_raw(1791800000000)
+        phone.notifications_raw()
+        phone.dial("+351912345678")
+        phone.hang_up()
+        phone.play_sound()
+        issued = [" ".join(a) for a in self.adb.calls] + self.popened
+        self.assertTrue(issued)
+        for cmd in issued:
+            for fragment in FORBIDDEN:
+                self.assertNotIn(fragment, cmd)
+
+    def test_ready_takes_its_discovery_from_reachable(self):
+        phone = self.phone()
+        with mock.patch.object(phone, "reachable", return_value="NO_PHONE") as reach:
+            self.assertEqual(phone.ready(), "NO_PHONE")
+        reach.assert_called_once_with()
         self.assertEqual(self.adb.calls, [])
 
 
