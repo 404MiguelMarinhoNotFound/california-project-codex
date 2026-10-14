@@ -9,13 +9,16 @@ NoRealPhoneTests pins that.
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 from services.gemini_live_call import CallLine, CallResult
+from services.incoming_call import IncomingCall, RingOffer
+from services.phone_adb import AnswerResult, CallLeg, CallTopology, SpeakerResult
 from services.phone_prompts import CallBrief
-from services.phone_service import PhoneService
+from services.phone_service import IncomingTarget, PhoneService
 from services.whatsapp_service import ContactMatch
 from tests.config_fixture import config_for_tests
 
@@ -804,12 +807,569 @@ class NoRealPhoneTests(unittest.TestCase):
             PhoneService(config_for_tests(phone={"enabled": True, "backend": "ai_studio"}))
 
 
+# ------------------------------------------------------------- native answer
+
+_KEY = "TC@5"
+_OFFER = RingOffer(7, IncomingCall("incoming", "+351910000001", "Example Caller", 0.0))
+_BUSY_LINE = "There's already another call on your phone. Answer this one on the phone."
+_UNCERTAIN_LINE = "I couldn't confirm whether the call answered. Check your phone."
+_STALE_LINE = "That call stopped ringing. I haven't answered the new one."
+_LOCK_LINE = "It's ringing, but I couldn't lock onto that call. Ask me again or answer it on the phone."
+_NOT_CONNECTED_LINE = ("I can only switch the speaker once the call is connected and it's the only one. "
+                       "Use the phone's speaker button.")
 
 
+def _topology(*legs):
+    return CallTopology(tuple(CallLeg(key, state) for key, state in legs))
 
 
+class FakeControl:
+    """PhoneService's own control transport. Reads are scripted; anything that
+    would end, dial or open call audio fails the test outright."""
+
+    def __init__(self, topology=None, answer=None, speaker=None, ready="OK"):
+        self.topology = topology
+        self.answer = answer or AnswerResult("ANSWERED_SPEAKER", _KEY, accepted=True, speaker_verified=True)
+        self.speaker = speaker or SpeakerResult("SPEAKER_ON", True)
+        self.ready_status = ready
+        self.answers = []
+        self.speakers = []
+        self.readies = []
+        self.reads = 0
+        self.during_answer = None
+        self.forbidden = []
+
+    def call_topology(self):
+        self.reads += 1
+        if isinstance(self.topology, Exception):
+            raise self.topology
+        return self.topology
+
+    def answer_incoming(self, expected_key, speaker=True):
+        self.answers.append((expected_key, speaker))
+        if self.during_answer is not None:
+            self.during_answer()
+        return self.answer
+
+    def set_speaker(self, expected_key, on):
+        self.speakers.append((expected_key, on))
+        return self.speaker
+
+    def ready(self, need_interception=True, need_helper=True):
+        self.readies.append((need_interception, need_helper))
+        return self.ready_status
+
+    def hang_up(self):
+        self.forbidden.append("hang_up")
+        raise AssertionError("a native call was hung up")
+
+    def dial(self, number):
+        self.forbidden.append("dial")
+        raise AssertionError("dialled on the control transport")
+
+    def audio(self, record_path=""):
+        self.forbidden.append("audio")
+        raise AssertionError("call audio opened for a native call")
 
 
+class _NativeBase(_Base):
+    def setUp(self):
+        super().setUp()
+        self.control = FakeControl(topology=_topology((_KEY, "ringing")))
+        self.ring = _OFFER
+        self.agents_built = 0
+
+    def _native(self, enabled=True, watcher=True, **phone):
+        cfg = config_for_tests(
+            # paths: never the real logs/calls.jsonl; the flags are what these tests exercise
+            # (no watcher is built here: current_ring is injected)
+            phone={"enabled": True, "log_path": self.log_path,
+                   "incoming": {"answer_speaker_enabled": enabled, "enabled": watcher}, **phone},
+        )
+
+        def agent():
+            self.agents_built += 1
+            return self.agent
+
+        svc = PhoneService(cfg, dialer=self.dialer, agent_factory=agent, control_phone=self.control,
+                           current_ring=lambda: self.ring)
+        svc._native_poll_s = 3600  # tests step the monitor by hand with _check_native()
+        self.addCleanup(svc.close)
+        return svc
+
+    def _answered(self, svc):
+        target = svc.bind_incoming(_OFFER)
+        self.assertIsNotNone(target)
+        self.control.topology = _topology((_KEY, "active"))
+        return svc.answer_speaker(target)
+
+    def assertNothingElseTouched(self, svc):
+        self.assertEqual(self.agents_built, 0)
+        self.assertEqual(self.dialer.dialed, [])
+        self.assertEqual(self.dialer.hung_up, 0)
+        self.assertFalse(hasattr(self.dialer, "audio_made"))
+        self.assertEqual(self.control.forbidden, [])
+        self.assertIsNone(svc.pop_report())
+        self.assertFalse(os.path.exists(self.log_path))
+
+
+class NativeAnswerTests(_NativeBase):
+    def test_native_answer_without_gemini(self):
+        no_creds = {"GEMINI_API_KEY": "", "VERTEX_API_KEY": "", "GOOGLE_APPLICATION_CREDENTIALS": ""}
+        # google.genai unimportable: the native path must never reach for it.
+        with mock.patch.dict(os.environ, no_creds), \
+                mock.patch.dict(sys.modules, {"google.genai": None}), \
+                mock.patch("services.phone_service._user_adc_path", return_value=""), \
+                self.assertLogs("services.phone_service", "WARNING"):
+            svc = PhoneService(
+                config_for_tests(phone={"enabled": True, "log_path": self.log_path,
+                                        "incoming": {"answer_speaker_enabled": True, "enabled": True}}),
+                control_phone=self.control, current_ring=lambda: self.ring,
+            )
+            svc._native_poll_s = 3600
+            self.addCleanup(svc.close)
+            self.assertFalse(svc.enabled)            # outgoing calls: no credentials
+            self.assertIs(svc.native_answer_enabled, True)
+            result = self._answered(svc)
+        self.assertTrue(result, result.message)
+        self.assertEqual(result.message, "Answered on your phone's speakerphone.")
+        self.assertEqual(self.control.answers, [(_KEY, True)])
+        self.assertEqual(self.control.forbidden, [])
+
+    def test_native_answer_uses_no_agent_or_audio(self):
+        svc = self._native()
+        result = self._answered(svc)
+        self.assertTrue(result)
+        self.assertEqual(result.message, "Answered on your phone's speakerphone.")
+        self.assertNothingElseTouched(svc)
+        self.assertIsNone(svc._thread)     # never the outgoing _run_call worker
+        self.assertIs(svc.busy(), False)   # not one of HER calls
+        self.assertEqual(svc._active["owner"], "human")
+        self.assertEqual(svc._active["call_key"], _KEY)
+        self.assertEqual(svc._active["ring_id"], 7)
+
+    def test_same_ring_only(self):
+        svc = self._native()
+        target = svc.bind_incoming(_OFFER)
+        self.assertEqual((target.offer, target.call_key), (_OFFER, _KEY))
+        # A new ring episode since the target was bound: nothing is answered.
+        self.ring = RingOffer(8, _OFFER.call)
+        result = svc.answer_speaker(target)
+        self.assertFalse(result)
+        self.assertEqual(result.message, _STALE_LINE)
+        self.assertEqual(self.control.answers, [])
+        self.assertIsNone(svc._active)
+        # The transport's own key check refusing it is the same line.
+        self.ring = _OFFER
+        self.control.answer = AnswerResult("STALE_RING", _KEY)
+        self.control.topology = _topology(("TC@6", "ringing"))
+        result = svc.answer_speaker(target)
+        self.assertEqual(result.message, _STALE_LINE)
+        self.assertIsNone(svc._active)
+        self.assertNothingElseTouched(svc)
+
+    def test_bind_refuses_anything_but_one_ringing_call(self):
+        svc = self._native()
+        for topology in (
+            None,                                                   # unreadable
+            _topology(),                                            # nothing rings
+            _topology((_KEY, "ringing"), ("TC@4", "active")),       # call waiting
+            _topology((_KEY, "ringing"), ("TC@6", "ringing")),
+            _topology((_KEY, "unknown")),
+            _topology((_KEY, "active")),
+            RuntimeError("adb broke"),
+        ):
+            self.control.topology = topology
+            with mock.patch("services.phone_service.logger"):   # the raising read logs a traceback
+                self.assertIsNone(svc.bind_incoming(_OFFER), topology)
+        self.control.topology = _topology((_KEY, "ringing"))
+        self.assertIsNone(svc.bind_incoming(None))
+        self.assertIsNone(svc.bind_incoming(RingOffer(7, IncomingCall("waiting", "", "", 0.0))))
+        self.ring = None   # the watcher no longer sees this ring
+        self.assertIsNone(svc.bind_incoming(_OFFER))
+        self.ring = RingOffer(8, _OFFER.call)
+        self.assertIsNone(svc.bind_incoming(_OFFER))
+        self.assertEqual(self.control.answers, [])
+        self.assertIsNone(svc._active)
+
+    def test_bind_and_answer_are_off_when_the_gate_is(self):
+        svc = self._native(enabled=False)
+        self.assertIs(svc.native_answer_enabled, False)
+        self.assertIsNone(svc.bind_incoming(_OFFER))
+        self.assertEqual(self.control.reads, 0)
+        result = svc.answer_speaker(None)
+        self.assertFalse(result)
+        self.assertEqual(self.control.answers, [])
+        self.assertEqual(self.control.reads, 0)
+
+    def test_answered_by_hand_is_not_no_ring(self):
+        svc = self._native()
+        target = svc.bind_incoming(_OFFER)
+        self.control.answer = AnswerResult("NO_RING", _KEY)
+        self.control.topology = _topology((_KEY, "active"))
+        result = svc.answer_speaker(target)
+        self.assertEqual(result.message, "Looks like it's already been answered.")
+        self.control.topology = _topology()
+        result = svc.answer_speaker(target)
+        self.assertEqual(result.message, "Your phone isn't ringing now.")
+        self.assertIsNone(svc._active)
+        self.assertNothingElseTouched(svc)
+
+    def test_no_target_says_why_without_answering(self):
+        svc = self._native()
+        self.control.topology = _topology()
+        self.assertEqual(svc.answer_speaker(None).message, "Your phone isn't ringing now.")
+        self.control.topology = _topology(("TC@6", "ringing"), ("TC@4", "active"))
+        self.assertEqual(svc.answer_speaker(None).message, _BUSY_LINE)
+        self.assertEqual(self.control.answers, [])
+        self.assertIsNone(svc._active)
+
+    def test_never_says_not_ringing_while_it_rings(self):
+        svc = self._native()
+        # Nothing was bound at the start of the turn, yet the phone rings now.
+        for topology in (_topology(("TC@6", "ringing")),
+                         _topology(("TC@1", "ended"), ("TC@6", "ringing"))):
+            self.control.topology = topology
+            self.assertEqual(svc.answer_speaker(None).message, _LOCK_LINE, topology)
+        # Bound, but the watcher has since lost the ring while telecom still shows it.
+        self.control.topology = _topology((_KEY, "ringing"))
+        target = svc.bind_incoming(_OFFER)
+        self.ring = None
+        self.assertEqual(svc.answer_speaker(target).message, _LOCK_LINE)
+        self.assertEqual(self.control.answers, [])
+        self.assertIsNone(svc._active)
+
+    def test_a_lingering_ended_leg_does_not_stop_the_bind(self):
+        svc = self._native()
+        self.control.topology = _topology(("TC@1", "ended"), (_KEY, "ringing"))
+        target = svc.bind_incoming(_OFFER)
+        self.assertIsNotNone(target)
+        self.assertEqual(target.call_key, _KEY)
+
+    def test_they_hung_up_as_i_answered(self):
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                self.control = FakeControl(topology=_topology((_KEY, "ringing")),
+                                           answer=AnswerResult("HUNG_UP", _KEY, accepted=accepted))
+                svc = self._native()
+                target = svc.bind_incoming(_OFFER)
+                self.control.topology = _topology()   # the stale-ring check must not run
+                result = svc.answer_speaker(target)
+                self.assertFalse(result)
+                self.assertEqual(result.message, "They hung up as I answered.")
+                self.assertIs(result.speaker_verified, False)
+                self.assertIsNone(svc._active)   # nothing left to own
+                self.assertNothingElseTouched(svc)
+
+    def test_human_call_active_follows_the_slot(self):
+        svc = self._native()
+        self.assertIs(svc.human_call_active(), False)
+        self._answered(svc)
+        self.assertIs(svc.human_call_active(), True)
+        svc._active["state"] = "unknown"
+        self.assertIs(svc.human_call_active(), True)    # any state while he holds it
+        svc._active = {"owner": "outgoing", "label": "x", "number": "+351900000000", "since": 0.0}
+        self.assertIs(svc.human_call_active(), False)   # her own call is busy(), not this
+
+    def test_find_phone_while_his_call_is_unknown(self):
+        svc = self._native()
+        self._answered(svc)
+        svc._active["state"] = "unknown"
+        result = svc.find_phone()
+        self.assertFalse(result)
+        self.assertEqual(result.message,
+                         "I can't tell yet whether the call on your phone has ended, so I won't ring it.")
+
+    def test_each_refusal_has_its_own_line(self):
+        cases = {
+            "BUSY": _BUSY_LINE,
+            "ANSWER_UNCERTAIN": _UNCERTAIN_LINE,
+            "NO_PHONE": "I can't reach your phone over Wi-Fi. Turn Wireless debugging back on in Developer options.",
+            "LOCKED_DOWN": "Your phone is blocking me from answering. Turn on USB debugging (Security settings) "
+                           "in Developer options.",
+            "HELPER_MISMATCH": "The call helper on your phone isn't the one I installed, so I won't run it. "
+                               "Something may have changed it.",
+            "UNREADABLE": "I couldn't read your phone's calls just now, so I didn't answer it. "
+                          "Answer it on the phone.",
+            "NOT_ANSWERED": "Your phone didn't take the answer. Answer it on the phone.",
+            "UNSUPPORTED": "Your phone won't let me answer calls. Answer it on the phone.",
+        }
+        for status, line in cases.items():
+            self.control = FakeControl(topology=_topology((_KEY, "ringing")),
+                                       answer=AnswerResult(status, _KEY))
+            svc = self._native()
+            target = svc.bind_incoming(_OFFER)
+            result = svc.answer_speaker(target)
+            self.assertFalse(result, status)
+            self.assertEqual(result.message, line, status)
+            if status == "ANSWER_UNCERTAIN":
+                # It may have answered: ownership stays, unknown, until a read says it ended.
+                self.assertEqual(svc._active["state"], "unknown")
+            else:
+                self.assertIsNone(svc._active, status)
+            self.assertNothingElseTouched(svc)
+
+    def test_a_raising_transport_is_uncertain_not_a_traceback(self):
+        svc = self._native()
+        target = svc.bind_incoming(_OFFER)
+
+        def boom():
+            raise RuntimeError("adb broke")
+
+        self.control.during_answer = boom
+        with self.assertLogs("services.phone_service", "ERROR"):
+            result = svc.answer_speaker(target)
+        self.assertEqual(result.message, _UNCERTAIN_LINE)
+        self.assertEqual(svc._active["state"], "unknown")
+
+    def test_route_failure_is_partial_success(self):
+        self.control.answer = AnswerResult("ANSWERED_ROUTE_FAILED", _KEY, accepted=True)
+        svc = self._native()
+        result = self._answered(svc)
+        self.assertTrue(result)   # the call IS answered
+        self.assertEqual(result.message, "The call is answered, but I couldn't switch it to speakerphone. "
+                                         "Use the phone's speaker button.")
+        self.assertEqual(svc._active["owner"], "human")
+        self.assertEqual(svc._active["state"], "connected")
+        self.assertNothingElseTouched(svc)
+
+    def test_answered_flags_follow_the_transport(self):
+        cases = (
+            (AnswerResult("ANSWERED_SPEAKER", _KEY, accepted=True, speaker_verified=True), True, True),
+            (AnswerResult("ANSWERED_ROUTE_FAILED", _KEY, accepted=True), True, False),
+            (AnswerResult("NOT_ANSWERED", _KEY), False, False),
+            (AnswerResult("ANSWER_UNCERTAIN", _KEY), False, False),
+        )
+        for answer, answered, verified in cases:
+            with self.subTest(status=answer.status):
+                self.control = FakeControl(topology=_topology((_KEY, "ringing")), answer=answer)
+                svc = self._native()
+                result = self._answered(svc)
+                self.assertIs(result.answered, answered)
+                self.assertIs(result.speaker_verified, verified)
+
+    def test_outgoing_cannot_overlap_reservation(self):
+        svc = self._native()
+        target = svc.bind_incoming(_OFFER)
+        svc.call(_brief(), number="+351912345678")  # read-back armed
+        seen = {}
+
+        def mid_answer():
+            # The reservation lock is free during the ADB work...
+            seen["lock_free"] = svc._lock.acquire(blocking=False)
+            if seen["lock_free"]:
+                svc._lock.release()
+            # ...and the slot is already taken: a confirmed dial is refused.
+            seen["dial"] = svc.call(_brief(), number="+351912345678", confirm=True)
+            seen["again"] = svc.answer_speaker(target)
+
+        self.control.during_answer = mid_answer
+        result = svc.answer_speaker(target)
+        self.assertTrue(result)
+        self.assertIs(seen["lock_free"], True)
+        self.assertFalse(seen["dial"])
+        self.assertEqual(self.dialer.dialed, [])
+        self.assertIsNone(svc._thread)
+        self.assertEqual(seen["again"].message, _BUSY_LINE)
+        self.assertEqual(len(self.control.answers), 1)
+        # And while her own outgoing call holds the slot, no native answer starts.
+        svc2 = self._native()
+        target2 = svc2.bind_incoming(_OFFER) or IncomingTarget(_OFFER, _KEY)
+        svc2._active = {"owner": "outgoing", "label": "x", "number": "+351900000000", "since": 0.0}
+        result = svc2.answer_speaker(target2)
+        self.assertEqual(result.message, _BUSY_LINE)
+        self.assertEqual(len(self.control.answers), 1)
+        self.assertEqual(svc2._active["owner"], "outgoing")   # her call's slot untouched
+
+    def test_close_never_hangs_up_human(self):
+        svc = self._native()
+        svc._native_poll_s = 0.01
+        self.assertTrue(self._answered(svc))
+        monitor = svc._monitor
+        self.assertTrue(monitor.is_alive())
+        self.assertTrue(monitor.daemon)
+        svc.close()
+        monitor.join(timeout=2)
+        self.assertFalse(monitor.is_alive())
+        self.assertNothingElseTouched(svc)   # hang_up/dial/audio on either transport
+
+    def test_monitor_releases_only_when_the_call_is_known_ended(self):
+        svc = self._native()
+        self._answered(svc)
+        self.control.topology = _topology((_KEY, "holding"))
+        self.assertTrue(svc._check_native())
+        self.assertEqual(svc._active["state"], "connected")
+        self.control.topology = _topology((_KEY, "ended"))
+        self.assertFalse(svc._check_native())
+        self.assertIsNone(svc._active)
+        self.assertNothingElseTouched(svc)
+
+    def test_the_monitor_ends_with_his_call_and_restarts_for_the_next(self):
+        svc = self._native()
+        svc._native_poll_s = 0.01
+        self._answered(svc)
+        first = svc._monitor
+        self.control.topology = _topology()   # he hung up
+        first.join(timeout=2)
+        self.assertFalse(first.is_alive())
+        self.assertIsNone(svc._active)
+        self.assertIsNone(svc._monitor)
+        self.control.topology = _topology((_KEY, "ringing"))
+        self.assertTrue(self._answered(svc))
+        self.assertIsNot(svc._monitor, first)
+        self.assertTrue(svc._monitor.is_alive())
+        self.assertNothingElseTouched(svc)
+
+    def test_adb_loss_keeps_unknown_ownership(self):
+        svc = self._native()
+        self._answered(svc)
+        self.control.topology = None   # phone off Wi-Fi
+        self.assertTrue(svc._check_native())
+        self.assertEqual(svc._active["owner"], "human")
+        self.assertEqual(svc._active["state"], "unknown")
+        # Unknown blocks every new mutation: a dial...
+        svc.call(_brief(), number="+351912345678")
+        result = svc.call(_brief(), number="+351912345678", confirm=True)
+        self.assertFalse(result)
+        self.assertEqual(result.message,
+                         "I can't tell yet whether the call on your phone has ended, so I won't dial over it.")
+        # ...and another native answer.
+        refused = svc.answer_speaker(IncomingTarget(_OFFER, "TC@6"))
+        self.assertFalse(refused)
+        self.assertEqual(refused.message, _BUSY_LINE)
+        self.assertEqual(len(self.control.answers), 1)
+        # A later read that resolves it frees the slot.
+        self.control.topology = _topology()
+        self.assertFalse(svc._check_native())
+        self.assertIsNone(svc._active)
+        self.assertNothingElseTouched(svc)
+
+    def test_status_line_and_find_phone_name_his_call(self):
+        svc = self._native()
+        self._answered(svc)
+        self.assertTrue(svc.status_line().startswith("You're on a call on your phone"))
+        result = svc.find_phone()
+        self.assertEqual(result.message, "You're on a call on your phone, so I won't ring it.")
+
+
+class NativeGateTests(unittest.TestCase):
+    def _gate(self, enabled=True, platform="win32", adb=True, watcher=True):
+        cfg = config_for_tests(phone={"enabled": False,
+                                      "incoming": {"answer_speaker_enabled": enabled, "enabled": watcher},
+                                      "adb": {"path": "Z:/nowhere/adb.exe"}})
+        with mock.patch("services.phone_service.sys.platform", platform), \
+                mock.patch("services.phone_service.shutil.which", return_value="C:/adb.exe" if adb else None), \
+                mock.patch("services.phone_service.logger"):
+            return PhoneService(cfg).native_answer_enabled
+
+    def test_gate_needs_flag_windows_and_adb(self):
+        self.assertIs(self._gate(), True)
+        self.assertIs(self._gate(enabled=False), False)
+        self.assertIs(self._gate(platform="linux"), False)
+        self.assertIs(self._gate(adb=False), False)
+
+    def test_gate_needs_the_ring_watcher(self):
+        # No watcher -> no trusted ring to bind -> the feature is off, not half on.
+        self.assertIs(self._gate(watcher=False), False)
+
+    def test_shipped_config_keeps_it_off(self):
+        import yaml
+
+        with open("config.yaml", encoding="utf-8") as handle:
+            shipped = yaml.safe_load(handle)
+        self.assertIs(shipped["phone"]["incoming"]["answer_speaker_enabled"], False)
+        self.assertIs(config_for_tests()["phone"]["incoming"]["answer_speaker_enabled"], False)
+
+    def test_construction_never_runs_adb(self):
+        cfg = config_for_tests(phone={"enabled": False, "incoming": {"answer_speaker_enabled": True}})
+        with mock.patch("subprocess.run", side_effect=AssertionError("shelled out")), \
+                mock.patch("subprocess.Popen", side_effect=AssertionError("shelled out")):
+            PhoneService(cfg)
+
+
+class NativeSpeakerTests(_NativeBase):
+    def setUp(self):
+        super().setUp()
+        self.control.topology = _topology((_KEY, "active"))
+
+    def test_speaker_on_and_off_for_a_call_answered_by_hand(self):
+        svc = self._native()
+        result = svc.set_speaker(True)
+        self.assertTrue(result)
+        self.assertEqual(result.message, "Speaker's on.")
+        self.assertEqual(self.control.speakers, [(_KEY, True)])
+        self.assertEqual(self.control.readies, [(False, False)])
+        self.control.speaker = SpeakerResult("SPEAKER_OFF", True)
+        self.assertEqual(svc.set_speaker(False).message, "Speaker's off.")
+        self.assertNothingElseTouched(svc)
+        self.assertIsNone(svc._active)   # a toggle claims nothing
+
+    def test_speaker_lines(self):
+        svc = self._native()
+        failed = "I couldn't switch the speaker. Use the phone's speaker button."
+        cases = [
+            (SpeakerResult("ALREADY", True), True, "It's already on speaker.", True),
+            (SpeakerResult("ALREADY", True), False, "It's already off speaker.", True),
+            (SpeakerResult("ROUTE_FAILED", False), True, failed, False),
+            (SpeakerResult("NO_BUTTON", False), True, failed, False),
+            (SpeakerResult("UNREADABLE", False), True, failed, False),
+            (SpeakerResult("STALE_CALL", False), True, _NOT_CONNECTED_LINE, False),
+            (SpeakerResult("NO_PHONE", False), True,
+             "I can't reach your phone over Wi-Fi. Turn Wireless debugging back on in Developer options.", False),
+        ]
+        for speaker, on, line, ok in cases:
+            self.control.speaker = speaker
+            result = svc.set_speaker(on)
+            self.assertEqual((result.message, bool(result)), (line, ok), speaker)
+
+    def test_speaker_needs_one_active_call(self):
+        svc = self._native()
+        for topology, line in (
+            (_topology(), "There's no call on your phone right now."),
+            (_topology(("TC@4", "ended")), "There's no call on your phone right now."),
+            (_topology(("TC@4", "ringing")), "Your phone is still ringing. Answer it first."),
+            (_topology(("TC@4", "active"), ("TC@6", "ringing")), _BUSY_LINE),
+            (_topology(("TC@4", "active"), ("TC@6", "holding")), _BUSY_LINE),
+            # A sole call that is not connected yet is not "another call".
+            (_topology(("TC@4", "dialing")), _NOT_CONNECTED_LINE),
+            (_topology(("TC@4", "holding")), _NOT_CONNECTED_LINE),
+            (_topology(("TC@4", "answered")), _NOT_CONNECTED_LINE),
+            (_topology(("TC@1", "ended"), ("TC@4", "holding")), _NOT_CONNECTED_LINE),
+            (_topology(("TC@4", "unknown")),
+             "I couldn't read your phone's calls just now. Use the phone's speaker button."),
+            (None, "I couldn't read your phone's calls just now. Use the phone's speaker button."),
+        ):
+            self.control.topology = topology
+            result = svc.set_speaker(True)
+            self.assertFalse(result)
+            self.assertEqual(result.message, line, topology)
+        self.assertEqual(self.control.speakers, [])
+
+    def test_speaker_checks_the_security_gate_first(self):
+        svc = self._native()
+        self.control.ready_status = "LOCKED_DOWN"
+        result = svc.set_speaker(True)
+        self.assertEqual(result.message, "Your phone is blocking me from switching the speaker. "
+                                         "Turn on USB debugging (Security settings) in Developer options.")
+        self.control.ready_status = "NO_PHONE"
+        self.assertEqual(svc.set_speaker(True).message,
+                         "I can't reach your phone over Wi-Fi. Turn Wireless debugging back on in Developer options.")
+        self.assertEqual(self.control.reads, 0)
+        self.assertEqual(self.control.speakers, [])
+
+    def test_speaker_refused_during_her_own_call(self):
+        svc = self._native()
+        svc._active = {"owner": "outgoing", "label": "x", "number": "+351900000000", "since": 0.0}
+        result = svc.set_speaker(True)
+        self.assertEqual(result.message, "I'm already on a call. Let me finish that one first.")
+        self.assertEqual(self.control.readies, [])
+        self.assertEqual(self.control.speakers, [])
+
+    def test_speaker_off_when_the_gate_is(self):
+        svc = self._native(enabled=False)
+        self.assertFalse(svc.set_speaker(True))
+        self.assertEqual(self.control.readies, [])
+        self.assertEqual(self.control.speakers, [])
 
 
 if __name__ == "__main__":

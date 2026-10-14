@@ -18,6 +18,12 @@ needs a different fix and PhoneService speaks each one:
     HELPER_MISMATCH  the helper on the phone is not this build; not run
     DIALED / NOT_PLACED, ENDED / NO_CALL, PLAYING / ALREADY_PLAYING / RING_FAILED
 
+Answering a ring and the speaker have their own result types; see
+`answer_incoming` and `set_speaker`. Call identity there is telecom's own call
+key (`TC@<n>`), read from `dumpsys telecom`'s live mCalls rows only: it is the
+one source that stays the same from ringing to active (measured 2026-10-14,
+docs/superpowers/probes/2026-10-14-native-incoming-answer.md).
+
 Construction runs nothing. Every adb call goes through `runner`, every
 long-running helper through `popen`, so tests never touch a real phone.
 """
@@ -32,6 +38,8 @@ import re
 import subprocess
 import threading
 import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -116,6 +124,162 @@ def parse_content_rows(text: str, keys: list[str]) -> tuple[list[dict[str, str |
         current = {k: (None if v == "NULL" else v) for k, v in row.items()}
         rows.append(current)
     return rows, unparsed
+
+
+# ------------------------------------------------------------- call topology
+
+# A telecom call key as it may appear in a shell command: only characters a
+# shell passes through unquoted, so a key can never become a second command.
+_CALL_KEY = re.compile(r"[A-Za-z0-9@_.:-]{1,128}")
+_ROW_ID = re.compile(r"\bid=([A-Za-z0-9@_.:-]+)")
+_ROW_STATE = re.compile(r"\bstate=([A-Z_]+)")
+_TELECOM_STATES = {
+    "RINGING": "ringing",
+    "ACTIVE": "active",
+    "ON_HOLD": "holding",
+    "DIALING": "dialing", "CONNECTING": "dialing", "NEW": "dialing", "SELECT_PHONE_ACCOUNT": "dialing",
+    "ANSWERED": "answered",  # observed between acceptRingingCall and ACTIVE
+    "DISCONNECTING": "ended", "DISCONNECTED": "ended", "ABORTED": "ended",
+}
+
+
+@dataclass(frozen=True)
+class CallLeg:
+    key: str    # telecom's call id, "TC@<n>"
+    state: str  # ringing / active / holding / dialing / answered / ended / unknown
+
+
+@dataclass(frozen=True)
+class CallTopology:
+    legs: tuple[CallLeg, ...]
+
+
+def parse_call_topology(text: str) -> CallTopology | None:
+    """
+    The phone's live calls from `dumpsys telecom`: the CallsManager `mCalls`
+    rows between `mCalls:` and `mCallAudioManager:`, never the call history
+    printed elsewhere in the dump. Each row must carry exactly one `id=` and
+    one `state=`; a row that does not, or a dump without the section, is None
+    ("could not tell"), never an empty topology. A state telecom names that is
+    not in the table above is `unknown`, which blocks every mutation.
+    """
+    text = text or ""
+    start = text.find("mCalls:")
+    end = text.find("mCallAudioManager:", start) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return None
+    legs = []
+    for row in text[start + len("mCalls:"):end].splitlines():
+        if not row.strip():
+            continue
+        ids, states = _ROW_ID.findall(row), _ROW_STATE.findall(row)
+        if len(ids) != 1 or len(states) != 1:
+            return None
+        legs.append(CallLeg(ids[0], _TELECOM_STATES.get(states[0], "unknown")))
+    return CallTopology(tuple(legs))
+
+
+def _live(topology: CallTopology) -> list[CallLeg]:
+    """The legs that are still calls: a DISCONNECTED row can linger a moment."""
+    return [leg for leg in topology.legs if leg.state != "ended"]
+
+
+def _hung_up(topology: CallTopology | None) -> bool:
+    """Every call ended or vanished (read, not unreadable): the caller hung up."""
+    return topology is not None and not _live(topology)
+
+
+# ------------------------------------------------------------- the speaker button
+
+_DIALER = "com.google.android.dialer"
+_SPEAKER_WORDS = re.compile(r"speaker|alta-?voz|altifalante|viva-?voz|alto-?falante", re.I)
+_BOUNDS = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
+
+
+@dataclass(frozen=True)
+class SpeakerButton:
+    center: tuple[int, int]
+    checked: bool
+
+
+def parse_speaker_button(xml: str) -> SpeakerButton | None:
+    """
+    Google Phone's own Speaker button in a `uiautomator dump`: the nearest
+    clickable ancestor of the node whose text or content-desc says Speaker
+    (the word is a plain TextView inside a clickable View with no
+    resource-id). Its centre comes from its bounds on every read, never a
+    remembered position, and its `checked` is the speaker's on/off state.
+    None for zero or two candidates, another app's button, a disabled one,
+    unparseable bounds or an unreadable screen.
+    """
+    xml = xml or ""
+    start, end = xml.find("<?xml"), xml.rfind("</hierarchy>")
+    if start < 0 or end < 0:
+        return None
+    try:
+        root = ET.fromstring(xml[start:end + len("</hierarchy>")])
+    except ET.ParseError:
+        return None
+    parent = {child: node for node in root.iter() for child in node}
+    buttons: list[ET.Element] = []
+    for node in root.iter("node"):
+        label = f"{node.get('text', '')} {node.get('content-desc', '')}"
+        if node.get("package") != _DIALER or not _SPEAKER_WORDS.search(label):
+            continue
+        button = node
+        while button is not None and button.get("clickable") != "true":
+            button = parent.get(button)
+        if button is not None and all(button is not b for b in buttons):
+            buttons.append(button)
+    if len(buttons) != 1:
+        return None
+    button = buttons[0]
+    bounds = _BOUNDS.fullmatch(button.get("bounds", ""))
+    checked = button.get("checked")
+    if (button.get("package") != _DIALER or button.get("enabled") != "true" or bounds is None
+            or checked not in ("true", "false")):
+        return None
+    x1, y1, x2, y2 = map(int, bounds.groups())
+    return SpeakerButton(center=((x1 + x2) // 2, (y1 + y2) // 2), checked=checked == "true")
+
+
+_ROUTE = re.compile(r"^[ \t]*Active communication device:[^\n]*?\btype:(\w+)", re.M)
+_MIC_MUTE = re.compile(r"mic mute FromSwitch=(true|false)")
+
+
+def parse_audio_route(text: str) -> tuple[str | None, bool | None]:
+    """(route, mic muted) from `dumpsys audio`: `speaker`/`earpiece`/... and the
+    phone mic's switch mute, each None when the dump does not say."""
+    route, mic = _ROUTE.search(text or ""), _MIC_MUTE.search(text or "")
+    return (route.group(1) if route else None, (mic.group(1) == "true") if mic else None)
+
+
+@dataclass(frozen=True)
+class AnswerResult:
+    status: str
+    call_key: str = ""
+    accepted: bool = False          # True only once the same key was read back ACTIVE
+    speaker_verified: bool = False  # True only once the audio route read back speaker
+
+
+@dataclass(frozen=True)
+class SpeakerResult:
+    status: str
+    speaker_verified: bool
+
+
+_ACCEPT_ACTIVE_S = 5.0     # acceptRingingCall -> the same key ACTIVE (ANSWERED in between)
+_SPEAKER_WINDOW_S = 8.0    # screen read (~2.5 s) + tap + audio read back (ruling R3)
+_SCREEN_TRIES = 3          # right after an answer the in-call screen may still be drawing
+_POLL_S = 0.25
+_HELPER_REFUSALS = {
+    "REFUSED_STALE": "STALE_RING",
+    "REFUSED_BUSY": "BUSY",
+    "REFUSED_NO_RING": "NO_RING",
+    "REFUSED_UNREADABLE": "UNREADABLE",
+    "REFUSED_BAD_KEY": "UNSUPPORTED",
+    "ACCEPT_UNSUPPORTED": "UNSUPPORTED",
+}
 
 
 class AdbPhone:
@@ -469,6 +633,188 @@ class AdbPhone:
         except OSError:
             pass
         return "RING_FAILED"
+
+    # ------------------------------------------------------------- answering and the speaker
+    #
+    # Neither path dials, hangs up, mutes, records or opens the bridge. After
+    # an acceptance nothing ever ends the call: a partial success (answered,
+    # speaker not confirmed) leaves him on the phone's actual route.
+
+    def _read_topology(self) -> CallTopology | None:
+        return parse_call_topology(self.sh("dumpsys telecom", timeout=20.0))
+
+    def call_topology(self) -> CallTopology | None:
+        """The phone's live calls (see parse_call_topology), or None when the
+        phone is not on adb or the dump could not be read. Read-only, no helper."""
+        if self.reachable() != "OK":
+            return None
+        return self._read_topology()
+
+    def _read_screen(self) -> str:
+        """The current screen as `uiautomator` XML ("" on failure); readable over the keyguard."""
+        return self._adb("-s", self.serial, "exec-out", "uiautomator", "dump", "/dev/tty", timeout=20.0)
+
+    def _read_audio(self) -> str:
+        return self.sh("dumpsys audio", timeout=20.0)
+
+    def answer_incoming(self, expected_key: str, speaker: bool = True) -> AnswerResult:
+        """
+        Answer the ring telecom calls `expected_key`, and put it on the phone's
+        own speaker when `speaker`.
+
+        Only one RINGING call and nothing else on the phone: a ring alongside
+        any other call is call waiting (BUSY), another key ringing is
+        STALE_RING, and a call already answered by hand is NO_RING. The helper
+        re-reads telecom itself right before its one global acceptRingingCall,
+        so the window for a different call to take the ring's place is the
+        width of one binder call, not of this whole method; it cannot be
+        closed from the shell. Afterwards the same key must read back ACTIVE
+        within 5 s before `accepted` is True or the speaker is touched; any
+        other key, an extra call or an unreadable read stops everything.
+        """
+        if not _CALL_KEY.fullmatch(expected_key or ""):
+            return AnswerResult("UNSUPPORTED")
+        status = self.ready(need_interception=False)
+        if status != "OK":
+            return AnswerResult(status, expected_key)
+        before = self._read_topology()
+        if before is None or any(leg.state == "unknown" for leg in before.legs):
+            return AnswerResult("UNREADABLE", expected_key)
+        ringing = [leg for leg in before.legs if leg.state == "ringing"]
+        if not ringing:
+            return AnswerResult("NO_RING", expected_key)
+        if len(before.legs) > 1:
+            return AnswerResult("BUSY", expected_key)
+        if ringing[0].key != expected_key:
+            return AnswerResult("STALE_RING", expected_key)
+
+        out = self._run_helper("accept", expected_key, timeout=15.0)
+        lines = [line.strip() for line in out.splitlines()]
+        if "HELPER_MISMATCH" in lines:
+            return AnswerResult("HELPER_MISMATCH", expected_key)
+        if "ACCEPT_REQUESTED" not in lines:
+            for marker, refused in _HELPER_REFUSALS.items():
+                if marker in lines:
+                    return AnswerResult(refused, expected_key)
+            if any(line.startswith("ACCEPT_FAILED") for line in lines):
+                logger.warning("Phone answer: the helper's acceptance failed")
+                return AnswerResult("NOT_ANSWERED", expected_key)
+            # It may or may not have accepted: no further reads or writes.
+            logger.warning("Phone answer: unrecognised helper output (%d chars)", len(out))
+            return AnswerResult("ANSWER_UNCERTAIN", expected_key)
+
+        status = self._await_active(expected_key)
+        if status != "ACTIVE":
+            logger.warning("Phone answer: %s after acceptance", status)
+            return AnswerResult(status, expected_key)
+        if not speaker:
+            return AnswerResult("ANSWERED", expected_key, accepted=True)
+        route = self.set_speaker(expected_key, True)
+        if route.speaker_verified:
+            return AnswerResult("ANSWERED_SPEAKER", expected_key, accepted=True, speaker_verified=True)
+        if route.status == "STALE_CALL" and _hung_up(self._read_topology()):
+            # Answered (ACTIVE was read), then they hung up before the speaker.
+            logger.warning("Phone answer: answered, then the call ended")
+            return AnswerResult("HUNG_UP", expected_key, accepted=True)
+        logger.warning("Phone answer: answered, speaker %s", route.status)
+        return AnswerResult("ANSWERED_ROUTE_FAILED", expected_key, accepted=True)
+
+    def _await_active(self, key: str) -> str:
+        """
+        ACTIVE once `key` is the sole call and active, read-only polling up to
+        5 s. Ringing/answered/unknown on the same sole key may still become
+        active; the call ending, or every call vanishing, is HUNG_UP (they hung
+        up as it was answered -- never a stale ring: no new call exists);
+        anything else -- another key, an extra call, an unreadable read, the
+        deadline -- is ANSWER_UNCERTAIN, because the acceptance was global.
+        """
+        deadline = self._clock() + _ACCEPT_ACTIVE_S
+        while True:
+            topology = self._read_topology()
+            if topology is None:
+                return "ANSWER_UNCERTAIN"
+            if _hung_up(topology):
+                return "HUNG_UP"
+            legs = _live(topology)
+            if len(legs) != 1 or legs[0].key != key:
+                return "ANSWER_UNCERTAIN"
+            if legs[0].state == "active":
+                return "ACTIVE"
+            if legs[0].state not in ("ringing", "answered", "unknown") or self._clock() >= deadline:
+                return "ANSWER_UNCERTAIN"
+            self._sleep(_POLL_S)
+
+    def _sole_active(self, key: str) -> str:
+        topology = self._read_topology()
+        if topology is None:
+            return "UNREADABLE"
+        # A lingering ended leg is not a call: the same filter PhoneService uses.
+        return "OK" if _live(topology) == [CallLeg(key, "active")] else "STALE_CALL"
+
+    def set_speaker(self, expected_key: str, on: bool) -> SpeakerResult:
+        """
+        Speaker on or off for the connected call `expected_key`, by one tap on
+        Google Phone's own Speaker button -- the default dialer owns the call's
+        audio route, and AudioManager's setters from the shell do not move it
+        (probe, 2026-10-14). The tap goes out only for the same sole ACTIVE
+        call, re-read right before it, and only when the button's `checked`
+        disagrees with `on`, and only once two screen reads agree on where the
+        button is (see _settled_button); never a second tap, which would
+        toggle it back. Success is the phone's audio route read back (speaker
+        / earpiece) with the mic unmuted, within 8 s of the tap; a tap alone
+        proves nothing.
+        """
+        if not _CALL_KEY.fullmatch(expected_key or ""):
+            return SpeakerResult("STALE_CALL", False)
+        if self.reachable() != "OK":
+            return SpeakerResult("NO_PHONE", False)
+        deadline = self._clock() + _SPEAKER_WINDOW_S
+        status = self._sole_active(expected_key)
+        if status != "OK":
+            return SpeakerResult(status, False)
+        screen = ""
+        for attempt in range(_SCREEN_TRIES):
+            screen = self._read_screen()
+            if "</hierarchy>" in screen or self._clock() >= deadline:
+                break
+            if attempt < _SCREEN_TRIES - 1:
+                self._sleep(0.7)
+        if "</hierarchy>" not in screen:
+            return SpeakerResult("UNREADABLE", False)
+        button = self._settled_button(parse_speaker_button(screen))
+        if button is None:
+            return SpeakerResult("NO_BUTTON", False)
+        if button.checked == on:
+            done = "ALREADY"
+        else:
+            status = self._sole_active(expected_key)
+            if status != "OK":
+                return SpeakerResult(status, False)
+            self.sh(f"input tap {button.center[0]} {button.center[1]}")
+            done = "SPEAKER_ON" if on else "SPEAKER_OFF"
+        # The route gets its full window from the tap, however long the reads took.
+        deadline = self._clock() + _SPEAKER_WINDOW_S
+        wanted = "speaker" if on else "earpiece"
+        while True:
+            if parse_audio_route(self._read_audio()) == (wanted, False):
+                return SpeakerResult(done, True)
+            if self._clock() >= deadline:
+                return SpeakerResult("ROUTE_FAILED", False)
+            self._sleep(0.5)
+
+    def _settled_button(self, first: SpeakerButton | None) -> SpeakerButton | None:
+        """
+        The Speaker button only once two back-to-back screen reads agree on its
+        centre and checked state (R14): right after an answer the in-call grid
+        can still be sliding into place, and a tap on a moving button can land
+        on Mute. One disagreement earns a third read, which must match the
+        second; otherwise None. At most two reads after the first readable one.
+        """
+        second = parse_speaker_button(self._read_screen())
+        if first is not None and first == second:
+            return first
+        third = parse_speaker_button(self._read_screen())
+        return second if second is not None and second == third else None
 
     def audio(self, record_path: str = ""):
         from services.phone_call_audio import PhoneCallAudio

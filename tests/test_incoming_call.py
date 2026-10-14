@@ -10,7 +10,7 @@ import time
 import unittest
 
 from services.incoming_call import (INCOMING, RING_LOOP, WAITING, IncomingCall, IncomingCallWatcher,
-                                    RingState, incoming_line, parse_ring_state)
+                                    RingOffer, RingState, incoming_line, parse_ring_state)
 
 
 def _block(ringing: int, number: str = "", foreground: int = 0) -> str:
@@ -216,11 +216,67 @@ class WatcherTests(unittest.TestCase):
         self.assertTrue(self.phone.procs[0].killed)
         self.assertEqual(self.waits, [])
 
+    def test_current_survives_announcement_pop(self):
+        w = None
+
+        def look():
+            self.seen.append((w.current(), w.pop(), w.current(), w.pop()))
+
+        w = self.watcher([IDLE + RINGING + [look]])
+        w.run(self.stop)
+        before, popped, after, again = self.seen[0]
+        call = IncomingCall("incoming", RINGER, "", 42.0)
+        self.assertEqual(before, RingOffer(1, call))
+        self.assertEqual(popped, call)
+        self.assertEqual(after, before)  # announcing did not consume the offer
+        self.assertIsNone(again)  # and the announcement is still once per ring
+
+    def test_number_fill_keeps_ring_id(self):
+        w = None
+        nameless = _lines(_dump(_block(INCOMING, ""), NO_SIM))
+        w = self.watcher([IDLE + nameless + [lambda: self.seen.append(w.current())] + RINGING
+                          + [lambda: self.seen.append(w.current())]],
+                         resolve_name=lambda n: "Ana Exemplo" if n == RINGER else "")
+        w.run(self.stop)
+        first, second = self.seen
+        self.assertEqual(first.call.number, "")
+        self.assertEqual((second.call.number, second.call.name), (RINGER, "Ana Exemplo"))
+        self.assertEqual(first.ring_id, second.ring_id)
+        self.assertEqual(first.call.started, second.call.started)
+
+    def test_same_number_after_idle_gets_new_id(self):
+        w = None
+        look = lambda: self.seen.append(w.current())  # noqa: E731
+        w = self.watcher([RINGING + [look] + IDLE + [look] + RINGING + [look]])
+        w.run(self.stop)
+        first, idle, second = self.seen
+        self.assertIsNone(idle)
+        self.assertEqual(first.call.number, second.call.number)
+        self.assertGreater(second.ring_id, first.ring_id)
+
+    def test_dead_stream_has_no_current_offer(self):
+        w = None
+        look = lambda: self.seen.append(w.current())  # noqa: E731
+        w = self.watcher([RINGING + [look, HANG, look]], clock=self.ticking())
+        with self.assertLogs("services.incoming_call", "WARNING"):
+            w.run(self.stop)
+        self.assertIsNotNone(self.seen[0])
+        self.assertIsNone(self.seen[1])  # the stalled stream: no stale ring to answer
+
+    def test_a_restart_mid_ring_keeps_the_episode(self):
+        w = None
+        look = lambda: self.seen.append(w.current())  # noqa: E731
+        w = self.watcher([RINGING + [look], RINGING + [look]])
+        w.run(self.stop)
+        first, second = self.seen
+        self.assertEqual(first.ring_id, second.ring_id)
+
     def test_construction_runs_nothing(self):
         w = self.watcher([])
         self.assertEqual(self.phone.commands, [])
         self.assertFalse(w.ringing())
         self.assertIsNone(w.pop())
+        self.assertIsNone(w.current())
 
     def test_the_stream_runs_the_ring_loop(self):
         w = self.watcher([IDLE])

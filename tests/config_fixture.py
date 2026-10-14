@@ -81,6 +81,8 @@ def config_for_tests(**overrides) -> dict:
     # A flag no test may leave on: a live incoming-call watcher would stream
     # from the real phone over adb. Tests that build one turn it back on.
     config.setdefault("phone", {}).setdefault("incoming", {})["enabled"] = False
+    # And native answering: a test that answers the phone injects its own transport.
+    config["phone"]["incoming"]["answer_speaker_enabled"] = False
     # A flag no test may leave on: the live UI binds a real port on the LAN.
     # tests/test_live_ui.py turns it back on, bound to localhost on port 0.
     config.setdefault("ui", {})["enabled"] = False

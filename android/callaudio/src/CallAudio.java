@@ -9,6 +9,9 @@ import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * California's phone-side call audio helper. Runs as the shell user:
@@ -17,6 +20,8 @@ import java.net.Socket;
  *
  * Modes:
  *   check                      is PSTN call audio interceptable on this phone?
+ *   accept <TC@key>            answer the ring telecom calls <TC@key>, only if it
+ *                              is still the sole call and RINGING; no audio routing
  *   bridge <port> <rec> <play> one TCP client on 127.0.0.1:<port>; the call's
  *                              downlink (the other person) goes out as PCM16
  *                              mono at <rec> Hz, and PCM16 mono at <play> Hz
@@ -205,8 +210,93 @@ public final class CallAudio {
         return 2;
     }
 
+    static final Pattern CALL_KEY = Pattern.compile("[A-Za-z0-9@_.:-]{1,128}");
+    static final Pattern ROW_ID = Pattern.compile("\\bid=([A-Za-z0-9@_.:-]+)");
+    static final Pattern ROW_STATE = Pattern.compile("\\bstate=([A-Z_]+)");
+
+    static String dumpsys(String service) throws Exception {
+        Process p = new ProcessBuilder("dumpsys", service).redirectErrorStream(true).start();
+        byte[] out = p.getInputStream().readAllBytes();
+        if (p.waitFor() != 0) throw new IllegalStateException("dumpsys failed");
+        return new String(out, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Why telecom's live calls do not allow answering <expected>, or null when
+     * it is the sole call and RINGING. Rows of CallsManager.mCalls only, each
+     * with exactly one id= and one state= (the same rules as the laptop's
+     * services/phone_adb.parse_call_topology).
+     */
+    static String acceptRefusal(String dump, String expected) {
+        int a = dump.indexOf("mCalls:");
+        int b = a < 0 ? -1 : dump.indexOf("mCallAudioManager:", a);
+        if (a < 0 || b < 0) return "REFUSED_UNREADABLE";
+        String key = null, state = null;
+        int rows = 0;
+        for (String row : dump.substring(a + "mCalls:".length(), b).split("\r?\n")) {
+            if (row.trim().isEmpty()) continue;
+            rows++;
+            Matcher i = ROW_ID.matcher(row), s = ROW_STATE.matcher(row);
+            if (!i.find() || !s.find()) return "REFUSED_UNREADABLE";
+            key = i.group(1);
+            state = s.group(1);
+            if (i.find() || s.find()) return "REFUSED_UNREADABLE";
+        }
+        if (rows == 0) return "REFUSED_NO_RING";
+        if (rows > 1) return "REFUSED_BUSY";
+        if (!expected.equals(key) || !"RINGING".equals(state)) return "REFUSED_STALE";
+        return null;
+    }
+
+    /**
+     * One acceptRingingCall for the ring <expected>, re-checked against
+     * telecom immediately before it. acceptRingingCall answers whatever rings,
+     * so the re-check is what binds it to this call; the laptop then reads the
+     * same key back ACTIVE. Prints fixed markers only, never a dump, a name or
+     * a number. Does not wait for ACTIVE and touches no audio route.
+     */
+    static int accept(String[] args) {
+        if (args.length != 2 || !CALL_KEY.matcher(args[1]).matches()) {
+            System.out.println("REFUSED_BAD_KEY");
+            return 2;
+        }
+        Object t;
+        Method acceptCall;
+        try {
+            t = telecom();
+            acceptCall = t.getClass().getMethod("acceptRingingCall", String.class);
+        } catch (Throwable e) {
+            System.out.println("ACCEPT_UNSUPPORTED");
+            return 4;
+        }
+        String refusal;
+        try {
+            refusal = acceptRefusal(dumpsys("telecom"), args[1]);
+        } catch (Throwable e) {
+            refusal = "REFUSED_UNREADABLE";
+        }
+        if (refusal != null) {
+            System.out.println(refusal);
+            return 3;
+        }
+        try {
+            acceptCall.invoke(t, "com.android.shell");
+        } catch (Throwable e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            System.out.println("ACCEPT_FAILED " + cause.getClass().getSimpleName());
+            return 1;
+        }
+        System.out.println("ACCEPT_REQUESTED");
+        return 0;
+    }
+
     public static void main(String[] args) throws Exception {
         String mode = args.length > 0 ? args[0] : "check";
+        if (mode.equals("accept")) {
+            int code = accept(args);
+            System.out.flush();
+            System.exit(code); // binder threads would otherwise keep app_process alive
+        }
         if (mode.equals("dial") || mode.equals("hangup")) {
             int code;
             try {
