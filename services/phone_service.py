@@ -34,7 +34,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from services.gemini_live_call import CallResult
 from services.phone_digest import (
@@ -47,6 +47,9 @@ from services.phone_digest import (
 from services.phone_prompts import CallBrief, build_call_prompt
 from services.whatsapp_service import looks_like_phone, normalize_phone
 
+if TYPE_CHECKING:
+    from services.incoming_call import RingOffer
+
 logger = logging.getLogger(__name__)
 
 _MSG_DISABLED = "Phone calls aren't set up right now."
@@ -57,6 +60,47 @@ _MSG_NO_NUMBER = (
     "person, ask him for the number; never search for a private person's number."
 )
 _MSG_BLOCKED = "I won't call that number myself."
+# Refusals while HIS call (one answered natively) holds the phone.
+_MSG_HUMAN_DIAL = "You're on a call on your phone, so I won't dial over it."
+_MSG_HUMAN_UNKNOWN = "I can't tell yet whether the call on your phone has ended, so I won't dial over it."
+_MSG_HUMAN_FIND = "You're on a call on your phone, so I won't ring it."
+
+# "Answer it on speakerphone": the phone answers its own ring and taps its own
+# Speaker button. No Gemini, no call audio, no recording, no report.
+_MSG_NATIVE_DISABLED = "Answering calls on your phone isn't set up right now."
+_MSG_NATIVE_BUSY = "There's already another call on your phone. Answer this one on the phone."
+_MSG_ALREADY_ANSWERED = "Looks like it's already been answered."
+_MSG_PARTIAL = "The call is answered, but I couldn't switch it to speakerphone. Use the phone's speaker button."
+_ANSWER_LINES = {
+    "ANSWERED_SPEAKER": "Answered on your phone's speakerphone.",
+    # Answered, the route not read back: he is on the call, on whatever route it is.
+    "ANSWERED": _MSG_PARTIAL,
+    "ANSWERED_ROUTE_FAILED": _MSG_PARTIAL,
+    "NO_RING": "Your phone isn't ringing now.",
+    "STALE_RING": "That call stopped ringing. I haven't answered the new one.",
+    "BUSY": _MSG_NATIVE_BUSY,
+    "ANSWER_UNCERTAIN": "I couldn't confirm whether the call answered. Check your phone.",
+    "UNREADABLE": "I couldn't read your phone's calls just now, so I didn't answer it. Answer it on the phone.",
+    "NOT_ANSWERED": "Your phone didn't take the answer. Answer it on the phone.",
+    "UNSUPPORTED": "Your phone won't let me answer calls. Answer it on the phone.",
+    "NO_PHONE": "I can't reach your phone over Wi-Fi. Turn Wireless debugging back on in Developer options.",
+    "LOCKED_DOWN": "Your phone is blocking me from answering. Turn on USB debugging (Security settings) "
+                   "in Developer options.",
+    "HELPER_MISMATCH": "The call helper on your phone isn't the one I installed, so I won't run it. "
+                       "Something may have changed it.",
+}
+_ANSWERED = ("ANSWERED_SPEAKER", "ANSWERED", "ANSWERED_ROUTE_FAILED")
+
+_SPEAKER_FAILED = "I couldn't switch the speaker. Use the phone's speaker button."
+_SPEAKER_LINES = {
+    "NO_PHONE": _ANSWER_LINES["NO_PHONE"],
+    "LOCKED_DOWN": "Your phone is blocking me from switching the speaker. Turn on USB debugging "
+                   "(Security settings) in Developer options.",
+    "NO_CALL": "There's no call on your phone right now.",
+    "RINGING": "Your phone is still ringing. Answer it first.",
+    "UNREADABLE": "I couldn't read your phone's calls just now. Use the phone's speaker button.",
+    "STALE_CALL": _MSG_NATIVE_BUSY,
+}
 
 # Find my phone, one line per way it can end. The fixes differ, so none is
 # collapsed into "couldn't".
@@ -111,6 +155,16 @@ class PhoneCommandResult:
 
     def __bool__(self) -> bool:
         return self.success
+
+
+@dataclass(frozen=True)
+class IncomingTarget:
+    """The ring a command is about: the watcher's episode and telecom's own key
+    for that call, read together once at the start of the turn and never
+    re-discovered afterwards."""
+
+    offer: "RingOffer"
+    call_key: str
 
 
 # How a call ended, in words for the report.
@@ -252,6 +306,29 @@ def call_log_line(record: dict) -> str:
     return line.rstrip(".") + "."
 
 
+def _is_human(active: dict) -> bool:
+    """A call he answered on the phone (native), as opposed to one of hers."""
+    return active.get("owner") == "human"
+
+
+def _sole_active_call(topology) -> tuple[str, str]:
+    """("OK", key) for exactly one live call and it active, else (why, "")."""
+    if topology is None:
+        return "UNREADABLE", ""
+    live = [leg for leg in topology.legs if leg.state != "ended"]
+    if any(leg.state == "unknown" for leg in live):
+        return "UNREADABLE", ""
+    if not live:
+        return "NO_CALL", ""
+    if len(live) > 1:
+        return "STALE_CALL", ""
+    if live[0].state == "ringing":
+        return "RINGING", ""
+    if live[0].state != "active":
+        return "STALE_CALL", ""
+    return "OK", live[0].key
+
+
 def _spoken_number(number: str) -> str:
     """+351961136786 -> '961 136 786' (local) for the read-back."""
     digits = number.lstrip("+")
@@ -271,6 +348,8 @@ class PhoneService:
         summarize: Callable | None = None,
         publish: Callable | None = None,
         read_phone=None,
+        control_phone=None,
+        current_ring: Callable[[], "RingOffer | None"] | None = None,
     ):
         cfg = config.get("phone", {}) or {}
         # The live UI's EventBus.publish, or None. Call lines go out as they
@@ -342,10 +421,25 @@ class PhoneService:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+        # Native answering ("answer it on speakerphone", "speaker off") runs on
+        # its own transport: never the outgoing call's, the digest's or the
+        # ring watcher's, whose cached serials are written without a lock.
+        # `current_ring` is the watcher's current(), for the episode checks.
+        self._control_phone = control_phone
+        self._control_lock = threading.Lock()  # one adb conversation at a time on it; never _lock
+        self._current_ring = current_ring
+        self._native_poll_s = 2.0
+        self._native_stop = threading.Event()
+        self._monitor: threading.Thread | None = None
+
         self.api_key = os.environ.get("GEMINI_API_KEY", "")
         self.client_kwargs: dict = {}
         configured = bool(cfg.get("enabled", False))
         self.enabled = configured and self._probe()
+        incoming_cfg = cfg.get("incoming", {}) or {}
+        self.native_answer_enabled = (
+            incoming_cfg.get("answer_speaker_enabled", False) is True and self._probe_native()
+        )
 
     # ------------------------------------------------------------- setup
 
@@ -373,6 +467,18 @@ class PhoneService:
                     "Phone calls disabled: %s is missing. Install it with: uv sync --extra default", module
                 )
                 return False
+        return True
+
+    def _probe_native(self) -> bool:
+        """Windows and adb only: no Gemini credentials, no google.genai. Never raises."""
+        if self._control_phone is not None:
+            return True  # injected (tests)
+        if sys.platform != "win32":
+            logger.warning("Answering on the phone disabled: Windows only")
+            return False
+        if not (shutil.which(self.adb_path) or os.path.isfile(self.adb_path)):
+            logger.warning("Answering on the phone disabled: adb not found at %r (phone.adb.path)", self.adb_path)
+            return False
         return True
 
     def _client_kwargs(self) -> tuple[dict | None, str]:
@@ -430,6 +536,17 @@ class PhoneService:
                 "mute_phone_mic": self.mute_phone_mic,
             }}})
         return self._read_phone
+
+    def _get_control_phone(self):
+        """PhoneService's own transport for answering and the speaker; callers hold _control_lock."""
+        if self._control_phone is None:
+            from services.phone_adb import AdbPhone
+
+            self._control_phone = AdbPhone.from_config({"phone": {"adb": {
+                "path": self.adb_path, "serial": self.adb_serial, "port": self.adb_port,
+                "mute_phone_mic": self.mute_phone_mic,
+            }}})
+        return self._control_phone
 
     def _make_agent(self, audio=None):
         if self._agent_factory is not None:
@@ -531,9 +648,9 @@ class PhoneService:
         if not self.enabled:
             return PhoneCommandResult(False, _MSG_DISABLED)
         with self._lock:
-            busy = self._active is not None
-        if busy:
-            return PhoneCommandResult(False, _MSG_BUSY)
+            refusal = self._dial_refusal(self._active)
+        if refusal is not None:
+            return refusal
 
         resolved, label, source, error = self._resolve(brief, number)
         if error is not None:
@@ -554,9 +671,10 @@ class PhoneService:
             )
 
         with self._lock:
-            if self._active is not None:
-                return PhoneCommandResult(False, _MSG_BUSY)
-            self._active = {"label": label, "number": resolved, "since": time.monotonic()}
+            refusal = self._dial_refusal(self._active)
+            if refusal is not None:
+                return refusal
+            self._active = {"owner": "outgoing", "label": label, "number": resolved, "since": time.monotonic()}
         self._thread = threading.Thread(
             target=self._run_call, args=(brief, resolved, label, source), name="phone-call", daemon=True
         )
@@ -574,9 +692,9 @@ class PhoneService:
         if not self.enabled:
             return PhoneCommandResult(False, _MSG_DISABLED)
         with self._lock:
-            busy = self._active is not None
-        if busy:
-            return PhoneCommandResult(False, _MSG_BUSY)
+            active = self._active
+        if active is not None:
+            return PhoneCommandResult(False, _MSG_HUMAN_FIND if _is_human(active) else _MSG_BUSY)
         try:
             status = self._get_dialer().play_sound()
         except Exception:
@@ -672,13 +790,18 @@ class PhoneService:
         return notes, None
 
     def busy(self) -> bool:
-        """True while one of her own calls is in progress."""
+        """True while one of her own calls is in progress (not a call he answered)."""
         with self._lock:
-            return self._active is not None
+            return self._active is not None and not _is_human(self._active)
 
     def status_line(self) -> str:
         with self._lock:
             active, last = self._active, self._last
+        if active is not None and _is_human(active):
+            if active.get("state") == "connected":
+                seconds = int(time.monotonic() - active["since"])
+                return f"You're on a call on your phone, {seconds // 60}m{seconds % 60:02d}s since I answered it."
+            return "You may still be on a call on your phone; I can't read it right now."
         if active is not None:
             seconds = int(time.monotonic() - active["since"])
             return f"On the phone with {active['label']}, {seconds // 60}m{seconds % 60:02d}s in."
@@ -709,9 +832,230 @@ class PhoneService:
             return None
 
     def close(self) -> None:
+        # Stops the native monitor and nothing else: his call is his to end.
+        self._native_stop.set()
         self._stop.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=15)
+        monitor = self._monitor
+        if monitor is not None and monitor is not threading.current_thread() and monitor.is_alive():
+            monitor.join(timeout=5)
+
+    def _dial_refusal(self, active: dict | None) -> PhoneCommandResult | None:
+        """Why the slot cannot take an outgoing call, or None. Callers hold _lock."""
+        if active is None:
+            return None
+        if _is_human(active):
+            return PhoneCommandResult(
+                False, _MSG_HUMAN_DIAL if active.get("state") == "connected" else _MSG_HUMAN_UNKNOWN
+            )
+        return PhoneCommandResult(False, _MSG_BUSY)
+
+    # ------------------------------------------------------------- native answer
+
+    def _read_control_topology(self):
+        """The phone's calls on the control transport, or None. Never raises."""
+        try:
+            with self._control_lock:
+                return self._get_control_phone().call_topology()
+        except Exception:
+            logger.exception("Reading the phone's calls failed")
+            return None
+
+    def _ring_now(self):
+        """(wired, the watcher's live offer or None). Never raises."""
+        if self._current_ring is None:
+            return False, None
+        try:
+            return True, self._current_ring()
+        except Exception:
+            logger.exception("Reading the current ring failed")
+            return True, None
+
+    def _same_ring(self, offer) -> bool:
+        """Is the watcher still on this ring episode? True when no watcher is wired."""
+        wired, now = self._ring_now()
+        return not wired or (now is not None and now.ring_id == offer.ring_id)
+
+    def bind_incoming(self, offer: "RingOffer | None") -> IncomingTarget | None:
+        """
+        Bind the ring the watcher offers to telecom's key for it: exactly one
+        call on the phone and it RINGING, with the watcher on the same episode
+        before and after the read. None for anything else (no ring, call
+        waiting, another call, unreadable). Read-only: never touches the phone.
+        """
+        if not self.native_answer_enabled or offer is None or offer.call.kind != "incoming":
+            return None
+        if not self._same_ring(offer):
+            return None
+        topology = self._read_control_topology()
+        if topology is None or len(topology.legs) != 1 or topology.legs[0].state != "ringing":
+            return None
+        if not self._same_ring(offer):
+            return None
+        return IncomingTarget(offer, topology.legs[0].key)
+
+    def answer_speaker(self, target: IncomingTarget | None) -> PhoneCommandResult:
+        """
+        Answer the bound ring on the phone itself and put it on the phone's
+        speaker. No read-back: he asked for exactly this. The slot is reserved
+        under the lock, the adb work runs outside it, and the transport
+        re-checks the key right before its one acceptance. An answered call is
+        then watched read-only until it ends; nothing here ever hangs it up.
+        """
+        if not self.native_answer_enabled:
+            return PhoneCommandResult(False, _MSG_NATIVE_DISABLED)
+        if target is None:
+            return self._why_no_target()
+        wired, now = self._ring_now()
+        if wired and now is None:
+            return self._ring_gone(target, "NO_RING")
+        if wired and now.ring_id != target.offer.ring_id:
+            return PhoneCommandResult(False, _ANSWER_LINES["STALE_RING"])
+
+        token = object()
+        with self._lock:
+            if self._active is not None:
+                return PhoneCommandResult(False, _MSG_NATIVE_BUSY)
+            self._active = {
+                "owner": "human", "state": "answering", "label": "your call", "since": time.monotonic(),
+                "ring_id": target.offer.ring_id, "call_key": target.call_key, "token": token,
+            }
+
+        try:
+            with self._control_lock:
+                result = self._get_control_phone().answer_incoming(target.call_key, speaker=True)
+            status = str(result.status)
+        except Exception:
+            logger.exception("Answering the phone failed")
+            status = "ANSWER_UNCERTAIN"
+
+        if status in _ANSWERED:
+            state = "connected"
+        elif status not in _ANSWER_LINES or status == "ANSWER_UNCERTAIN":
+            status = "ANSWER_UNCERTAIN"
+            state = "unknown"   # it may have answered: keep it until a read says otherwise
+        else:
+            state = ""          # refused before any acceptance: nothing to own
+        with self._lock:
+            mine = self._active is not None and self._active.get("token") is token
+            if mine:
+                if state:
+                    self._active["state"] = state
+                else:
+                    self._active = None
+        if not mine:
+            logger.warning("Phone answer: the reservation changed under the answer (%s)", status)
+        elif state:
+            self._start_monitor()
+        logger.info("Phone answer: %s", status)
+
+        if status in ("NO_RING", "STALE_RING"):
+            return self._ring_gone(target, status)
+        return PhoneCommandResult(status in _ANSWERED, _ANSWER_LINES[status])
+
+    def _ring_gone(self, target: IncomingTarget, status: str) -> PhoneCommandResult:
+        """NO_RING / STALE_RING, unless the same call is now up: he answered it by hand."""
+        topology = self._read_control_topology()
+        if topology is not None and any(
+            leg.key == target.call_key and leg.state in ("active", "holding", "answered") for leg in topology.legs
+        ):
+            return PhoneCommandResult(False, _MSG_ALREADY_ANSWERED)
+        return PhoneCommandResult(False, _ANSWER_LINES[status])
+
+    def _why_no_target(self) -> PhoneCommandResult:
+        """No ring was bound at the start of the turn: one read-only look says why."""
+        topology = self._read_control_topology()
+        if topology is None:
+            return PhoneCommandResult(False, _ANSWER_LINES["UNREADABLE"])
+        live = [leg for leg in topology.legs if leg.state != "ended"]
+        if any(leg.state == "ringing" for leg in live) and len(live) > 1:
+            return PhoneCommandResult(False, _MSG_NATIVE_BUSY)
+        return PhoneCommandResult(False, _ANSWER_LINES["NO_RING"])
+
+    def _start_monitor(self) -> None:
+        # Start and exit are both decided under _lock, so a monitor on its way
+        # out can never leave a slot reserved a moment later unwatched.
+        with self._lock:
+            if self._monitor is not None:
+                return
+            monitor = self._monitor = threading.Thread(
+                target=self._monitor_native, name="phone-native-call", daemon=True
+            )
+        monitor.start()
+
+    def _monitor_native(self) -> None:
+        """Read-only, every ~2 s, while he holds the slot. Never ends a call."""
+        while not self._native_stop.wait(self._native_poll_s):
+            try:
+                self._check_native()
+            except Exception:
+                logger.exception("Watching the call on the phone failed")
+            with self._lock:
+                if self._active is None or not _is_human(self._active):
+                    self._monitor = None
+                    return
+
+    def _check_native(self) -> bool:
+        """
+        One read-only look at the call he answered. The slot is released only
+        when telecom no longer lists its key, or lists it ended; an unreadable
+        read keeps the slot as "unknown", which blocks every new mutation.
+        True while there is still something to watch.
+        """
+        with self._lock:
+            active = self._active
+        if active is None or not _is_human(active):
+            return False
+        topology = self._read_control_topology()
+        key = active.get("call_key")
+        with self._lock:
+            if self._active is not active:
+                return self._active is not None and _is_human(self._active)
+            legs = [] if topology is None else [leg for leg in topology.legs if leg.key == key]
+            if topology is None or any(leg.state == "unknown" for leg in legs):
+                active["state"] = "unknown"
+                return True
+            if not legs or legs[0].state == "ended":
+                self._active = None
+                logger.info("Phone answer: his call ended")
+                return False
+            active["state"] = "connected" if legs[0].state in ("active", "holding", "answered") else "unknown"
+            return True
+
+    def set_speaker(self, on: bool) -> PhoneCommandResult:
+        """
+        Speaker on or off for the call on his phone -- one he answered by hand
+        too. Never during her own call. The Security-settings gate first (the
+        tap needs it), then exactly one live call and it active, then one tap
+        on the phone's own Speaker button, verified by the audio route.
+        """
+        if not self.native_answer_enabled:
+            return PhoneCommandResult(False, _MSG_NATIVE_DISABLED)
+        with self._lock:
+            active = self._active
+        if active is not None and not _is_human(active):
+            return PhoneCommandResult(False, _MSG_BUSY)
+        try:
+            with self._control_lock:
+                phone = self._get_control_phone()
+                status = phone.ready(need_interception=False, need_helper=False)
+                if status == "OK":
+                    status, key = _sole_active_call(phone.call_topology())
+                if status == "OK":
+                    result = phone.set_speaker(key, on)
+                    if result.speaker_verified is True:
+                        status = result.status
+                    else:
+                        status = result.status if result.status in ("NO_PHONE", "STALE_CALL") else "FAILED"
+        except Exception:
+            logger.exception("Switching the phone's speaker failed")
+            status = "FAILED"
+        if status == "ALREADY":
+            return PhoneCommandResult(True, "It's already on speaker." if on else "It's already off speaker.")
+        if status in ("SPEAKER_ON", "SPEAKER_OFF"):
+            return PhoneCommandResult(True, "Speaker's on." if on else "Speaker's off.")
+        return PhoneCommandResult(False, _SPEAKER_LINES.get(status, _SPEAKER_FAILED))
 
     # ------------------------------------------------------------- the call
 
