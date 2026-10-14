@@ -98,12 +98,15 @@ RINGER = "+351910004567"  # invented
 
 
 def _lines(block: str) -> list:
-    """One loop iteration as the phone prints it: the separator, then grep's lines."""
-    return ["---\n"] + block.splitlines(keepends=True)
+    """One loop iteration as the phone prints it: grep's lines, then the separator."""
+    return block.splitlines(keepends=True) + ["---\n"]
 
 
 IDLE = _lines(_dump(_block(0), NO_SIM))
 RINGING = _lines(_dump(_block(INCOMING, RINGER), NO_SIM))
+
+
+HANG = object()  # in a script: the shell goes silent, no output and no EOF, until it is killed
 
 
 class FakeProc:
@@ -111,10 +114,15 @@ class FakeProc:
 
     def __init__(self, script):
         self.killed = False
+        self._kill = threading.Event()
         self.stdout = self._read(script)
 
     def _read(self, script):
         for item in script:
+            if item is HANG:
+                if not self._kill.wait(5.0):
+                    raise AssertionError("a hung shell was never killed")
+                continue  # killed: whatever follows runs, then EOF
             if callable(item):
                 item()
             else:
@@ -122,6 +130,7 @@ class FakeProc:
 
     def kill(self):
         self.killed = True
+        self._kill.set()
 
 
 class FakePhone:
@@ -151,10 +160,61 @@ class WatcherTests(unittest.TestCase):
         self.waits: list[float] = []
         self.seen: list = []
 
-    def watcher(self, scripts, resolve_name=lambda n: ""):
+    def watcher(self, scripts, resolve_name=lambda n: "", clock=lambda: 42.0):
         self.phone = FakePhone(scripts, self.stop)
-        return IncomingCallWatcher(self.phone, resolve_name=resolve_name, clock=lambda: 42.0,
+        return IncomingCallWatcher(self.phone, resolve_name=resolve_name, clock=clock,
                                    sleep=self.waits.append)
+
+    @staticmethod
+    def ticking():
+        """A clock that moves a second each time it is read: a stall shows up in a few polls."""
+        now = [0.0]
+
+        def clock():
+            now[0] += 1.0
+            return now[0]
+        return clock
+
+    def test_the_first_block_parses_without_a_separator_before_it(self):
+        w = None
+        w = self.watcher([RINGING + [lambda: self.seen.append(w.ringing())]])
+        w.run(self.stop)
+        self.assertEqual(self.seen, [True])
+
+    def test_a_block_without_its_separator_is_not_complete(self):
+        partial = _lines(_dump(_block(INCOMING, RINGER), NO_SIM))[:-1]
+        w = None
+        w = self.watcher([IDLE + partial + [lambda: self.seen.append((w.ringing(), w.pop()))]])
+        w.run(self.stop)
+        self.assertEqual(self.seen, [(False, None)])
+
+    def test_a_hung_stream_is_killed_and_restarted(self):
+        w = self.watcher([IDLE + [HANG], IDLE], clock=self.ticking())
+        started = time.monotonic()
+        with self.assertLogs("services.incoming_call", "WARNING"):
+            w.run(self.stop)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertTrue(self.phone.procs[0].killed)
+        self.assertEqual(len(self.phone.procs), 2)  # the backoff path reopened the shell
+        self.assertEqual(self.waits, [5.0, 5.0])  # the hung stream had read a block: reset to 5
+
+    def test_a_hung_stream_never_reports_a_stale_ring(self):
+        w = None
+        look = lambda: self.seen.append((w.ringing(), w.pop()))  # noqa: E731
+        w = self.watcher([RINGING + [HANG, look]], clock=self.ticking())
+        with self.assertLogs("services.incoming_call", "WARNING"):
+            w.run(self.stop)
+        self.assertEqual(self.seen, [(False, None)])
+
+    def test_stop_during_a_hung_read_ends_the_thread(self):
+        w = self.watcher([IDLE + [HANG]])  # a still clock: only the stop can end it
+        w.start(self.stop)
+        time.sleep(0.1)
+        self.stop.set()
+        w.thread.join(2.0)
+        self.assertFalse(w.thread.is_alive())
+        self.assertTrue(self.phone.procs[0].killed)
+        self.assertEqual(self.waits, [])
 
     def test_construction_runs_nothing(self):
         w = self.watcher([])
@@ -163,11 +223,11 @@ class WatcherTests(unittest.TestCase):
         self.assertIsNone(w.pop())
 
     def test_the_stream_runs_the_ring_loop(self):
-        w = self.watcher([IDLE + ["---\n"]])
+        w = self.watcher([IDLE])
         w.run(self.stop)
         self.assertEqual(self.phone.commands[0], RING_LOOP)
-        self.assertEqual(RING_LOOP, "while true; do echo ---; dumpsys telephony.registry | grep -E "
-                                    "'mPreciseCallState|mCallIncomingNumber'; sleep 1; done")
+        self.assertEqual(RING_LOOP, "while true; do dumpsys telephony.registry | grep -E "
+                                    "'mPreciseCallState|mCallIncomingNumber'; echo ---; sleep 1; done")
 
     def test_a_new_ring_is_queued_once(self):
         w = None
@@ -175,7 +235,7 @@ class WatcherTests(unittest.TestCase):
         def look():
             self.seen.append((w.ringing(), w.pop(), w.pop()))
 
-        w = self.watcher([IDLE + RINGING + RINGING + RINGING + [look] + IDLE + ["---\n"]])
+        w = self.watcher([IDLE + RINGING + RINGING + RINGING + [look] + IDLE])
         w.run(self.stop)
         ringing, first, second = self.seen[0]
         self.assertTrue(ringing)
@@ -185,7 +245,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_a_ring_that_ended_is_not_announced(self):
         w = None
-        w = self.watcher([IDLE + RINGING + IDLE + ["---\n", lambda: self.seen.append(w.pop())]])
+        w = self.watcher([IDLE + RINGING + IDLE + [lambda: self.seen.append(w.pop())]])
         w.run(self.stop)
         self.assertEqual(self.seen, [None])
 
@@ -193,21 +253,21 @@ class WatcherTests(unittest.TestCase):
         other = "+351910009999"  # invented
         w = None
         w = self.watcher([RINGING + IDLE + _lines(_dump(_block(WAITING, other), NO_SIM))
-                          + ["---\n", lambda: self.seen.append(w.pop())]])
+                          + [lambda: self.seen.append(w.pop())]])
         w.run(self.stop)
         self.assertEqual(self.seen, [IncomingCall("waiting", other, "", 42.0)])
 
     def test_a_number_that_arrives_late_follows_the_queued_call(self):
         w = None
         w = self.watcher([IDLE + _lines(_dump(_block(INCOMING, ""), NO_SIM)) + RINGING
-                          + ["---\n", lambda: self.seen.append(w.pop())]],
+                          + [lambda: self.seen.append(w.pop())]],
                          resolve_name=lambda n: "Ana Exemplo" if n == RINGER else "")
         w.run(self.stop)
         self.assertEqual(self.seen, [IncomingCall("incoming", RINGER, "Ana Exemplo", 42.0)])
 
     def test_the_name_comes_from_the_book(self):
         w = None
-        w = self.watcher([RINGING + ["---\n", lambda: self.seen.append(w.pop())]],
+        w = self.watcher([RINGING + [lambda: self.seen.append(w.pop())]],
                          resolve_name=lambda n: "Ana Exemplo" if n == RINGER else "")
         w.run(self.stop)
         self.assertEqual(self.seen[0].name, "Ana Exemplo")
@@ -217,12 +277,12 @@ class WatcherTests(unittest.TestCase):
             raise RuntimeError("book unreadable")
 
         w = None
-        w = self.watcher([RINGING + ["---\n", lambda: self.seen.append(w.pop())]], resolve_name=boom)
+        w = self.watcher([RINGING + [lambda: self.seen.append(w.pop())]], resolve_name=boom)
         w.run(self.stop)
         self.assertEqual(self.seen[0], IncomingCall("incoming", RINGER, "", 42.0))
 
     def test_a_dead_stream_restarts_with_backoff(self):
-        w = self.watcher([[], [], [], IDLE + ["---\n"], []])
+        w = self.watcher([[], [], [], IDLE, []])
         w.run(self.stop)
         self.assertEqual(self.waits, [5.0, 10.0, 20.0, 5.0, 5.0])
         self.assertTrue(all(p.killed for p in self.phone.procs))
@@ -233,7 +293,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.waits, [5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0])
 
     def test_an_unreadable_block_restarts_the_stream(self):
-        w = self.watcher([["---\n", "error: device offline\n", "---\n"] + RINGING + ["---\n"]])
+        w = self.watcher([["error: device offline\n", "---\n"] + RINGING])
         with self.assertLogs("services.incoming_call", "WARNING"):
             w.run(self.stop)
         self.assertTrue(self.phone.procs[0].killed)
@@ -264,15 +324,15 @@ class WatcherTests(unittest.TestCase):
 
     def test_a_stream_restart_mid_ring_does_not_announce_it_twice(self):
         w = None
-        w = self.watcher([RINGING + ["---\n", lambda: self.seen.append(w.pop())],
-                          RINGING + ["---\n", lambda: self.seen.append(w.pop())]])
+        w = self.watcher([RINGING + [lambda: self.seen.append(w.pop())],
+                          RINGING + [lambda: self.seen.append(w.pop())]])
         w.run(self.stop)
         self.assertIsNotNone(self.seen[0])
         self.assertIsNone(self.seen[1])
 
     def test_nothing_is_ringing_while_the_stream_is_down(self):
         w = None
-        w = self.watcher([RINGING + ["---\n"], None])
+        w = self.watcher([RINGING, None])
         w.run(self.stop)
         self.assertFalse(w.ringing())
         self.assertIsNone(w.pop())

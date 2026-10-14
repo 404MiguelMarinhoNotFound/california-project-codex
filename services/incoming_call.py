@@ -73,10 +73,15 @@ def parse_ring_state(text: str) -> RingState | None:
 
 
 # One read-only shell for the life of the watcher: a block a second, each
-# opened by "---" so a block is complete when the next separator arrives.
-RING_LOOP = ("while true; do echo ---; dumpsys telephony.registry | grep -E "
-             "'mPreciseCallState|mCallIncomingNumber'; sleep 1; done")
+# closed by "---", so a block is complete the moment its dump ends.
+RING_LOOP = ("while true; do dumpsys telephony.registry | grep -E "
+             "'mPreciseCallState|mCallIncomingNumber'; echo ---; sleep 1; done")
 _SEPARATOR = "---"
+# Blocks arrive every ~1.2-1.9 s (measured 2026-10-14). A shell silent this
+# long is hung -- `adb shell` over TCP can stall with no output and no EOF
+# when the phone drops off Wi-Fi -- so it is killed and the backoff restarts it.
+STALL_S = 5.0
+_WATCHDOG_POLL_S = 0.05
 
 
 @dataclass(frozen=True)
@@ -120,6 +125,7 @@ class IncomingCallWatcher:
         # when the stream comes back is not announced a second time.
         self._state = RingState("none", "")
         self._live = False  # the stream is up and its last block was readable
+        self._last_block = 0.0  # clock() of the last readable block, for the watchdog
         self.thread: threading.Thread | None = None
 
     def start(self, stop: threading.Event) -> None:
@@ -167,34 +173,56 @@ class IncomingCallWatcher:
             self._sleep(seconds)
 
     def _watch(self, stop: threading.Event) -> bool:
-        """One shell, read until EOF, an unreadable block or stop. True if any block read."""
+        """One shell, read until EOF, an unreadable block, a stall or stop. True if any block read."""
         proc = self._phone.stream(RING_LOOP)
         if proc is None:
             return False
         read_any = False
-        block: list[str] | None = None  # None until the first separator
+        block: list[str] = []
+        self._last_block = self._clock()
+        done = threading.Event()
+        watchdog = threading.Thread(target=self._watchdog, args=(proc, stop, done),
+                                    name="incoming-call-watchdog", daemon=True)
+        watchdog.start()
         try:
             for line in proc.stdout:
                 if stop.is_set():
                     break
                 if line.strip() != _SEPARATOR:
-                    if block is not None:
-                        block.append(line)
+                    block.append(line)
                     continue
-                if block is not None:
-                    state = parse_ring_state("".join(block))
-                    if state is None:
-                        logger.warning("Incoming-call watcher: unreadable block, restarting")
-                        break
-                    read_any = True
-                    self._read(state)
+                state = parse_ring_state("".join(block))
                 block = []
+                if state is None:
+                    logger.warning("Incoming-call watcher: unreadable block, restarting")
+                    break
+                read_any = True
+                self._last_block = self._clock()
+                self._read(state)
         finally:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            done.set()
+            self._kill(proc)
+            watchdog.join(1.0)
         return read_any
+
+    def _watchdog(self, proc, stop: threading.Event, done: threading.Event) -> None:
+        """Kill a shell that went silent or outlived `stop`; the kill ends its read with EOF."""
+        while not done.wait(_WATCHDOG_POLL_S):
+            stalled = self._clock() - self._last_block > STALL_S
+            if stop.is_set() or stalled:
+                if stalled and not stop.is_set():
+                    logger.warning("Incoming-call watcher: no block for %.0f s, restarting", STALL_S)
+                with self._lock:
+                    self._live = False  # never a stale ring while the shell is dying
+                self._kill(proc)
+                return
+
+    @staticmethod
+    def _kill(proc) -> None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
     def _read(self, state: RingState) -> None:
         name = ""
