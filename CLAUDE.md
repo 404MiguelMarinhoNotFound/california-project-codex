@@ -277,6 +277,7 @@ california/
 │   ├── call_outcome.py          # What a call achieved, read from its transcript by Claude after the call
 │   ├── phone_adb.py             # The phone over ADB: find it (never the Mi Box), dial, call state, hang up, ring, read-only reads
 │   ├── phone_digest.py          # What he missed: call-log and notification parsers, senders-first spoken lines, no full numbers
+│   ├── incoming_call.py         # Who is ringing: ring-state parser, read-only adb stream watcher (watchdog + backoff), the spoken line
 │   ├── phone_call_audio.py      # The call's audio from the phone: downlink in, uplink out, over adb forward
 │   ├── gemini_live_call.py      # One Gemini Live session per call: phone audio in/out, transcript, end_call only
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
@@ -362,6 +363,8 @@ california/
 │   ├── test_phone_service.py    # Read-back token, number rules, one call at a time, report + log, no-adb guard
 │   ├── test_phone_adb.py        # Discovery (never the Mi Box), Security-settings gate, hash-checked helper, dial/hang up/ring
 │   ├── test_phone_digest.py     # Call-log/notification parsing, masked callers, senders not text, app texts as their words
+│   ├── test_incoming_call.py    # Ring-state parsing, once per ring, stall watchdog, backoff, the spoken line per caller
+│   ├── test_orchestrator_incoming.py # Announced between mic reads, not during her own call, reset_playback first, no LLM turn
 │   ├── test_phone_call_audio.py # Bridge: starts at the answer, 20 ms blocks, real-time pacing, flush, stop
 │   ├── test_gemini_live_call.py # Fake Live session: transcript, hang-up guard, silent tool replies, every way a call ends
 │   ├── test_call_outcome.py     # Reading the outcome from a transcript: statuses, never raises, their words as data
@@ -2579,8 +2582,8 @@ Plan: `docs/superpowers/plans/2026-10-13-phone-missed-digest.md`.
   digest names senders by the notification's title, which an app or a sender controls
   (a group name, an email subject). Texts carry the "their words" label; titles in
   the plain digest do not yet.
-- **Pull only.** Nothing is announced on wake or from the idle loop; SMS, calendar,
-  battery and incoming calls stay parked. WhatsApp notifications appear here as one
+- **Pull only.** Nothing is announced on wake or from the idle loop; SMS, calendar
+  and battery stay parked. (Incoming calls are the one push, see below.) WhatsApp notifications appear here as one
   app among others, alongside (not routed to) `whatsapp_unread`.
 - **Needs `phone.enabled`.** Unlike `phone_sync_contacts`, both actions sit behind the
   calls gate in `_dispatch_phone`, so with calls off they answer "Phone calls aren't set
@@ -2591,9 +2594,91 @@ Plan: `docs/superpowers/plans/2026-10-13-phone-missed-digest.md`.
   on my phone?", then "read me the WhatsApp ones") needs her restarted; read the
   `tools` timing in `logs/turns.jsonl` then.
 
+**Incoming calls: who is ringing (2026-10-14).** When his phone rings, she says who,
+once, from the idle loop: "Mum is calling.", "A number ending 4567 is calling.", "A
+private number is calling." Plan:
+`docs/superpowers/plans/2026-10-13-incoming-call-announcement.md`.
+`services/incoming_call.py` holds all of it; `phone.incoming.enabled` switches it.
+
+- **What is read.** `dumpsys telephony.registry`, two lines per modem block:
+  `mPreciseCallState=Ringing call state: N` (PreciseCallState: 5 incoming, 6 waiting,
+  i.e. a second call during one; 0 idle) and the `mCallIncomingNumber=` after it. The
+  phone prints one block per modem (the empty SIM slot reads -1 throughout); the first
+  block ringing wins and a number is never borrowed from another block.
+  `parse_ring_state` returns `None` for text that is not a dump: "could not tell" is
+  never "not ringing".
+- **One shell, not a poll per second.** `RING_LOOP` is a single long-running
+  `adb shell` (`while true; do dumpsys ... | grep ...; echo ---; sleep 1; done`) started
+  through `AdbPhone.stream`: `reachable()` only, never the helper, no push, no
+  Security-settings gate. **The `---` separator comes after each dump**, not before:
+  a block is complete the moment its dump ends, so a ring is read at once instead of
+  waiting out the next `sleep 1`. Blocks arrive every ~1.2-1.9 s.
+- **Once per ring.** A not-ringing -> ringing transition queues one `IncomingCall` in a
+  single slot (a newer ring replaces an older one still waiting); later blocks of the
+  same ring queue nothing, and a number that fills in a beat late follows the queued
+  call. `pop()` hands it over only while the latest reading still shows that ring, so a
+  ring that stopped before the idle loop got to it is never announced. The last state
+  survives a stream restart, so a restart mid-ring does not announce it twice.
+- **Stall watchdog and backoff.** `adb shell` over TCP can hang with no output and no
+  EOF when the phone drops off Wi-Fi. A watchdog thread kills a shell silent for
+  `STALL_S` (5 s), marking the stream not live first so a stale ring is never reported.
+  EOF, an unreadable block or a stall restarts the shell after 5 s, doubling to 60 s,
+  back to 5 s after any stream that read something. Nothing raises into the
+  orchestrator and nothing spins without sleeping; `stop` ends the thread at once,
+  even inside a 60 s backoff.
+- **Its own `AdbPhone`.** `_build_incoming_calls` builds a second `AdbPhone` from config
+  rather than sharing PhoneService's: `reachable()` writes the cached serial without a
+  lock, and the watcher reads from its own thread. Construction runs no adb.
+- **Who.** The name comes from `WhatsAppService.name_for_number` (the same book as calls
+  and WhatsApp: both sides normalised, aliases ignored, `""` when two differently named
+  contacts share the number). The line goes through `caller_phrase`, shared with the
+  digest, so the private-number rule is the same: no name, "a number ending 4567";
+  empty, `-1`/`-2`/`-3` or NULL, "a private number". **No full number is ever spoken
+  or logged**; the watcher logs only the kind.
+
+  | the phone gave | she says |
+  |---|---|
+  | a number in the book | "Mum is calling." |
+  | a number not in the book | "A number ending 4567 is calling." |
+  | a private/withheld number | "A private number is calling." |
+  | no number and no name | "Someone's calling you." |
+  | any of the above, call waiting | "... is calling on the other line." / "Someone is calling on the other line." |
+
+- **A fixed line through TTS, not an LLM turn.** `Orchestrator._announce` opens the
+  speaker, synthesizes the line, plays it as clip kind `announce`, closes the speaker
+  and drains the mic, like a turn. No history, no API call. A TTS or playback failure is
+  logged and listening carries on.
+- **`reset_playback()` before the clip.** A stop stays in force until the next turn
+  (see "The Speaker Is Opened Once Per Turn"): after a dropped wake, a "stop" or a
+  barge-in, `play_audio` would refuse the clip and the announcement would silently
+  play nothing.
+- **Where it sits in the idle loop.** After the phone report, before the mic read, so
+  the mic keeps one reader. During one of her own calls (`PhoneService.busy()`) the
+  ring is dropped, not kept for later. During a reply it waits: the next idle pass
+  announces it if the phone is still ringing.
+- **Read-only.** A `dumpsys` and a `grep`; nothing on the phone is answered, rejected,
+  silenced or written.
+- **Checked live 2026-10-14, no ring:** the watcher against the real phone read a block
+  0.9 s after start and 5 blocks in ~7 s, all `none`, nothing queued, and the thread
+  ended on stop.
+- **Pending live checks** (need her restarted and a call from his backup line):
+  1. Ring the main phone: one line within ~2 s of the first ring, nothing more while it
+     rings, nothing after he rejects it.
+  2. Whether `mCallIncomingNumber` was filled during the ring. The log does not say (it
+     carries the kind only); the spoken line does: a name or "a number ending ..."
+     means it was filled, "Someone's calling you." means it was empty. If empty, the
+     follow-up is to take the number from the call log right after the ring, or from
+     `dumpsys telecom`.
+  3. Ring during a reply: the line comes after her reply if it is still ringing, not at
+     all if it stopped.
+- **Open items.** The live UI publishes an `incoming_call` bus event (`kind`, plus a
+  `label` only with transcripts on) that the page has no handler for yet, and the
+  `announce` clip renders as an ordinary clip on the halo. No quiet hours: every call is
+  announced at any hour. Answering ("answer it") is a separate later plan.
+
 **Not built yet, on purpose:** asking Miguel mid-call (`ask_miguel`; he may not be in the
-room, so it needs WhatsApp). More of the phone over ADB (SMS, calendar, battery,
-incoming-call announcements...) is parked in `docs/ideas/2026-10-13-phone-toolkit.md`.
+room, so it needs WhatsApp). More of the phone over ADB (SMS, calendar, battery...) is
+parked in `docs/ideas/2026-10-13-phone-toolkit.md`.
 
 ### StremioService
 
@@ -3739,6 +3824,20 @@ Current automated coverage exists for:
   texts quoted as the sender's words; an unreachable phone or a failed read never
   spoken as "nothing new"; the reads issue no write and push no helper; the shipped
   config carries the `phone.digest` block
+- Incoming calls (`tests/test_incoming_call.py`, `tests/test_orchestrator_incoming.py`,
+  plus `name_for_number` in `tests/test_whatsapp_service.py` and `busy()` in
+  `tests/test_phone_service.py`): ring state parsed per modem block, waiting as its own
+  kind, CRLF and the watcher's grep output, unreadable text `None`; a ring queued once,
+  a ring that ended not announced, a newer ring replacing an older one, a late number
+  following the queued call, a restart mid-ring not announcing twice; a block read only
+  at its separator; a hung stream killed, restarted and never reporting a stale ring;
+  the backoff doubling and capped, no phone waiting instead of spinning, a raising
+  stream never escaping, stop ending the thread; each caller's line, never a full
+  number; announced between mic reads with the speaker opened and closed around it, a
+  stop in force cleared first, after a phone report, not during her own call, never an
+  LLM turn, a TTS or playback failure not ending the idle loop, no bus label without
+  transcripts; the watcher built with its own phone and no adb, and the shipped config
+  enabling it
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
