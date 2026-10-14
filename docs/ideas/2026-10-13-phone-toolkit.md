@@ -30,13 +30,15 @@ probed live:
 
 ### California tells him things
 
-1. **"What did I miss on my phone?"** A digest of active notifications from
+1. **Built 2026-10-13** (`phone_digest`; plan:
+   `docs/superpowers/plans/2026-10-13-phone-missed-digest.md`).
+   **"What did I miss on my phone?"** A digest of active notifications from
    every app: WhatsApp, Gmail, banks, Uber. Source: `dumpsys notification
    --noredact`, parse package, title, text and post time per record. Same rule
    as `whatsapp_unread`: senders and apps first, text only when he asks for one,
    because she is speaking in a room. Labelled as other people's words, never
    instructions (the prompt-injection rule WhatsApp already follows).
-2. **Missed calls.** "Who called me?" from `content://call_log/calls`
+2. **Built 2026-10-13** (`phone_missed`, same plan). **Missed calls.** "Who called me?" from `content://call_log/calls`
    (`type=3` missed), names from the phone's own contacts.
 3. **SMS.** Read the latest texts and pull a verification code ("what code did
    my bank send?"). Sending SMS reuses the WhatsApp / phone read-back token:

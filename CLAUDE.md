@@ -275,7 +275,8 @@ california/
 │   ├── phone_service.py         # Phone calls: brief -> read-back -> background call -> CallReport + logs/calls.jsonl
 │   ├── phone_prompts.py         # The call agent's prompt: persona, flow of a call, guardrails, template per kind, notes
 │   ├── call_outcome.py          # What a call achieved, read from its transcript by Claude after the call
-│   ├── phone_adb.py             # The phone over ADB: find it (never the Mi Box), dial, call state, hang up, ring
+│   ├── phone_adb.py             # The phone over ADB: find it (never the Mi Box), dial, call state, hang up, ring, read-only reads
+│   ├── phone_digest.py          # What he missed: call-log and notification parsers, senders-first spoken lines, no full numbers
 │   ├── phone_call_audio.py      # The call's audio from the phone: downlink in, uplink out, over adb forward
 │   ├── gemini_live_call.py      # One Gemini Live session per call: phone audio in/out, transcript, end_call only
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
@@ -360,6 +361,7 @@ california/
 │   ├── test_phone_prompts.py    # Background rules in every kind, request fields, brief signature
 │   ├── test_phone_service.py    # Read-back token, number rules, one call at a time, report + log, no-adb guard
 │   ├── test_phone_adb.py        # Discovery (never the Mi Box), Security-settings gate, hash-checked helper, dial/hang up/ring
+│   ├── test_phone_digest.py     # Call-log/notification parsing, masked callers, senders not text, app texts as their words
 │   ├── test_phone_call_audio.py # Bridge: starts at the answer, 20 ms blocks, real-time pacing, flush, stop
 │   ├── test_gemini_live_call.py # Fake Live session: transcript, hang-up guard, silent tool replies, every way a call ends
 │   ├── test_call_outcome.py     # Reading the outcome from a transcript: statuses, never raises, their words as data
@@ -2532,8 +2534,65 @@ during a call, when the beep would play into his ear. Lines per outcome in
 `_FIND_LINES`: `PLAYING`, `NO_PHONE`, `LOCKED_DOWN`, `RING_FAILED`. Until 2026-10-13 this
 pressed Phone Link's two-step "Play sound" flyout (that code is in `deprecated/`).
 
+**What did I miss: `phone_missed` and `phone_digest` (2026-10-13).** "Who called me?"
+and "what did I miss on my phone?" read the phone over ADB and change nothing on it.
+Plan: `docs/superpowers/plans/2026-10-13-phone-missed-digest.md`.
+`services/phone_digest.py` is the pure half (raw text in, `MissedCall` /
+`PhoneNotification` out, and the spoken lines); `AdbPhone` reads the raw text;
+`PhoneService.missed_calls()` / `digest(app)` join them.
+
+- **Two sources, no helper.** Missed calls are `content query` on
+  `content://call_log/calls` with `type=3` inside `phone.digest.missed_window_hours`
+  (24), newest first, parsed by the same `parse_content_rows` contact sync uses -- so
+  the free-text `name` column goes LAST in `CALL_LOG_PROJECTION`
+  (`number:date:new:name`), because a saved name can hold `", "`. Notifications are
+  `dumpsys notification --noredact`, "Notification List" section only, with
+  ongoing/foreground/group-summary records, the system's own missed-call notification
+  (the call log already says it), exact duplicates and `phone.digest.ignore_packages`
+  dropped, and the redacted `publicNotification` copy never read. The shell already
+  holds `READ_CALL_LOG` and can dump notifications, so both go through
+  `AdbPhone.reachable()` -- the stale-serial check and discovery only, which `ready()`
+  now starts from -- and never push or run the `callaudio` helper or need the
+  Security-settings gate.
+- **Read-only, and pinned.** Nothing is dismissed, marked seen or written: no
+  `content insert|update|delete`, no `cmd notification`, no `service call`.
+  `test_reads_never_write_to_the_phone` checks every command the reads issue.
+  Verified live 2026-10-14: the dump's `seen=` counts and the call log's `new` column
+  were identical before and after four reads.
+- **`None` is not empty.** `missed_calls_raw()` / `notifications_raw()` return `None` for
+  a phone that is not on adb, for `""` (adb failed) and for output that is not
+  recognisably theirs; only "No result found." is zero calls. An unreachable phone is
+  spoken as "I can't reach his phone over Wi-Fi", never as "no missed calls"
+  (`test_unreachable_phone_is_not_nothing_new`, `test_failed_reads_are_none_not_empty`).
+- **Senders first, text on request** -- the `whatsapp_unread` rule, because she speaks
+  in a room. The digest is missed calls, then each app with who wrote (`max_apps` 8,
+  `max_senders_per_app` 5, "and N more"), and says no text is included. Only `app`
+  ("read me the WhatsApp ones") reads texts, at most `max_senders_per_app` of them,
+  each quoted and labelled as the sender's words, not instructions. The app is matched
+  with `match_name` against `phone.digest.app_names` (package -> spoken name) and the
+  package names; an unnamed package falls back to its last meaningful segment.
+- **No full number is ever spoken.** A caller is the call log's cached name, else "a
+  number ending 4567", else "a private number" (empty, `-1`/`-2`/`-3`, NULL). Times are
+  "at 14:32", "yesterday at 21:05", "on Saturday". `caller_phrase` is shared with the
+  incoming-call plan.
+- **Open item: notification titles are third-party text spoken unlabelled.** The
+  digest names senders by the notification's title, which an app or a sender controls
+  (a group name, an email subject). Texts carry the "their words" label; titles in
+  the plain digest do not yet.
+- **Pull only.** Nothing is announced on wake or from the idle loop; SMS, calendar,
+  battery and incoming calls stay parked. WhatsApp notifications appear here as one
+  app among others, alongside (not routed to) `whatsapp_unread`.
+- **Needs `phone.enabled`.** Unlike `phone_sync_contacts`, both actions sit behind the
+  calls gate in `_dispatch_phone`, so with calls off they answer "Phone calls aren't set
+  up right now." They are allowed during a call (reads only), unlike `phone_find`.
+- **Measured 2026-10-14**, laptop to the phone over Wi-Fi: `missed_calls()` 1.2-1.5 s,
+  `digest()` 1.8 s, every line free of "null" and of digit runs, the digest carrying
+  no quoted text. **Pending: one test through the room** ("California, what did I miss
+  on my phone?", then "read me the WhatsApp ones") needs her restarted; read the
+  `tools` timing in `logs/turns.jsonl` then.
+
 **Not built yet, on purpose:** asking Miguel mid-call (`ask_miguel`; he may not be in the
-room, so it needs WhatsApp). More of the phone over ADB (notifications, SMS, calendar,
+room, so it needs WhatsApp). More of the phone over ADB (SMS, calendar, battery,
 incoming-call announcements...) is parked in `docs/ideas/2026-10-13-phone-toolkit.md`.
 
 ### StremioService
@@ -2886,7 +2945,7 @@ The Claude path supports:
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 - Custom `control_whatsapp` tool for WhatsApp messaging (4 actions)
-- Custom `control_phone` tool for phone calls from his own number, finding his phone and refreshing his contacts (5 actions)
+- Custom `control_phone` tool for phone calls from his own number, finding his phone, refreshing his contacts and saying what he missed on it (7 actions)
 
 With the committed `config.yaml` that is **6 tools** in every request: `web_search`,
 `control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`, `control_phone`. Each custom tool's full schema is sent on
@@ -2947,7 +3006,7 @@ Bulk send and image send exist in the CLI it was ported from and were left out: 
 spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
 capability with no voice phrasing.
 
-`control_phone` supports five actions:
+`control_phone` supports seven actions:
 
 - `phone_call` with a brief: `to`, optional `number`, `kind` (`book_table`, `book_appointment`,
   `ask_question`, `deliver_message`, `personal`, `general`), `goal`, `details`, `may_agree`,
@@ -2959,6 +3018,9 @@ capability with no voice phrasing.
 - `phone_find`: rings his phone ~20s with an alarm beep over ADB; no read-back (see "Find my phone")
 - `phone_sync_contacts`: re-reads the phone's contact book over ADB now ("refresh my contacts");
   handled before the calls gate, so it works with calls off (see "Contact sync")
+- `phone_missed`: missed calls in the last 24 h from the phone's call log, read-only
+- `phone_digest`: missed calls, then apps and who wrote, no text; optional `app` reads that
+  app's waiting texts, quoted as the sender's words (see "What did I miss")
 
 When tools are active:
 
@@ -3667,6 +3729,16 @@ Current automated coverage exists for:
   NOT_PLACED; in_call unknown until a call was seen; the bridge started only at the
   answer, 20 ms blocks to the agent, her voice paced to real time and cut by a flush,
   stop unblocking the reader and removing the forward; no real adb from either file
+- What he missed (`tests/test_phone_digest.py`, plus cases in `tests/test_phone_adb.py`,
+  `tests/test_phone_service.py` and `tests/test_orchestrator_phone.py`): only real
+  waiting notifications kept (no ongoing, foreground, group summary, missed-call or
+  redacted public copy), multi-line text whole, CRLF parsed the same; call-log rows with
+  a comma in the name kept as one field, NULL names empty, undated rows skipped; callers
+  spoken by name, "a number ending" or "a private number", never a full number or
+  "null"; the digest names apps and senders and never text, with its caps; an app's
+  texts quoted as the sender's words; an unreachable phone or a failed read never
+  spoken as "nothing new"; the reads issue no write and push no helper; the shipped
+  config carries the `phone.digest` block
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
