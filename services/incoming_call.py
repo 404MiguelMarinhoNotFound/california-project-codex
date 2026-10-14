@@ -112,6 +112,15 @@ def incoming_line(call: IncomingCall) -> str:
     return f"{who} is calling."
 
 
+@dataclass(frozen=True)
+class RingOffer:
+    """The ring happening now, bound to its episode: `ring_id` is the same for
+    every reading of one ring (a late number included) and new for the next."""
+
+    ring_id: int
+    call: IncomingCall
+
+
 class IncomingCallWatcher:
     """
     Watches the phone's ring state and queues the newest ring, one slot.
@@ -141,6 +150,10 @@ class IncomingCallWatcher:
         self._backoff_min, self._backoff_max = backoff_s
         self._lock = threading.Lock()
         self._pending: IncomingCall | None = None
+        # The ring in progress, kept apart from `_pending` so announcing it
+        # (pop) never takes it away from a later "answer it".
+        self._ring_id = 0  # monotonic per watcher; bumped on each idle -> ringing
+        self._current: IncomingCall | None = None
         # The last readable state survives a restart, so a ring still going
         # when the stream comes back is not announced a second time.
         self._state = RingState("none", "")
@@ -155,6 +168,14 @@ class IncomingCallWatcher:
     def ringing(self) -> bool:
         with self._lock:
             return self._live and self._state.kind != "none"
+
+    def current(self) -> RingOffer | None:
+        """The live ring's latest reading with its episode id, without consuming
+        anything. None when nothing rings or the stream is not live."""
+        with self._lock:
+            if not self._live or self._state.kind == "none" or self._current is None:
+                return None
+            return RingOffer(self._ring_id, self._current)
 
     def pop(self) -> IncomingCall | None:
         with self._lock:
@@ -250,17 +271,23 @@ class IncomingCallWatcher:
             before = self._state
             new_ring = state.kind != "none" and before.kind == "none"
             changed = state.kind != "none" and (state.kind, state.number) != (before.kind, before.number)
-            pending = self._pending
-        if new_ring or (changed and pending is not None):
-            # The number can fill in a beat after the ring starts: a call still
-            # waiting to be announced follows it rather than being dropped.
+        if new_ring or changed:
+            # The number can fill in a beat after the ring starts: the ring
+            # (and a call still waiting to be announced) follows it.
             name = self._name(state.number)
         with self._lock:
             if new_ring:
                 self._pending = IncomingCall(state.kind, state.number, name, self._clock())
+                self._ring_id += 1
+                self._current = self._pending
                 logger.info("Incoming-call watcher: phone ringing (%s)", state.kind)
-            elif changed and self._pending is not None:
-                self._pending = IncomingCall(state.kind, state.number, name, self._pending.started)
+            elif changed:
+                started = self._current.started if self._current is not None else self._clock()
+                self._current = IncomingCall(state.kind, state.number, name, started)
+                if self._pending is not None:
+                    self._pending = self._current
+            elif state.kind == "none":
+                self._current = None
             self._state = state
             self._live = True
 
