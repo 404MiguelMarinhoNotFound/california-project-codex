@@ -2221,6 +2221,9 @@ class Orchestrator:
         try:
             self.audio.open_speaker()
             try:
+                # A stop stays in force until cleared (a dropped wake, "stop", a
+                # barge-in); without this the line would silently play nothing.
+                self.audio.reset_playback()
                 audio, sr = self.tts.synthesize(text)
                 if len(audio) > 0:
                     self.audio.play_audio(audio, sr, blocking=True, text=text, kind="announce")

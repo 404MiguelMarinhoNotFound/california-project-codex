@@ -77,6 +77,46 @@ class AnnounceTests(unittest.TestCase):
         orch._idle_loop(_mic())
         self.assertEqual(order, ["open", "play", "close"])
 
+    def test_a_stop_still_in_force_is_cleared_before_the_clip(self):
+        orch = _orch(_call())
+        order = []
+        orch.audio.open_speaker.side_effect = lambda *a, **k: order.append("open")
+        orch.audio.reset_playback.side_effect = lambda *a, **k: order.append("reset")
+        orch.audio.play_audio.side_effect = lambda *a, **k: order.append("play")
+        orch._idle_loop(_mic())
+        self.assertEqual(order, ["open", "reset", "play"])
+
+    def test_the_announcement_plays_after_an_earlier_stop(self):
+        class _AbortableAudio:
+            """play_audio is a no-op while a stop is in force, like AudioPipeline."""
+
+            def __init__(self):
+                self._abort = False
+                self.played = []
+
+            def stop_playback(self):
+                self._abort = True
+
+            def reset_playback(self):
+                self._abort = False
+
+            def open_speaker(self, *a, **k):
+                pass
+
+            def close_speaker(self, *a, **k):
+                pass
+
+            def play_audio(self, audio, sr, blocking=True, *, text="", kind="reply"):
+                if self._abort:
+                    return
+                self.played.append((text, kind))
+
+        orch = _orch(_call())
+        orch.audio = _AbortableAudio()
+        orch.audio.stop_playback()  # e.g. a dropped false wake, or "stop"
+        orch._idle_loop(_mic())
+        self.assertEqual(orch.audio.played, [("Mama is calling.", "announce")])
+
     def test_no_announcement_during_her_own_call(self):
         orch = _orch(_call(), busy=True)
         orch._idle_loop(_mic())
