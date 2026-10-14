@@ -171,8 +171,10 @@ def _tool_target(tool_name, tool_input) -> str | None:
                 return f"{name}'s chat" if name != "a number" else "a chat"
             return name
         if tool_name == "control_phone":
-            if action == "phone_find":
+            if action in ("phone_find", "phone_missed"):
                 return "your phone"
+            if action == "phone_digest":
+                return text("app") or "your phone"
             if action == "phone_call":
                 return who() or ("a number" if text("number") else None)
             return None
@@ -1770,6 +1772,10 @@ def _dispatch_phone(params: dict, phone_svc, contact_sync=None) -> str:
         return phone_svc.status_line()
     if action == "phone_find":
         return phone_svc.find_phone().message
+    if action == "phone_missed":
+        return phone_svc.missed_calls().message
+    if action == "phone_digest":
+        return phone_svc.digest(str(params.get("app") or "")).message
     if action == "phone_log":
         records = phone_svc.recent_calls(params.get("count") or 5)
         if not records:

@@ -177,6 +177,15 @@ class DispatcherReportTests(unittest.TestCase):
             with self.subTest(action):
                 self.assertIsNone(_outcome(fn, *args))
 
+    def test_phone_reads_report_nothing(self):
+        # Reading what is waiting on his phone is a status read: a worked read
+        # is not a happy moment and a failed one is not his fault to apologise for.
+        phone = Mock()
+        phone.enabled = True
+        for action in ("phone_missed", "phone_digest"):
+            with self.subTest(action):
+                self.assertIsNone(_outcome(_dispatch_phone, {"action": action}, phone))
+
     def test_bare_mock_result_is_never_a_success(self):
         self.assertIsNone(_outcome(_dispatch_lights, {"action": "light_on"}, _lights(Mock())))
         self.assertIsNone(_outcome(_dispatch_vacuum, {"action": "vacuum_stop"}, _vacuum(Mock())))
