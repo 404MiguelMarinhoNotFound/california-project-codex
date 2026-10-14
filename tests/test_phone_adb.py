@@ -8,14 +8,38 @@ import unittest
 from unittest import mock
 
 from services import phone_adb
-from services.phone_adb import ACTIVE, ALERTING, DIALING, IDLE, AdbPhone, parse_content_rows
+from services.phone_adb import (
+    ACTIVE, ALERTING, DIALING, IDLE, AdbPhone, AnswerResult, CallLeg, CallTopology, SpeakerButton, SpeakerResult,
+    parse_audio_route, parse_call_topology, parse_content_rows, parse_speaker_button,
+)
 from tests.config_fixture import config_for_tests
 
 NOTIFICATION_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "phone_notification_dump.txt")
+SCREEN_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "dialer_incall_screen.xml")
+with open(SCREEN_FIXTURE, encoding="utf-8") as _f:
+    INCALL_SCREEN = _f.read()
 # The phone-missed-digest plan's Global Constraints: nothing this file drives may write.
 FORBIDDEN = ("content update", "content delete", "content insert", "cmd notification", "service call")
 PHONE = "192.168.1.101:38731"  # config-literal: adb devices/mdns output shape, not the deployment
 MDNS_NAME = "adb-4POJ4DWOJBXWIVLB-lmuzi2._adb-tls-connect._tcp"
+
+
+def telecom_dump(*rows: tuple[str, str]) -> str:
+    """`dumpsys telecom` shaped like the Xiaomi's: history around the live mCalls rows."""
+    live = "".join(f"    [Call id={key}, state={state}, videoState=0, handle=tel:REDACTED]\n" for key, state in rows)
+    return ("CallsManager:\n  mCurrentUserHandle: 0\n  mCalls: \n" + live
+            + "  mCallAudioManager:\n    mCallAudioRouteAdapter: x\n"
+            + "  Historical calls:\n    [Call id=TC@1, state=DISCONNECTED, videoState=0]\n")
+
+
+def audio_dump(route: str = "earpiece", mic: str = "false") -> str:
+    return ("  Audio mode:\n  - MODE_IN_CALL\n"
+            f"  Active communication device: AudioDeviceAttributes: role:output type:{route} addr: name:\n"
+            f"  mic mute FromSwitch={mic} FromRestrictions=false FromApi=false\n")
+
+
+KEY = "TC@412"
+OTHER = "TC@413"
 
 
 class FakeAdb:
@@ -29,13 +53,21 @@ class FakeAdb:
         self.gate = "1"
         self.interceptable = "true"
         self.states = [IDLE]
-        self.replies = {"dial": "DIALED", "hangup": "ENDED=false", "check": "INTERCEPTABLE=true\nAUDIO_MODE=0\nTELEPHONY_TX=18/x/"}
+        self.replies = {"dial": "DIALED", "hangup": "ENDED=false", "accept": "ACCEPT_REQUESTED", "check": "INTERCEPTABLE=true\nAUDIO_MODE=0\nTELEPHONY_TX=18/x/"}
         self.swapped = False
         self.content = "No result found.\n"
         self.call_log = "No result found.\n"
         with open(NOTIFICATION_FIXTURE, encoding="utf-8") as f:
             self.notifications = f.read()
+        self.telecom = [telecom_dump()]
+        self.audio = [audio_dump("earpiece")]
+        self.screens = [INCALL_SCREEN]
+        self.tap_routes = "speaker"  # the route a Speaker tap switches the phone to; None: the tap does nothing
         self.calls: list[list[str]] = []
+
+    @staticmethod
+    def _next(seq):
+        return seq.pop(0) if len(seq) > 1 else seq[0]
 
     def __call__(self, argv, timeout):
         self.calls.append(argv)
@@ -56,7 +88,17 @@ class FakeAdb:
             return ""
         if args[0] == "-s" and args[1] not in self.devices and args[1] not in self.mdns:
             return ""  # "device not found" goes to stderr
+        if args[2:] == ["exec-out", "uiautomator", "dump", "/dev/tty"]:
+            return self._next(self.screens)
         cmd = args[3] if len(args) > 3 and args[2] == "shell" else ""
+        if cmd == "dumpsys telecom":
+            return self._next(self.telecom)
+        if cmd == "dumpsys audio":
+            return self._next(self.audio)
+        if cmd.startswith("input tap "):
+            if self.tap_routes:
+                self.audio = [audio_dump(self.tap_routes)]
+            return ""
         if "CallAudio" in cmd:
             if self.swapped or self.local_hash not in cmd or "exec app_process" not in cmd:
                 return "HELPER_MISMATCH"
@@ -82,6 +124,12 @@ class FakeAdb:
 
     def shell_cmds(self):
         return [a[4] for a in self.calls if len(a) > 4 and a[3] == "shell"]
+
+    def taps(self):
+        return [c for c in self.shell_cmds() if c.startswith("input tap")]
+
+    def accepts(self):
+        return [c for c in self.shell_cmds() if "CallAudio accept" in c]
 
 
 class FakeProc:
@@ -629,3 +677,355 @@ class StreamTests(_Base):
         phone._popen = mock.Mock(side_effect=OSError("adb missing"))
         with self.assertLogs("services.phone_adb", "WARNING"):
             self.assertIsNone(phone.stream("true"))
+
+
+def _checked(xml: str, value: str) -> str:
+    """The fixture with the Speaker button's own `checked` set to `value`."""
+    marker = 'bounds="[643,1981][907,2261]"'
+    head, tail = xml.split(marker, 1)
+    start = head.rfind("<node ")
+    node = head[start:].replace('checked="false"', f'checked="{value}"', 1)
+    return head[:start] + node + marker + tail
+
+
+class CallTopologyParseTests(unittest.TestCase):
+    """parse_call_topology(): telecom's live mCalls rows only (ruling R1)."""
+
+    def test_rows_map_to_states_and_history_is_ignored(self):
+        topo = parse_call_topology(telecom_dump((KEY, "RINGING"), (OTHER, "ON_HOLD")))
+        self.assertEqual(topo, CallTopology((CallLeg(KEY, "ringing"), CallLeg(OTHER, "holding"))))
+
+    def test_state_names(self):
+        for raw, mapped in (("RINGING", "ringing"), ("ACTIVE", "active"), ("ON_HOLD", "holding"),
+                            ("DIALING", "dialing"), ("CONNECTING", "dialing"), ("NEW", "dialing"),
+                            ("SELECT_PHONE_ACCOUNT", "dialing"), ("ANSWERED", "answered"),
+                            ("DISCONNECTING", "ended"), ("DISCONNECTED", "ended"), ("ABORTED", "ended"),
+                            ("PULLING", "unknown")):
+            self.assertEqual(parse_call_topology(telecom_dump((KEY, raw))).legs, (CallLeg(KEY, mapped),), raw)
+
+    def test_no_live_calls_is_an_empty_topology(self):
+        self.assertEqual(parse_call_topology(telecom_dump()), CallTopology(()))
+
+    def test_crlf_parses_the_same(self):
+        text = telecom_dump((KEY, "ACTIVE")).replace("\n", "\r\n")
+        self.assertEqual(parse_call_topology(text).legs, (CallLeg(KEY, "active"),))
+
+    def test_unknown_dumps_are_none(self):
+        for text in ("", "Can't find service: telecom\n", "  mCalls: \n    [Call id=TC@1, state=RINGING]\n",
+                     telecom_dump().replace("  mCalls: \n", "  mCalls: \n    something unexpected\n"),
+                     telecom_dump((KEY, "RINGING")).replace("videoState=0", "id=TC@9"),
+                     telecom_dump((KEY, "RINGING")).replace("videoState=0", "state=ACTIVE")):
+            self.assertIsNone(parse_call_topology(text), text[:60])
+
+
+class SpeakerButtonParseTests(unittest.TestCase):
+    def test_the_label_finds_its_clickable_ancestor(self):
+        self.assertEqual(parse_speaker_button(INCALL_SCREEN), SpeakerButton(center=(775, 2121), checked=False))
+
+    def test_checked_is_read_from_the_button(self):
+        self.assertEqual(parse_speaker_button(_checked(INCALL_SCREEN, "true")),
+                         SpeakerButton(center=(775, 2121), checked=True))
+
+    def test_portuguese_label(self):
+        self.assertIsNotNone(parse_speaker_button(INCALL_SCREEN.replace('text="Speaker"', 'text="Altifalante"')))
+
+    def test_refusals(self):
+        refused = {
+            "no button": INCALL_SCREEN.replace('text="Speaker"', 'text="Audio"'),
+            "two buttons": INCALL_SCREEN.replace('text="Hold"', 'text="Speaker"'),
+            "wrong package": INCALL_SCREEN.replace('package="com.google.android.dialer"', 'package="com.other.app"'),
+            "bad bounds": INCALL_SCREEN.replace('bounds="[643,1981][907,2261]"', 'bounds="[643,1981]"'),
+            "unknown checked": _checked(INCALL_SCREEN, "maybe"),
+            "not xml": "ERROR: could not get idle state.",
+            "empty": "",
+        }
+        for why, xml in refused.items():
+            self.assertIsNone(parse_speaker_button(xml), why)
+
+
+class AudioRouteParseTests(unittest.TestCase):
+    def test_route_and_mic(self):
+        self.assertEqual(parse_audio_route(audio_dump("speaker")), ("speaker", False))
+        self.assertEqual(parse_audio_route(audio_dump("earpiece", "true")), ("earpiece", True))
+        self.assertEqual(parse_audio_route(""), (None, None))
+
+
+class AnswerIncomingTests(_Base):
+    """answer_incoming(): the same sole ring, accepted once, ACTIVE read back, speaker read back."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(phone_adb, "logger")  # statuses only; keeps the run quiet
+        self.log = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_logs_carry_statuses_not_keys(self):
+        self.ringing_then_active()
+        self.adb.tap_routes = None
+        self.phone().answer_incoming(KEY)
+        logged = " ".join(str(c) for c in self.log.mock_calls)
+        self.assertIn("ROUTE_FAILED", logged)
+        self.assertNotIn(KEY, logged)
+
+    def ringing_then_active(self):
+        self.adb.telecom = [telecom_dump((KEY, "RINGING")), telecom_dump((KEY, "ANSWERED")),
+                            telecom_dump((KEY, "ACTIVE"))]
+        self.adb.audio = [audio_dump("earpiece")]
+
+    def test_answer_requires_same_single_key(self):
+        self.adb.telecom = [telecom_dump((OTHER, "RINGING"))]
+        result = self.phone().answer_incoming(KEY)
+        self.assertEqual((result.status, result.accepted), ("STALE_RING", False))
+        self.assertEqual(self.adb.accepts(), [])
+
+        self.ringing_then_active()
+        result = self.phone().answer_incoming(KEY)
+        self.assertEqual(result, AnswerResult("ANSWERED_SPEAKER", KEY, accepted=True, speaker_verified=True))
+        self.assertEqual(len(self.adb.accepts()), 1)
+        self.assertIn(f"CallAudio accept {KEY}", self.adb.accepts()[0])
+
+    def test_manual_answer_does_not_mutate(self):
+        self.adb.telecom = [telecom_dump((KEY, "ACTIVE"))]
+        result = self.phone().answer_incoming(KEY)
+        self.assertEqual((result.status, result.accepted), ("NO_RING", False))
+        self.assertEqual(self.adb.accepts(), [])
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_no_ring_is_no_ring(self):
+        self.assertEqual(self.phone().answer_incoming(KEY).status, "NO_RING")
+        self.assertEqual(self.adb.accepts(), [])
+
+    def test_waiting_or_multiple_calls_are_busy(self):
+        for rows in (((KEY, "RINGING"), (OTHER, "ACTIVE")), ((KEY, "RINGING"), (OTHER, "ON_HOLD")),
+                     ((OTHER, "DIALING"), (KEY, "RINGING")), ((KEY, "RINGING"), (OTHER, "RINGING"))):
+            self.adb.telecom = [telecom_dump(*rows)]
+            result = self.phone().answer_incoming(KEY)
+            self.assertEqual((result.status, result.accepted), ("BUSY", False), rows)
+        self.assertEqual(self.adb.accepts(), [])
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_unknown_topology_mutates_nothing(self):
+        for dump in ("garbage", telecom_dump((KEY, "RINGING"), (OTHER, "PULLING"))):
+            self.adb.telecom = [dump]
+            self.assertEqual(self.phone().answer_incoming(KEY).status, "UNREADABLE")
+        self.assertEqual(self.adb.accepts(), [])
+
+    def test_answer_requires_matching_active_identity(self):
+        self.adb.telecom = [telecom_dump((KEY, "RINGING")), telecom_dump((OTHER, "ACTIVE"))]
+        result = self.phone().answer_incoming(KEY)
+        self.assertEqual(result, AnswerResult("ANSWER_UNCERTAIN", KEY))
+        self.assertEqual(self.adb.taps(), [])
+
+        self.adb.telecom = [telecom_dump((KEY, "RINGING")), telecom_dump((KEY, "ACTIVE"), (OTHER, "RINGING"))]
+        self.assertEqual(self.phone().answer_incoming(KEY).status, "ANSWER_UNCERTAIN")
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_a_call_that_never_turns_active_is_uncertain_within_5s(self):
+        self.adb.telecom = [telecom_dump((KEY, "RINGING")), telecom_dump((KEY, "ANSWERED"))]
+        result = self.phone().answer_incoming(KEY)
+        self.assertEqual((result.status, result.accepted), ("ANSWER_UNCERTAIN", False))
+        self.assertLessEqual(self.now[0], 5.5)
+        self.assertEqual(len(self.adb.accepts()), 1)  # one acceptance, never a second
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_caller_hanging_up_is_stale(self):
+        for after in (telecom_dump(), telecom_dump((KEY, "DISCONNECTED"))):
+            self.adb.telecom = [telecom_dump((KEY, "RINGING")), after]
+            result = self.phone().answer_incoming(KEY)
+            self.assertEqual((result.status, result.accepted), ("STALE_RING", False))
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_unreadable_after_accept_is_uncertain(self):
+        self.adb.telecom = [telecom_dump((KEY, "RINGING")), "", telecom_dump((KEY, "ACTIVE"))]
+        result = self.phone().answer_incoming(KEY)
+        self.assertEqual((result.status, result.accepted), ("ANSWER_UNCERTAIN", False))
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_helper_refusals_and_unknown_output(self):
+        cases = {"REFUSED_STALE": "STALE_RING", "REFUSED_BUSY": "BUSY", "REFUSED_NO_RING": "NO_RING",
+                 "REFUSED_UNREADABLE": "UNREADABLE", "ACCEPT_UNSUPPORTED": "UNSUPPORTED",
+                 "ACCEPT_FAILED SecurityException": "NOT_ANSWERED", "": "ANSWER_UNCERTAIN",
+                 "Killed": "ANSWER_UNCERTAIN"}
+        for reply, status in cases.items():
+            self.ringing_then_active()
+            self.adb.replies["accept"] = reply
+            before = len(self.adb.calls)
+            result = self.phone().answer_incoming(KEY)
+            self.assertEqual((result.status, result.accepted), (status, False), reply)
+            # Nothing is read or written after a helper that did not say it accepted.
+            later = [" ".join(a) for a in self.adb.calls[before:]]
+            accept_at = max(i for i, c in enumerate(later) if "CallAudio accept" in c)
+            self.assertEqual(later[accept_at + 1:], [], reply)
+
+    def test_hash_mismatch_runs_no_answer(self):
+        self.ringing_then_active()
+        self.adb.swapped = True
+        result = self.phone().answer_incoming(KEY)
+        self.assertEqual((result.status, result.accepted), ("HELPER_MISMATCH", False))
+        self.assertEqual(self.adb.taps(), [])
+        for cmd in self.adb.accepts():
+            self.assertIn(self.local_hash, cmd)
+            self.assertIn("exec app_process", cmd)
+
+    def test_preflight_needs_the_gate_not_interception(self):
+        self.ringing_then_active()
+        self.adb.interceptable = "false"
+        self.assertEqual(self.phone().answer_incoming(KEY).status, "ANSWERED_SPEAKER")
+        self.assertFalse(any("CallAudio check" in c for c in self.adb.shell_cmds()))
+
+        self.adb.gate = "0"
+        self.ringing_then_active()
+        self.assertEqual(self.phone().answer_incoming(KEY).status, "LOCKED_DOWN")
+
+    def test_no_phone(self):
+        self.adb.devices = "List of devices attached\n192.168.1.200:5555\tdevice\n"
+        self.adb.mdns = "List of discovered mdns services\n"
+        self.assertEqual(self.phone().answer_incoming(KEY).status, "NO_PHONE")
+        self.assertEqual(self.adb.accepts(), [])
+
+    def test_unsupported_key_shapes_never_reach_the_shell(self):
+        phone = self.phone()
+        for bad in ("TC@1; reboot", "", "$(id)", "TC@1 x", "a" * 129, "TC@1\n"):
+            self.assertEqual(phone.answer_incoming(bad).status, "UNSUPPORTED", repr(bad))
+            self.assertEqual(phone.set_speaker(bad, True).status, "STALE_CALL", repr(bad))
+        self.assertEqual(self.adb.calls, [])
+
+    def test_answer_without_speaker_never_taps(self):
+        self.ringing_then_active()
+        result = self.phone().answer_incoming(KEY, speaker=False)
+        self.assertEqual(result, AnswerResult("ANSWERED", KEY, accepted=True))
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_route_setter_alone_is_not_success(self):
+        # The tap goes out, but the phone's audio route never reads speaker.
+        self.ringing_then_active()
+        self.adb.tap_routes = None
+        result = self.phone().answer_incoming(KEY)
+        self.assertEqual(result, AnswerResult("ANSWERED_ROUTE_FAILED", KEY, accepted=True, speaker_verified=False))
+        self.assertEqual(self.adb.taps(), ["input tap 775 2121"])
+
+    def test_a_muted_mic_is_not_success(self):
+        self.ringing_then_active()
+        self.adb.tap_routes = None
+        self.adb.audio = [audio_dump("speaker", mic="true")]
+        self.assertEqual(self.phone().answer_incoming(KEY).status, "ANSWERED_ROUTE_FAILED")
+
+    def test_route_failure_preserves_call(self):
+        self.ringing_then_active()
+        self.adb.tap_routes = None
+        self.phone().answer_incoming(KEY)
+        self.assertEqual(len(self.adb.taps()), 1)  # no retry tap: a second tap toggles back
+        self.assertFalse(any("hangup" in c or "endCall" in c for c in self.adb.shell_cmds()))
+
+    def test_answer_never_dials_mutes_or_bridges(self):
+        self.ringing_then_active()
+        self.phone().answer_incoming(KEY)
+        issued = [" ".join(a) for a in self.adb.calls] + self.popened
+        self.assertEqual(self.popened, [])
+        self.assertFalse(any("push" in a for a in self.adb.calls))
+        for cmd in issued:
+            for fragment in ("CallAudio dial", "CallAudio hangup", "CallAudio bridge", "CallAudio ring",
+                             "mutemic", "forward", "keyevent", *FORBIDDEN):
+                self.assertNotIn(fragment, cmd)
+
+    def test_the_helper_source_exits_explicitly_in_accept_mode(self):
+        # Ruling R5: app_process lingers on binder threads unless the mode exits.
+        source = os.path.join(os.path.dirname(os.path.dirname(__file__)), "android", "callaudio", "src",
+                              "CallAudio.java")
+        with open(source, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("System.exit(", text.split('mode.equals("accept")', 1)[1][:300])
+        self.assertIn('getMethod("acceptRingingCall", String.class)', text)
+        self.assertNotIn("setSpeakerphoneOn", text)
+        self.assertNotIn("setCommunicationDevice", text)
+
+
+class SetSpeakerTests(_Base):
+    """set_speaker(): one tap on the dialer's own button for the same sole ACTIVE call, route read back."""
+
+    def setUp(self):
+        super().setUp()
+        self.adb.telecom = [telecom_dump((KEY, "ACTIVE"))]
+
+    def test_speaker_on(self):
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("SPEAKER_ON", True))
+        self.assertEqual(self.adb.taps(), ["input tap 775 2121"])
+
+    def test_speaker_off(self):
+        self.adb.screens = [_checked(INCALL_SCREEN, "true")]
+        self.adb.audio = [audio_dump("speaker")]
+        self.adb.tap_routes = "earpiece"
+        self.assertEqual(self.phone().set_speaker(KEY, False), SpeakerResult("SPEAKER_OFF", True))
+        self.assertEqual(len(self.adb.taps()), 1)
+
+    def test_already_on_is_not_tapped(self):
+        self.adb.screens = [_checked(INCALL_SCREEN, "true")]
+        self.adb.audio = [audio_dump("speaker")]
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("ALREADY", True))
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_already_but_route_disagrees_is_route_failed_and_not_tapped(self):
+        self.adb.screens = [_checked(INCALL_SCREEN, "true")]
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("ROUTE_FAILED", False))
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_only_the_same_sole_active_call(self):
+        for rows in (((OTHER, "ACTIVE"),), ((KEY, "RINGING"),), ((KEY, "ACTIVE"), (OTHER, "RINGING")), ()):
+            self.adb.telecom = [telecom_dump(*rows)]
+            self.assertEqual(self.phone().set_speaker(KEY, True).status, "STALE_CALL", rows)
+        self.adb.telecom = ["garbage"]
+        self.assertEqual(self.phone().set_speaker(KEY, True).status, "UNREADABLE")
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_call_changing_before_the_tap_is_not_tapped(self):
+        self.adb.telecom = [telecom_dump((KEY, "ACTIVE")), telecom_dump((OTHER, "ACTIVE"))]
+        self.assertEqual(self.phone().set_speaker(KEY, True).status, "STALE_CALL")
+        self.assertEqual(self.adb.taps(), [])
+        reads = [a for a in self.adb.calls if a[-1:] == ["dumpsys telecom"]]
+        self.assertEqual(len(reads), 2)  # once before the screen read, once right before the tap
+
+    def test_screen_read_is_retried_then_unreadable(self):
+        self.adb.screens = ["", "ERROR: null root node", INCALL_SCREEN]
+        self.assertEqual(self.phone().set_speaker(KEY, True).status, "SPEAKER_ON")
+
+        self.adb.screens = [""]
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("UNREADABLE", False))
+        reads = [a for a in self.adb.calls if "exec-out" in a]
+        self.assertEqual(len(reads), 3 + 3)  # three tries each time, no more
+        self.assertEqual(len(self.adb.taps()), 1)
+
+    def test_no_button(self):
+        self.adb.screens = [INCALL_SCREEN.replace('text="Speaker"', 'text="Audio"')]
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("NO_BUTTON", False))
+        self.assertEqual(self.adb.taps(), [])
+
+    def test_verification_is_bounded_at_8s(self):
+        self.adb.tap_routes = None
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("ROUTE_FAILED", False))
+        self.assertLessEqual(self.now[0], 8.5)
+        self.assertEqual(len(self.adb.taps()), 1)
+
+    def test_no_phone(self):
+        self.adb.devices = "List of devices attached\n"
+        self.adb.mdns = ""
+        self.assertEqual(self.phone().set_speaker(KEY, True), SpeakerResult("NO_PHONE", False))
+
+    def test_speaker_needs_no_helper(self):
+        self.adb.remote_hash = "0" * 64
+        self.phone().set_speaker(KEY, True)
+        self.assertFalse(any("push" in a for a in self.adb.calls))
+        self.assertFalse(any("CallAudio" in c for c in self.adb.shell_cmds()))
+
+    def test_screen_and_audio_reads_are_injectable(self):
+        phone = self.phone()
+        phone._read_screen = lambda: INCALL_SCREEN
+        phone._read_audio = mock.Mock(side_effect=[audio_dump("earpiece"), audio_dump("speaker")])
+        self.adb.tap_routes = None
+        self.assertEqual(phone.set_speaker(KEY, True), SpeakerResult("SPEAKER_ON", True))
+        self.assertFalse(any("exec-out" in a for a in self.adb.calls))
+
+    def test_call_topology_reads_telecom(self):
+        self.assertEqual(self.phone().call_topology(), CallTopology((CallLeg(KEY, "active"),)))
+        self.adb.devices = "List of devices attached\n"
+        self.adb.mdns = ""
+        self.assertIsNone(self.phone().call_topology())

@@ -20,6 +20,7 @@ so `javac` compiles and are left out of the dex.
 | `check` | `INTERCEPTABLE=`, `AUDIO_MODE=`, `TELEPHONY_TX=` | Can call audio be intercepted, and is the Telephony Tx output visible |
 | `dial <digits>` | `DIALED` or `ERROR ...` (exit 1) | `ITelecomService.placeCall` |
 | `hangup` | `ENDED=true\|false` or `ERROR ...` | `ITelecomService.endCall` |
+| `accept <TC@key>` | `ACCEPT_REQUESTED`, or one of `REFUSED_STALE`, `REFUSED_BUSY`, `REFUSED_NO_RING`, `REFUSED_UNREADABLE`, `REFUSED_BAD_KEY`, `ACCEPT_UNSUPPORTED`, `ACCEPT_FAILED <ExceptionKind>` | Answers an incoming call: re-reads `dumpsys telecom`'s live `mCalls` rows, refuses unless `<TC@key>` is the **sole** row and `RINGING`, then one `ITelecomService.acceptRingingCall("com.android.shell")` and `System.exit`. It does not wait for ACTIVE and touches no audio route: the laptop (`AdbPhone.answer_incoming`) reads the same key back ACTIVE and switches the speaker by tapping the dialer's own Speaker button. Fixed markers only, never a dump, name or number |
 | `ring <seconds>` | `RINGING` or `ERROR ...` | Find my phone: 880/660 Hz beeps on the alarm stream at max volume, previous alarm volume restored in a `finally` (stderr: `alarm volume A -> max -> restored A`) |
 | `bridge <port> 16000 24000 [mutemic]` | `LISTENING <port>` | One TCP client on 127.0.0.1:port (reach it with `adb forward`): the other side of the call goes out as 16 kHz mono PCM16, 24 kHz mono PCM16 coming in is upsampled to 48 kHz stereo and injected into the call. `mutemic` mutes the phone's own mic for the call and restores it after |
 
@@ -51,3 +52,21 @@ it, so a swapped file is never executed.
   stereo.
 - **Android 16's AudioTrack.Builder needs a Context** (it reads the attribution
   tag), hence `setContext(new FakeContext())` in `ring`.
+
+## Answering, and why the speaker is not here (measured 2026-10-14)
+
+- **`acceptRingingCall(String)` from the shell answers the ring**, and telecom's
+  call id (`TC@<n>`) stays the same from RINGING through a brief ANSWERED to
+  ACTIVE. It answers *whatever* rings, so `accept` re-checks the sole RINGING
+  row immediately before the call; the gap is one binder call wide and cannot
+  be closed from the shell.
+- **`app_process` lingers on binder threads after `main` returns**, so every
+  mode that touches a system service ends in `System.exit`.
+- **No AudioManager setter moves a cellular call to the speaker from the
+  shell**: `setCommunicationDevice` returned true and `setSpeakerphoneOn`
+  returned, and the route stayed `earpiece` both times. The default dialer owns
+  call audio, so the laptop taps Google Phone's own Speaker button instead.
+  Evidence: `docs/superpowers/probes/2026-10-14-native-incoming-answer.md`.
+- **A rebuilt dex has a new sha256**, so the next helper command re-pushes it
+  (`AdbPhone._push_helper`, called from `ready()`): that is a write to the
+  phone and comes with the next approved live test, never with unit tests.
