@@ -1072,6 +1072,21 @@ class NativeAnswerTests(_NativeBase):
         self.assertEqual(svc._active["state"], "connected")
         self.assertNothingElseTouched(svc)
 
+    def test_answered_flags_follow_the_transport(self):
+        cases = (
+            (AnswerResult("ANSWERED_SPEAKER", _KEY, accepted=True, speaker_verified=True), True, True),
+            (AnswerResult("ANSWERED_ROUTE_FAILED", _KEY, accepted=True), True, False),
+            (AnswerResult("NOT_ANSWERED", _KEY), False, False),
+            (AnswerResult("ANSWER_UNCERTAIN", _KEY), False, False),
+        )
+        for answer, answered, verified in cases:
+            with self.subTest(status=answer.status):
+                self.control = FakeControl(topology=_topology((_KEY, "ringing")), answer=answer)
+                svc = self._native()
+                result = self._answered(svc)
+                self.assertIs(result.answered, answered)
+                self.assertIs(result.speaker_verified, verified)
+
     def test_outgoing_cannot_overlap_reservation(self):
         svc = self._native()
         target = svc.bind_incoming(_OFFER)

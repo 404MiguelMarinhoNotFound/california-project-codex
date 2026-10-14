@@ -121,13 +121,16 @@ def _syncer(status="SYNCED", message=_SYNCED_LINE, **counts):
 _RING = RingOffer(7, IncomingCall("incoming", "+351910000001", "Example Caller", 0.0))
 _TARGET = IncomingTarget(_RING, "TC@5")
 _NATIVE_OFF = "I can't answer calls for you yet; that's switched off."
+_FULL = PhoneCommandResult(True, "Answered on your phone's speakerphone.", answered=True, speaker_verified=True)
+_PARTIAL = PhoneCommandResult(True, "The call is answered, but I couldn't switch it to speakerphone. "
+                                    "Use the phone's speaker button.", answered=True)
 
 
 def _native_svc(enabled=True, calls_enabled=False):
     service = mock.Mock()
     service.enabled = calls_enabled                 # the Gemini gate
     service.native_answer_enabled = enabled
-    service.answer_speaker.return_value = PhoneCommandResult(True, "Answered on your phone's speakerphone.")
+    service.answer_speaker.return_value = _FULL
     service.set_speaker.return_value = PhoneCommandResult(True, "Speaker's on.")
     return service
 
@@ -208,8 +211,7 @@ class NativeAnswerDispatchTests(unittest.TestCase):
     def test_playback_stops_before_native_accept(self):
         order = []
         service = _native_svc()
-        service.answer_speaker.side_effect = lambda target: (
-            order.append("answer"), PhoneCommandResult(True, "Answered on your phone's speakerphone."))[1]
+        service.answer_speaker.side_effect = lambda target: (order.append("answer"), _FULL)[1]
         orch = Orchestrator.__new__(Orchestrator)
         orch.audio = mock.Mock()
         orch.audio.stop_playback.side_effect = lambda: order.append("stop")
@@ -220,15 +222,69 @@ class NativeAnswerDispatchTests(unittest.TestCase):
         self.assertEqual(line, "Answered on your phone's speakerphone.")
         self.assertEqual(order, ["stop", "answer"])
         service.answer_speaker.assert_called_once_with(_TARGET)
+        # Answered and on speaker: she stays stopped, so no line reaches the call.
+        orch.audio.reset_playback.assert_not_called()
+
+    def _answer_through_orchestrator(self, result):
+        order = []
+        service = _native_svc()
+        service.answer_speaker.side_effect = lambda target: (order.append("answer"), result)[1]
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.audio = mock.Mock()
+        orch.audio.stop_playback.side_effect = lambda: order.append("stop")
+        orch.audio.reset_playback.side_effect = lambda: order.append("reset")
+        orch.phone_service = service
+        orch.contact_sync = None
+        orch._incoming_target = _TARGET
+        token = _TOOL_OUTCOME.set(None)
+        try:
+            line = orch._handle_tool_call("control_phone", {"action": "phone_answer_speaker"})
+        finally:
+            _TOOL_OUTCOME.reset(token)
+        return line, order
+
+    def test_full_success_stays_silent(self):
+        line, order = self._answer_through_orchestrator(_FULL)
+        self.assertEqual(line, "Answered on your phone's speakerphone.")
+        self.assertEqual(order, ["stop", "answer"])
+
+    def test_partial_answer_is_rearmed_and_spoken(self):
+        line, order = self._answer_through_orchestrator(_PARTIAL)
+        self.assertEqual(line, _PARTIAL.message)
+        self.assertEqual(order, ["stop", "answer", "reset"])
+
+    def test_not_answered_outcomes_are_rearmed_and_spoken(self):
+        for message in (
+            "Your phone didn't take the answer. Answer it on the phone.",                 # NOT_ANSWERED
+            "I couldn't read your phone's calls just now, so I didn't answer it. Answer it on the phone.",
+            "That call stopped ringing. I haven't answered the new one.",                # stale
+            "I couldn't confirm whether the call answered. Check your phone.",           # uncertain
+        ):
+            with self.subTest(message=message):
+                line, order = self._answer_through_orchestrator(PhoneCommandResult(False, message))
+                self.assertEqual(line, message)
+                self.assertEqual(order, ["stop", "answer", "reset"])
+
+    def test_moods_full_happy_partial_and_failures_sheepish(self):
+        for result, expected in ((_FULL, True), (_PARTIAL, False),
+                                 (PhoneCommandResult(False, "Your phone isn't ringing now."), False)):
+            with self.subTest(result=result):
+                service = _native_svc()
+                service.answer_speaker.return_value = result
+                _, mood = _with_mood(lambda: _dispatch_phone(
+                    {"action": "phone_answer_speaker"}, service, None, incoming_target=_TARGET))
+                self.assertIs(mood, expected)
 
     def test_no_stop_when_there_is_nothing_to_accept(self):
         # Nothing was bound at the start of the turn: no acceptance can happen,
         # so she stays free to say why.
         service = _native_svc()
         service.answer_speaker.return_value = PhoneCommandResult(False, "Your phone isn't ringing now.")
-        stop = mock.Mock()
-        _dispatch_phone({"action": "phone_answer_speaker"}, service, None, stop_playback=stop)
+        stop, reset = mock.Mock(), mock.Mock()
+        _dispatch_phone({"action": "phone_answer_speaker"}, service, None, stop_playback=stop,
+                        reset_playback=reset)
         stop.assert_not_called()
+        reset.assert_not_called()   # nothing was stopped, so nothing to re-arm
         # And phone_speaker never stops her: it answers nothing.
         _dispatch_phone({"action": "phone_speaker", "on": True}, service, None,
                         incoming_target=_TARGET, stop_playback=stop)

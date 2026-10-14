@@ -1765,7 +1765,7 @@ _NATIVE_ANSWER_OFF = "I can't answer calls for you yet; that's switched off."
 _SPEAKER_WHICH = "Say whether you want the speaker on or off."
 
 
-def _dispatch_native(params: dict, phone_svc, incoming_target, stop_playback) -> str:
+def _dispatch_native(params: dict, phone_svc, incoming_target, stop_playback, reset_playback=None) -> str:
     """
     phone_answer_speaker / phone_speaker: the phone answers its own ring and
     uses its own speaker. No Gemini, so this sits before the calls gate.
@@ -1787,18 +1787,33 @@ def _dispatch_native(params: dict, phone_svc, incoming_target, stop_playback) ->
     # Her own voice must not be the first thing the caller hears on the
     # speaker. Only when an acceptance can actually happen: with no target
     # nothing is answered, and she stays free to say why.
+    stopped = False
     if incoming_target is not None and stop_playback is not None:
         try:
             stop_playback()
+            stopped = True
         except Exception:
             logger.exception("Stopping playback before answering failed")
     result = phone_svc.answer_speaker(incoming_target)
-    _report_typed(result, PhoneCommandResult)
+    # Full success is answered AND on speaker: the room line would go straight
+    # into his call, so she stays quiet. Anything less (a partial answer, not
+    # answered at all) is re-armed and spoken. Mood: only full success is happy.
+    full = (
+        isinstance(result, PhoneCommandResult)
+        and result.answered is True and result.speaker_verified is True
+    )
+    if isinstance(result, PhoneCommandResult):
+        _report(full)
+    if stopped and not full and reset_playback is not None:
+        try:
+            reset_playback()
+        except Exception:
+            logger.exception("Re-arming playback after answering failed")
     return result.message
 
 
 def _dispatch_phone(params: dict, phone_svc, contact_sync=None, incoming_target=None,
-                    stop_playback=None) -> str:
+                    stop_playback=None, reset_playback=None) -> str:
     """
     control_phone -> PhoneService. Module-level with the service injected, like
     the other dispatchers, so tests drive it with a bare Mock.
@@ -1810,14 +1825,15 @@ def _dispatch_phone(params: dict, phone_svc, contact_sync=None, incoming_target=
     phone_sync_contacts comes before the enabled gate: it needs adb, not the
     call backend's credentials, so "phone calls aren't set up" is no answer.
     phone_answer_speaker and phone_speaker do too, gated on
-    `native_answer_enabled` instead. `incoming_target` and `stop_playback` are
-    supplied by the orchestrator out of band, never by the model.
+    `native_answer_enabled` instead. `incoming_target`, `stop_playback` and
+    `reset_playback` are supplied by the orchestrator out of band, never by
+    the model.
     """
     action = params.get("action")
     if action == "phone_sync_contacts":
         return _sync_contacts(contact_sync)
     if action in ("phone_answer_speaker", "phone_speaker"):
-        return _dispatch_native(params, phone_svc, incoming_target, stop_playback)
+        return _dispatch_native(params, phone_svc, incoming_target, stop_playback, reset_playback)
     if not phone_svc or not getattr(phone_svc, "enabled", False):
         return "Phone calls aren't set up right now."
     if action == "phone_status":
@@ -3120,6 +3136,7 @@ class Orchestrator:
                 tool_input, getattr(self, "phone_service", None), getattr(self, "contact_sync", None),
                 incoming_target=self._incoming_target,
                 stop_playback=self.audio.stop_playback if getattr(self, "audio", None) is not None else None,
+                reset_playback=self.audio.reset_playback if getattr(self, "audio", None) is not None else None,
             )
         return "unknown tool"
 

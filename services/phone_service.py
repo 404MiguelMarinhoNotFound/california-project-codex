@@ -152,6 +152,11 @@ class PhoneCommandResult:
     message: str = ""
     # A read-back or "which one?": nothing dialled, waiting for his answer.
     awaiting: bool = False
+    # Answering on speakerphone only: the phone accepted the ring (the same
+    # call read back ACTIVE), and separately whether its speaker route was read
+    # back. A partial answer is answered=True, speaker_verified=False.
+    answered: bool = False
+    speaker_verified: bool = False
 
     def __bool__(self) -> bool:
         return self.success
@@ -922,10 +927,13 @@ class PhoneService:
                 "ring_id": target.offer.ring_id, "call_key": target.call_key, "token": token,
             }
 
+        accepted = verified = False
         try:
             with self._control_lock:
                 result = self._get_control_phone().answer_incoming(target.call_key, speaker=True)
             status = str(result.status)
+            accepted = getattr(result, "accepted", False) is True
+            verified = accepted and getattr(result, "speaker_verified", False) is True
         except Exception:
             logger.exception("Answering the phone failed")
             status = "ANSWER_UNCERTAIN"
@@ -952,7 +960,8 @@ class PhoneService:
 
         if status in ("NO_RING", "STALE_RING"):
             return self._ring_gone(target, status)
-        return PhoneCommandResult(status in _ANSWERED, _ANSWER_LINES[status])
+        return PhoneCommandResult(status in _ANSWERED, _ANSWER_LINES[status],
+                                  answered=accepted, speaker_verified=verified)
 
     def _ring_gone(self, target: IncomingTarget, status: str) -> PhoneCommandResult:
         """NO_RING / STALE_RING, unless the same call is now up: he answered it by hand."""

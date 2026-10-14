@@ -2713,8 +2713,11 @@ afterwards: it is his call, not hers. Plan:
   here ever hangs up. An answered call is watched read-only every ~2 s
   (`PhoneService._monitor_native`) and blocks her own dialling and ringing until telecom
   says it ended; an unreadable or unknown state keeps it blocked. Her playback is stopped
-  just before an acceptance can happen, so the caller's first sound is not her voice;
-  that also silences the rest of that reply.
+  just before an acceptance can happen, so the caller's first sound is not her voice. It
+  stays stopped only on full success (`PhoneCommandResult.answered` and
+  `speaker_verified`), where anything she said would go straight into his speakerphone
+  call; a partial answer and every not-answered outcome re-arm it (`reset_playback`) so
+  the line is spoken. Only full success counts as "worked" for the halo's mood.
 - **Flag.** `phone.incoming.answer_speaker_enabled` (needs `phone.incoming.enabled` for
   the ring) ships **false** until the live test passes. Off, both actions say "I can't
   answer calls for you yet; that's switched off." Both sit before the Gemini gate, like
@@ -3907,7 +3910,8 @@ Current automated coverage exists for:
   episode during the bind not kept, the binding cleared at turn end and taken afresh
   in a chained turn; the model's own ids ignored and no ring acquired during dispatch,
   so an old turn cannot answer a new ring; playback stopped before the acceptance and
-  not when nothing can be accepted; `phone_speaker` needing a real boolean and never
+  not when nothing can be accepted, kept stopped only on full success and re-armed for a
+  partial or failed answer; `answered`/`speaker_verified` following the transport; `phone_speaker` needing a real boolean and never
   answering; no agent, dial, log line or call report for a native call; satellite
   labels that never name the caller; one `on` boolean and no caller field in the schema
 - `control_lights` dispatch strings and failure fallbacks
