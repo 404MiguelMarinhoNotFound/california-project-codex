@@ -24,6 +24,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from services.phone_digest import caller_phrase
+
 logger = logging.getLogger(__name__)
 
 INCOMING = 5
@@ -90,6 +92,24 @@ class IncomingCall:
     number: str  # "" when the phone gave none
     name: str  # from the contact book, "" when unknown
     started: float  # the watcher's clock when the ring was first read
+
+
+def incoming_line(call: IncomingCall) -> str:
+    """
+    What she says when the phone rings: "Mama is calling.", "A number ending
+    4567 is calling.", "A private number is calling.", with "on the other
+    line" for a call waiting. Never the full number. A phone that gave no
+    number and no name gets "Someone's calling you."
+    """
+    if not (call.number or "").strip() and not (call.name or "").strip():
+        if call.kind == "waiting":
+            return "Someone is calling on the other line."
+        return "Someone's calling you."
+    who = caller_phrase(call.name, call.number)
+    who = who[:1].upper() + who[1:]
+    if call.kind == "waiting":
+        return f"{who} is calling on the other line."
+    return f"{who} is calling."
 
 
 class IncomingCallWatcher:

@@ -722,6 +722,26 @@ class WhatsAppService:
         self._load_contacts()
         return len(self.contacts)
 
+    def name_for_number(self, number: str) -> str:
+        """
+        The saved name of the contact owning `number`, for saying who is calling.
+
+        Both sides go through normalize_phone, so "912000111" in the book and
+        "+351912000111" from the phone meet. Aliases play no part: a nickname is
+        how he asks for someone, the saved name is who they are. "" when nobody
+        has the number, or when two differently named contacts share it.
+        """
+        wanted = normalize_phone(number or "", self.default_country)
+        if not wanted:
+            return ""
+        names = {
+            c.name.strip()
+            for c in self.contacts
+            if c.name.strip()
+            and any(normalize_phone(p, self.default_country) == wanted for p in c.phones)
+        }
+        return names.pop() if len(names) == 1 else ""
+
     def resolve_contact(self, hint: str) -> ContactMatch:
         """
         Turn a spoken name or number into someone to message.

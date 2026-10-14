@@ -10,7 +10,7 @@ import time
 import unittest
 
 from services.incoming_call import (INCOMING, RING_LOOP, WAITING, IncomingCall, IncomingCallWatcher,
-                                    RingState, parse_ring_state)
+                                    RingState, incoming_line, parse_ring_state)
 
 
 def _block(ringing: int, number: str = "", foreground: int = 0) -> str:
@@ -369,3 +369,33 @@ class WatcherTests(unittest.TestCase):
         self.assertTrue(watcher.thread.daemon)
         self.assertEqual(watcher.thread.name, "incoming-call")
         self.assertTrue(proc.killed)
+
+
+def _call(number: str = "", name: str = "", kind: str = "incoming") -> IncomingCall:
+    return IncomingCall(kind=kind, number=number, name=name, started=0.0)
+
+
+class IncomingLineTests(unittest.TestCase):
+    """The spoken "who is calling" line. Names and numbers are invented."""
+
+    def test_named_caller(self):
+        self.assertEqual(incoming_line(_call("+351910004567", "Mama")), "Mama is calling.")
+        self.assertEqual(incoming_line(_call("", "Mama")), "Mama is calling.")
+
+    def test_unknown_and_private_callers(self):
+        line = incoming_line(_call("+351910004567"))
+        self.assertEqual(line, "A number ending 4567 is calling.")
+        self.assertNotIn("910004567", line)
+        for withheld in ("-2", "-1", "-3", "NULL"):
+            self.assertEqual(incoming_line(_call(withheld)), "A private number is calling.")
+
+    def test_waiting_line(self):
+        self.assertEqual(incoming_line(_call("+351910004567", "Mama", "waiting")),
+                         "Mama is calling on the other line.")
+        self.assertEqual(incoming_line(_call("+351910004567", kind="waiting")),
+                         "A number ending 4567 is calling on the other line.")
+
+    def test_no_number_at_all_says_someone(self):
+        self.assertEqual(incoming_line(_call("")), "Someone's calling you.")
+        self.assertEqual(incoming_line(_call("", kind="waiting")),
+                         "Someone is calling on the other line.")

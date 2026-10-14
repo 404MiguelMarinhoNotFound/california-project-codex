@@ -872,6 +872,42 @@ class SnapshotBookTests(unittest.TestCase):
         self.assertIn(path + ".tmp", ignored)
 
 
+class NameForNumberTests(unittest.TestCase):
+    """Who owns a number, for the incoming-call announcement. Aliases play no part."""
+
+    def test_name_for_number_matches_normalised_numbers(self):
+        service = _service(aliases={"the boss": "Joaquim Reis"})
+        # The book holds "912000111" (no country code); the phone gives +351.
+        self.assertEqual(service.name_for_number("+351912000111"), "Ana Silva")
+        self.assertEqual(service.name_for_number("00351 933 852 719"), "Marta Zuka")
+        # A second number on the card counts too.
+        self.assertEqual(service.name_for_number("213000111"), "Joaquim Reis")
+        self.assertEqual(service.name_for_number("+351919999999"), "")
+        for nothing in ("", "-2", "111", "NULL"):
+            self.assertEqual(service.name_for_number(nothing), "")
+
+    def test_name_for_number_is_empty_when_two_contacts_share_it(self):
+        shared = VCF + """BEGIN:VCARD
+VERSION:2.1
+FN:Ana Silva Work
+TEL;CELL:+351912000111
+END:VCARD
+"""
+        service = _service(_book(shared))
+        self.assertEqual(service.name_for_number("+351912000111"), "")
+        self.assertEqual(service.name_for_number("+351912000222"), "Ana Costa")
+
+    def test_the_same_person_listed_twice_is_still_named(self):
+        dup = VCF + """BEGIN:VCARD
+VERSION:2.1
+FN:Ana Costa
+TEL;CELL:+351912000222
+END:VCARD
+"""
+        service = _service(_book(dup))
+        self.assertEqual(service.name_for_number("912000222"), "Ana Costa")
+
+
 class ShippedConfigTests(unittest.TestCase):
     def test_the_shipped_config_has_a_whatsapp_block(self):
         cfg = config_for_tests()["whatsapp"]
