@@ -2680,7 +2680,58 @@ private number is calling." Plan:
 - **Open items.** The live UI publishes an `incoming_call` bus event (`kind`, plus a
   `label` only with transcripts on) that the page has no handler for yet, and the
   `announce` clip renders as an ordinary clip on the halo. No quiet hours: every call is
-  announced at any hour. Answering ("answer it") is a separate later plan.
+  announced at any hour. Answering ("answer it") is the next subsection.
+
+**Answering on speakerphone: `phone_answer_speaker` and `phone_speaker` (2026-10-14).**
+"Answer it on speaker" answers the ringing phone itself and puts the call on the PHONE's
+speaker and microphone; "speaker off" / "put it on speaker" switches a call already
+connected, one she answered or one he picked up by hand. No Gemini, no bridge, no
+recording, no transcript, no phone-mic mute, no Windows audio change, and no call report
+afterwards: it is his call, not hers. Plan:
+`docs/superpowers/plans/2026-10-14-native-incoming-speakerphone.md`; evidence:
+`docs/superpowers/probes/2026-10-14-native-incoming-answer.md`.
+
+- **Mechanism.** Acceptance is the hash-checked `callaudio` helper's one
+  `acceptRingingCall` (`AdbPhone.answer_incoming`). The speaker is one tap on Google
+  Phone's own Speaker button (`AdbPhone.set_speaker`): `uiautomator dump`, the nearest
+  clickable ancestor of the "Speaker"/"Altifalante"/"Alta-voz" label, the centre of its
+  bounds computed on every read, tapped only when its `checked` disagrees. **The two
+  AudioManager setters are UNSUPPORTED from the shell**: `setCommunicationDevice`
+  returned true and `setSpeakerphoneOn` returned quietly, and in both live tests the
+  route stayed `earpiece`. The default dialer owns call audio, so asking it (its button)
+  is what works: earpiece -> speaker in ~1 s, still speaker at +5 s, two-way audio.
+- **Guards.** The ring is bound once at the start of the turn
+  (`Orchestrator._capture_incoming_target`: the watcher's episode, then telecom's key,
+  then the watcher again; telecom is only read when something rings) and passed to the
+  dispatcher out of band. The model has no caller or call-id field, and a tool call
+  never looks for a ring of its own, so a turn that began before a new ring cannot
+  answer it; the binding ends with the turn. Then: the sole call on the phone, RINGING,
+  under that key (call waiting, a held or outgoing call, or an unknown state refuses);
+  the same key ACTIVE afterwards before the speaker is touched; telecom re-read right
+  before the tap; one tap, never a retry (a second tap toggles it back); success only
+  when `dumpsys audio` reads the speaker (earpiece for off) with the mic unmuted. Nothing
+  here ever hangs up. An answered call is watched read-only every ~2 s
+  (`PhoneService._monitor_native`) and blocks her own dialling and ringing until telecom
+  says it ended; an unreadable or unknown state keeps it blocked. Her playback is stopped
+  just before an acceptance can happen, so the caller's first sound is not her voice;
+  that also silences the rest of that reply.
+- **Flag.** `phone.incoming.answer_speaker_enabled` (needs `phone.incoming.enabled` for
+  the ring) ships **false** until the live test passes. Off, both actions say "I can't
+  answer calls for you yet; that's switched off." Both sit before the Gemini gate, like
+  `phone_sync_contacts`: they need adb, not credentials.
+- **Spoken lines** (from `services/phone_service.py`): "Answered on your phone's
+  speakerphone."; answered but not on speaker: "The call is answered, but I couldn't
+  switch it to speakerphone. Use the phone's speaker button."; "Your phone isn't ringing
+  now."; "That call stopped ringing. I haven't answered the new one."; call waiting:
+  "There's already another call on your phone. Answer this one on the phone.";
+  "Looks like it's already been answered."; "I couldn't confirm whether the call
+  answered. Check your phone."; for the speaker: "Speaker's on." / "Speaker's off.",
+  "It's already on speaker.", "Your phone is still ringing. Answer it first.",
+  "There's no call on your phone right now.", and "I couldn't switch the speaker. Use
+  the phone's speaker button." A `phone_speaker` without `on` asks which.
+- **Not yet verified live:** helper acceptance followed directly by the tap (each half
+  passed on its own), a connected Bluetooth headset (the button may become a route
+  menu), a non-English dialer locale, and the full voice path through the room.
 
 **Not built yet, on purpose:** asking Miguel mid-call (`ask_miguel`; he may not be in the
 room, so it needs WhatsApp). More of the phone over ADB (SMS, calendar, battery...) is
@@ -3036,7 +3087,7 @@ The Claude path supports:
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 - Custom `control_whatsapp` tool for WhatsApp messaging (4 actions)
-- Custom `control_phone` tool for phone calls from his own number, finding his phone, refreshing his contacts and saying what he missed on it (7 actions)
+- Custom `control_phone` tool for phone calls from his own number, finding his phone, refreshing his contacts, saying what he missed on it and answering it on speakerphone (9 actions)
 
 With the committed `config.yaml` that is **6 tools** in every request: `web_search`,
 `control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`, `control_phone`. Each custom tool's full schema is sent on
@@ -3097,7 +3148,7 @@ Bulk send and image send exist in the CLI it was ported from and were left out: 
 spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
 capability with no voice phrasing.
 
-`control_phone` supports seven actions:
+`control_phone` supports nine actions:
 
 - `phone_call` with a brief: `to`, optional `number`, `kind` (`book_table`, `book_appointment`,
   `ask_question`, `deliver_message`, `personal`, `general`), `goal`, `details`, `may_agree`,
@@ -3112,6 +3163,10 @@ capability with no voice phrasing.
 - `phone_missed`: missed calls in the last 24 h from the phone's call log, read-only
 - `phone_digest`: missed calls, then apps and who wrote, no text; optional `app` reads that
   app's waiting texts, quoted as the sender's words (see "What did I miss")
+- `phone_answer_speaker`: answers the ring bound at the start of the turn on the phone's own
+  speakerphone; no read-back, no caller field (see "Answering on speakerphone")
+- `phone_speaker`: `on` true/false for a call already connected; never answers. Both are
+  handled before the calls gate, behind `phone.incoming.answer_speaker_enabled`
 
 When tools are active:
 
@@ -3844,6 +3899,17 @@ Current automated coverage exists for:
   LLM turn, a TTS or playback failure not ending the idle loop, no bus label without
   transcripts; the watcher built with its own phone and no adb, and the shipped config
   enabling it
+- Answering on speakerphone (`tests/test_orchestrator_phone.py`,
+  `tests/test_orchestrator_incoming.py`, `tests/test_llm_prompt.py`, plus the native
+  cases in `tests/test_phone_service.py` and `tests/test_phone_adb.py`): both actions
+  before the calls gate and a fixed line when switched off; the ring bound once after
+  the transcript and before the LLM, telecom not read with nothing ringing, a new
+  episode during the bind not kept, the binding cleared at turn end and taken afresh
+  in a chained turn; the model's own ids ignored and no ring acquired during dispatch,
+  so an old turn cannot answer a new ring; playback stopped before the acceptance and
+  not when nothing can be accepted; `phone_speaker` needing a real boolean and never
+  answering; no agent, dial, log line or call report for a native call; satellite
+  labels that never name the caller; one `on` boolean and no caller field in the schema
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection

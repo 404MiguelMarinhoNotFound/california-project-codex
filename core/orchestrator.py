@@ -44,7 +44,7 @@ from services.incoming_call import IncomingCallWatcher, incoming_line
 from services.phone_adb import AdbPhone
 from services.phone_digest import caller_phrase
 from services.phone_prompts import CallBrief
-from services.phone_service import PhoneService, call_log_line, short_duration
+from services.phone_service import PhoneCommandResult, PhoneService, call_log_line, short_duration
 from services.surfshark_service import SurfsharkService
 from services.tv_volume import TvVolume, VolumeResult
 from services.youtube_playlist_resolver import resolve_playlist_choice
@@ -178,6 +178,13 @@ def _tool_target(tool_name, tool_input) -> str | None:
                 return "your phone"
             if action == "phone_digest":
                 return text("app") or "your phone"
+            # Never the caller: the name and number are the phone's, not his.
+            if action == "phone_answer_speaker":
+                return "answer on speaker"
+            if action == "phone_speaker":
+                if p.get("on") is True:
+                    return "speaker on"
+                return "speaker off" if p.get("on") is False else None
             if action == "phone_call":
                 return who() or ("a number" if text("number") else None)
             return None
@@ -1754,7 +1761,44 @@ def _sync_contacts(contact_sync) -> str:
     return result.message
 
 
-def _dispatch_phone(params: dict, phone_svc, contact_sync=None) -> str:
+_NATIVE_ANSWER_OFF = "I can't answer calls for you yet; that's switched off."
+_SPEAKER_WHICH = "Say whether you want the speaker on or off."
+
+
+def _dispatch_native(params: dict, phone_svc, incoming_target, stop_playback) -> str:
+    """
+    phone_answer_speaker / phone_speaker: the phone answers its own ring and
+    uses its own speaker. No Gemini, so this sits before the calls gate.
+
+    The ring answered is `incoming_target`, bound at the start of the turn by
+    the orchestrator -- never anything in `params`, and never looked up here:
+    a turn that started with nothing ringing cannot answer a ring that began
+    while it was thinking. The caller's name stays display data.
+    """
+    if phone_svc is None or getattr(phone_svc, "native_answer_enabled", False) is not True:
+        return _NATIVE_ANSWER_OFF
+    if params.get("action") == "phone_speaker":
+        on = params.get("on")
+        if on is not True and on is not False:
+            return _SPEAKER_WHICH  # a question back, not a failure
+        result = phone_svc.set_speaker(on)
+        _report_typed(result, PhoneCommandResult)
+        return result.message
+    # Her own voice must not be the first thing the caller hears on the
+    # speaker. Only when an acceptance can actually happen: with no target
+    # nothing is answered, and she stays free to say why.
+    if incoming_target is not None and stop_playback is not None:
+        try:
+            stop_playback()
+        except Exception:
+            logger.exception("Stopping playback before answering failed")
+    result = phone_svc.answer_speaker(incoming_target)
+    _report_typed(result, PhoneCommandResult)
+    return result.message
+
+
+def _dispatch_phone(params: dict, phone_svc, contact_sync=None, incoming_target=None,
+                    stop_playback=None) -> str:
     """
     control_phone -> PhoneService. Module-level with the service injected, like
     the other dispatchers, so tests drive it with a bare Mock.
@@ -1765,10 +1809,15 @@ def _dispatch_phone(params: dict, phone_svc, contact_sync=None) -> str:
 
     phone_sync_contacts comes before the enabled gate: it needs adb, not the
     call backend's credentials, so "phone calls aren't set up" is no answer.
+    phone_answer_speaker and phone_speaker do too, gated on
+    `native_answer_enabled` instead. `incoming_target` and `stop_playback` are
+    supplied by the orchestrator out of band, never by the model.
     """
     action = params.get("action")
     if action == "phone_sync_contacts":
         return _sync_contacts(contact_sync)
+    if action in ("phone_answer_speaker", "phone_speaker"):
+        return _dispatch_native(params, phone_svc, incoming_target, stop_playback)
     if not phone_svc or not getattr(phone_svc, "enabled", False):
         return "Phone calls aren't set up right now."
     if action == "phone_status":
@@ -1897,6 +1946,9 @@ class Orchestrator:
     # Who is ringing the phone (see _build_incoming_calls). None means nothing
     # is watched, which is also what a __new__-built test orchestrator gets.
     incoming_calls = None
+    # The ring this turn may answer, bound at its start (_capture_incoming_target)
+    # and cleared when it ends. Trusted state: never filled from a tool call.
+    _incoming_target = None
     # Which activation the last published mood belonged to, and whether a
     # failure has been shown in it. See _publish_mood.
     _mood_seq = -1
@@ -1984,10 +2036,17 @@ class Orchestrator:
         # resolver only reads the VCF and aliases, never the browser). The call
         # agent hears the laptop speakers, which is also where she talks to the
         # room, so its ears are muted while a room turn holds the speaker.
+        #
+        # The incoming-call watcher is built first (its own AdbPhone, no adb
+        # yet) so PhoneService can check a ring's episode against it when
+        # answering on speakerphone; it is started further down.
+        self._include_text = (config.get("logging") or {}).get("include_transcripts", True) is not False
+        self.incoming_calls = self._build_incoming_calls(config)
         self.phone_service = PhoneService(
             config,
             resolve_contact=getattr(self.whatsapp_service, "resolve_contact", None),
             publish=self.bus.publish,
+            current_ring=self._current_ring if self.incoming_calls is not None else None,
         )
 
         # The phone's own contact book, re-read over adb weekly (and at boot
@@ -2080,10 +2139,9 @@ class Orchestrator:
             )
 
         # Who is calling: a read-only adb stream of the phone's ring state, on
-        # its own thread. Construction runs no adb; start() does, on that thread.
-        # The idle loop pops a ring and says who it is.
-        self._include_text = (config.get("logging") or {}).get("include_transcripts", True) is not False
-        self.incoming_calls = self._build_incoming_calls(config)
+        # its own thread (built above, before PhoneService). Construction ran no
+        # adb; start() does, on that thread. The idle loop pops a ring and says
+        # who it is.
         if self.incoming_calls is not None:
             self.incoming_calls.start(self._background_stop)
             logger.info("Incoming-call watcher started")
@@ -2420,6 +2478,7 @@ class Orchestrator:
         """
         self._turn = TurnTimer(self._turn_writer, chained=pre_roll is None, bus=self.bus)
         self._activation_seq += 1
+        self._incoming_target = None
         barged_in = False
         try:
             barged_in = self._run_activation(mic_stream, pre_roll)
@@ -2428,10 +2487,47 @@ class Orchestrator:
             self._turn.set(outcome="error")
             raise
         finally:
+            # A ring bound in this turn is never answerable from the next one.
+            self._incoming_target = None
             if barged_in:
                 self._turn.set(outcome="barged_in")
             self._mood_for_turn_end(self._turn.finish())
             self._turn = NULL_TURN
+
+    def _current_ring(self):
+        """The watcher's live RingOffer, or None. PhoneService's episode check."""
+        watcher = self.incoming_calls
+        return watcher.current() if watcher is not None else None
+
+    def _capture_incoming_target(self) -> None:
+        """
+        Bind the ring this turn may answer, once, before the LLM runs: the
+        watcher's episode, telecom's key for it, then the watcher again to make
+        sure the episode did not change under the read. Telecom is only read
+        when the watcher has a ring. Whatever is bound here is all
+        phone_answer_speaker can touch; a tool call never looks for another.
+        Never raises.
+        """
+        self._incoming_target = None
+        watcher = self.incoming_calls
+        phone = getattr(self, "phone_service", None)
+        if watcher is None or phone is None or getattr(phone, "native_answer_enabled", False) is not True:
+            return
+        try:
+            offer = watcher.current()
+            if offer is None:
+                return
+            target = phone.bind_incoming(offer)
+            if target is None:
+                return
+            now = watcher.current()
+            if now is None or now.ring_id != offer.ring_id:
+                logger.info("Incoming call: the ring changed while binding it; not answerable this turn")
+                return
+            self._incoming_target = target
+        except Exception:
+            logger.exception("Binding the ringing call failed")
+            self._incoming_target = None
 
     def _run_activation(self, mic_stream, pre_roll=None) -> bool:
         """
@@ -2523,6 +2619,9 @@ class Orchestrator:
         if self._handle_command(transcript):
             self._turn.set(outcome="command")
             return False
+
+        # The ring (if any) "answer it" may mean, bound now and only now.
+        self._capture_incoming_target()
 
         # --- STREAMING: LLM → Sentence Chunker → TTS ---
         self._set_state("thinking")
@@ -3015,8 +3114,12 @@ class Orchestrator:
         if tool_name == "control_whatsapp":
             return self._guard_whatsapp_send(tool_input)
         if tool_name == "control_phone":
+            # The ring is the one bound at the start of this turn, out of band:
+            # nothing the model passes can name a different call.
             return _dispatch_phone(
-                tool_input, getattr(self, "phone_service", None), getattr(self, "contact_sync", None)
+                tool_input, getattr(self, "phone_service", None), getattr(self, "contact_sync", None),
+                incoming_target=self._incoming_target,
+                stop_playback=self.audio.stop_playback if getattr(self, "audio", None) is not None else None,
             )
         return "unknown tool"
 

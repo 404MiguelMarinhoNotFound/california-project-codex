@@ -4,11 +4,15 @@ import unittest
 from types import SimpleNamespace as NS
 from unittest import mock
 
-from core.orchestrator import _TOOL_OUTCOME, Orchestrator, _dispatch_phone, _phone_report_message
+from core.orchestrator import _TOOL_OUTCOME, Orchestrator, _dispatch_phone, _phone_report_message, _tool_target
 from services.contact_sync import ContactSyncResult
 from services.gemini_live_call import CallLine, CallResult
 from services.phone_prompts import CallBrief
-from services.phone_service import CallReport, PhoneCommandResult, PhoneService
+from services.incoming_call import IncomingCall, RingOffer
+from services.phone_service import CallReport, IncomingTarget, PhoneCommandResult, PhoneService
+from tests.config_fixture import config_for_tests
+# Fakes only (none is a TestCase, so nothing from that module runs twice here).
+from tests.test_phone_service import FakeAgent, FakeControl, FakeDialer, _topology
 
 
 def _svc(result=None):
@@ -109,6 +113,164 @@ def _syncer(status="SYNCED", message=_SYNCED_LINE, **counts):
     sync = mock.Mock()
     sync.sync.return_value = ContactSyncResult(status, message=message, **counts)
     return sync
+
+
+# ------------------------------------------------- answering on speakerphone
+
+# Synthetic caller; the name is untrusted display data from the phone.
+_RING = RingOffer(7, IncomingCall("incoming", "+351910000001", "Example Caller", 0.0))
+_TARGET = IncomingTarget(_RING, "TC@5")
+_NATIVE_OFF = "I can't answer calls for you yet; that's switched off."
+
+
+def _native_svc(enabled=True, calls_enabled=False):
+    service = mock.Mock()
+    service.enabled = calls_enabled                 # the Gemini gate
+    service.native_answer_enabled = enabled
+    service.answer_speaker.return_value = PhoneCommandResult(True, "Answered on your phone's speakerphone.")
+    service.set_speaker.return_value = PhoneCommandResult(True, "Speaker's on.")
+    return service
+
+
+def _with_mood(fn):
+    token = _TOOL_OUTCOME.set(None)
+    try:
+        line = fn()
+        return line, _TOOL_OUTCOME.get()
+    finally:
+        _TOOL_OUTCOME.reset(token)
+
+
+class NativeAnswerDispatchTests(unittest.TestCase):
+    def test_answer_dispatch_before_calls_gate(self):
+        # Outgoing calls off (no Gemini credentials): answering still works.
+        service = _native_svc(calls_enabled=False)
+        line, mood = _with_mood(lambda: _dispatch_phone(
+            {"action": "phone_answer_speaker"}, service, None, incoming_target=_TARGET))
+        self.assertEqual(line, "Answered on your phone's speakerphone.")
+        service.answer_speaker.assert_called_once_with(_TARGET)
+        self.assertIs(mood, True)
+        line = _dispatch_phone({"action": "phone_speaker", "on": False}, service)
+        self.assertEqual(line, "Speaker's on.")
+        service.set_speaker.assert_called_once_with(False)
+        service.call.assert_not_called()
+
+    def test_native_switched_off_says_so_and_touches_nothing(self):
+        for service in (_native_svc(enabled=False, calls_enabled=True), None):
+            for params in ({"action": "phone_answer_speaker"}, {"action": "phone_speaker", "on": True}):
+                with self.subTest(service=service, params=params):
+                    line, mood = _with_mood(lambda: _dispatch_phone(
+                        params, service, None, incoming_target=_TARGET))
+                    self.assertEqual(line, _NATIVE_OFF)
+                    self.assertIsNone(mood)
+            if service is not None:
+                service.answer_speaker.assert_not_called()
+                service.set_speaker.assert_not_called()
+
+    def test_model_cannot_override_turn_target(self):
+        service = _native_svc()
+        params = {"action": "phone_answer_speaker", "ring_id": 99, "call_key": "TC@9",
+                  "to": "Someone Else", "number": "+351910000002", "target": "TC@9"}
+        _dispatch_phone(params, service, None, incoming_target=_TARGET)
+        service.answer_speaker.assert_called_once_with(_TARGET)
+        service.bind_incoming.assert_not_called()
+        # No target captured at the start of the turn: none is acquired now.
+        service = _native_svc()
+        _dispatch_phone(params, service, None)
+        service.answer_speaker.assert_called_once_with(None)
+        service.bind_incoming.assert_not_called()
+
+    def test_failed_answer_is_sheepish(self):
+        service = _native_svc()
+        service.answer_speaker.return_value = PhoneCommandResult(False, "Your phone isn't ringing now.")
+        line, mood = _with_mood(lambda: _dispatch_phone(
+            {"action": "phone_answer_speaker"}, service, None, incoming_target=_TARGET))
+        self.assertEqual(line, "Your phone isn't ringing now.")
+        self.assertIs(mood, False)
+
+    def test_speaker_needs_an_explicit_on_and_never_answers(self):
+        for value in (None, "true", 1):
+            with self.subTest(on=value):
+                service = _native_svc()
+                params = {"action": "phone_speaker"}
+                if value is not None:
+                    params["on"] = value
+                line, mood = _with_mood(lambda: _dispatch_phone(params, service, None, incoming_target=_TARGET))
+                self.assertEqual(line, "Say whether you want the speaker on or off.")
+                self.assertIsNone(mood)
+                service.set_speaker.assert_not_called()
+                service.answer_speaker.assert_not_called()
+        service = _native_svc()
+        _dispatch_phone({"action": "phone_speaker", "on": True}, service, None, incoming_target=_TARGET)
+        service.set_speaker.assert_called_once_with(True)
+        service.answer_speaker.assert_not_called()
+
+    def test_playback_stops_before_native_accept(self):
+        order = []
+        service = _native_svc()
+        service.answer_speaker.side_effect = lambda target: (
+            order.append("answer"), PhoneCommandResult(True, "Answered on your phone's speakerphone."))[1]
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.audio = mock.Mock()
+        orch.audio.stop_playback.side_effect = lambda: order.append("stop")
+        orch.phone_service = service
+        orch.contact_sync = None
+        orch._incoming_target = _TARGET
+        line = orch._handle_tool_call("control_phone", {"action": "phone_answer_speaker"})
+        self.assertEqual(line, "Answered on your phone's speakerphone.")
+        self.assertEqual(order, ["stop", "answer"])
+        service.answer_speaker.assert_called_once_with(_TARGET)
+
+    def test_no_stop_when_there_is_nothing_to_accept(self):
+        # Nothing was bound at the start of the turn: no acceptance can happen,
+        # so she stays free to say why.
+        service = _native_svc()
+        service.answer_speaker.return_value = PhoneCommandResult(False, "Your phone isn't ringing now.")
+        stop = mock.Mock()
+        _dispatch_phone({"action": "phone_answer_speaker"}, service, None, stop_playback=stop)
+        stop.assert_not_called()
+        # And phone_speaker never stops her: it answers nothing.
+        _dispatch_phone({"action": "phone_speaker", "on": True}, service, None,
+                        incoming_target=_TARGET, stop_playback=stop)
+        stop.assert_not_called()
+
+    def test_native_call_has_no_ai_report(self):
+        import os
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log_path = os.path.join(tmp.name, "calls.jsonl")
+        control = FakeControl(topology=_topology(("TC@5", "ringing")))
+        dialer, agents = FakeDialer(), []
+        svc = PhoneService(
+            # paths: never the real logs/calls.jsonl; the flag is what this test exercises
+            config_for_tests(phone={"enabled": True, "log_path": log_path,
+                                    "incoming": {"answer_speaker_enabled": True}}),
+            dialer=dialer, agent_factory=lambda: agents.append(1) or FakeAgent(),
+            control_phone=control, current_ring=lambda: _RING,
+        )
+        svc._native_poll_s = 3600
+        self.addCleanup(svc.close)
+        target = svc.bind_incoming(_RING)
+        self.assertIsNotNone(target)
+        control.topology = _topology(("TC@5", "active"))
+        line = _dispatch_phone({"action": "phone_answer_speaker"}, svc, None, incoming_target=target)
+        self.assertEqual(line, "Answered on your phone's speakerphone.")
+        self.assertIsNone(svc.pop_report())
+        self.assertEqual(agents, [])
+        self.assertEqual(dialer.dialed, [])
+        self.assertEqual(control.forbidden, [])
+        self.assertFalse(os.path.exists(log_path))
+
+    def test_satellite_labels_never_name_the_caller(self):
+        for params, label in (
+            ({"action": "phone_answer_speaker", "to": "Example Caller"}, "answer on speaker"),
+            ({"action": "phone_speaker", "on": True, "to": "+351910000001"}, "speaker on"),
+            ({"action": "phone_speaker", "on": False}, "speaker off"),
+        ):
+            with self.subTest(params=params):
+                self.assertEqual(_tool_target("control_phone", params), label)
 
 
 class ContactSyncDispatchTests(unittest.TestCase):

@@ -12,7 +12,8 @@ from unittest import mock
 import numpy as np
 
 from core.orchestrator import Orchestrator
-from services.incoming_call import IncomingCall
+from services.incoming_call import IncomingCall, RingOffer
+from services.phone_service import IncomingTarget, PhoneCommandResult
 from tests.config_fixture import config_for_tests
 
 
@@ -199,6 +200,144 @@ class BusTests(unittest.TestCase):
         self.assertEqual(calls[0].args[1], {"kind": "incoming"})
 
 
+class _Episodes:
+    """A watcher whose current() plays a script of offers (the last one repeats)."""
+
+    def __init__(self, *offers):
+        self.offers = list(offers)
+        self.reads = 0
+
+    def current(self):
+        self.reads += 1
+        if len(self.offers) > 1:
+            return self.offers.pop(0)
+        return self.offers[0] if self.offers else None
+
+
+def _target_orch(watcher, enabled=True):
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.audio = mock.Mock()
+    orch.incoming_calls = watcher
+    orch.contact_sync = None
+    orch.phone_service = mock.Mock()
+    orch.phone_service.native_answer_enabled = enabled
+    orch.phone_service.bind_incoming.side_effect = lambda offer: IncomingTarget(offer, "TC@5")
+    orch.phone_service.answer_speaker.return_value = PhoneCommandResult(False, "Your phone isn't ringing now.")
+    return orch
+
+
+_RING_7 = RingOffer(7, _call(name="Example Caller"))
+_RING_8 = RingOffer(8, _call(number="+351912000222", name="Another Caller"))
+
+
+class TurnTargetTests(unittest.TestCase):
+    def test_a_ring_at_turn_start_is_bound_once(self):
+        orch = _target_orch(_Episodes(_RING_7))
+        orch._capture_incoming_target()
+        self.assertEqual(orch._incoming_target, IncomingTarget(_RING_7, "TC@5"))
+        orch.phone_service.bind_incoming.assert_called_once_with(_RING_7)
+
+    def test_no_ring_reads_no_telecom(self):
+        # R4: telecom is only read when the watcher has a ring.
+        orch = _target_orch(_Episodes(None))
+        orch._capture_incoming_target()
+        self.assertIsNone(orch._incoming_target)
+        orch.phone_service.bind_incoming.assert_not_called()
+
+    def test_switched_off_reads_nothing(self):
+        watcher = _Episodes(_RING_7)
+        orch = _target_orch(watcher, enabled=False)
+        orch._capture_incoming_target()
+        self.assertIsNone(orch._incoming_target)
+        self.assertEqual(watcher.reads, 0)
+        orch.phone_service.bind_incoming.assert_not_called()
+
+    def test_a_new_episode_during_the_bind_is_not_kept(self):
+        orch = _target_orch(_Episodes(_RING_7, _RING_8))
+        orch._capture_incoming_target()
+        self.assertIsNone(orch._incoming_target)
+        orch = _target_orch(_Episodes(_RING_7, None))
+        orch._capture_incoming_target()
+        self.assertIsNone(orch._incoming_target)
+
+    def test_no_watcher_or_a_raising_one_binds_nothing(self):
+        orch = _target_orch(None)
+        orch._capture_incoming_target()
+        self.assertIsNone(orch._incoming_target)
+        watcher = mock.Mock()
+        watcher.current.side_effect = RuntimeError("stream died")
+        orch = _target_orch(watcher)
+        with self.assertLogs("core.orchestrator", "ERROR"):
+            orch._capture_incoming_target()
+        self.assertIsNone(orch._incoming_target)
+
+    def test_old_turn_cannot_answer_new_ring(self):
+        watcher = _Episodes(_RING_7)
+        orch = _target_orch(watcher)
+
+        def turn_one(mic, pre_roll):
+            orch._capture_incoming_target()
+            self.assertIsNotNone(orch._incoming_target)
+            return False
+
+        orch._run_activation = turn_one
+        orch._handle_activation(mock.Mock(), pre_roll=[])
+        # The target ends with its turn.
+        self.assertIsNone(orch._incoming_target)
+
+        # Turn two starts with nothing ringing; ring 8 starts mid-turn. The
+        # tool call must not go and find it.
+        watcher.offers = [None]
+
+        def turn_two(mic, pre_roll):
+            orch._capture_incoming_target()
+            watcher.offers = [_RING_8]
+            orch._handle_tool_call("control_phone", {"action": "phone_answer_speaker", "ring_id": 8})
+            return False
+
+        orch._run_activation = turn_two
+        orch._handle_activation(mock.Mock(), pre_roll=[])
+        orch.phone_service.bind_incoming.assert_called_once_with(_RING_7)   # turn one only
+        orch.phone_service.answer_speaker.assert_called_once_with(None)
+        orch.audio.stop_playback.assert_not_called()
+
+    def test_a_chained_turn_captures_afresh(self):
+        watcher = _Episodes(_RING_7)
+        orch = _target_orch(watcher)
+        seen = []
+
+        def turn(mic, pre_roll):
+            orch._capture_incoming_target()
+            seen.append(orch._incoming_target)
+            return False
+
+        orch._run_activation = turn
+        orch._handle_activation(mock.Mock(), pre_roll=[])
+        watcher.offers = [_RING_8]
+        orch._handle_activation(mock.Mock(), pre_roll=None)   # chained after a barge-in
+        self.assertEqual([t.offer.ring_id for t in seen], [7, 8])
+
+    def test_the_turn_captures_after_the_transcript_and_before_the_llm(self):
+        orch = _target_orch(_Episodes(_RING_7))
+        order = []
+        orch._capture_incoming_target = lambda: order.append("capture")
+        orch._stream_response = lambda text, mic: order.append("llm") or False
+        orch._handle_command = lambda text: False
+        orch.wake_word = mock.Mock()
+        orch.leds = mock.Mock()
+        orch._wake_count = 1
+        orch._record_speech = mock.Mock(return_value=np.ones(16000, dtype="int16"))
+        orch._last_record_outcome = "ok"
+        orch._capture_activation = mock.Mock()
+        orch.audio.play_activation_sound.return_value = None
+        orch.audio.sample_rate = 16000
+        orch.stt = mock.Mock()
+        orch.stt.transcribe.side_effect = lambda wav: order.append("stt") or "answer it on speaker"
+        with mock.patch("builtins.print"):
+            orch._run_activation(mock.Mock(), pre_roll=[])
+        self.assertEqual(order, ["stt", "capture", "llm"])
+
+
 class BuildTests(unittest.TestCase):
     def test_disabled_builds_no_watcher(self):
         orch = Orchestrator.__new__(Orchestrator)
@@ -241,6 +380,15 @@ class BuildTests(unittest.TestCase):
             with self.assertLogs("core.orchestrator", level="ERROR"):
                 watcher = orch._build_incoming_calls(cfg)
         self.assertIsNone(watcher)
+
+    def test_phone_service_reads_the_watchers_current_ring(self):
+        orch = Orchestrator.__new__(Orchestrator)
+        watcher = mock.Mock()
+        watcher.current.return_value = "offer"
+        orch.incoming_calls = watcher
+        self.assertEqual(orch._current_ring(), "offer")
+        orch.incoming_calls = None
+        self.assertIsNone(orch._current_ring())
 
     def test_the_shipped_config_enables_it(self):
         from tests.config_fixture import real_config
