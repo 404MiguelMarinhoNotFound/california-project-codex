@@ -250,6 +250,21 @@ class AdbPhone:
     def helper(self, *args: str) -> subprocess.Popen:
         return self._popen([self.adb_path, "-s", self.serial, "shell", self._helper_cmd(*args)])
 
+    def stream(self, command: str) -> subprocess.Popen | None:
+        """
+        A long-running plain `adb shell <command>`, for the incoming-call
+        watcher's read-only RING_LOOP and nothing else. Never the helper, no
+        push, no Security-settings gate: `reachable()` only. None when the
+        phone is not on adb or adb would not start; never raises.
+        """
+        try:
+            if self.reachable() != "OK":
+                return None
+            return self._popen([self.adb_path, "-s", self.serial, "shell", command])
+        except Exception as exc:  # the watcher restarts on None; a raise would end it
+            logger.warning("adb stream did not start: %s", type(exc).__name__)
+            return None
+
     def forward(self, port: int) -> None:
         self._adb("-s", self.serial, "forward", f"tcp:{port}", f"tcp:{port}")
 

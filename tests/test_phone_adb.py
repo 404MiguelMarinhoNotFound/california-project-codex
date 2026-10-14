@@ -591,3 +591,41 @@ class FromConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StreamTests(_Base):
+    """stream(): one long-running read-only shell, for the incoming-call watcher."""
+
+    def test_stream_is_read_only_and_needs_no_helper(self):
+        from services.incoming_call import RING_LOOP
+
+        self.adb.remote_hash = "0" * 64  # a stale helper must not be pushed by a stream either
+        proc = self.phone().stream(RING_LOOP)
+        self.assertIs(proc, self.procs[-1])
+        self.assertEqual(self.popened, [RING_LOOP])  # the Popen argv ends with the command
+        self.assertFalse(any("push" in a for a in self.adb.calls))
+        for cmd in self.adb.shell_cmds() + self.popened:
+            self.assertNotIn("CallAudio", cmd)
+            self.assertNotIn("adbinput", cmd)
+            for verb in FORBIDDEN:
+                self.assertNotIn(verb, cmd)
+
+    def test_stream_targets_the_phone(self):
+        argv = []
+        phone = self.phone()
+        phone._popen = lambda a, **kw: argv.append(a) or FakeProc("x")
+        phone.stream("true")
+        self.assertEqual(argv[0][1:4], ["-s", PHONE, "shell"])
+        self.assertEqual(argv[0][-1], "true")
+
+    def test_no_phone_streams_nothing(self):
+        self.adb.devices = "List of devices attached\n192.168.1.200:5555\tdevice\n"
+        self.adb.mdns = "List of discovered mdns services\n"
+        self.assertIsNone(self.phone().stream("true"))
+        self.assertEqual(self.popened, [])
+
+    def test_a_failing_popen_is_none_not_a_raise(self):
+        phone = self.phone()
+        phone._popen = mock.Mock(side_effect=OSError("adb missing"))
+        with self.assertLogs("services.phone_adb", "WARNING"):
+            self.assertIsNone(phone.stream("true"))
