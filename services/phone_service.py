@@ -655,6 +655,11 @@ class PhoneService:
         notes = [n for n in parse_notifications(raw) if n.package not in self.digest_ignore_packages]
         return notes, None
 
+    def busy(self) -> bool:
+        """True while one of her own calls is in progress."""
+        with self._lock:
+            return self._active is not None
+
     def status_line(self) -> str:
         with self._lock:
             active, last = self._active, self._last

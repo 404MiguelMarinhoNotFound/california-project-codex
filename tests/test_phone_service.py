@@ -119,6 +119,14 @@ class _Base(unittest.TestCase):
         return first, second
 
 
+class BusyTests(_Base):
+    def test_busy_reads_the_active_call(self):
+        svc = self._svc()
+        self.assertIs(svc.busy(), False)
+        svc._active = {"label": "Taberna da Praia", "number": "+351912345678", "since": 0.0}
+        self.assertIs(svc.busy(), True)
+
+
 class ReadBackTests(_Base):
     def test_first_call_reads_back_and_dials_nothing(self):
         svc = self._svc()

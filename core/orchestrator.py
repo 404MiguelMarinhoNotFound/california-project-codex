@@ -40,6 +40,9 @@ from services.whatsapp_service import (
     looks_like_phone,
 )
 from services.contact_sync import ContactSync
+from services.incoming_call import IncomingCallWatcher, incoming_line
+from services.phone_adb import AdbPhone
+from services.phone_digest import caller_phrase
 from services.phone_prompts import CallBrief
 from services.phone_service import PhoneService, call_log_line, short_duration
 from services.surfshark_service import SurfsharkService
@@ -1891,6 +1894,9 @@ class Orchestrator:
     _mic_meter = None
     _clip_ids = itertools.count(1)
     _include_text = True
+    # Who is ringing the phone (see _build_incoming_calls). None means nothing
+    # is watched, which is also what a __new__-built test orchestrator gets.
+    incoming_calls = None
     # Which activation the last published mood belonged to, and whether a
     # failure has been shown in it. See _publish_mood.
     _mood_seq = -1
@@ -2073,6 +2079,15 @@ class Orchestrator:
                 "Contact sync check started (%d min interval)", self.contact_sync.check_interval_minutes
             )
 
+        # Who is calling: a read-only adb stream of the phone's ring state, on
+        # its own thread. Construction runs no adb; start() does, on that thread.
+        # The idle loop pops a ring and says who it is.
+        self._include_text = (config.get("logging") or {}).get("include_transcripts", True) is not False
+        self.incoming_calls = self._build_incoming_calls(config)
+        if self.incoming_calls is not None:
+            self.incoming_calls.start(self._background_stop)
+            logger.info("Incoming-call watcher started")
+
         # Register tool handler so LLM can dispatch control_tv / control_lights
         self.llm.tool_handler = self._handle_tool_call
         self.llm.on_server_tool = self._on_server_tool
@@ -2170,6 +2185,51 @@ class Orchestrator:
         # Last, because the hooks go on self.audio, which phase 1 built.
         self._attach_live_ui(config)
 
+    def _build_incoming_calls(self, config: dict):
+        """
+        The incoming-call watcher, or None when `phone.incoming.enabled` is off
+        or the phone transport cannot be built. It gets its OWN AdbPhone, never
+        PhoneService's: `reachable()` writes the serial without a lock, and the
+        watcher reads from its own thread. Runs no adb.
+        """
+        incoming_cfg = ((config.get("phone") or {}).get("incoming") or {})
+        if incoming_cfg.get("enabled", False) is not True:
+            return None
+        try:
+            phone = AdbPhone.from_config(config)
+        except Exception:
+            logger.exception("Incoming calls: the phone transport could not be built; not watching")
+            return None
+        whatsapp = getattr(self, "whatsapp_service", None)
+        if whatsapp is not None and getattr(whatsapp, "enabled", False) is True:
+            resolve_name = whatsapp.name_for_number
+        else:
+            resolve_name = lambda n: ""  # noqa: E731
+        return IncomingCallWatcher(phone, resolve_name=resolve_name)
+
+    def _announce(self, text: str, mic_stream, kind: str = "incoming", who: str = "") -> None:
+        """
+        Say one fixed line to the room, unprompted: no LLM call, no history.
+        Same speaker and drain rules as a turn. Never raises into the idle
+        loop -- a TTS or playback failure is logged and listening carries on.
+        """
+        payload = {"kind": kind}
+        if self._include_text:
+            payload["label"] = who
+        self.bus.publish("incoming_call", payload)
+        logger.info("Announcing an incoming call (%s)", kind)
+        try:
+            self.audio.open_speaker()
+            try:
+                audio, sr = self.tts.synthesize(text)
+                if len(audio) > 0:
+                    self.audio.play_audio(audio, sr, blocking=True, text=text, kind="announce")
+            finally:
+                self.audio.close_speaker()
+        except Exception:
+            logger.exception("Incoming-call announcement failed")
+        self._drain_mic(mic_stream, "announcement")
+
     def _play_bootup_sound(self):
         """Pick a random WAV from `sounds.bootup_dir` and play it."""
         import soundfile as sf
@@ -2256,6 +2316,15 @@ class Orchestrator:
         report = phone.pop_report() if phone is not None else None
         if report is not None:
             self._deliver_phone_report(report, mic_stream)
+            return
+
+        # The phone is ringing: say who, once per ring, unless she is on one of
+        # her own calls (then the ring is dropped, not kept for later).
+        watcher = getattr(self, "incoming_calls", None)
+        call = watcher.pop() if watcher is not None else None
+        if call is not None and not (phone is not None and phone.busy() is True):
+            who = caller_phrase(call.name, call.number) if (call.name or call.number).strip() else ""
+            self._announce(incoming_line(call), mic_stream, kind=call.kind, who=who)
             return
 
         # Read one chunk from mic

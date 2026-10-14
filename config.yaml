@@ -1125,6 +1125,11 @@ phone:
     serial: ""            # empty: found over mDNS or its attached IP:port, never the Mi Box
     port: 27183           # adb forward port for the call-audio socket
     mute_phone_mic: true  # keep the phone's own mic (the room) out of the call
+  # Who is calling: a read-only adb stream of the phone's ring state; she says
+  # the caller's saved name (or "a number ending 4567") once per ring, from the
+  # idle loop, never during one of her own calls. Never the full number.
+  incoming:
+    enabled: true      # announce who is calling, once per ring
   # "What did I miss on my phone?" -- read-only (call log + notification shade).
   # Nothing is dismissed or marked seen, and nothing is announced unprompted.
   digest:
