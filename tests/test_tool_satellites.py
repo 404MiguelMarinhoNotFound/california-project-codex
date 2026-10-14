@@ -90,6 +90,9 @@ class TargetLabelTests(unittest.TestCase):
             ("control_whatsapp", {"action": "whatsapp_unread"}, None),
             ("control_phone", {"action": "phone_call", "to": "Taberna da Praia", "goal": "a table for two"}, "Taberna da Praia"),
             ("control_phone", {"action": "phone_find"}, "your phone"),
+            ("control_phone", {"action": "phone_digest", "app": "Gmail"}, "Gmail"),
+            ("control_phone", {"action": "phone_digest"}, "your phone"),
+            ("control_phone", {"action": "phone_missed"}, "your phone"),
             ("web_search", {"query": "benfica result"}, "benfica result"),
         ]
         for tool, params, expected in cases:

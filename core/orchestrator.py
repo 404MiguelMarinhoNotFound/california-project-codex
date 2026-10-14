@@ -39,6 +39,10 @@ from services.whatsapp_service import (
     WhatsAppService,
     looks_like_phone,
 )
+from services.contact_sync import ContactSync
+from services.incoming_call import IncomingCallWatcher, incoming_line
+from services.phone_adb import AdbPhone
+from services.phone_digest import caller_phrase
 from services.phone_prompts import CallBrief
 from services.phone_service import PhoneService, call_log_line, short_duration
 from services.surfshark_service import SurfsharkService
@@ -170,8 +174,10 @@ def _tool_target(tool_name, tool_input) -> str | None:
                 return f"{name}'s chat" if name != "a number" else "a chat"
             return name
         if tool_name == "control_phone":
-            if action == "phone_find":
+            if action in ("phone_find", "phone_missed"):
                 return "your phone"
+            if action == "phone_digest":
+                return text("app") or "your phone"
             if action == "phone_call":
                 return who() or ("a number" if text("number") else None)
             return None
@@ -1723,7 +1729,32 @@ def _dispatch_whatsapp(params: dict, whatsapp_svc, say_now=None) -> str:
     return "unknown action"
 
 
-def _dispatch_phone(params: dict, phone_svc) -> str:
+_CONTACT_SYNC_FAILED = "I couldn't refresh your contacts just now. I kept the ones I had."
+
+
+def _sync_contacts(contact_sync) -> str:
+    """phone_sync_contacts: the ContactSync line, with the mood it implies.
+
+    BUSY and DISABLED are neither a success nor a failure, so they report
+    nothing. A raise (the snapshot could not be written) is spoken, not thrown.
+    """
+    if contact_sync is None:
+        return "Contact sync isn't set up."
+    try:
+        result = contact_sync.sync()
+    except Exception as exc:
+        logger.warning("Contact sync failed: %s", type(exc).__name__)
+        _report(False)
+        return _CONTACT_SYNC_FAILED
+    status = getattr(result, "status", None)
+    if status in ("SYNCED", "UNCHANGED"):
+        _report(True)
+    elif status in ("NO_PHONE", "UNREADABLE", "SHRUNK", "LOCKED_DOWN"):
+        _report(False)
+    return result.message
+
+
+def _dispatch_phone(params: dict, phone_svc, contact_sync=None) -> str:
     """
     control_phone -> PhoneService. Module-level with the service injected, like
     the other dispatchers, so tests drive it with a bare Mock.
@@ -1731,14 +1762,23 @@ def _dispatch_phone(params: dict, phone_svc) -> str:
     The service's own lines are returned verbatim: the read-back is phrased for
     the model to relay, and "Calling X now" means the call really went to the
     background worker.
+
+    phone_sync_contacts comes before the enabled gate: it needs adb, not the
+    call backend's credentials, so "phone calls aren't set up" is no answer.
     """
+    action = params.get("action")
+    if action == "phone_sync_contacts":
+        return _sync_contacts(contact_sync)
     if not phone_svc or not getattr(phone_svc, "enabled", False):
         return "Phone calls aren't set up right now."
-    action = params.get("action")
     if action == "phone_status":
         return phone_svc.status_line()
     if action == "phone_find":
         return phone_svc.find_phone().message
+    if action == "phone_missed":
+        return phone_svc.missed_calls().message
+    if action == "phone_digest":
+        return phone_svc.digest(str(params.get("app") or "")).message
     if action == "phone_log":
         records = phone_svc.recent_calls(params.get("count") or 5)
         if not records:
@@ -1854,6 +1894,9 @@ class Orchestrator:
     _mic_meter = None
     _clip_ids = itertools.count(1)
     _include_text = True
+    # Who is ringing the phone (see _build_incoming_calls). None means nothing
+    # is watched, which is also what a __new__-built test orchestrator gets.
+    incoming_calls = None
     # Which activation the last published mood belonged to, and whether a
     # failure has been shown in it. See _publish_mood.
     _mood_seq = -1
@@ -1944,8 +1987,14 @@ class Orchestrator:
         self.phone_service = PhoneService(
             config,
             resolve_contact=getattr(self.whatsapp_service, "resolve_contact", None),
-            room_speaking=getattr(self.audio, "speaker_open", None),
             publish=self.bus.publish,
+        )
+
+        # The phone's own contact book, re-read over adb weekly (and at boot
+        # when the snapshot is stale) for WhatsApp and calls to resolve names
+        # against. Construction only: the first sync runs on the loop below.
+        self.contact_sync = ContactSync(
+            config, on_synced=getattr(self.whatsapp_service, "reload_contacts", None)
         )
 
         if media_enabled:
@@ -2015,6 +2064,29 @@ class Orchestrator:
                 daemon=True,
             ).start()
             logger.info("WhatsApp group refresh started (%d min interval)", groups_interval)
+
+        # The contact snapshot: checked at once (a stale one syncs without
+        # delaying boot), then every check_interval_minutes. A fresh snapshot
+        # costs a file read; a missed phone simply retries next pass.
+        if self.contact_sync.enabled is True:
+            threading.Thread(
+                target=self._contacts_sync_loop,
+                args=(self.contact_sync.check_interval_minutes,),
+                name="contacts-sync",
+                daemon=True,
+            ).start()
+            logger.info(
+                "Contact sync check started (%d min interval)", self.contact_sync.check_interval_minutes
+            )
+
+        # Who is calling: a read-only adb stream of the phone's ring state, on
+        # its own thread. Construction runs no adb; start() does, on that thread.
+        # The idle loop pops a ring and says who it is.
+        self._include_text = (config.get("logging") or {}).get("include_transcripts", True) is not False
+        self.incoming_calls = self._build_incoming_calls(config)
+        if self.incoming_calls is not None:
+            self.incoming_calls.start(self._background_stop)
+            logger.info("Incoming-call watcher started")
 
         # Register tool handler so LLM can dispatch control_tv / control_lights
         self.llm.tool_handler = self._handle_tool_call
@@ -2113,6 +2185,54 @@ class Orchestrator:
         # Last, because the hooks go on self.audio, which phase 1 built.
         self._attach_live_ui(config)
 
+    def _build_incoming_calls(self, config: dict):
+        """
+        The incoming-call watcher, or None when `phone.incoming.enabled` is off
+        or the phone transport cannot be built. It gets its OWN AdbPhone, never
+        PhoneService's: `reachable()` writes the serial without a lock, and the
+        watcher reads from its own thread. Runs no adb.
+        """
+        incoming_cfg = ((config.get("phone") or {}).get("incoming") or {})
+        if incoming_cfg.get("enabled", False) is not True:
+            return None
+        try:
+            phone = AdbPhone.from_config(config)
+        except Exception:
+            logger.exception("Incoming calls: the phone transport could not be built; not watching")
+            return None
+        whatsapp = getattr(self, "whatsapp_service", None)
+        if whatsapp is not None and getattr(whatsapp, "enabled", False) is True:
+            resolve_name = whatsapp.name_for_number
+        else:
+            resolve_name = lambda n: ""  # noqa: E731
+        return IncomingCallWatcher(phone, resolve_name=resolve_name)
+
+    def _announce(self, text: str, mic_stream, kind: str = "incoming", who: str = "") -> None:
+        """
+        Say one fixed line to the room, unprompted: no LLM call, no history.
+        Same speaker and drain rules as a turn. Never raises into the idle
+        loop -- a TTS or playback failure is logged and listening carries on.
+        """
+        payload = {"kind": kind}
+        if self._include_text:
+            payload["label"] = who
+        self.bus.publish("incoming_call", payload)
+        logger.info("Announcing an incoming call (%s)", kind)
+        try:
+            self.audio.open_speaker()
+            try:
+                # A stop stays in force until cleared (a dropped wake, "stop", a
+                # barge-in); without this the line would silently play nothing.
+                self.audio.reset_playback()
+                audio, sr = self.tts.synthesize(text)
+                if len(audio) > 0:
+                    self.audio.play_audio(audio, sr, blocking=True, text=text, kind="announce")
+            finally:
+                self.audio.close_speaker()
+        except Exception:
+            logger.exception("Incoming-call announcement failed")
+        self._drain_mic(mic_stream, "announcement")
+
     def _play_bootup_sound(self):
         """Pick a random WAV from `sounds.bootup_dir` and play it."""
         import soundfile as sf
@@ -2199,6 +2319,15 @@ class Orchestrator:
         report = phone.pop_report() if phone is not None else None
         if report is not None:
             self._deliver_phone_report(report, mic_stream)
+            return
+
+        # The phone is ringing: say who, once per ring, unless she is on one of
+        # her own calls (then the ring is dropped, not kept for later).
+        watcher = getattr(self, "incoming_calls", None)
+        call = watcher.pop() if watcher is not None else None
+        if call is not None and not (phone is not None and phone.busy() is True):
+            who = caller_phrase(call.name, call.number) if (call.name or call.number).strip() else ""
+            self._announce(incoming_line(call), mic_stream, kind=call.kind, who=who)
             return
 
         # Read one chunk from mic
@@ -2886,7 +3015,9 @@ class Orchestrator:
         if tool_name == "control_whatsapp":
             return self._guard_whatsapp_send(tool_input)
         if tool_name == "control_phone":
-            return _dispatch_phone(tool_input, getattr(self, "phone_service", None))
+            return _dispatch_phone(
+                tool_input, getattr(self, "phone_service", None), getattr(self, "contact_sync", None)
+            )
         return "unknown tool"
 
     def _guard_whatsapp_send(self, tool_input: dict) -> str:
@@ -2944,6 +3075,24 @@ class Orchestrator:
                 self.whatsapp_service.refresh_groups_in_background()
             except Exception as exc:
                 logger.warning("Background WhatsApp group refresh failed: %s", exc)
+
+    def _contacts_sync_loop(self, interval_minutes: int):
+        """
+        Keep the phone contact snapshot fresh, like _whatsapp_groups_loop.
+
+        Unlike the other loops it checks FIRST, then waits: a stale snapshot is
+        synced right after boot, without delaying __init__. Failures log the
+        exception type only (never a name or number) and the next pass retries.
+        """
+        interval_seconds = max(60, interval_minutes * 60)
+        while True:
+            try:
+                if self.contact_sync.due():
+                    self.contact_sync.sync()
+            except Exception as exc:
+                logger.warning("Background contact sync failed: %s", type(exc).__name__)
+            if self._background_stop.wait(interval_seconds):
+                return
 
     def _deebot_token_loop(self, interval_minutes: int):
         """

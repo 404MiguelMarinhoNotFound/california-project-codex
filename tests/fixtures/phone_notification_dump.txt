@@ -1,0 +1,359 @@
+Current Notification Manager state:
+  Notification List:
+    NotificationRecord(0x0a000001: pkg=com.whatsapp user=UserHandle{0} id=1 tag=null importance=4 key=0|com.whatsapp|1|null|10001 bbbc=0: Notification(channel=messages shortcut=null contentView=null vibrate=null sound=null defaults=0 flags=AUTO_CANCEL|ONLY_ALERT_ONCE color=0xff25d366 groupKey=group_key_messages vis=PRIVATE focusType=null))
+      uid=10001 userId=0
+      opPkg=com.whatsapp
+      icon=Icon(typ=RESOURCE pkg=com.whatsapp id=0x7f080abc)
+      flags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      originalFlags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      pri=1
+      key=0|com.whatsapp|1|null|10001
+      seen=false
+      groupKey=0|com.whatsapp|g:group_key_messages
+      notification=
+            fullscreenIntent=null
+            contentIntent=PendingIntent{4728fa0: PendingIntentRecord{2cd93e6 com.whatsapp startActivity}}
+            deleteIntent=null
+            number=0
+            groupAlertBehavior=0
+            when=1791900000000/1791900000000
+            tickerText=null
+            vis=0
+            contentView=null
+            bigContentView=null
+            color=0xff25d366
+            timeout=PT0S
+            extras={
+                android.title=String (Rita)
+                android.text=String (Já cheguei)
+                android.showWhen=Boolean (true)
+            }
+      publicNotification=
+            when=1791900000000/1791900000000
+            extras={
+                android.title=String [length=4]
+                android.text=String [length=10]
+            }
+      stats=SingleNotificationStats{posttimeElapsedMs=338684302, posttimeToFirstClickMs=-1, airtimeCount=1}
+      mContactAffinity=0.0
+      mImportance=DEFAULT
+      mGlobalSortKey=crtcl=0x0002:intrsv=2:grnk=0x0002:gsmry=0:nsk:rnk=0x0001
+      mRankingTimeMs=1791900000000
+      mAdjustments=[]
+      hasSummarization=false
+    NotificationRecord(0x0a000002: pkg=com.whatsapp user=UserHandle{0} id=2 tag=null importance=4 key=0|com.whatsapp|2|null|10002 bbbc=0: Notification(channel=messages shortcut=null contentView=null vibrate=null sound=null defaults=0 flags=AUTO_CANCEL|ONLY_ALERT_ONCE color=0xff25d366 groupKey=group_key_messages vis=PRIVATE focusType=null))
+      uid=10002 userId=0
+      opPkg=com.whatsapp
+      icon=Icon(typ=RESOURCE pkg=com.whatsapp id=0x7f080abc)
+      flags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      originalFlags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      pri=1
+      key=0|com.whatsapp|2|null|10002
+      seen=true
+      groupKey=0|com.whatsapp|g:group_key_messages
+      notification=
+            fullscreenIntent=null
+            contentIntent=PendingIntent{4728fa0: PendingIntentRecord{2cd93e6 com.whatsapp startActivity}}
+            deleteIntent=null
+            number=0
+            groupAlertBehavior=0
+            when=1791899000000/1791899000000
+            tickerText=null
+            vis=0
+            contentView=null
+            bigContentView=null
+            color=0xff25d366
+            timeout=PT0S
+            extras={
+                android.title=String (Jantar sábado)
+                android.text=String (Ana: amanhã às 20h)
+                android.bigText=String (Ana: (amanhã) às 20h,
+leva vinho = ok?)
+                android.showWhen=Boolean (true)
+            }
+      publicNotification=
+            None
+      stats=SingleNotificationStats{posttimeElapsedMs=338684302, posttimeToFirstClickMs=-1, airtimeCount=1}
+      mContactAffinity=0.0
+      mImportance=DEFAULT
+      mGlobalSortKey=crtcl=0x0002:intrsv=2:grnk=0x0002:gsmry=0:nsk:rnk=0x0001
+      mRankingTimeMs=1791899000000
+      mAdjustments=[]
+      hasSummarization=false
+    NotificationRecord(0x0a000003: pkg=com.google.android.gm user=UserHandle{0} id=3 tag=null importance=4 key=0|com.google.android.gm|3|null|10003 bbbc=0: Notification(channel=mail shortcut=null contentView=null vibrate=null sound=null defaults=0 flags=AUTO_CANCEL|ONLY_ALERT_ONCE color=0xff25d366 category=email groupKey=group_key_messages vis=PRIVATE focusType=null))
+      uid=10003 userId=0
+      opPkg=com.google.android.gm
+      icon=Icon(typ=RESOURCE pkg=com.google.android.gm id=0x7f080abc)
+      flags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      originalFlags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      pri=1
+      key=0|com.google.android.gm|3|null|10003
+      seen=true
+      groupKey=0|com.google.android.gm|g:group_key_messages
+      notification=
+            fullscreenIntent=null
+            contentIntent=PendingIntent{4728fa0: PendingIntentRecord{2cd93e6 com.google.android.gm startActivity}}
+            deleteIntent=null
+            number=0
+            groupAlertBehavior=0
+            when=1791898000000/1791898000000
+            tickerText=null
+            vis=0
+            contentView=null
+            bigContentView=null
+            color=0xff25d366
+            timeout=PT0S
+            extras={
+                android.title=String (Booking.com)
+                android.text=String (A sua reserva)
+                android.showWhen=Boolean (true)
+            }
+      publicNotification=
+            None
+      stats=SingleNotificationStats{posttimeElapsedMs=338684302, posttimeToFirstClickMs=-1, airtimeCount=1}
+      mContactAffinity=0.0
+      mImportance=DEFAULT
+      mGlobalSortKey=crtcl=0x0002:intrsv=2:grnk=0x0002:gsmry=0:nsk:rnk=0x0001
+      mRankingTimeMs=1791898000000
+      mAdjustments=[]
+      hasSummarization=false
+    NotificationRecord(0x0a000004: pkg=com.spotify.music user=UserHandle{0} id=4 tag=null importance=4 key=0|com.spotify.music|4|null|10004 bbbc=0: Notification(channel=playback shortcut=null contentView=null vibrate=null sound=null defaults=0 flags=ONGOING_EVENT|FOREGROUND_SERVICE|NO_CLEAR color=0xff25d366 category=transport groupKey=group_key_messages vis=PRIVATE focusType=null))
+      uid=10004 userId=0
+      opPkg=com.spotify.music
+      icon=Icon(typ=RESOURCE pkg=com.spotify.music id=0x7f080abc)
+      flags=ONGOING_EVENT|FOREGROUND_SERVICE|NO_CLEAR
+      originalFlags=ONGOING_EVENT|FOREGROUND_SERVICE|NO_CLEAR
+      pri=1
+      key=0|com.spotify.music|4|null|10004
+      seen=false
+      groupKey=0|com.spotify.music|g:group_key_messages
+      notification=
+            fullscreenIntent=null
+            contentIntent=PendingIntent{4728fa0: PendingIntentRecord{2cd93e6 com.spotify.music startActivity}}
+            deleteIntent=null
+            number=0
+            groupAlertBehavior=0
+            when=1791900000000/1791900000000
+            tickerText=null
+            vis=0
+            contentView=null
+            bigContentView=null
+            color=0xff25d366
+            timeout=PT0S
+            extras={
+                android.title=String (Uma Canção)
+                android.text=String (Um Artista)
+                android.showWhen=Boolean (true)
+            }
+      publicNotification=
+            None
+      stats=SingleNotificationStats{posttimeElapsedMs=338684302, posttimeToFirstClickMs=-1, airtimeCount=1}
+      mContactAffinity=0.0
+      mImportance=DEFAULT
+      mGlobalSortKey=crtcl=0x0002:intrsv=2:grnk=0x0002:gsmry=0:nsk:rnk=0x0001
+      mRankingTimeMs=1791900000000
+      mAdjustments=[]
+      hasSummarization=false
+    NotificationRecord(0x0a000005: pkg=com.whatsapp user=UserHandle{0} id=5 tag=null importance=4 key=0|com.whatsapp|5|null|10005 bbbc=0: Notification(channel=messages shortcut=null contentView=null vibrate=null sound=null defaults=0 flags=AUTO_CANCEL|GROUP_SUMMARY color=0xff25d366 groupKey=group_key_messages vis=PRIVATE focusType=null))
+      uid=10005 userId=0
+      opPkg=com.whatsapp
+      icon=Icon(typ=RESOURCE pkg=com.whatsapp id=0x7f080abc)
+      flags=AUTO_CANCEL|GROUP_SUMMARY
+      originalFlags=AUTO_CANCEL|GROUP_SUMMARY
+      pri=1
+      key=0|com.whatsapp|5|null|10005
+      seen=false
+      groupKey=0|com.whatsapp|g:group_key_messages
+      notification=
+            fullscreenIntent=null
+            contentIntent=PendingIntent{4728fa0: PendingIntentRecord{2cd93e6 com.whatsapp startActivity}}
+            deleteIntent=null
+            number=0
+            groupAlertBehavior=0
+            when=1791900000000/1791900000000
+            tickerText=null
+            vis=0
+            contentView=null
+            bigContentView=null
+            color=0xff25d366
+            timeout=PT0S
+            extras={
+                android.title=String (WhatsApp)
+                android.text=String (3 mensagens de 2 conversas)
+                android.showWhen=Boolean (true)
+            }
+      publicNotification=
+            None
+      stats=SingleNotificationStats{posttimeElapsedMs=338684302, posttimeToFirstClickMs=-1, airtimeCount=1}
+      mContactAffinity=0.0
+      mImportance=DEFAULT
+      mGlobalSortKey=crtcl=0x0002:intrsv=2:grnk=0x0002:gsmry=0:nsk:rnk=0x0001
+      mRankingTimeMs=1791900000000
+      mAdjustments=[]
+      hasSummarization=false
+    NotificationRecord(0x0a000006: pkg=com.google.android.dialer user=UserHandle{0} id=6 tag=null importance=4 key=0|com.google.android.dialer|6|null|10006 bbbc=0: Notification(channel=missed_calls shortcut=null contentView=null vibrate=null sound=null defaults=0 flags=AUTO_CANCEL|ONLY_ALERT_ONCE color=0xff25d366 category=missed_call groupKey=group_key_messages vis=PRIVATE focusType=null))
+      uid=10006 userId=0
+      opPkg=com.google.android.dialer
+      icon=Icon(typ=RESOURCE pkg=com.google.android.dialer id=0x7f080abc)
+      flags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      originalFlags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      pri=1
+      key=0|com.google.android.dialer|6|null|10006
+      seen=false
+      groupKey=0|com.google.android.dialer|g:group_key_messages
+      notification=
+            fullscreenIntent=null
+            contentIntent=PendingIntent{4728fa0: PendingIntentRecord{2cd93e6 com.google.android.dialer startActivity}}
+            deleteIntent=null
+            number=0
+            groupAlertBehavior=0
+            when=1791900000000/1791900000000
+            tickerText=null
+            vis=0
+            contentView=null
+            bigContentView=null
+            color=0xff25d366
+            timeout=PT0S
+            extras={
+                android.title=String (Chamada não atendida)
+                android.text=String (+351910000009)
+                android.showWhen=Boolean (true)
+            }
+      publicNotification=
+            None
+      stats=SingleNotificationStats{posttimeElapsedMs=338684302, posttimeToFirstClickMs=-1, airtimeCount=1}
+      mContactAffinity=0.0
+      mImportance=DEFAULT
+      mGlobalSortKey=crtcl=0x0002:intrsv=2:grnk=0x0002:gsmry=0:nsk:rnk=0x0001
+      mRankingTimeMs=1791900000000
+      mAdjustments=[]
+      hasSummarization=false
+    NotificationRecord(0x0a000007: pkg=com.android.systemui user=UserHandle{0} id=7 tag=null importance=4 key=0|com.android.systemui|7|null|10007 bbbc=0: Notification(channel=misc shortcut=null contentView=null vibrate=null sound=null defaults=0 flags=AUTO_CANCEL|ONLY_ALERT_ONCE color=0xff25d366 groupKey=group_key_messages vis=PRIVATE focusType=null))
+      uid=10007 userId=0
+      opPkg=com.android.systemui
+      icon=Icon(typ=RESOURCE pkg=com.android.systemui id=0x7f080abc)
+      flags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      originalFlags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      pri=1
+      key=0|com.android.systemui|7|null|10007
+      seen=false
+      groupKey=0|com.android.systemui|g:group_key_messages
+      notification=
+            fullscreenIntent=null
+            contentIntent=PendingIntent{4728fa0: PendingIntentRecord{2cd93e6 com.android.systemui startActivity}}
+            deleteIntent=null
+            number=0
+            groupAlertBehavior=0
+            when=1791900000000/1791900000000
+            tickerText=null
+            vis=0
+            contentView=null
+            bigContentView=null
+            color=0xff25d366
+            timeout=PT0S
+            extras={
+                android.title=null
+                android.text=null
+                android.showWhen=Boolean (true)
+            }
+      publicNotification=
+            None
+      stats=SingleNotificationStats{posttimeElapsedMs=338684302, posttimeToFirstClickMs=-1, airtimeCount=1}
+      mContactAffinity=0.0
+      mImportance=DEFAULT
+      mGlobalSortKey=crtcl=0x0002:intrsv=2:grnk=0x0002:gsmry=0:nsk:rnk=0x0001
+      mRankingTimeMs=1791900000000
+      mAdjustments=[]
+      hasSummarization=false
+    NotificationRecord(0x0a000008: pkg=com.whatsapp user=UserHandle{0} id=8 tag=null importance=4 key=0|com.whatsapp|8|null|10008 bbbc=0: Notification(channel=messages shortcut=null contentView=null vibrate=null sound=null defaults=0 flags=AUTO_CANCEL|ONLY_ALERT_ONCE color=0xff25d366 groupKey=group_key_messages vis=PRIVATE focusType=null))
+      uid=10008 userId=0
+      opPkg=com.whatsapp
+      icon=Icon(typ=RESOURCE pkg=com.whatsapp id=0x7f080abc)
+      flags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      originalFlags=AUTO_CANCEL|ONLY_ALERT_ONCE
+      pri=1
+      key=0|com.whatsapp|8|null|10008
+      seen=false
+      groupKey=0|com.whatsapp|g:group_key_messages
+      notification=
+            fullscreenIntent=null
+            contentIntent=PendingIntent{4728fa0: PendingIntentRecord{2cd93e6 com.whatsapp startActivity}}
+            deleteIntent=null
+            number=0
+            groupAlertBehavior=0
+            when=1791900000000/1791900000000
+            tickerText=null
+            vis=0
+            contentView=null
+            bigContentView=null
+            color=0xff25d366
+            timeout=PT0S
+            extras={
+                android.title=String (Rita)
+                android.text=String (Já cheguei)
+                android.showWhen=Boolean (true)
+            }
+      publicNotification=
+            when=1791900000000/1791900000000
+            extras={
+                android.title=String [length=4]
+                android.text=String [length=10]
+            }
+      stats=SingleNotificationStats{posttimeElapsedMs=338684302, posttimeToFirstClickMs=-1, airtimeCount=1}
+      mContactAffinity=0.0
+      mImportance=DEFAULT
+      mGlobalSortKey=crtcl=0x0002:intrsv=2:grnk=0x0002:gsmry=0:nsk:rnk=0x0001
+      mRankingTimeMs=1791900000000
+      mAdjustments=[]
+      hasSummarization=false
+  mMaxPackageEnqueueRate=5.0
+  hideSilentStatusBar=false
+
+  Notification attention state:
+      mSoundNotificationKey=null
+      mCallState=CALL_STATE_IDLE
+  mArchive=Archive (0 notifications)
+
+  Snoozed notifications:
+    NotificationRecord(0x0b000001: pkg=com.whatsapp user=UserHandle{0} id=99 tag=null importance=4 key=0|com.whatsapp|99|null|10099 bbbc=0: Notification(channel=messages shortcut=null contentView=null vibrate=null sound=null defaults=0 flags=AUTO_CANCEL color=0xff25d366 groupKey=group_key_messages vis=PRIVATE focusType=null))
+      uid=10099 userId=0
+      opPkg=com.whatsapp
+      icon=Icon(typ=RESOURCE pkg=com.whatsapp id=0x7f080abc)
+      flags=AUTO_CANCEL
+      originalFlags=AUTO_CANCEL
+      pri=1
+      key=0|com.whatsapp|99|null|10099
+      seen=false
+      groupKey=0|com.whatsapp|g:group_key_messages
+      notification=
+            fullscreenIntent=null
+            contentIntent=PendingIntent{4728fa0: PendingIntentRecord{2cd93e6 com.whatsapp startActivity}}
+            deleteIntent=null
+            number=0
+            groupAlertBehavior=0
+            when=1791890000000/1791890000000
+            tickerText=null
+            vis=0
+            contentView=null
+            bigContentView=null
+            color=0xff25d366
+            timeout=PT0S
+            extras={
+                android.title=String (Snoozed Pessoa)
+                android.text=String (Mais tarde)
+                android.showWhen=Boolean (true)
+            }
+      publicNotification=
+            None
+      stats=SingleNotificationStats{posttimeElapsedMs=338684302, posttimeToFirstClickMs=-1, airtimeCount=1}
+      mContactAffinity=0.0
+      mImportance=DEFAULT
+      mGlobalSortKey=crtcl=0x0002:intrsv=2:grnk=0x0002:gsmry=0:nsk:rnk=0x0001
+      mRankingTimeMs=1791890000000
+      mAdjustments=[]
+      hasSummarization=false
+
+ Pending snoozed notifications
+
+  Ranking Config:
+    RankingHelper:

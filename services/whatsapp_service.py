@@ -445,6 +445,16 @@ class WhatsAppService:
             os.getenv("FIREFOX_PATH") or str(cfg.get("firefox_path") or "").strip() or _DEFAULT_FIREFOX
         )
         self.contacts_path = Path(str(cfg.get("contacts_path") or "contacts.vcf"))
+        # The phone's own book, synced over ADB by services/contact_sync.py.
+        # Read first when contacts_sync is on; the VCF above is the fallback.
+        sync_cfg = config.get("contacts_sync", {}) or {}
+        self.snapshot_path: Path | None = (
+            Path(str(sync_cfg.get("snapshot_path") or "phone_contacts.json"))
+            if sync_cfg.get("enabled") is True
+            else None
+        )
+        # "phone", "vcf", or "" when neither gave a contact.
+        self.contacts_source = ""
         self.groups_path = Path(str(cfg.get("groups_path") or "whatsapp_groups.json"))
         # The orchestrator re-reads the group list on this interval, the way it
         # re-syncs the Stremio library. 0 = only at boot.
@@ -498,8 +508,9 @@ class WhatsAppService:
         configured = bool(cfg.get("enabled", False))
         if configured and self.available and not self.contacts:
             logger.warning(
-                "whatsapp.enabled is true but no contacts loaded from %s, "
+                "whatsapp.enabled is true but no contacts loaded (snapshot %s, VCF %s), "
                 "only explicit phone numbers will resolve",
+                self.snapshot_path,
                 self.contacts_path,
             )
         self.enabled = bool(configured and self.available)
@@ -516,9 +527,10 @@ class WhatsAppService:
 
         if self.enabled:
             logger.info(
-                "WhatsApp initialized (%s backend): %d contact(s), %d alias(es)",
+                "WhatsApp initialized (%s backend): %d contact(s) from %s, %d alias(es)",
                 self.backend,
                 len(self.contacts),
+                self.contacts_source or "nowhere",
                 len(self.aliases),
             )
 
@@ -673,24 +685,62 @@ class WhatsAppService:
         return aliases, prefer
 
     def _load_contacts(self) -> None:
+        """
+        The phone snapshot if it holds anyone, else the VCF. Never raises.
+
+        The list is built aside and swapped in by assignment, never mutated in
+        place, so a resolve_contact on another thread sees the whole old book
+        or the whole new one.
+        """
+        if self.snapshot_path is not None:
+            # Lazy: contact_sync imports Contact from this module.
+            from services.contact_sync import load_snapshot
+
+            snapshot, _synced_at = load_snapshot(self.snapshot_path)
+            if snapshot:
+                self.contacts, self.contacts_source = snapshot, "phone"
+                return
+        contacts = self._load_vcf()
+        self.contacts, self.contacts_source = contacts, ("vcf" if contacts else "")
+
+    def _load_vcf(self) -> list[Contact]:
         """Read the VCF. A missing or unreadable book is a warning, never a raise."""
         if not self.contacts_path.is_file():
             logger.warning(
                 "WhatsApp contact book not found at %s, name lookup unavailable",
                 self.contacts_path,
             )
-            self.contacts = []
-            return
+            return []
         try:
-            self.contacts = load_vcf(self.contacts_path, self.default_country)
+            return load_vcf(self.contacts_path, self.default_country)
         except Exception:  # noqa: BLE001 - a malformed export must not take the assistant down
             logger.exception("Could not parse %s, WhatsApp name lookup unavailable", self.contacts_path)
-            self.contacts = []
+            return []
 
     def reload_contacts(self) -> int:
-        """Re-read the VCF so a refreshed export does not need a restart."""
+        """Re-read the phone snapshot, then the VCF, so a fresh sync needs no restart."""
         self._load_contacts()
         return len(self.contacts)
+
+    def name_for_number(self, number: str) -> str:
+        """
+        The saved name of the contact owning `number`, for saying who is calling.
+
+        Both sides go through normalize_phone, so "912000111" in the book and
+        "+351912000111" from the phone meet. Aliases play no part: a nickname is
+        how he asks for someone, the saved name is who they are. "" when nobody
+        has the number, or when two differently named contacts share it.
+        """
+        wanted = normalize_phone(number or "", self.default_country)
+        if not wanted:
+            return ""
+        names = {
+            c.name.strip()
+            for c in self.contacts
+            if c.name.strip()
+            and any(normalize_phone(p, self.default_country) == wanted for p in c.phones)
+        }
+        return names.pop() if len(names) == 1 else ""
 
     def resolve_contact(self, hint: str) -> ContactMatch:
         """

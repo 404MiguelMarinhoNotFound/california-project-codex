@@ -1,23 +1,24 @@
 """
 The call agent: one Gemini Live session for the length of one phone call.
 
-Audio path, proven on the real laptop (2026-10-06):
+Audio path, proven live on 2026-10-13 (services/phone_call_audio.py):
 
-  callee --(Phone Link, laptop speakers)--> WASAPI loopback --16 kHz PCM--> Gemini Live
-  Gemini Live --24 kHz PCM--> VB-CABLE "CABLE Input" --(Phone Link's default mic)--> callee
+  callee --(phone call downlink, intercepted on the phone)--16 kHz PCM--> Gemini Live
+  Gemini Live --24 kHz PCM--> (injected into the call uplink on the phone) --> callee
 
-The loopback carries ONLY the callee: her voice goes into the cable, never out
-of the speakers, so the line is echo-free and Gemini's own voice-activity
-detection can tell exactly when they are talking. That is also why barge-in
+The downlink carries ONLY the callee and her voice only goes up the line, so
+it is echo-free and Gemini's own voice-activity detection can tell exactly
+when they are talking. (Until 2026-10-13 the path was Phone Link + a WASAPI
+loopback + VB-CABLE; that code lives in deprecated/services/.) That is also why barge-in
 needs no work here -- when they talk over her, Gemini sends `interrupted` and
 the queued audio is dropped.
 
 The session ends on the first of: the agent calls `end_call`, the callee hangs
-up (Phone Link's call window goes away), nobody speaks within `no_answer_s`,
+up (the phone's call state goes idle), nobody speaks within `no_answer_s`,
 `max_call_s` runs out, or the service asks it to stop.
 
-`google.genai` and `soundcard` are imported lazily, inside the factories, so
-importing this module never needs them -- the unit tests drive it with a fake
+`google.genai` is imported lazily, inside the client factory, so importing
+this module never needs it -- the unit tests drive it with a fake
 session and fake audio.
 """
 
@@ -25,20 +26,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import queue
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-import numpy as np
-
 logger = logging.getLogger(__name__)
 
 INPUT_RATE = 16000
 OUTPUT_RATE = 24000
-_BLOCK_MS = 100
 _WATCH_INTERVAL_S = 2.0
 # After end_call, how long to let her goodbye finish playing before hanging up.
 _GOODBYE_DRAIN_S = 8.0
@@ -57,6 +53,12 @@ _LIVE_IF_HEARD_S = 8.0
 # Loudest loopback block below this (0-1 RMS) means she heard nothing at all.
 _SILENT_PEAK = 0.002
 _NUDGE_MAX = 2
+# With a transport that knows the moment of the answer (the phone's own call
+# state, tools/phone_adb_call.py), she is nudged this long after it instead of
+# waiting to hear them and then _NUDGE_AFTER_S more. Live 2026-10-13: with only
+# the heard-them clock, Marta said "Hola", the model reached for end_call three
+# times, and she hung up on 9 s of silence.
+_ANSWERED_GRACE_S = 0.8
 _NUDGE_TEXT = (
     "[The call has been answered and they are waiting for you. Greet them and "
     "say why you are calling, now, in their language.]"
@@ -125,7 +127,7 @@ class CallResult:
     # What the session saw, for the call log and the report. Every key is
     # optional: a stage that did not happen is absent, never zero.
     #   connect_s        opening the Live session
-    #   dial_s           Phone Link dialling (prefill, Call, first End button)
+    #   dial_s           the phone dialling (placeCall until the call shows in its state)
     #   talk_window_s    from the end of the dial to the end of the call
     #   answered_at_s    first words heard from them, after the dial
     #   first_spoke_at_s her first words, after the dial
@@ -187,161 +189,6 @@ def _reply(call, response: dict, scheduling: str) -> dict:
     return {"id": call.id, "name": call.name, "response": response, "scheduling": scheduling}
 
 
-# ----------------------------------------------------------------- audio I/O
-
-
-class LoopbackCapture:
-    """
-    The callee, as a speaker plays them. 16 kHz mono int16 blocks.
-
-    `device` names the speaker to record (a prefix of its name). It used to be
-    whatever the default speaker was at the time, and on 2026-10-08 that was a
-    pair of Bluetooth headphones the call audio never reached: she heard
-    nothing for 35 seconds of a real call. PhoneService now pins the default
-    speaker for the call (`phone_link.SpeakerRoute`) and passes the same name
-    here. Empty `device` keeps the old default-speaker behaviour.
-
-    The capture thread used to die silently; its error is logged now, and
-    `peak` (loudest block, 0-1 RMS) says afterwards whether she heard anything.
-    """
-
-    def __init__(self, samplerate: int = INPUT_RATE, block_ms: int = _BLOCK_MS, device: str = ""):
-        self.samplerate = samplerate
-        self.frames = int(samplerate * block_ms / 1000)
-        self.device = device
-        self.peak = 0.0
-        self.blocks = 0
-        self.source = ""
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def _speaker(self, sc):
-        if self.device:
-            for speaker in sc.all_speakers():
-                if str(speaker.name).startswith(self.device):
-                    return speaker
-            logger.warning("Loopback: no speaker named %r; using the default one", self.device)
-        return sc.default_speaker()
-
-    def start(self, on_block: Callable[[bytes], None]) -> None:
-        def loop():
-            # soundcard calls CoInitializeEx only on the thread that first
-            # imports it. When anything imported it earlier on another thread,
-            # this one has no COM and every call fails with 0x800401F0
-            # (CO_E_NOTINITIALIZED): measured 2026-10-08, a deaf capture. So
-            # this thread initialises COM itself (MTA, as soundcard does) --
-            # AFTER importing soundcard: when this thread is the first to
-            # import it, soundcard's own CoInitializeEx must run first, or it
-            # gets S_FALSE ("already initialised") and raises 0x100000001
-            # (found on the next real call, 2026-10-08).
-            com = None
-            try:
-                import soundcard as sc
-
-                if sys.platform == "win32":
-                    import ctypes
-
-                    com = ctypes.windll.ole32
-                    com.CoInitializeEx(None, 0)  # S_OK or S_FALSE; balanced below either way
-                speaker = self._speaker(sc)
-                self.source = str(speaker.name)
-                logger.info("Loopback: listening to %s", self.source)
-                mic = sc.get_microphone(id=self.source, include_loopback=True)
-                with mic.recorder(samplerate=self.samplerate, channels=1) as rec:
-                    while not self._stop.is_set():
-                        block = rec.record(numframes=self.frames)[:, 0]
-                        self.blocks += 1
-                        level = float(np.sqrt(np.mean(np.square(block)))) if block.size else 0.0
-                        self.peak = max(self.peak, level)
-                        pcm = np.clip(block * 32767.0, -32768, 32767).astype("<i2").tobytes()
-                        on_block(pcm)
-            except Exception:
-                logger.exception("Loopback capture failed: California cannot hear the call")
-            finally:
-                if com is not None:
-                    com.CoUninitialize()
-
-        self._thread = threading.Thread(target=loop, name="call-loopback", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-        if self.blocks:
-            logger.info("Loopback: %d blocks from %s, peak level %.4f%s", self.blocks, self.source,
-                        self.peak, " (SILENT: she heard nothing)" if self.peak < _SILENT_PEAK else "")
-
-
-class CableSpeaker:
-    """Her voice into the virtual cable Phone Link records from. 24 kHz int16."""
-
-    def __init__(self, device_prefix: str = "CABLE Input", samplerate: int = OUTPUT_RATE):
-        self.device_prefix = device_prefix
-        self.samplerate = samplerate
-        self._q: queue.Queue[bytes | None] = queue.Queue()
-        self._busy = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def _device(self) -> int:
-        import sounddevice as sd
-
-        for index, dev in enumerate(sd.query_devices()):
-            api = sd.query_hostapis(dev["hostapi"])["name"]
-            if api == "MME" and dev["name"].startswith(self.device_prefix) and dev["max_output_channels"] > 0:
-                return index
-        raise RuntimeError(f"no output device starting with {self.device_prefix!r}")
-
-    def start(self) -> None:
-        import sounddevice as sd
-
-        stream = sd.RawOutputStream(
-            samplerate=self.samplerate, channels=1, dtype="int16", device=self._device()
-        )
-        stream.start()
-
-        def loop():
-            try:
-                while True:
-                    chunk = self._q.get()
-                    if chunk is None:
-                        return
-                    self._busy.set()
-                    stream.write(chunk)
-                    if self._q.empty():
-                        self._busy.clear()
-            finally:
-                stream.stop()
-                stream.close()
-
-        self._thread = threading.Thread(target=loop, name="call-cable", daemon=True)
-        self._thread.start()
-
-    def write(self, pcm: bytes) -> None:
-        if pcm:
-            self._q.put(pcm)
-
-    def flush(self) -> None:
-        """They talked over her: drop everything not yet played."""
-        try:
-            while True:
-                item = self._q.get_nowait()
-                if item is None:
-                    self._q.put(None)
-                    break
-        except queue.Empty:
-            pass
-        self._busy.clear()
-
-    def idle(self) -> bool:
-        return self._q.empty() and not self._busy.is_set()
-
-    def stop(self) -> None:
-        self._q.put(None)
-        if self._thread is not None:
-            self._thread.join(timeout=3)
-
-
 # ----------------------------------------------------------------- the agent
 
 
@@ -365,12 +212,12 @@ class GeminiLiveAgent:
         voice: str = "Aoede",
         language_code: str = "",
         silence_ms: int = 700,
-        cable_device: str = "CABLE Input",
-        listen_device: str = "",
+        *,
+        capture_factory: Callable,
+        speaker_factory: Callable,
         client_factory: Callable | None = None,
-        capture_factory: Callable | None = None,
-        speaker_factory: Callable | None = None,
         on_line: Callable | None = None,
+        live_if_heard_s: float | None = None,
     ):
         self.client_kwargs = dict(client_kwargs)
         # Called with (index, who, text, at) as each piece of transcript
@@ -381,8 +228,13 @@ class GeminiLiveAgent:
         self.language_code = language_code
         self.silence_ms = silence_ms
         self.client_factory = client_factory or _default_client_factory
-        self.capture_factory = capture_factory or (lambda: LoopbackCapture(device=listen_device))
-        self.speaker_factory = speaker_factory or (lambda: CableSpeaker(cable_device))
+        # Her ears and mouth: PhoneCallAudio's capture() and speaker() faces.
+        self.capture_factory = capture_factory
+        self.speaker_factory = speaker_factory
+        # How long a "they hung up" reading is doubted after they last spoke.
+        # Phone Link's End button vanished mid-call; the phone's own call state
+        # does not, so PhoneService passes 0 and a hang-up lands at once.
+        self.live_if_heard_s = _LIVE_IF_HEARD_S if live_if_heard_s is None else float(live_if_heard_s)
 
     def _config(self, prompt: str):
         from google.genai import types
@@ -411,6 +263,7 @@ class GeminiLiveAgent:
         stop: threading.Event | None = None,
         dial: Callable[[], bool] | None = None,
         mute: Callable[[], bool] | None = None,
+        answered: Callable[[], bool] | None = None,
     ) -> CallResult:
         """
         Blocking: one call, start to finish. Never raises.
@@ -423,11 +276,15 @@ class GeminiLiveAgent:
         hears the laptop speakers, so without it her room voice reaches the
         call agent as if the callee said it (seen 2026-10-07: "looks like it
         didn't go through" transcribed as theirs). Muted blocks go as silence.
+
+        `answered` is True once the transport knows the call was picked up;
+        she is then nudged to open after _ANSWERED_GRACE_S rather than after
+        hearing them. A transport that cannot tell passes nothing.
         """
         result = CallResult()
         started = time.monotonic()
         try:
-            asyncio.run(self._run(prompt, max_call_s, no_answer_s, still_connected, stop or threading.Event(), dial, result, mute))
+            asyncio.run(self._run(prompt, max_call_s, no_answer_s, still_connected, stop or threading.Event(), dial, result, mute, answered))
         except Exception as exc:  # the call must always come back with a result
             logger.exception("Call agent failed")
             result.ended_by = result.ended_by or "error"
@@ -435,7 +292,7 @@ class GeminiLiveAgent:
         result.duration_s = round(time.monotonic() - started, 1)
         return result
 
-    async def _run(self, prompt, max_call_s, no_answer_s, still_connected, stop, dial, result: CallResult, mute=None) -> None:
+    async def _run(self, prompt, max_call_s, no_answer_s, still_connected, stop, dial, result: CallResult, mute=None, answered=None) -> None:
         loop = asyncio.get_running_loop()
         audio_in: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
         finished = asyncio.Event()
@@ -537,12 +394,12 @@ class GeminiLiveAgent:
                         elif still_connected is not None:
                             connected = await asyncio.to_thread(still_connected)
                             them_at = clock.get("them_at")
-                            heard_recently = them_at is not None and time.monotonic() - them_at < _LIVE_IF_HEARD_S
+                            heard_recently = them_at is not None and time.monotonic() - them_at < self.live_if_heard_s
                             if connected is False and heard_recently:
                                 # 2026-10-08: Phone Link's End button vanished
                                 # 20s into a live call. Someone talking means
                                 # the line is up, whatever the screen says.
-                                logger.info("Call agent: Phone Link says ended, but they spoke %.0fs ago; staying on",
+                                logger.info("Call agent: the line reads ended, but they spoke %.0fs ago; staying on",
                                             time.monotonic() - them_at)
                             elif connected is False:
                                 finish("hung_up")
@@ -555,7 +412,16 @@ class GeminiLiveAgent:
                         if any(l.who == "california" and l.text.strip() for l in result.lines):
                             return
                         them_at = clock.get("them_at")
-                        if them_at is None or time.monotonic() - them_at < _NUDGE_AFTER_S:
+                        if answered is not None and nudges == 0 and "answered_at" not in clock:
+                            try:
+                                if await asyncio.to_thread(answered):
+                                    clock["answered_at"] = time.monotonic()
+                            except Exception:
+                                pass
+                        answered_at = clock.get("answered_at")
+                        due_answer = nudges == 0 and answered_at is not None and time.monotonic() - answered_at >= _ANSWERED_GRACE_S
+                        due_heard = them_at is not None and time.monotonic() - them_at >= _NUDGE_AFTER_S
+                        if not (due_answer or due_heard):
                             continue
                         nudges += 1
                         result._count("nudges")

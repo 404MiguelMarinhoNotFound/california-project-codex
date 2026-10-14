@@ -3,8 +3,9 @@ PhoneService: California places a phone call from Master Miguel's own number
 and holds the conversation herself, then reports back.
 
     control_phone(phone_call, brief) -> read back once -> "go" -> background call:
-        default mic -> VB-CABLE, Gemini Live session up, Phone Link dials,
-        conversation, hang up, mic restored -> CallReport queued
+        Gemini Live session up, the phone dials over ADB (services/phone_adb.py),
+        call audio straight from the phone (services/phone_call_audio.py),
+        conversation, hang up -> CallReport queued
     Orchestrator._idle_loop picks the report up and runs a turn on it, so the
     report lands in her conversation history and she tells him how it went.
 
@@ -23,11 +24,11 @@ read-back of the SAME number and the SAME brief, exactly like WhatsApp's.
 from __future__ import annotations
 
 import importlib.util
-import contextlib
 import json
 import logging
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -36,6 +37,13 @@ from datetime import datetime
 from typing import Callable
 
 from services.gemini_live_call import CallResult
+from services.phone_digest import (
+    app_texts_line,
+    digest_line,
+    missed_calls_line,
+    parse_call_log,
+    parse_notifications,
+)
 from services.phone_prompts import CallBrief, build_call_prompt
 from services.whatsapp_service import looks_like_phone, normalize_phone
 
@@ -51,37 +59,43 @@ _MSG_NO_NUMBER = (
 _MSG_BLOCKED = "I won't call that number myself."
 
 # Find my phone, one line per way it can end. The fixes differ, so none is
-# collapsed into "couldn't": a closed window, a dropped link and a lock on the
-# laptop each send him somewhere else.
+# collapsed into "couldn't".
 _FIND_LINES = {
     "PLAYING": "It's ringing on his phone now, a sound for about twenty seconds. Say 'again' if he needs longer.",
-    "ALREADY_PLAYING": "The phone is already playing its sound. Tell him to listen for it.",
-    "NO_WINDOW": "Phone Link won't open on the laptop, so I couldn't ring the phone.",
-    "NO_BUTTON": "Phone Link is open but I can't see its Play sound button. The phone may be disconnected from the laptop.",
-    "DISABLED": "Phone Link says the phone isn't reachable right now, so Play sound is greyed out. Check it's on Wi-Fi and Bluetooth.",
-    "NO_CONFIRM": "Phone Link didn't show its Play sound confirmation, so nothing rang. Try again in a moment.",
-    "NOT_STARTED": "I pressed Play sound but the phone didn't start it. It may be out of reach of the laptop.",
-    "NOT_FOREGROUND": "I couldn't bring Phone Link to the front, so I didn't press anything. Try again in a moment.",
-    "NOT_FOCUSED": "I couldn't reach the Play sound button, so I didn't press anything. Try again in a moment.",
+    "ALREADY_PLAYING": "His phone is already ringing from a moment ago. Tell him to listen for it.",
+    "NO_PHONE": "I can't reach his phone over Wi-Fi, so I couldn't ring it. Wireless debugging may be off on it.",
+    "LOCKED_DOWN": "His phone is blocking me, so I couldn't ring it. USB debugging (Security settings) needs to be on.",
+    "RING_FAILED": "His phone didn't start the sound. Try again in a moment.",
 }
-_MSG_FIND_FAILED = "I couldn't ring the phone, Phone Link didn't answer."
+_MSG_FIND_FAILED = "I couldn't ring the phone, it didn't answer."
 
-# A dial that went out. DIALED_UNCONFIRMED: Enter reached the verified Call
-# button, but Phone Link's call screen is invisible to automation (2026-10-07:
-# the call rang and was answered while the old check reported failure).
-_DIALED = ("DIALED", "DIALED_UNCONFIRMED")
+# "What did I miss?" when the phone could not be read. Never "nothing new":
+# an unreadable phone and a quiet one need opposite answers.
+_READ_FAILURES = {
+    "NO_PHONE": "I can't reach his phone over Wi-Fi, so I can't see what he missed. "
+                "Wireless debugging may be off on it.",
+    "": "His phone didn't answer just now, so I can't say what he missed.",
+}
+
+_DEFAULT_DIGEST_IGNORE = [
+    "android", "com.android.systemui", "com.miui.securitycenter", "com.xiaomi.mirror",
+    "com.xiaomi.aicr", "com.miui.misound", "com.microsoft.appmanager",
+]
+
+_DIALED = ("DIALED",)
 
 # Why a dial did not go out, in words California can say. Each needs a
 # different fix, so they are never collapsed into "couldn't call".
 _DIAL_FAILURES = {
-    "PHONE_NOT_CONNECTED": "Phone Link isn't connected to the phone for calls. Toggle Bluetooth "
-                           "on the phone and the laptop, then press Try again in Phone Link's Calls tab.",
-    "NOT_PREFILLED": "Phone Link never showed the number on its dial pad, so I didn't press call.",
-    "NO_BUTTON": "Phone Link's call button wasn't available.",
-    "NOT_FOREGROUND": "I couldn't bring Phone Link to the front, so I didn't press anything.",
-    "NOT_FOCUSED": "Phone Link's call button didn't take focus, so I didn't press anything.",
-    "NO_CALL_WINDOW": "I pressed call but couldn't see the call start in Phone Link.",
-    "": "I couldn't drive Phone Link to place the call.",
+    "NO_PHONE": "I can't reach your phone over Wi-Fi. Turn Wireless debugging back on in Developer options.",
+    "LOCKED_DOWN": "Your phone is blocking me from calling. Turn on USB debugging (Security settings) "
+                   "in Developer options.",
+    "NO_INTERCEPTION": "Your phone won't let me into the call audio, so I can't talk on it.",
+    "HELPER_MISMATCH": "The call helper on your phone isn't the one I installed, so I won't run it. "
+                       "Something may have changed it.",
+    "NOT_PLACED": "I asked your phone to call but the call never started.",
+    "BUSY": "You're already on a call on your phone, so I didn't dial over it.",
+    "": "I couldn't reach your phone to place the call.",
 }
 
 # Portuguese premium-rate and adult-line prefixes: never dialled by her.
@@ -123,8 +137,8 @@ class CallReport:
     call_id: str = ""
     ended_at: str = ""
     number_source: str = ""  # "from your contacts" | "the number I found" | "the number you said"
-    dial_status: str = ""  # Phone Link's answer to the dial (DIALED, DIALED_UNCONFIRMED, PHONE_NOT_CONNECTED...)
-    hang_up_status: str = ""  # Phone Link's answer to the hang-up (ENDED, NO_CALL...)
+    dial_status: str = ""  # the phone's answer to the dial (DIALED, NO_PHONE, LOCKED_DOWN...)
+    hang_up_status: str = ""  # the phone's answer to the hang-up (ENDED, NO_CALL...)
     backend: str = ""
     model: str = ""
     voice: str = ""
@@ -254,11 +268,9 @@ class PhoneService:
         resolve_contact: Callable | None = None,
         dialer=None,
         agent_factory: Callable | None = None,
-        mic_route_factory: Callable | None = None,
-        speaker_route_factory: Callable | None = None,
-        room_speaking: Callable[[], bool] | None = None,
         summarize: Callable | None = None,
         publish: Callable | None = None,
+        read_phone=None,
     ):
         cfg = config.get("phone", {}) or {}
         # The live UI's EventBus.publish, or None. Call lines go out as they
@@ -285,12 +297,24 @@ class PhoneService:
         self.no_answer_s = float(cfg.get("no_answer_s") or 45)
         self.silence_ms = int(cfg.get("silence_duration_ms") or 700)
         self.confirm_timeout_s = max(10.0, float(cfg.get("confirm_timeout_ms") or 120000) / 1000.0)
-        self.cable_output = str(cfg.get("cable_output_device") or "CABLE Input")
-        self.cable_mic_endpoint = str(cfg.get("cable_mic_endpoint") or "CABLE Output (VB-Audio Virtual Cable)")
-        # Where the callee plays and where she listens: pinned for the call,
-        # never "whatever the default speaker is" (see phone_link.SpeakerRoute).
-        # Empty keeps the default speaker, for machines without that device.
-        self.call_speaker_endpoint = str(cfg.get("call_speaker_endpoint") or "")
+        # The phone over Wireless debugging. No serial: found by mDNS or its
+        # attached IP:port (services/phone_adb.py), never the Mi Box.
+        adb_cfg = cfg.get("adb", {}) or {}
+        self.adb_path = str(adb_cfg.get("path") or "adb")
+        self.adb_serial = str(adb_cfg.get("serial") or "")
+        self.adb_port = int(adb_cfg.get("port") or 27183)
+        # The phone's own mic stays out of the call, or the room goes in under her voice.
+        self.mute_phone_mic = adb_cfg.get("mute_phone_mic", True) is not False
+        # "What did I miss?": read-only, see missed_calls() and digest().
+        digest_cfg = cfg.get("digest", {}) or {}
+        self.digest_window_hours = int(digest_cfg.get("missed_window_hours") or 24)
+        self.digest_max_apps = int(digest_cfg.get("max_apps") or 8)
+        self.digest_max_senders = int(digest_cfg.get("max_senders_per_app") or 5)
+        ignore = digest_cfg.get("ignore_packages")
+        self.digest_ignore_packages = frozenset(
+            str(p) for p in (_DEFAULT_DIGEST_IGNORE if ignore is None else ignore)
+        )
+        self.digest_app_names = {str(k): str(v) for k, v in (digest_cfg.get("app_names") or {}).items()}
         self.default_country = str(cfg.get("default_country") or "351")
         self.allowed_country_codes = [str(c) for c in (cfg.get("allowed_country_codes") or [self.default_country])]
         self.blocked_prefixes = [str(p) for p in (cfg.get("blocked_prefixes") or _DEFAULT_BLOCKED_PREFIXES)]
@@ -300,10 +324,9 @@ class PhoneService:
 
         self.resolve_contact = resolve_contact
         self._dialer = dialer
+        self._read_phone = read_phone
+        self._read_lock = threading.Lock()
         self._agent_factory = agent_factory
-        self._mic_route_factory = mic_route_factory
-        self._speaker_route_factory = speaker_route_factory
-        self._room_speaking = room_speaking
         # What the call achieved is read from the transcript after it ends
         # (services/call_outcome.py), with the same Claude model the room
         # uses. Only for the real agent: tests that inject one never reach
@@ -330,8 +353,8 @@ class PhoneService:
         """Never raises. Each missing piece logs its own fix."""
         if self._dialer is not None and self._agent_factory is not None:
             return True  # injected (tests)
-        if sys.platform != "win32":
-            logger.warning("Phone calls disabled: they drive Phone Link, which is Windows only")
+        if not (shutil.which(self.adb_path) or os.path.isfile(self.adb_path)):
+            logger.warning("Phone calls disabled: adb not found at %r (phone.adb.path)", self.adb_path)
             return False
         kwargs, why = self._client_kwargs()
         if kwargs is None:
@@ -340,7 +363,7 @@ class PhoneService:
         self.client_kwargs = kwargs
         # find_spec, not an import: google.genai is heavy, and boot should not
         # pay for it when no call is ever made.
-        for module in ("google.genai", "soundcard"):
+        for module in ("google.genai",):
             try:
                 found = importlib.util.find_spec(module) is not None
             except (ImportError, ValueError):
@@ -389,12 +412,26 @@ class PhoneService:
 
     def _get_dialer(self):
         if self._dialer is None:
-            from services.phone_link import PhoneLinkDialer
+            from services.phone_adb import AdbPhone
 
-            self._dialer = PhoneLinkDialer()
+            self._dialer = AdbPhone.from_config({"phone": {"adb": {
+                "path": self.adb_path, "serial": self.adb_serial, "port": self.adb_port,
+                "mute_phone_mic": self.mute_phone_mic,
+            }}})
         return self._dialer
 
-    def _make_agent(self):
+    def _get_read_phone(self):
+        """A separate transport; callers hold _read_lock through discovery and reads."""
+        if self._read_phone is None:
+            from services.phone_adb import AdbPhone
+
+            self._read_phone = AdbPhone.from_config({"phone": {"adb": {
+                "path": self.adb_path, "serial": self.adb_serial, "port": self.adb_port,
+                "mute_phone_mic": self.mute_phone_mic,
+            }}})
+        return self._read_phone
+
+    def _make_agent(self, audio=None):
         if self._agent_factory is not None:
             return self._agent_factory()
         from services.gemini_live_call import GeminiLiveAgent
@@ -405,9 +442,10 @@ class PhoneService:
             voice=self.voice,
             language_code=self.language_code,
             silence_ms=self.silence_ms,
-            cable_device=self.cable_output,
-            listen_device=self.call_speaker_endpoint,
+            capture_factory=audio.capture,
+            speaker_factory=audio.speaker,
             on_line=self._on_call_line,
+            live_if_heard_s=0,
         )
 
     def _publish(self, kind: str, data: dict) -> None:
@@ -421,22 +459,6 @@ class PhoneService:
     def _on_call_line(self, index: int, who: str, text: str, at: float) -> None:
         if self._publish_text:
             self._publish("call_line", {"index": index, "who": who, "text": text, "at": at})
-
-    def _mic_route(self):
-        if self._mic_route_factory is not None:
-            return self._mic_route_factory()
-        from services.phone_link import MicRoute
-
-        return MicRoute(self.cable_mic_endpoint)
-
-    def _speaker_route(self):
-        if self._speaker_route_factory is not None:
-            return self._speaker_route_factory()
-        if not self.call_speaker_endpoint:
-            return contextlib.nullcontext()
-        from services.phone_link import SpeakerRoute
-
-        return SpeakerRoute(self.call_speaker_endpoint)
 
     # ------------------------------------------------------------- numbers
 
@@ -543,10 +565,10 @@ class PhoneService:
 
     def find_phone(self) -> PhoneCommandResult:
         """
-        Ring the phone with Phone Link's "Play sound" (about 20 seconds).
+        Ring the phone over adb: an alarm-stream beep, about 20 seconds, that
+        plays through silent mode.
 
-        Not during a call: it drives the same Phone Link window and takes the
-        foreground, which would disturb a call in progress. Blocks for the few
+        Not during a call: the beep would play into his ear on the call. Blocks for the few
         seconds the UI takes, on the caller's thread, like the other tools.
         """
         if not self.enabled:
@@ -564,6 +586,95 @@ class PhoneService:
         if line is None:
             return PhoneCommandResult(False, _MSG_FIND_FAILED)
         return PhoneCommandResult(status in ("PLAYING", "ALREADY_PLAYING"), line)
+
+    # ------------------------------------------------------------- what he missed
+
+    def missed_calls(self) -> PhoneCommandResult:
+        """
+        Missed calls in the last `phone.digest.missed_window_hours`, from the
+        phone's call log. Read-only. success=True even when there are none;
+        False only when the phone could not be read.
+        """
+        if not self.enabled:
+            return PhoneCommandResult(False, _MSG_DISABLED)
+        now = time.time()
+        with self._read_lock:
+            failure = self._unreachable()
+            if failure is None:
+                calls, failure = self._read_missed(now)
+        if failure is not None:
+            return failure
+        return PhoneCommandResult(True, missed_calls_line(calls, now, self.digest_window_hours))
+
+    def digest(self, app: str = "") -> PhoneCommandResult:
+        """
+        Missed calls plus who is waiting in which app -- no message text. With
+        `app`, that app's waiting texts instead, each quoted as the sender's
+        words. Read-only, so allowed during a call (unlike find_phone).
+        """
+        if not self.enabled:
+            return PhoneCommandResult(False, _MSG_DISABLED)
+        now = time.time()
+        app = (app or "").strip()
+        with self._read_lock:
+            failure = self._unreachable()
+            if failure is not None:
+                return failure
+            calls = []
+            if not app:
+                calls, failure = self._read_missed(now)
+                if failure is not None:
+                    return failure
+            notes, failure = self._read_notifications()
+            if failure is not None:
+                return failure
+        if app:
+            line = app_texts_line(app, notes, self.digest_app_names, now, max_items=self.digest_max_senders)
+        else:
+            line = digest_line(
+                calls, notes, self.digest_app_names, now, self.digest_window_hours,
+                max_apps=self.digest_max_apps, max_senders=self.digest_max_senders,
+            )
+        return PhoneCommandResult(True, line)
+
+    def _unreachable(self) -> PhoneCommandResult | None:
+        """The NO_PHONE line when the phone is not on adb, else None. Never raises."""
+        try:
+            status = self._get_read_phone().reachable()
+        except Exception:
+            logger.exception("Checking the phone over adb failed")
+            return PhoneCommandResult(False, _READ_FAILURES[""])
+        if status != "OK":
+            return PhoneCommandResult(False, _READ_FAILURES["NO_PHONE"])
+        return None
+
+    def _read_missed(self, now: float) -> tuple[list, PhoneCommandResult | None]:
+        """(calls, None), or ([], the failure line). Never raises."""
+        try:
+            raw = self._get_read_phone().missed_calls_raw(int((now - self.digest_window_hours * 3600) * 1000))
+        except Exception:
+            logger.exception("Reading the phone's call log failed")
+            raw = None
+        if raw is None:
+            return [], PhoneCommandResult(False, _READ_FAILURES[""])
+        return parse_call_log(raw), None
+
+    def _read_notifications(self) -> tuple[list, PhoneCommandResult | None]:
+        """(notifications without the ignored packages, None), or ([], the failure line). Never raises."""
+        try:
+            raw = self._get_read_phone().notifications_raw()
+        except Exception:
+            logger.exception("Reading the phone's notifications failed")
+            raw = None
+        if raw is None:
+            return [], PhoneCommandResult(False, _READ_FAILURES[""])
+        notes = [n for n in parse_notifications(raw) if n.package not in self.digest_ignore_packages]
+        return notes, None
+
+    def busy(self) -> bool:
+        """True while one of her own calls is in progress."""
+        with self._lock:
+            return self._active is not None
 
     def status_line(self) -> str:
         with self._lock:
@@ -613,49 +724,57 @@ class PhoneService:
         try:
             dialer = self._get_dialer()
 
+            audio_box: list = []
+
             def dial() -> bool:
                 self._publish("call_state", {"state": "dialing", "label": label})
                 dial_status.append(dialer.dial(number))
-                return dial_status[-1] in _DIALED
+                placed = dial_status[-1] in _DIALED
+                if placed and audio_box and audio_box[0] is not None:
+                    audio_box[0].arm()  # only now may the bridge open on an ACTIVE call
+                return placed
+
+            def still_connected():
+                # A dead bridge means no ears and no mouth: end the call.
+                if audio_box and getattr(audio_box[0], "failed", False) is True:
+                    return False
+                return dialer.in_call()
 
             prompt = build_call_prompt(brief, owner=self.owner, callback_number=self.callback_number)
             self._publish("call_state", {
                 "state": "starting", "label": label, "kind": brief.kind, "started_at": started_at,
             })
-            with self._mic_route(), self._speaker_route():
-                agent = self._make_agent()
-                result = agent.run(
-                    prompt,
-                    max_call_s=self.max_call_s,
-                    no_answer_s=self.no_answer_s,
-                    still_connected=dialer.in_call,
-                    stop=self._stop,
-                    dial=dial,
-                    mute=self._room_speaking,
-                )
-                if result.ended_by == "dial_failed":
-                    result.error = _DIAL_FAILURES.get(dial_status[-1] if dial_status else "", _DIAL_FAILURES[""])
-                elif dial_status:
-                    # Always try, still inside the mic route: a call whose End
-                    # button was never seen (DIALED_UNCONFIRMED) reads None, not
-                    # True, and skipping it would leave the line open on the
-                    # room mic once the route is undone. After "hung_up" too:
-                    # if that reading was ever wrong, this closes the line.
-                    # NO_CALL is only reassuring once the call was seen on
-                    # screen, which "hung_up" (seen, then gone) implies.
-                    hung = dialer.hang_up()
-                    hang_up_status = hung or ""
-                    unseen = (
-                        dial_status[-1] == "DIALED_UNCONFIRMED"
-                        and result.ended_by != "hung_up"
-                        and hung != "ENDED"
+            # The other side's audio, recorded for debugging only when
+            # transcripts are kept at all (it is their voice).
+            record = (os.path.join("debug", "phone_adb", f"{started.strftime('%Y%m%d-%H%M%S')}-downlink.wav")
+                      if self.include_transcripts else "")
+            audio = dialer.audio(record) if hasattr(dialer, "audio") else None
+            audio_box.append(audio)
+            agent = self._make_agent(audio)
+            result = agent.run(
+                prompt,
+                max_call_s=self.max_call_s,
+                no_answer_s=self.no_answer_s,
+                still_connected=still_connected,
+                stop=self._stop,
+                dial=dial,
+                answered=audio.answered if audio is not None else None,
+            )
+            if audio is not None and getattr(audio, "failed", False) is True:
+                result.error = result.error or "The call audio on your phone stopped, so I hung up."
+            if result.ended_by == "dial_failed":
+                result.error = _DIAL_FAILURES.get(dial_status[-1] if dial_status else "", _DIAL_FAILURES[""])
+            elif dial_status:
+                # Always try: if a "they hung up" reading was ever wrong, this
+                # closes the line. NO_CALL is the normal answer after they hung up.
+                hung = dialer.hang_up()
+                hang_up_status = hung or ""
+                if hung == "ENDED" and result.ended_by == "hung_up":
+                    logger.warning("Call read as hung up was still live; ended it now")
+                if hung not in ("ENDED", "NO_CALL"):
+                    result.error = result.error or (
+                        "I couldn't confirm the call hung up. Check the phone, it may still be connected."
                     )
-                    if hung == "ENDED" and result.ended_by == "hung_up":
-                        logger.warning("Call read as hung up was still live; ended it now")
-                    if unseen or hung not in ("ENDED", "NO_CALL"):
-                        result.error = result.error or (
-                            "I couldn't confirm the call hung up. Check the phone, it may still be connected."
-                        )
         except Exception as exc:
             logger.exception("Phone call to %s failed", label)
             result.ended_by = result.ended_by or "error"

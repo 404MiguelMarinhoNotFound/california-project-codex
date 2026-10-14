@@ -102,7 +102,12 @@ Required for the vacuum (`control_vacuum`):
   service reads the code itself over IMAP. Without it, the vacuum tool stalls until
   `ECOVACS_VERIFICATION_CODE` is set by hand once. See "DeebotService" below
 
-Required for phone calls (`control_phone`), depending on `phone.backend`:
+Required for phone calls (`control_phone`): the phone itself, over ADB (no credential,
+but three one-time switches on the Xiaomi, see "PhoneService"): Developer options,
+**Wireless debugging** paired once with this laptop, and HyperOS **"USB debugging
+(Security settings)"** (needs a Mi account). The laptop's `~/.android/adbkey` IS the key
+to the phone: readable only by Master Miguel, SYSTEM and Administrators (fixed
+2026-10-13). Plus Gemini credentials, depending on `phone.backend`:
 
 - `vertex` (shipped; bills the Google Cloud project, so its credits apply):
   `phone.vertex.project` in `config.yaml` plus Application Default Credentials --
@@ -121,8 +126,10 @@ Required for phone calls (`control_phone`), depending on `phone.backend`:
 WhatsApp (`control_whatsapp`) needs **no credential at all**, and that is deliberate: the send
 path drives WhatsApp Web in a linked browser profile (`whatsapp.profile_dir`, linked once with
 `tools/link_whatsapp.py`), so the session *is* the auth -- and is gitignored like one.
-What it does need is `contacts.vcf` at `whatsapp.contacts_path` -- a VCF export of the phone's
-address book, gitignored because it is several hundred real people's phone numbers -- and,
+What it does need is a contact book: `phone_contacts.json`, the snapshot "Contact sync" reads
+off the phone over ADB, or failing that `contacts.vcf` at `whatsapp.contacts_path` -- a VCF
+export of the phone's address book. Both are gitignored because they are several hundred real
+people's phone numbers -- and,
 optionally, `whatsapp_aliases.yaml` at `whatsapp.aliases_path`: the spoken nicknames, gitignored
 for the same reason, since the repository is public.
 
@@ -261,19 +268,24 @@ california/
 │   ├── tts.py                   # Text-to-speech
 │   ├── tts_text_sanitizer.py    # Text cleanup for TTS timing
 │   ├── youtube_playlist_resolver.py # Matches voice playlist names and picks one saved ID at random
-│   ├── whatsapp_service.py      # WhatsApp: VCF contacts, confirm-before-send, one worker thread, backend switch
+│   ├── whatsapp_service.py      # WhatsApp: phone-snapshot (else VCF) contacts, confirm-before-send, one worker thread, backend switch
+│   ├── contact_sync.py          # The phone's contact book over ADB (read-only) into phone_contacts.json, weekly
 │   ├── whatsapp_web.py          # Playwright driver for WhatsApp Web: selectors table, send + sent-tick confirm
 │   ├── whatsapp_groups.py       # Forgiving spoken-name -> group-title matcher (emoji-blind, sound-alike words)
 │   ├── phone_service.py         # Phone calls: brief -> read-back -> background call -> CallReport + logs/calls.jsonl
 │   ├── phone_prompts.py         # The call agent's prompt: persona, flow of a call, guardrails, template per kind, notes
 │   ├── call_outcome.py          # What a call achieved, read from its transcript by Claude after the call
-│   ├── phone_link.py            # Phone Link over PowerShell/UIA: dial, in-call, hang up, default-mic swap
-│   ├── gemini_live_call.py      # One Gemini Live session per call: loopback in, VB-CABLE out, transcript, end_call only
+│   ├── phone_adb.py             # The phone over ADB: find it (never the Mi Box), dial, call state, hang up, ring, read-only reads
+│   ├── phone_digest.py          # What he missed: call-log and notification parsers, senders-first spoken lines, no full numbers
+│   ├── incoming_call.py         # Who is ringing: ring-state parser, read-only adb stream watcher (watchdog + backoff), the spoken line
+│   ├── phone_call_audio.py      # The call's audio from the phone: downlink in, uplink out, over adb forward
+│   ├── gemini_live_call.py      # One Gemini Live session per call: phone audio in/out, transcript, end_call only
 │   └── youtube_search.py        # Resolves a spoken query to the first video id over the public results page
 ├── hardware/
 │   └── led_controller.py        # LED state feedback
 ├── ui/                          # The live page: index.html, app.css, app.js, halo.js (no build step)
 │   └── vendor/                  # three.min.js r149, vendored; version and SHA-256 in its README
+├── android/callaudio/           # Phone-side helper (dex, run as shell): Telecom + call-audio interception, see its README
 ├── training/                    # Wake-word training, runs on Modal, see training/README.md
 │   ├── modal_train.py           # Modal app: setup / smoke / train entrypoints
 │   ├── california.yaml          # Run 1 config, kept for comparison
@@ -292,7 +304,7 @@ california/
 │   ├── pair_samsung_tv.py          # Pair/re-pair with the TV for CEC wake; needs on-screen approval
 │   ├── link_whatsapp.py            # Link California's WhatsApp Web profile by QR; rerun after a logout
 │   ├── list_whatsapp_groups.py     # Read every WhatsApp group off the chat list and refresh the cache
-│   ├── fix_phone_link.py           # Bring Phone Link's calling link back: Try again, laptop Bluetooth off/on; --check to report
+│   ├── phone_adb_call.py           # Phone over ADB by hand: check, state, ring, call (no read-back; test calls go to Miguel)
 │   ├── probe_phone_backend.py      # Connect Gemini Live with the phone config, no call: credentials, latency, her first line
 │   ├── eval_phone_conversation.py  # Simulated calls (Claude as callee, spoken pt-PT TTS) scored for how she talks
 │   ├── bench_tv_power.py           # Measure the power path on the real room: standby depth, One Touch Play, turn_on timings
@@ -340,6 +352,7 @@ california/
 │   ├── test_youtube_playlist_resolver.py # Matching, aliases, and random-selection coverage
 │   ├── test_youtube_search_autoplay.py # Query -> video id -> watch link, session-stamp verification, spoken lines
 │   ├── test_whatsapp_service.py # WhatsApp self-disable, VCF parsing, match certainty, the confirm token, no-keyboard guard
+│   ├── test_contact_sync.py     # Rows folded per contact, atomic snapshot, SHRUNK/UNREADABLE keep the book, BUSY, counts-only logs
 │   ├── test_orchestrator_whatsapp.py # control_whatsapp dispatch: spoken lines, the read-back guard, the interim line
 │   ├── test_whatsapp_web.py     # Playwright driver on a fake page, outcome lines, one-thread worker, no-browser guard
 │   ├── test_whatsapp_unread.py  # Unread from the chat list: never opens a chat, senders-first lines, messages quoted not obeyed
@@ -347,7 +360,12 @@ california/
 │   ├── test_whatsapp_group_send.py # Group sends: misheard names matched, always read back, groups-only, one guess per turn
 │   ├── test_whatsapp_read.py    # Reading a chat's latest messages: open-read-close, quoted not obeyed, sends close the chat too
 │   ├── test_phone_prompts.py    # Background rules in every kind, request fields, brief signature
-│   ├── test_phone_service.py    # Read-back token, number rules, one call at a time, report + log, no-PowerShell guard
+│   ├── test_phone_service.py    # Read-back token, number rules, one call at a time, report + log, no-adb guard
+│   ├── test_phone_adb.py        # Discovery (never the Mi Box), Security-settings gate, hash-checked helper, dial/hang up/ring
+│   ├── test_phone_digest.py     # Call-log/notification parsing, masked callers, senders not text, app texts as their words
+│   ├── test_incoming_call.py    # Ring-state parsing, once per ring, stall watchdog, backoff, the spoken line per caller
+│   ├── test_orchestrator_incoming.py # Announced between mic reads, not during her own call, reset_playback first, no LLM turn
+│   ├── test_phone_call_audio.py # Bridge: starts at the answer, 20 ms blocks, real-time pacing, flush, stop
 │   ├── test_gemini_live_call.py # Fake Live session: transcript, hang-up guard, silent tool replies, every way a call ends
 │   ├── test_call_outcome.py     # Reading the outcome from a transcript: statuses, never raises, their words as data
 │   ├── test_orchestrator_phone.py # control_phone dispatch, the labelled report, speaking it from the idle loop
@@ -366,7 +384,8 @@ california/
 ├── vpn_state.json               # Generated locally, Surfshark diagnostic cache
 ├── watch_state.json             # Generated locally, cached Stremio progress
 ├── .deebot_device_id            # Generated locally, the Ecovacs device id that got verified
-├── contacts.vcf                 # Local only: the phone's contacts export (WhatsApp)
+├── phone_contacts.json          # Local only: the phone's contact book, synced over ADB weekly (WhatsApp, calls)
+├── contacts.vcf                 # Local only: the phone's contacts export, the fallback when there is no snapshot
 ├── whatsapp_aliases.yaml        # Local only: WhatsApp nickname -> contact map
 ├── whatsapp_groups.json         # Local only: cached WhatsApp group titles (list_groups)
 ├── .whatsapp_profile/           # Local only: the linked WhatsApp Web browser session
@@ -1808,6 +1827,16 @@ and wrong for four hundred people: "ana" would resolve to "Joana" as confidently
 was and returns ambiguity rather than a best guess -- exactly what the confirm step
 needs. `match_name` is still used for the small `aliases` map, like the lights.
 
+**The book comes from the phone first, the VCF second (2026-10-14).** `_load_contacts`
+reads `phone_contacts.json` (`contacts_sync.snapshot_path`) when contact sync is enabled
+and the snapshot holds anyone, and `contacts.vcf` only otherwise; `contacts_source` says
+which (`"phone"`, `"vcf"`, or `""` for no book at all). A missing, empty or corrupt
+snapshot falls back to the VCF with a warning and never touches the boot.
+`reload_contacts` is what `ContactSync` calls after it writes, so a weekly sync lands
+without a restart, and a read-back already pending survives the swap: the confirmation
+token is keyed on contact key and number, not on the list. Everything below about the
+VCF still holds for the fallback. See "Contact sync" below.
+
 **The phone's VCF export is vCard 2.1, and a name with an accent or an emoji is
 quoted-printable.** Android writes `FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=6D=61...`
 for any non-ASCII name, and wraps a long one with a trailing `=` and **no** leading space
@@ -2083,29 +2112,175 @@ the tick alone missed two of his messages, which read as "Miguel".
   sending), and the line names whose chat it was.
 
 Setup: `uv sync --extra default`, `uv run python tools/link_whatsapp.py` once (scan the
-QR code from the phone's Linked devices screen), export the phone's contacts as VCF and
-drop it at `whatsapp.contacts_path` (gitignored). On the Pi, also
+QR code from the phone's Linked devices screen), and either let contact sync read the
+phone over ADB (below) or export the phone's contacts as VCF and drop it at
+`whatsapp.contacts_path` (gitignored). On the Pi, also
 `uv run playwright install chromium` once -- that browser lives outside `uv.lock`, like
 the openWakeWord models, so a fresh machine needs it again.
+
+### Contact sync
+
+`services/contact_sync.py` (`ContactSync`) reads the phone's own contact book over ADB
+into `phone_contacts.json`, which `WhatsAppService` loads in place of `contacts.vcf` --
+and `PhoneService` with it, since calls resolve names through
+`WhatsAppService.resolve_contact`. `contacts.vcf` was a hand export that went stale the
+day it was made. Lookups never touch the phone: the snapshot is a file, so WhatsApp and
+calls keep resolving names with the phone off the network. Plan:
+`docs/superpowers/plans/2026-10-13-weekly-contact-sync.md`.
+
+**What the phone returns (probed read-only, 2026-10-13).** One
+`content query --uri content://com.android.contacts/data/phones` answered **845 rows for
+418 distinct `contact_id`s in 1.4s**. A row is one (raw contact, number), and a person
+appears once per account -- Google, WhatsApp, Duo/Meet, the SIM -- with the WhatsApp and
+Duo rows copying the Google numbers. `contacts_from_rows` therefore folds rows per
+`contact_id`, normalises each number (cutting a `,` pause or `;` wait suffix first),
+ranks them the way the VCF loader does (default number 3, mobile 2, home 1) and
+deduplicates. Two ids with the same name stay two contacts: the "which one?" question
+depends on it. A card with no name or no usable number is dropped. Measured end to end
+on 2026-10-14: **413 contacts, 2.0s** for the first sync, **1.4s** for the next.
+
+- **Values are printed raw**: `Row: <n> key=value, key=value`, no quoting, `NULL` for
+  null. Names are free text and `data1` may legally hold `,` and `;`, so the row cannot
+  be split on `", "`. `parse_content_rows` (in `services/phone_adb.py`) anchors on the
+  known key sequence, and **`display_name` is the last column of the projection** because
+  only the last value can safely run to the end of the line. A line it cannot place is
+  counted as `unparsed`, never guessed. `test_projection_keeps_display_name_last` pins it.
+- **Decoded as UTF-8 the output is clean** (88 non-ASCII names and 28 with emoji came
+  through intact), which removes the quoted-printable problem the VCF has.
+
+**A shell `content query`, not a mode of the `callaudio` helper.** The shell user already
+holds `READ_CONTACTS`, the query is one round trip, and it needs neither the helper push
+nor its hash-checked launch. A helper mode would add a dex rebuild, a hash bump and a
+`HELPER_MISMATCH` path, all for JSON-escaped output that the anchored parser makes
+unnecessary. `AdbPhone.query` calls `ready(need_interception=False, need_helper=False)`,
+sends exactly one shell command, never pushes or runs the helper, and refuses a URI or
+key that is not a plain identifier, so no caller can inject shell. It is read-only:
+never `insert`, `update` or `delete`. Revisit the helper only if a real name ever breaks
+the parser, which the `unparsed` count will show.
+
+**Two rules keep a bad answer from deleting his people:**
+
+- **Zero contacts is never a book.** A phone with a contact book does not answer with
+  none, so `[]`, or rows that fold to nothing, is `UNREADABLE` and the snapshot is left
+  alone.
+- **`SHRUNK`: a book below `min_keep_ratio` (0.5) of the last one is not written.** A
+  half-synced account, a revoked permission or a provider hiccup can return a fraction of
+  the book; writing it would quietly drop half his contacts until the next week. He is
+  told the two counts and the old list is kept.
+
+Every outcome has its own line (`SYNCED`, `UNCHANGED`, `NO_PHONE` with the snapshot's
+age, `LOCKED_DOWN` for Security settings off, `UNREADABLE`, `SHRUNK`, `BUSY`,
+`DISABLED`). `ContactSyncResult` is falsy unless `SYNCED`/`UNCHANGED`, like every other
+result type here. One sync at a time: a second one, voice and loop together, is refused
+as `BUSY`, and a sync never touches a call in progress because `query` never runs the
+helper. The snapshot is written to `<path>.tmp` and `os.replace`d, so a crash never
+leaves half a book; a corrupt one reads as "no snapshot", which makes a sync due at once.
+
+**Logs and spoken lines carry counts only** -- `Contacts synced from phone: 413 contacts
+(+2 -0 ~1) in 1.4s` -- never a name or a number. The logs get shared when debugging and
+the repository is public. Failures log the exception *type*, not its message, for the
+same reason. `test_logs_and_messages_carry_no_names_or_numbers` pins it. The contact
+roster is still never put in the system prompt.
+
+**When it runs.** `Orchestrator._contacts_sync_loop` (thread `contacts-sync`, stopped by
+`_background_stop`) **checks first, then waits** -- the reverse of the other loops -- so
+a snapshot older than `interval_days` (7), or missing, is synced right after boot
+without delaying `__init__`. After that it asks `due()` every `check_interval_minutes`
+(360), so a phone that was off the network is retried within hours, not a week later.
+Construction runs no adb; the `AdbPhone` is built on the first sync.
+
+**By voice: "refresh my contacts"** is `control_phone`'s `phone_sync_contacts`. It is
+handled in `_dispatch_phone` **before** the `phone_svc.enabled` gate, through a trailing
+`contact_sync=None` parameter: it needs adb, not the call backend's Gemini credentials,
+so "phone calls aren't set up" would be the wrong answer. A raising sync is a spoken
+failure, never a traceback.
+
+Config is the top-level `contacts_sync:` block (`enabled`, `snapshot_path`,
+`interval_days`, `check_interval_minutes`, `min_keep_ratio`). It self-disables off
+Windows, without adb at `phone.adb.path`, or when neither WhatsApp nor phone calls is
+enabled (nothing would read it). `tests/config_fixture.py` points `snapshot_path` at a
+nonexistent file so a test never reads or overwrites his real book.
 
 ### PhoneService
 
 `services/phone_service.py` places real phone calls from Master Miguel's own number
-(Xiaomi 17T, Android) and has the conversation itself, behind `control_phone`. Same
-contract as WhatsApp and the vacuum: never raises at construction, self-disables (flag
-off, not Windows, no credentials for `phone.backend`, `google-genai`/`soundcard` missing), returns
-`PhoneCommandResult` (falsy on failure), one call in flight on a daemon thread.
+(Xiaomi, HyperOS 3, Android 16, MediaTek) and has the conversation itself, behind
+`control_phone`. Same contract as WhatsApp and the vacuum: never raises at construction,
+self-disables (flag off, no `adb`, no credentials for `phone.backend`, `google-genai`
+missing), returns `PhoneCommandResult` (falsy on failure), one call in flight on a daemon
+thread.
 
 ```text
 room -> Claude: control_phone(phone_call, brief) -> read-back -> "go" -> confirm true
-  -> background: default mic -> CABLE Output, Gemini Live connects, THEN Phone Link dials
-  -> callee <-> loopback (16k) -> Gemini Live -> 24k PCM -> CABLE Input -> Phone Link mic
-  -> goodbye + end_call -> hang up -> mic restored -> outcome read from transcript
+  -> background: Gemini Live connects, THEN the phone dials (AdbPhone -> Telecom)
+  -> answered (call state ACTIVE) -> callaudio bridge: downlink 16k -> Gemini Live
+     -> 24k PCM -> injected into the call uplink; she is nudged 0.8 s after the answer
+  -> goodbye + end_call -> hang up -> outcome read from transcript
   -> logs/calls.jsonl -> CallReport
   -> _idle_loop pops the report between mic reads -> a turn on "[Phone call report ...]"
 ```
 
-**Everything below was found live on 2026-10-06, and most of it is not what you'd guess:**
+**The transport is the phone itself, over ADB (2026-10-13).** Plan:
+`docs/superpowers/plans/2026-10-13-phone-over-adb.md`. `services/phone_adb.py`
+(`AdbPhone`) keeps the dialer interface PhoneService always used (`dial`, `in_call`,
+`hang_up`, `play_sound`) and adds `audio()`, a `PhoneCallAudio`
+(`services/phone_call_audio.py`) whose `capture()`/`speaker()` faces are her ears and
+mouth. Everything on the phone runs through the `callaudio` helper
+(`android/callaudio/`, its README has the modes) as the shell user via `app_process`.
+No laptop audio device is involved, so the room cannot leak into a call through the
+laptop, and the phone's own mic is muted for the call (`phone.adb.mute_phone_mic`).
+Found live, in order, and none of it guessable:
+
+- **Phone Link's calling link stopped reconnecting** and six fixes failed live (phone and
+  laptop Bluetooth toggles, Try again, an HFP service bounce via
+  `BluetoothSetServiceState`, restarting both apps). The phone's own log showed why: the
+  laptop opens the Bluetooth link but never the hands-free one, and WinRT's
+  `PhoneLineTransportDevice.ConnectAsync` answers `DeniedBySystem` to anything that is
+  not a packaged app. That path is in `deprecated/` now.
+- **The shell has the permissions; HyperOS takes them away.** `CALL_PHONE`,
+  `CALL_AUDIO_INTERCEPTION`, `CAPTURE_AUDIO_OUTPUT`... are granted to `com.android.shell`,
+  but Xiaomi's `PKMSImpl` hook denies `CALL_PHONE` and `INJECT_EVENTS` system-wide until
+  **"USB debugging (Security settings)"** is on (`persist.security.adbinput=1`). `ready()`
+  checks it before every dial and says `LOCKED_DOWN` rather than half-placing a call.
+- **Telecom, not intents.** `am start -a android.intent.action.CALL` and `input keyevent`
+  are the hooked paths; `ITelecomService.placeCall` / `endCall` from the helper are not.
+- **`isPstnCallAudioInterceptable()` is true on this phone**, and it has the two HAL
+  devices it needs: `Telephony Tx` fed by `incall_music_uplink`, and `Voice Call In`.
+- **Her voice played nowhere until the track was pinned.** MediaTek's policy opened the
+  injection track on `TELEPHONY_TX`, then resolved its start to the earpiece and killed
+  it ("Device doesn't sync between startOutput[0x1] and getOutputForAttr"), 51 times in
+  3 s. `setPreferredDevice(TYPE_TELEPHONY)` plus the output's native 48 kHz stereo fixed
+  it: the first call where the callee heard her (2026-10-13 18:51) was the first with
+  both. The laptop still sends 24 kHz mono; the helper upsamples.
+- **The answer is a fact now, so she is told at once.** `PreciseCallState` foreground
+  `ACTIVE` is the answer; the bridge opens then, and `GeminiLiveAgent.run(answered=)`
+  nudges her `_ANSWERED_GRACE_S` (0.8 s) later. Without it the model reached for
+  `end_call` three times while the callee said "Hola" into silence.
+- **Gemini runs in `europe-west1`**: first audio 0.70 s against 0.95 s in `us-central1`
+  from Lisbon (3 runs each). `silence_duration_ms` stays 700 by his call.
+- **The helper runs with the shell's powers, so it is guarded.** Pushed read-only, and
+  its sha256 is checked against the local build in the same shell command that `exec`s
+  it (`HELPER_MISMATCH` otherwise, spoken). Discovery never returns a `:5555` device: the
+  Mi Box is on the same adb server.
+- **Guards from the final review (2026-10-13), each with a test:** the cached serial is
+  re-checked against `adb devices` before every command (Wireless debugging takes a new
+  port on each reboot, and a stale serial read as LOCKED_DOWN, the wrong fix, until a
+  restart); a dial over a call already up is `BUSY` and the bridge only opens once
+  PhoneService arms it after ITS dial, so his own call is never taken over; a dial that
+  never shows in the call state is hung up before `NOT_PLACED`; a helper that dies or
+  never starts sets `PhoneCallAudio.failed` and ends the call instead of leaving it
+  open in silence; a stop during the helper's start-up closes the socket, the forward
+  and the helper (which also exits if nobody connects within 20 s); a second `ring`
+  while one plays is `ALREADY_PLAYING` (two would leave the alarm at max); and the
+  agent believes the phone's hang-up at once (`live_if_heard_s=0`; the 8 s grace was
+  for Phone Link's vanishing End button). The mic mute is optional: a mute that throws
+  is logged and the call continues (an uncaught one killed a live call's audio).
+- **A downlink recording** goes to `debug/phone_adb/<call_id>-downlink.wav` when
+  `logging.include_transcripts` is on, and every turn logs a "Response gap" (their last
+  sound to her first audio) for latency work.
+
+**Until 2026-10-13 calls went through Phone Link. What follows up to "How she talks" is
+that history (found live 2026-10-06/08); the code is in `deprecated/`:**
 
 - **There is no Phone Link API, and the WinRT calls API sees 0 lines** from unpackaged
   Python (Phone Link owns the HFP registration). Calls go through Phone Link's UI.
@@ -2289,8 +2464,9 @@ says which ("from your contacts", "the number I found", "the number you said"):
 
 1. Digits in `to` -- he said the number.
 2. A **certain** contact match for `to` (`WhatsAppService.resolve_contact`: aliases + the
-   VCF, no browser) -- even when Claude also passed a `number`, because a number the model
-   passes for a person may be invented and the book is what his phone holds.
+   phone contact snapshot, else the VCF; no browser) -- even when Claude also passed a
+   `number`, because a number the model passes for a person may be invented and the book
+   is what his phone holds.
 3. The brief's `number` -- a business Claude looked up with web search. It beats a loose
    or tied contact match, so "Taberna da Praia" brushing a contact's surname cannot
    redirect the call.
@@ -2321,7 +2497,7 @@ relevant metadata, how long it took". Three layers, one source:
   seconds after the dial, so the transcript is timestamped. A stage that did not happen is
   absent, never zero -- the `turns.jsonl` rule.
 - `PhoneService` adds what only it knows: `call_id`, `started_at`/`ended_at`,
-  `number_source`, Phone Link's `dial_status` and `hang_up_status`, backend, model, voice.
+  `number_source`, the phone's `dial_status` and `hang_up_status`, backend, model, voice.
   `CallReport.metadata()` derives the rest once: `ring_s`, `talk_s` (talk window minus
   ring), turns and words per side, and `ended_how` in words.
 - `call_record()` is the one shape of a call: `logs/calls.jsonl` writes it (brief, outcome,
@@ -2352,30 +2528,163 @@ list endpoint on Vertex rejects API keys outright ("API keys are not supported b
 API"), so it is no test of whether a key works -- a real request is. Voice `Aoede`; `language_code` is left
 empty so the native-audio model follows the prompt (Portuguese, English if they do).
 
-**Find my phone: `phone_find` (2026-10-08).** "Where is my phone?" presses Phone Link's
-**Play sound** (AutomationId `RingMyPhoneIndicatorToggleButton` in the left pane, a toggle
-that rings the phone ~20s even on silent) through `PhoneLinkDialer.play_sound` ->
-`PhoneService.find_phone`. It is an action on `control_phone`, so no new tool schema, and it
-needs no read-back: ringing a phone is harmless and repeatable. Same rules as the dial:
-focus the button through UIA, then a real key through `PressEnterOn` (foreground and focus
-verified before any key); Phone Link is launched by its AUMID when closed; refused during a
-call, because it shares the window. Each outcome has its own spoken line (`_FIND_LINES`):
-`PLAYING`, `ALREADY_PLAYING`, `NO_WINDOW`, `NO_BUTTON`, `DISABLED` (greyed out = phone not
-reachable), `NO_CONFIRM`, `NOT_STARTED`, `NOT_FOREGROUND`, `NOT_FOCUSED`.
+**Find my phone: `phone_find`.** "Where is my phone?" runs the helper's `ring` mode
+(`AdbPhone.play_sound`): a two-tone beep on the alarm stream at its max volume for
+~20 s, which plays through silent mode, with the previous alarm volume put back in a
+`finally` (verified 6 -> 15 -> 6, 2026-10-13). It returns `PLAYING` as soon as the beep
+starts and the beep runs on. No read-back (ringing is harmless and repeatable); refused
+during a call, when the beep would play into his ear. Lines per outcome in
+`_FIND_LINES`: `PLAYING`, `NO_PHONE`, `LOCKED_DOWN`, `RING_FAILED`. Until 2026-10-13 this
+pressed Phone Link's two-step "Play sound" flyout (that code is in `deprecated/`).
 
-**It is two presses, and the first one alone looks like a failure.** The toggle only opens a
-confirmation flyout ("The sound will play for 20 seconds..."); the flyout's own **Play sound**
-button (a plain `Button` named exactly "Play sound", no AutomationId, and focus lands on it)
-does the ringing. Until that was found, four live runs pressed the toggle, saw it stay `Off`
-and reported `NOT_STARTED` over a silent phone, and a hand click "also failed" only because
-the flyout was never confirmed. The script presses the toggle, waits for the flyout, presses
-its button, and takes `ToggleState` going `On` as proof (it returns to `Off` after 20s, seen
-live). An already-open flyout is reused, not toggled shut. Verified live 2026-10-08:
-`PLAYING` in 1.5s. `TogglePattern.Toggle` is ignored, like Invoke on the Call button.
+**What did I miss: `phone_missed` and `phone_digest` (2026-10-13).** "Who called me?"
+and "what did I miss on my phone?" read the phone over ADB and change nothing on it.
+Plan: `docs/superpowers/plans/2026-10-13-phone-missed-digest.md`.
+`services/phone_digest.py` is the pure half (raw text in, `MissedCall` /
+`PhoneNotification` out, and the spoken lines); `AdbPhone` reads the raw text;
+`PhoneService.missed_calls()` / `digest(app)` join them.
+
+- **Two sources, no helper.** Missed calls are `content query` on
+  `content://call_log/calls` with `type=3` inside `phone.digest.missed_window_hours`
+  (24), newest first, parsed by the same `parse_content_rows` contact sync uses -- so
+  the free-text `name` column goes LAST in `CALL_LOG_PROJECTION`
+  (`number:date:new:name`), because a saved name can hold `", "`. Notifications are
+  `dumpsys notification --noredact`, "Notification List" section only, with
+  ongoing/foreground/group-summary records, the system's own missed-call notification
+  (the call log already says it), exact duplicates and `phone.digest.ignore_packages`
+  dropped, and the redacted `publicNotification` copy never read. The shell already
+  holds `READ_CALL_LOG` and can dump notifications, so both go through
+  `AdbPhone.reachable()` -- the stale-serial check and discovery only, which `ready()`
+  now starts from -- and never push or run the `callaudio` helper or need the
+  Security-settings gate. Reads use a separate, lazily created `AdbPhone`, with one
+  lock covering discovery and all reads in a request. A discovery hiccup cannot
+  clear the active call transport's serial or lose its hang-up. Tests may inject
+  `read_phone` separately from the call `dialer`; construction runs no adb.
+- **Read-only, and pinned.** Nothing is dismissed, marked seen or written: no
+  `content insert|update|delete`, no `cmd notification`, no `service call`.
+  `test_reads_never_write_to_the_phone` checks every command the reads issue.
+  Verified live 2026-10-14: the dump's `seen=` counts and the call log's `new` column
+  were identical before and after four reads.
+- **`None` is not empty.** `missed_calls_raw()` / `notifications_raw()` return `None` for
+  a phone that is not on adb, for `""` (adb failed) and for output that is not
+  recognisably theirs; only "No result found." is zero calls. An unreachable phone is
+  spoken as "I can't reach his phone over Wi-Fi", never as "no missed calls"
+  (`test_unreachable_phone_is_not_nothing_new`, `test_failed_reads_are_none_not_empty`).
+- **Senders first, text on request** -- the `whatsapp_unread` rule, because she speaks
+  in a room. The digest is missed calls, then each app with who wrote (`max_apps` 8,
+  `max_senders_per_app` 5, "and N more"), and says no text is included. Only `app`
+  ("read me the WhatsApp ones") reads texts, at most `max_senders_per_app` of them,
+  each quoted and labelled as the sender's words, not instructions. Both summary
+  and explicit-text results first label sender/title and app fields as app-provided
+  data, not instructions, before showing those fields. This reduces injection risk;
+  it is not a formal prevention guarantee. The app is matched
+  with `match_name` against `phone.digest.app_names` (package -> spoken name) and the
+  package names; an unnamed package falls back to its last meaningful segment.
+- **No full number is ever spoken.** A caller is the call log's cached name, else "a
+  number ending 4567", else "a private number" (empty, `-1`/`-2`/`-3`, NULL). Times are
+  "at 14:32", "yesterday at 21:05", "on Saturday". `caller_phrase` is shared with the
+  incoming-call plan. Speech display reuses `whatsapp_groups.speakable_title` with
+  its raw fallback disabled: emoji, joiners, variation selectors and keycap marks
+  are removed, while accents and punctuation remain. An emoji-only name uses the
+  same last-four-digits or private-number fallback; the saved contact is untouched.
+- **Pull only.** Nothing is announced on wake or from the idle loop; SMS, calendar
+  and battery stay parked. (Incoming calls are the one push, see below.) WhatsApp notifications appear here as one
+  app among others, alongside (not routed to) `whatsapp_unread`.
+- **Needs `phone.enabled`.** Unlike `phone_sync_contacts`, both actions sit behind the
+  calls gate in `_dispatch_phone`, so with calls off they answer "Phone calls aren't set
+  up right now." They are allowed during a call (reads only), unlike `phone_find`.
+- **Measured 2026-10-14**, laptop to the phone over Wi-Fi: `missed_calls()` 1.2-1.5 s,
+  `digest()` 1.8 s, every line free of "null" and of digit runs, the digest carrying
+  no quoted text. **Pending: one test through the room** ("California, what did I miss
+  on my phone?", then "read me the WhatsApp ones") needs her restarted; read the
+  `tools` timing in `logs/turns.jsonl` then.
+
+**Incoming calls: who is ringing (2026-10-14).** When his phone rings, she says who,
+once, from the idle loop: "Mum is calling.", "A number ending 4567 is calling.", "A
+private number is calling." Plan:
+`docs/superpowers/plans/2026-10-13-incoming-call-announcement.md`.
+`services/incoming_call.py` holds all of it; `phone.incoming.enabled` switches it.
+
+- **What is read.** `dumpsys telephony.registry`, two lines per modem block:
+  `mPreciseCallState=Ringing call state: N` (PreciseCallState: 5 incoming, 6 waiting,
+  i.e. a second call during one; 0 idle) and the `mCallIncomingNumber=` after it. The
+  phone prints one block per modem (the empty SIM slot reads -1 throughout); the first
+  block ringing wins and a number is never borrowed from another block.
+  `parse_ring_state` returns `None` for text that is not a dump: "could not tell" is
+  never "not ringing".
+- **One shell, not a poll per second.** `RING_LOOP` is a single long-running
+  `adb shell` (`while true; do dumpsys ... | grep ...; echo ---; sleep 1; done`) started
+  through `AdbPhone.stream`: `reachable()` only, never the helper, no push, no
+  Security-settings gate. **The `---` separator comes after each dump**, not before:
+  a block is complete the moment its dump ends, so a ring is read at once instead of
+  waiting out the next `sleep 1`. Blocks arrive every ~1.2-1.9 s.
+- **Once per ring.** A not-ringing -> ringing transition queues one `IncomingCall` in a
+  single slot (a newer ring replaces an older one still waiting); later blocks of the
+  same ring queue nothing, and a number that fills in a beat late follows the queued
+  call. `pop()` hands it over only while the latest reading still shows that ring, so a
+  ring that stopped before the idle loop got to it is never announced. The last state
+  survives a stream restart, so a restart mid-ring does not announce it twice.
+- **Stall watchdog and backoff.** `adb shell` over TCP can hang with no output and no
+  EOF when the phone drops off Wi-Fi. A watchdog thread kills a shell silent for
+  `STALL_S` (5 s), marking the stream not live first so a stale ring is never reported.
+  EOF, an unreadable block or a stall restarts the shell after 5 s, doubling to 60 s,
+  back to 5 s after any stream that read something. Nothing raises into the
+  orchestrator and nothing spins without sleeping; `stop` ends the thread at once,
+  even inside a 60 s backoff.
+- **Its own `AdbPhone`.** `_build_incoming_calls` builds a second `AdbPhone` from config
+  rather than sharing PhoneService's: `reachable()` writes the cached serial without a
+  lock, and the watcher reads from its own thread. Construction runs no adb.
+- **Who.** The name comes from `WhatsAppService.name_for_number` (the same book as calls
+  and WhatsApp: both sides normalised, aliases ignored, `""` when two differently named
+  contacts share the number). The line goes through `caller_phrase`, shared with the
+  digest, so the private-number rule is the same: no name, "a number ending 4567";
+  empty, `-1`/`-2`/`-3` or NULL, "a private number". **No full number is ever spoken
+  or logged**; the watcher logs only the kind. Saved-name emoji are cleaned for
+  this spoken line by the shared caller formatter, without changing the book.
+
+  | the phone gave | she says |
+  |---|---|
+  | a number in the book | "Mum is calling." |
+  | a number not in the book | "A number ending 4567 is calling." |
+  | a private/withheld number | "A private number is calling." |
+  | no number and no name | "Someone's calling you." |
+  | any of the above, call waiting | "... is calling on the other line." / "Someone is calling on the other line." |
+
+- **A fixed line through TTS, not an LLM turn.** `Orchestrator._announce` opens the
+  speaker, synthesizes the line, plays it as clip kind `announce`, closes the speaker
+  and drains the mic, like a turn. No history, no API call. A TTS or playback failure is
+  logged and listening carries on.
+- **`reset_playback()` before the clip.** A stop stays in force until the next turn
+  (see "The Speaker Is Opened Once Per Turn"): after a dropped wake, a "stop" or a
+  barge-in, `play_audio` would refuse the clip and the announcement would silently
+  play nothing.
+- **Where it sits in the idle loop.** After the phone report, before the mic read, so
+  the mic keeps one reader. During one of her own calls (`PhoneService.busy()`) the
+  ring is dropped, not kept for later. During a reply it waits: the next idle pass
+  announces it if the phone is still ringing.
+- **Read-only.** A `dumpsys` and a `grep`; nothing on the phone is answered, rejected,
+  silenced or written.
+- **Checked live 2026-10-14, no ring:** the watcher against the real phone read a block
+  0.9 s after start and 5 blocks in ~7 s, all `none`, nothing queued, and the thread
+  ended on stop.
+- **Pending live checks** (need her restarted and a call from his backup line):
+  1. Ring the main phone: one line within ~2 s of the first ring, nothing more while it
+     rings, nothing after he rejects it.
+  2. Whether `mCallIncomingNumber` was filled during the ring. The log does not say (it
+     carries the kind only); the spoken line does: a name or "a number ending ..."
+     means it was filled, "Someone's calling you." means it was empty. If empty, the
+     follow-up is to take the number from the call log right after the ring, or from
+     `dumpsys telecom`.
+  3. Ring during a reply: the line comes after her reply if it is still ringing, not at
+     all if it stopped.
+- **Open items.** The live UI publishes an `incoming_call` bus event (`kind`, plus a
+  `label` only with transcripts on) that the page has no handler for yet, and the
+  `announce` clip renders as an ordinary clip on the halo. No quiet hours: every call is
+  announced at any hour. Answering ("answer it") is a separate later plan.
 
 **Not built yet, on purpose:** asking Miguel mid-call (`ask_miguel`; he may not be in the
-room, so it needs WhatsApp), and the Pi. On the Pi the transport becomes PipeWire's
-Bluetooth telephony (`org.pipewire.Telephony`, `Dial`), behind the same agent.
+room, so it needs WhatsApp). More of the phone over ADB (SMS, calendar, battery...) is
+parked in `docs/ideas/2026-10-13-phone-toolkit.md`.
 
 ### StremioService
 
@@ -2727,7 +3036,7 @@ The Claude path supports:
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 - Custom `control_whatsapp` tool for WhatsApp messaging (4 actions)
-- Custom `control_phone` tool for phone calls from his own number and finding his phone (4 actions)
+- Custom `control_phone` tool for phone calls from his own number, finding his phone, refreshing his contacts and saying what he missed on it (7 actions)
 
 With the committed `config.yaml` that is **6 tools** in every request: `web_search`,
 `control_tv`, `control_lights`, `control_vacuum`, `control_whatsapp`, `control_phone`. Each custom tool's full schema is sent on
@@ -2788,7 +3097,7 @@ Bulk send and image send exist in the CLI it was ported from and were left out: 
 spoken form (it reads a file of numbers) and image send would pull in `pywhatkit` for a
 capability with no voice phrasing.
 
-`control_phone` supports four actions:
+`control_phone` supports seven actions:
 
 - `phone_call` with a brief: `to`, optional `number`, `kind` (`book_table`, `book_appointment`,
   `ask_question`, `deliver_message`, `personal`, `general`), `goal`, `details`, `may_agree`,
@@ -2797,7 +3106,12 @@ capability with no voice phrasing.
 - `phone_status`: on a call or not, and the last call's line (when, who, result, how long)
 - `phone_log`: the last calls from `logs/calls.jsonl`, newest first (`count`, default 5,
   max 20). Reads the file, so it survives restarts and reads lines from before `meta` existed
-- `phone_find`: rings his phone ~20s through Phone Link's Play sound; no read-back (see "Find my phone")
+- `phone_find`: rings his phone ~20s with an alarm beep over ADB; no read-back (see "Find my phone")
+- `phone_sync_contacts`: re-reads the phone's contact book over ADB now ("refresh my contacts");
+  handled before the calls gate, so it works with calls off (see "Contact sync")
+- `phone_missed`: missed calls in the last 24 h from the phone's call log, read-only
+- `phone_digest`: missed calls, then apps and who wrote, no text; optional `app` reads that
+  app's waiting texts, quoted as the sender's words (see "What did I miss")
 
 When tools are active:
 
@@ -3487,6 +3801,49 @@ Current automated coverage exists for:
   quotes and labels every message, describes a photo rather than inventing it, asks
   which of two people, clamps the count, and unread still never opens a chat
 - That the contact roster is never injected into the system prompt
+- Contact sync (`tests/test_contact_sync.py`, plus snapshot cases in
+  `tests/test_whatsapp_service.py`, `tests/test_orchestrator_phone.py` and
+  `tests/test_phone_adb.py`): rows folded per contact with account duplicates dropped,
+  the default number first, a pause suffix cut, same-name ids kept apart; free text
+  parsed with `display_name` last; the snapshot round-trips and is written atomically;
+  zero rows is UNREADABLE and a shrunken book is not written; no phone, locked down and
+  a second sync at once (BUSY) each a line, never a raise; due after seven days or on a
+  corrupt snapshot; the query never pushes or runs the helper and never writes; the
+  snapshot beats the VCF and a corrupt one falls back to it; a read-back survives a
+  reload; `phone_sync_contacts` works with calls disabled; the loop syncs before its
+  first wait; and no log or spoken line carries a name or a number
+- The phone over ADB (`tests/test_phone_adb.py`, `tests/test_phone_call_audio.py`): the
+  phone found by mDNS name or attached IP:port and never the Mi Box on :5555; no phone,
+  Security settings off and no interception each a status, never an exception, with
+  nothing dialled; the helper pushed only when its hash differs, always read-only, and
+  never run when swapped; only digits dialled; a dial that never registers is
+  NOT_PLACED; in_call unknown until a call was seen; the bridge started only at the
+  answer, 20 ms blocks to the agent, her voice paced to real time and cut by a flush,
+  stop unblocking the reader and removing the forward; no real adb from either file
+- What he missed (`tests/test_phone_digest.py`, plus cases in `tests/test_phone_adb.py`,
+  `tests/test_phone_service.py` and `tests/test_orchestrator_phone.py`): only real
+  waiting notifications kept (no ongoing, foreground, group summary, missed-call or
+  redacted public copy), multi-line text whole, CRLF parsed the same; call-log rows with
+  a comma in the name kept as one field, NULL names empty, undated rows skipped; callers
+  spoken by name, "a number ending" or "a private number", never a full number or
+  "null"; the digest names apps and senders and never text, with its caps; an app's
+  texts quoted as the sender's words; an unreachable phone or a failed read never
+  spoken as "nothing new"; the reads issue no write and push no helper; the shipped
+  config carries the `phone.digest` block
+- Incoming calls (`tests/test_incoming_call.py`, `tests/test_orchestrator_incoming.py`,
+  plus `name_for_number` in `tests/test_whatsapp_service.py` and `busy()` in
+  `tests/test_phone_service.py`): ring state parsed per modem block, waiting as its own
+  kind, CRLF and the watcher's grep output, unreadable text `None`; a ring queued once,
+  a ring that ended not announced, a newer ring replacing an older one, a late number
+  following the queued call, a restart mid-ring not announcing twice; a block read only
+  at its separator; a hung stream killed, restarted and never reporting a stale ring;
+  the backoff doubling and capped, no phone waiting instead of spinning, a raising
+  stream never escaping, stop ending the thread; each caller's line, never a full
+  number; announced between mic reads with the speaker opened and closed around it, a
+  stop in force cleared first, after a phone report, not during her own call, never an
+  LLM turn, a TTS or playback failure not ending the idle loop, no bus label without
+  transcripts; the watcher built with its own phone and no adb, and the shipped config
+  enabling it
 - `control_lights` dispatch strings and failure fallbacks
 - YouTube playlist and search launch behavior
 - YouTube playlist name matching and random multi-ID selection
@@ -4295,6 +4652,19 @@ just the commits.
   `ui.voice_offset_ms` and `audio_levels.DB_FLOOR`/`DB_CEIL` against real Chirp
   clips on the laptop, and the `first_audio` latency comparison with the UI on and off.
 
+
+- **"Phone Link has common bugs... route everything via adb" (2026-10-13, branch
+  `feat/phone-over-adb`).** Phone Link's Calls tab was broken; six fixes tried live,
+  none worked (the laptop never re-opens the hands-free link). Paired the phone over
+  Wireless debugging and found the shell holds call and call-audio permissions, then
+  hit HyperOS's Security-settings gate, the Telecom-vs-intent hook, and MediaTek's
+  injection-track loop, each in turn, over four test calls to Marta: the last one she
+  heard and answered. Then moved Gemini to `europe-west1`, ran a security review of
+  what was enabled (only this laptop's key is authorized; the key's ACL was widened to
+  a Codex sandbox group and was tightened; the helper is now hash-checked), parked a
+  list of further phone features in `docs/ideas/`, and wired it all into
+  `control_phone` with Phone Link moved to `deprecated/`. Test calls go to Master
+  Miguel from now on, not Marta.
 -----
 
 ## Known Bugs / Audit

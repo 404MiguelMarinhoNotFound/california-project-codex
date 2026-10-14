@@ -75,6 +75,12 @@ def config_for_tests(**overrides) -> dict:
     # Same for the cached group list -- and more so: list_groups() WRITES it,
     # so a test left on the real path would overwrite his cache with fakes.
     config["whatsapp"]["groups_path"] = "/nonexistent/whatsapp_groups.json"
+    # And the phone-contact snapshot: real people's numbers in the developer's
+    # CWD, and ContactSync WRITES it. A test that exercises it sets its own path.
+    config.setdefault("contacts_sync", {})["snapshot_path"] = "/nonexistent/phone_contacts.json"
+    # A flag no test may leave on: a live incoming-call watcher would stream
+    # from the real phone over adb. Tests that build one turn it back on.
+    config.setdefault("phone", {}).setdefault("incoming", {})["enabled"] = False
     # A flag no test may leave on: the live UI binds a real port on the LAN.
     # tests/test_live_ui.py turns it back on, bound to localhost on port 0.
     config.setdefault("ui", {})["enabled"] = False

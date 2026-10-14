@@ -18,6 +18,27 @@ back along the same relative path.
 | `sounds/activate/` | Superseded duplicate (2 files) of `sounds/california_activations/` (48 files), which is what `core/audio_pipeline.py:45` actually loads. |
 | `debug/surfshark/<11 dated folders>` | 14 MB of screenshots from one calibration session on 2026-03-12. The conclusions are recorded in CLAUDE.md ("Current Surfshark Route Calibration") and `surfshark_routes.json`. |
 
+## Phone Link, retired 2026-10-13
+
+Phone calls now run entirely over ADB to the phone (`services/phone_adb.py`,
+`services/phone_call_audio.py`, `android/callaudio/`). Phone Link's calling
+link had stopped reconnecting: on 2026-10-13 six fixes were tried live (phone
+and laptop Bluetooth toggles, Try again, a hands-free service bounce, restarting
+Phone Link and Link to Windows) and the laptop never re-opened the hands-free
+connection. Nothing here is imported any more.
+
+| Path | What it was |
+|---|---|
+| `services/phone_link.py` | Phone Link over PowerShell/UIA: dial, in-call, hang up, Play sound, default mic/speaker swaps, `repair_calling_link` |
+| `services/phone_link_audio.py` | `LoopbackCapture` (WASAPI loopback of the speakers, her ears) and `CableSpeaker` (VB-CABLE, her mouth), cut out of `services/gemini_live_call.py` |
+| `tools/fix_phone_link.py` | Ran `repair_calling_link` by hand |
+| `tests/test_phone_link.py` | Their tests, from `tests/test_phone_service.py` and `tests/test_gemini_live_call.py`; not discovered (the suite runs `-s tests`) |
+
+Also gone with it: `soundcard` from the `phone` extra, and the `phone.cable_*` /
+`phone.call_speaker_endpoint` keys in `config.yaml`. VB-CABLE can be
+uninstalled; its installer made the cable the default speaker and mic once
+already, so check Windows' default devices afterwards.
+
 ## Not moved, deliberately
 
 - **`debug/surfshark/` itself** stays in the live tree — `config.yaml:288` sets it

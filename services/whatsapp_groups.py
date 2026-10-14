@@ -152,12 +152,19 @@ def match_group(hint: str, titles: list[str]) -> GroupMatch:
     return GroupMatch(title=best, score=best_score, shared=titles.count(best) > 1)
 
 
-def speakable_title(title: str) -> str:
+def speakable_title(title: str, *, fallback_to_raw: bool = True) -> str:
     """
     The title as something she can say: emoji, symbols and joiners removed.
 
     "🦩‍🔥☭flamingus unanounymous☭🦩‍🔥" becomes "flamingus unanounymous". Falls
-    back to the raw title only when nothing speakable is left.
+    back to the raw title only when nothing speakable is left, unless the
+    caller disables that fallback (e.g. a phone caller has a number fallback).
     """
-    kept = "".join(" " if unicodedata.category(ch)[0] in "SC" else ch for ch in title or "")
-    return " ".join(kept.split()) or (title or "")
+    # Variation selectors and the keycap mark are emoji decoration, but other
+    # combining marks (including accents in saved names) remain pronounceable.
+    kept = "".join(
+        "" if '\ufe00' <= ch <= '\ufe0f' or '\U000e0100' <= ch <= '\U000e01ef' or ch == '\u20e3'
+        else " " if unicodedata.category(ch)[0] in "SC" else ch
+        for ch in title or ""
+    )
+    return " ".join(kept.split()) or ((title or "") if fallback_to_raw else "")

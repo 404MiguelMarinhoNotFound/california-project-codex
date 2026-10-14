@@ -164,7 +164,11 @@ audio:
   sample_rate: 16000          # 16kHz mono — what Whisper expects
   channels: 1
   chunk_duration_ms: 40
-  device: null                # null = system default mic, or device index/name
+  # Pinned, not null (the Windows default): on 2026-10-13 the default input
+  # switched itself to "CABLE Output (VB-Audio Virtual Cable)" and she went
+  # deaf -- no wake word, nothing logged. A sounddevice query: every word must
+  # match, and "MME" picks the one host API (the bare name matches four).
+  device: "Microphone Array MME"
 
 # --- Runtime logs (core/turn_log.py) ---
 # Everything the console shows, and DEBUG besides, goes to logs/california.log
@@ -1057,6 +1061,16 @@ whatsapp:
     # the landlord: "Joao Silva"
     # mum: {contact: "Maria Silva", prefer: "+351"}
 
+# The phone's own contact book, read over ADB (phone.adb) into a local
+# snapshot that WhatsApp and phone calls resolve names against. Read-only on
+# the phone; contacts.vcf stays the fallback. Gitignored: real people's numbers.
+contacts_sync:
+  enabled: true
+  snapshot_path: "phone_contacts.json"
+  interval_days: 7              # boot syncs when older than this, then weekly
+  check_interval_minutes: 360   # how often the loop asks "is it due"; a missed phone retries here
+  min_keep_ratio: 0.5           # a book shrunk below half the last one is not written
+
 # ============================================================
 # PHONE CALLS (control_phone) -- from Master Miguel's own number
 # ============================================================
@@ -1082,7 +1096,9 @@ phone:
     # GOOGLE_CLOUD_PROJECT. Credentials: GOOGLE_APPLICATION_CREDENTIALS (a
     # service account key file) in .env, or VERTEX_API_KEY for express mode.
     project: "project-65ef5b79-5402-4096-a93"
-    location: "us-central1"
+    # europe-west1, not us-central1: first audio 0.70s vs 0.95s from Lisbon
+    # (measured 2026-10-13, 3 runs each). europe-west4 answered only 1 of 3.
+    location: "europe-west1"
     model: "gemini-live-2.5-flash-native-audio"
   # backend: ai_studio only. The cheapest Live model there: the same audio
   # price as gemini-3.8-live ($3 in / $12 out per 1M tokens) and lower text
@@ -1100,15 +1116,39 @@ phone:
   confirm_timeout_ms: 120000
   default_country: "351"
   allowed_country_codes: ["351"]
-  # Where her voice goes (an output device name prefix), and the Windows
-  # recording endpoint Phone Link must use as its microphone.
-  cable_output_device: "CABLE Input"
-  cable_mic_endpoint: "CABLE Output (VB-Audio Virtual Cable)"
-  # Where the callee plays and where she listens, pinned for the length of a
-  # call (restored after). Never left to "the default speaker": on 2026-10-08
-  # Bluetooth headphones had become the default, the call audio went to their
-  # hands-free side, and she heard nothing on a real call. "" = default speaker.
-  call_speaker_endpoint: "Speakers (Realtek High Definition Audio)"
+  # The phone itself, over Wireless debugging (paired once, plus HyperOS
+  # "USB debugging (Security settings)" on). Calls are placed and their audio
+  # carried by the phone: no Phone Link, no VB-CABLE (moved to deprecated/
+  # 2026-10-13). See android/callaudio/README.md.
+  adb:
+    path: "adb"
+    serial: ""            # empty: found over mDNS or its attached IP:port, never the Mi Box
+    port: 27183           # adb forward port for the call-audio socket
+    mute_phone_mic: true  # keep the phone's own mic (the room) out of the call
+  # Who is calling: a read-only adb stream of the phone's ring state; she says
+  # the caller's saved name (or "a number ending 4567") once per ring, from the
+  # idle loop, never during one of her own calls. Never the full number.
+  incoming:
+    enabled: true      # announce who is calling, once per ring
+  # "What did I miss on my phone?" -- read-only (call log + notification shade).
+  # Nothing is dismissed or marked seen, and nothing is announced unprompted.
+  digest:
+    missed_window_hours: 24
+    max_apps: 8
+    max_senders_per_app: 5
+    # Never worth saying out loud:
+    #   android, com.android.systemui -- the OS's own status notices (USB, charging, screenshots)
+    #   com.miui.securitycenter       -- HyperOS cleaner/scan nags
+    #   com.xiaomi.mirror             -- Xiaomi Interconnectivity's "connected to PC" banner
+    #   com.xiaomi.aicr               -- HyperOS AI engine's background notices
+    #   com.miui.misound              -- earphone/sound-effects prompts
+    #   com.microsoft.appmanager      -- Link to Windows' persistent "connected" notice
+    ignore_packages: ["android", "com.android.systemui", "com.miui.securitycenter",
+                      "com.xiaomi.mirror", "com.xiaomi.aicr", "com.miui.misound",
+                      "com.microsoft.appmanager"]
+    app_names: {com.whatsapp: WhatsApp, com.google.android.gm: Gmail,
+                com.instagram.android: Instagram, com.google.android.apps.maps: Maps,
+                com.todoist: Todoist}
   # One line per call: outcome and, unless logging.include_transcripts is
   # false, both sides of the conversation.
   log_path: "logs/calls.jsonl"
