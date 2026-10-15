@@ -110,13 +110,21 @@ something else.
      follow-up turn (chain depth >= 1).
 - She says **nothing** when the first window after a wake-word turn times out
   (he ignored one question), and nothing after an `[ignore]`.
-- Two fixed lines, one per case, both in config: after a silent chained window
-  `stop_line_timeout` ("I'll take that as a no. Say my name if you need me."), at
-  the cap `stop_line_cap` ("Okay, I'll stop listening now. Say California if you
-  need me."). Synthesized live through `TTSService` on the open speaker session,
-  so they are always in her current voice (Aoede today) and follow any voice
-  change with nothing to regenerate; the ~0.3-1s synthesis lands after a silence,
-  where it is not felt. Then the mic is drained.
+- Two fixed lines, one per case, **pre-recorded** (not synthesized at runtime):
+  - `timeout`: "I'll take that as a no. Say my name if you need me."
+  - `cap`: "Okay, I'll stop listening now. Say California if you need me."
+- The text lives in a new generator, `generate_stop_lines.py`, a sibling of
+  `generate_activation_phrases.py` and `generate_bootup_sounds.py`. It
+  synthesizes with the `tts` block in config.yaml (Aoede today), applies the same
+  `trim_silence`, and writes `sounds/stop_lines/<voice_slug>/{timeout,cap}.wav`
+  plus a `manifest.json` with the text. Like every other generated clip, the WAVs
+  are not committed; run it on a fresh clone and after a voice change.
+- `sounds.stop_lines_dir` in config.yaml points at the folder, next to
+  `activation_dir` and `bootup_dir`. The orchestrator loads both clips once at
+  startup and plays them on the open speaker session (`kind: "stop_listening"`,
+  with the manifest text for the live UI), then drains the mic.
+- A missing clip is logged once at startup and plays nothing at runtime; the
+  conversation still ends normally. Never a live synthesis fallback.
 
 ## Config
 
@@ -127,8 +135,12 @@ conversation:
   follow_up_enabled: true
   follow_up_timeout_s: 3.0
   max_follow_ups: 10
-  stop_line_timeout: "I'll take that as a no. Say my name if you need me."
-  stop_line_cap: "Okay, I'll stop listening now. Say California if you need me."
+```
+
+And under `sounds:`, next to `bootup_dir`:
+
+```yaml
+  stop_lines_dir: "sounds/stop_lines/google_en-US-Chirp3-HD-Aoede"
 ```
 
 `tests/config_fixture.py` needs no override. `follow_up_enabled: false` must
