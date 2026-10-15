@@ -61,11 +61,15 @@
     threshold.reply = h.barge_in_threshold;
     threshold.current = h.threshold;
     $("wake-threshold").textContent = h.threshold != null ? Number(h.threshold).toFixed(2) : "-";
-    if (h.threshold != null) $("tick-idle").style.left = (h.threshold * 100) + "%";
+    if (h.threshold != null) {
+      $("tick-idle").style.left = (h.threshold * 100) + "%";
+      $("tick-idle").dataset.label = `wake ${Number(h.threshold).toFixed(2)}`;
+    }
     const barge = $("tick-barge");
     if (h.barge_in_threshold != null && h.barge_in_threshold !== h.threshold) {
       barge.hidden = false;
       barge.style.left = (h.barge_in_threshold * 100) + "%";
+      barge.dataset.label = `barge ${Number(h.barge_in_threshold).toFixed(2)}`;
     } else {
       barge.hidden = true;
     }
@@ -165,6 +169,9 @@
       li.append(el("div", "name", name), el("div", "ms", "-"));
       return li;
     }));
+    $("tl-dots").replaceChildren();
+    $("tl-run").style.width = "0";
+    $("tl-end").textContent = "6s";
     clearInterval(clockTimer);
     const tick = () => {
       if (!turn) return;
@@ -185,6 +192,30 @@
       node.classList.add("done", "latest");
       node.querySelector(".ms").textContent = fmtMs(d.ms);
     }
+    drawTimeline();
+  }
+
+  // The turn on one line: a dot per stage at its time, the run up to the
+  // latest one. The scale grows with the turn so a long reply still fits.
+  function drawTimeline() {
+    const marks = STAGES.filter(([k]) => turn.marks[k] != null).map(([k]) => [k, turn.marks[k]]);
+    if (!marks.length) return;
+    const latest = Math.max(...marks.map(([, ms]) => ms));
+    const scale = Math.max(6000, latest * 1.15);
+    const dots = $("tl-dots");
+    for (const [k, ms] of marks) {
+      let dot = dots.querySelector(`[data-key="${k}"]`);
+      if (!dot) {
+        dot = el("span", "tl-dot");
+        dot.dataset.key = k;
+        dots.append(dot);
+      }
+      dot.classList.toggle("end", k === "reply_done");
+      dot.style.left = ((100 * ms) / scale).toFixed(2) + "%";
+    }
+    $("tl-run").style.width = ((100 * latest) / scale).toFixed(2) + "%";
+    $("tl-end").textContent = Math.round(scale / 1000) + "s";
+    $("timeline").setAttribute("aria-label", marks.map(([k, ms]) => `${STAGES.find(([s]) => s === k)[1]} ${fmtMs(ms)}`).join(", "));
   }
 
   function onSet(d) {
@@ -427,6 +458,7 @@
   function onReplayed(d) {
     noteServerTs(d.ts);
     replaying = false;
+    document.body.classList.remove("loading");
     loadCalls();
     if (!halo) return;
     halo.toolsClear();
@@ -497,11 +529,16 @@
       this.words = String(text).split(/\s+/).filter(Boolean);
       this.start = clip.start; this.ms = clip.ms; this.clip = clip.id; this.shown = -1;
       this.frozen = false;
+      $("pin-line").textContent = this.words.join(" ");
       if (reducedMotion) this.render(this.words.length);
     },
     // She was cut off: leave the words she got to, reveal no more.
     freeze() { this.frozen = true; },
-    clear() { this.words = []; this.shown = -1; this.clip = null; this.frozen = false; $("halo-caption").replaceChildren(); },
+    clear() {
+      this.words = []; this.shown = -1; this.clip = null; this.frozen = false;
+      $("halo-caption").replaceChildren();
+      $("pin-line").textContent = "";
+    },
     tick(now) {
       if (!this.words.length || reducedMotion || this.frozen) return;
       const elapsed = Math.max(0, now - this.start);
@@ -527,6 +564,7 @@
     const prev = haloShown;
     haloShown = state;
     $("halo-state").textContent = (STATE_LABELS[state] || state).toLowerCase();
+    pinText();
     if (halo) halo.setState(state);
     if (state === prev) return;
     if (state === "listening") caption.clear();
@@ -539,6 +577,7 @@
     if (halo) halo.setMood(mood);
     $("halo-mood").textContent = MOOD_WORDS[mood];
     $("halo-mood-sep").hidden = mood === "none";
+    pinText();
     clearTimeout(moodTimer);
     if (haloShown === "idle") holdMood();
   }
@@ -569,8 +608,79 @@
 
   function haloFrame(now) {
     requestAnimationFrame(haloFrame);
-    if (halo) halo.setVoice(VoiceClock.level(now));
+    const level = VoiceClock.level(now);
+    if (halo) halo.setVoice(level);
     caption.tick(now);
+    if (pinned && !reducedMotion) miniRing.draw(now, level);
+  }
+
+  // ------------------------------------------------------------ pinned strip
+  // Once the halo scrolls away the header turns into a strip that keeps her in
+  // view: a small ring, her state, the sentence she is saying. The ring is a
+  // 2D canvas, not a second WebGL halo: at 40px the halo's embers would be
+  // blobs, and a second render loop would cost the frame budget.
+  let pinned = false;
+
+  function pinText() {
+    const word = STATE_LABELS[haloShown] || "Connecting";
+    $("pin-state").textContent = mood !== "none" ? `${word}, ${MOOD_WORDS[mood]}` : word;
+    if (pinned && reducedMotion) miniRing.draw(performance.now(), 0);
+  }
+
+  const miniRing = {
+    ps: Array.from({ length: 56 }, (_, i) => ({
+      a: (i / 56) * Math.PI * 2 + Math.random() * 0.2, r: 0.84 + Math.random() * 0.3,
+      sp: 0.1 + Math.random() * 0.25, sz: 0.5 + Math.random() * 1.3, ph: Math.random() * 6.3,
+      c: i % 7 === 0 ? "255,154,107" : i % 3 === 0 ? "179,136,255" : "255,111,168",
+    })),
+    draw(now, level) {
+      const cv = $("pin-ring");
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const w = cv.clientWidth || 40, h = cv.clientHeight || 40;
+      if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+      const c = cv.getContext("2d");
+      c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      c.clearRect(0, 0, w, h);
+      const t = now / 1000;
+      const st = haloShown;
+      const live = st === "speaking" || st === "listening" || st === "thinking";
+      const env = st === "speaking" ? 0.2 + level * 0.8 : st === "listening" ? 0.35 : st === "thinking" ? 0.25 : 0.1;
+      const cx = w / 2, cy = h / 2, R = Math.min(w, h) * 0.32 * (1 + env * 0.08);
+      const g = c.createRadialGradient(cx, cy, 0, cx, cy, R);
+      g.addColorStop(0, `rgba(255,190,215,${0.45 + env * 0.4})`);
+      g.addColorStop(0.45, `rgba(255,111,168,${0.18 + env * 0.25})`);
+      g.addColorStop(1, "rgba(179,136,255,0)");
+      c.fillStyle = g;
+      c.beginPath(); c.arc(cx, cy, R, 0, 6.283); c.fill();
+      c.globalCompositeOperation = "lighter";
+      const spin = st === "thinking" ? 1.8 : live ? 1 : 0.4;
+      for (const p of this.ps) {
+        const a = p.a + t * p.sp * spin;
+        const rr = R * (p.r + Math.sin(t * 2 + p.ph) * 0.04 + env * 0.08 * Math.sin(p.ph * 3 + t * 6));
+        const al = (0.3 + 0.5 * (0.5 + 0.5 * Math.sin(t * 3 + p.ph))) * (haloShown === "unknown" ? 0.45 : 1);
+        c.fillStyle = `rgba(${p.c},${al.toFixed(3)})`;
+        c.beginPath(); c.arc(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr, p.sz * (1 + env * 0.3), 0, 6.283); c.fill();
+      }
+      c.globalCompositeOperation = "source-over";
+    },
+  };
+
+  function setPinned(on) {
+    on = on && !!halo && !document.body.classList.contains("ambient");
+    if (on === pinned) return;
+    pinned = on;
+    document.body.classList.toggle("pinned", on);
+    if (on) miniRing.draw(performance.now(), 0);
+  }
+
+  function setupPin() {
+    if (!("IntersectionObserver" in window)) return;
+    // Pinned once the bottom of the halo (less the caption's room) has gone
+    // up behind the header, not merely touched the top of the window.
+    const io = new IntersectionObserver(([e]) => {
+      setPinned(!e.isIntersecting && e.boundingClientRect.top < (e.rootBounds ? e.rootBounds.top + 60 : 60));
+    }, { rootMargin: "-56px 0px 0px 0px" });
+    io.observe($("halo-end"));
   }
 
   function showPill() {
@@ -616,6 +726,7 @@
     halo.setState(lastState);
     requestAnimationFrame(haloFrame);
     setupAmbient();
+    setupPin();
   }
 
   // A server with `ui.halo: false` gets the page exactly as it was before.
@@ -623,6 +734,7 @@
     if (h.halo !== false || !halo) return;
     halo.dispose();
     halo = null;
+    setPinned(false);
     $("halo").hidden = true;
     setAmbient(false);
     showPill();
@@ -642,6 +754,7 @@
   }
 
   function setAmbient(on) {
+    if (on) setPinned(false);
     document.body.classList.toggle("ambient", on);
     const btn = $("halo-full");
     btn.setAttribute("aria-pressed", String(on));
@@ -711,6 +824,8 @@
     const tools = (r.tools || []).map((t) => t.action || t.name);
     what.append(document.createTextNode(r.transcript || (tools.length ? tools.join(", ") : DROPPED.has(outcome) ? "nothing said" : "")));
     const bar = el("div", "bar");
+    bar.setAttribute("role", "img");
+    bar.setAttribute("aria-label", STAGES.filter(([k]) => k in marks).map(([k, n]) => `${n} ${fmtMs(marks[k])}`).join(", ") || "no timings");
     for (const [cls, pct] of segments(marks, total)) {
       const s = el("span", cls);
       s.style.width = pct + "%";
@@ -888,6 +1003,7 @@
     const pill = el("span", "call-pill", String(status || "calling").replace(/_/g, " "));
     pill.dataset.tone = tone(status);
     const d = el("span", "muted mono", seconds == null ? "" : dur(seconds));
+    if (window.haloGlyph) head.append(window.haloGlyph("phone", "g"));
     head.append(el("span", "sub-who", label), pill, d, el("span", "chev", "›"));
     return { head, pill, d };
   }
@@ -979,12 +1095,15 @@
       const body = el("div", "sub-body");
       body.hidden = true;
       let loaded = false;
-      head.addEventListener("click", async () => {
-        body.hidden = !body.hidden;
-        head.setAttribute("aria-expanded", String(!body.hidden));
-        if (body.hidden || loaded) return;
+      const load = async () => {
         const rec = await fetchCall(c.id);
-        if (!rec) { body.append(el("p", "muted", "Couldn't load this call.")); return; }
+        if (!rec) {
+          const retry = el("button", "call-btn", "Try again");
+          retry.type = "button";
+          retry.addEventListener("click", load);
+          body.replaceChildren(el("p", "muted", "Couldn't load this call."), retry);
+          return;
+        }
         loaded = true;
         renderCall(body, rec);
         const turnLi = c.turn != null ? feedByTurn.get(c.turn) : null;
@@ -992,12 +1111,21 @@
           const jump = el("button", "call-btn", "Show its turn");
           jump.type = "button";
           jump.addEventListener("click", () => {
-            turnLi.scrollIntoView({ behavior: "smooth", block: "center" });
+            const turnBtn = turnLi.querySelector(":scope > button");
+            if (turnBtn && turnBtn.getAttribute("aria-expanded") === "false") turnBtn.click();
+            turnLi.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
+            turnLi.classList.remove("flash"); void turnLi.offsetWidth;
             turnLi.classList.add("flash");
             setTimeout(() => turnLi.classList.remove("flash"), 1500);
           });
           body.append(jump);
         }
+      };
+      head.addEventListener("click", async () => {
+        body.hidden = !body.hidden;
+        head.setAttribute("aria-expanded", String(!body.hidden));
+        if (body.hidden || loaded) return;
+        await load();
       });
       li.append(head, body);
       ol.append(li);
@@ -1098,6 +1226,7 @@
       // EventSource retries on its own; a closed one (404: bad token) does not.
       if (source.readyState === EventSource.CLOSED) {
         setLink("down", "offline");
+        document.body.classList.remove("loading");
         const b = $("banner");
         b.textContent = "Cannot reach California. Check she is running and that this is the URL from her boot log, token included.";
         b.hidden = false;

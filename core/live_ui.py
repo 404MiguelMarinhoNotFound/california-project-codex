@@ -53,6 +53,10 @@ _STATIC = {
     # ~600 KB the stdlib server cannot gzip, and versioned by ui/vendor/README.md,
     # so a phone downloads it once a day rather than on every page load.
     "vendor/three.min.js": ("vendor/three.min.js", "text/javascript; charset=utf-8", _IMMUTABLE),
+    # Geist, self-hosted (the CSP blocks font CDNs). The version is in the name,
+    # so immutable is safe while app.css stays no-store; see ui/fonts/README.md.
+    "fonts/geist-1.7.2.woff2": ("fonts/geist-1.7.2.woff2", "font/woff2", _IMMUTABLE),
+    "fonts/geist-mono-1.7.2.woff2": ("fonts/geist-mono-1.7.2.woff2", "font/woff2", _IMMUTABLE),
 }
 
 DEFAULT_TOKEN = "california"

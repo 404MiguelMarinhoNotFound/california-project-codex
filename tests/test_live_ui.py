@@ -146,6 +146,25 @@ class LiveUITests(unittest.TestCase):
             self.assertEqual(resp.getheader("Cache-Control"), "no-store", name)
             self.assertIn("worker-src 'none'", resp.getheader("Content-Security-Policy"))
 
+    def test_vendored_fonts_are_served_as_woff2_and_cacheable(self):
+        for name in ("geist-1.7.2.woff2", "geist-mono-1.7.2.woff2"):
+            conn, resp = self._get(f"/s3cret-token/fonts/{name}")
+            body = resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 200, name)
+            self.assertEqual(resp.getheader("Content-Type"), "font/woff2", name)
+            self.assertEqual(resp.getheader("Cache-Control"), "public, max-age=86400, immutable", name)
+            self.assertEqual(body[:4], b"wOF2", name)
+
+    def test_only_the_whitelisted_fonts_are_served(self):
+        for path in ("/fonts/geist-1.7.2.woff2", "/s3cret-token/fonts/x.woff2",
+                     "/s3cret-token/fonts/", "/s3cret-token/fonts/README.md",
+                     "/s3cret-token/fonts/OFL.txt", "/s3cret-token/fonts/../app.js"):
+            conn, resp = self._get(path)
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 404, path)
+
     def test_hello_carries_voice_offset_palette_mood_hold_and_halo(self):
         conn, resp = self._get("/s3cret-token/events")
         (hello,) = self._read_events(resp, 1)

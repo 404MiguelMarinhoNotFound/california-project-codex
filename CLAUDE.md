@@ -4182,10 +4182,57 @@ Smug, unimpressed and the eye-roll are drawn but nothing sends them yet (phase 2
   horizontal scroll, a ring still moving 300ms after a barge-in, or a broken
   ambient/fallback path. `--no-project` keeps `uv.lock` untouched; set
   `CHROMIUM_PATH` if Chromium is not where Playwright put it.
-- **The served files are now five**: `index.html`, `app.js`, `app.css`, `halo.js` and
-  `vendor/three.min.js`, the last with a one-day immutable `Cache-Control` (~600 KB
+- **The served files are now seven**: `index.html`, `app.js`, `app.css`, `halo.js`,
+  `vendor/three.min.js` and the two Geist fonts under `fonts/` (see the Dusk section
+  below). Three.js and the fonts get a one-day immutable `Cache-Control` (~600 KB
   the stdlib server cannot gzip); everything else stays `no-store`. The CSP adds
   `worker-src 'none'`.
+
+### Dusk: the page lives in the halo's sky (2026-10-15)
+
+The rest of the page was restyled around the halo, from three mockups Master Miguel
+compared (artifact `https://claude.ai/artifact/9d2HGitfMT6h8HVJkvAnwu`; he picked
+"Dusk" and borrowed the timeline, wake history and usual-time tick from
+"Instrument"). Same ids,
+same events, same features; `ui/app.css` was rewritten and `app.js` gained the
+pinned strip and the timeline.
+
+- **One accent.** Rose (`--accent`, `--sky-accent` on the halo stage) marks live and
+  active state. Violet and coral live only in `ui/halo.js`; `--seg-tts` is a rose
+  tint, so the session bar's segments step in lightness of one hue and still read
+  without colour, next to their labels. No colour literal outside the tokens except
+  the satellite `fail` tint.
+- **Sheets on the sky.** A fixed `body::before` layer carries the gradient (no
+  `background-attachment`, no repaint on scroll); panels are 20px sheets with an
+  inset hairline highlight and a shadow tinted to the sky. Light theme is a dawn
+  sky. Radius scale is 10px (controls, tiles) and 20px (sheets), pills only for
+  chips and badges. Motion tokens `--dur-fast/--dur/--dur-slow` on one ease-out.
+- **Geist is self-hosted** (`ui/fonts/`, version in the filename, SHA-256 and the
+  OFL in `ui/fonts/README.md`). The CSP's `default-src 'self'` blocks font CDNs,
+  so they are in `_STATIC`; the immutable cache is safe only because the name
+  changes with the version.
+- **The pinned strip is the header, not a new element.** An `IntersectionObserver`
+  on `#halo-end` (96px above the halo's bottom) toggles `body.pinned`; the sticky
+  `.top` then turns into dark glass with a small ring, her state and the sentence
+  she is saying (`#pin-state`, `#pin-line`, from the same `caption`). It stays a
+  body child the ambient rule already hides, and ambient clears `pinned`.
+  **The ring is a 2D canvas in `app.js` (`miniRing`), not a second halo**: at 40px
+  the WebGL embers are blobs, and a second render loop would cost the frame budget
+  the tools perf check gates. It only draws while pinned, off the halo's rAF.
+- **The turn timeline** (`#timeline`, drawn by `drawTimeline` on every mark) places
+  each stage on one line; the scale is `max(6000, latest * 1.15)` so a long reply
+  still fits. The six stage tiles stay underneath with their times.
+- **Everything tappable is at least 44px** (chips, Full screen, call buttons, Jump to
+  latest; turn rows 56px, call heads 52px). `--check` fails on any visible button
+  shorter. "Full screen" sits at `bottom: 6px` so its 44px clears the caption.
+- **Turns and calls stay clickable.** Turn rows expand in place (chevron from CSS);
+  call heads open the transcript and fetch `calls/<id>` once; a failed load offers
+  "Try again"; "Show its turn" also expands the turn before flashing it.
+- **Connecting** is `body.loading` from the markup until `replayed` (or the stream
+  is declared down): the empty states show as shimmer bars meanwhile.
+- `--check` gained `_check_dusk`: fonts loaded, strip pins after scrolling past the
+  halo and lets go at the top and in ambient, no button under 44px, a turn row and a
+  call row open on a tap.
 
 ### Tool satellites: what she is doing with her hands (2026-10-13)
 
