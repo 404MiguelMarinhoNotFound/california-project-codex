@@ -14,8 +14,8 @@ The number is NOT in config.yaml: the repository is public, so it comes from
 every window (the window title only shows the active tab). It is Mozilla's LZ4
 variant, decoded below with no new dependency. Firefox rewrites it about every
 15s, and keeps it after a quit, so it only counts while firefox.exe is running.
-With no `CALIFORNIA_UI_TOKEN` the URL is new each run and never matches an old
-tab; that old tab is dead anyway (its token 404s), so a fresh one is right.
+The URL is the same every run (token "california" unless overridden), so an
+open tab is recognised and not opened twice.
 """
 
 from __future__ import annotations

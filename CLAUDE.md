@@ -4062,14 +4062,29 @@ from the boot log (`Live UI: http://<laptop>:8765/<token>/`) on the phone.
   as "stalled", and a reconnecting page shows the state as unknown: a frozen page
   must never pass for a quiet room. A new `hello.started` (California restarted)
   clears the page rather than mixing two runs.
-- **The token is in the path**, so the page's relative `app.js`, `app.css` and `events`
-  carry it with no JavaScript, and everything else, `/` included, is a 404. Set
-  `CALIFORNIA_UI_TOKEN` in `.env` so a bookmark survives restarts; unset, a new one is
-  generated each run. Only whitelisted files are ever served. Everything on the
+- **The token is in the path**, so the page's relative `app.js`, `app.css`, `events` and
+  `calls` carry it with no JavaScript, and everything else, `/` included, is a 404. **The
+  token is the word `california` by default (2026-10-15)**, so the URL is
+  `http://<laptop>:8765/california/`; `CALIFORNIA_UI_TOKEN` in `.env` or `ui.token` overrides
+  it. It is a name, not a secret: anyone on the LAN can guess it and read transcripts, so set
+  a longer one if the network is not his alone. Only whitelisted files are ever served. Everything on the
   page is written with `textContent`, never as HTML, because other people's WhatsApp
   text reaches it through tool results and logs.
 - **`logging.include_transcripts: false` governs the page too**: transcript, reply,
   spoken sentences and call lines stay off the bus.
+- **Call history (2026-10-15).** The full call log is on the page, not only the summary.
+  `GET <token>/calls` lists `logs/calls.jsonl` newest first (no transcripts) and
+  `GET <token>/calls/<call_id>` returns one record with its whole timed transcript; the
+  server reads the file per request, so the 500-event ring never holds calls. A call is a
+  **sub-turn**: `PhoneService.current_turn` (set by the orchestrator to the running
+  `TurnTimer`'s id) is read when the call is placed, and `call_state` events and the log's
+  `meta` carry `call_id` and `turn`, so the page nests the call under the turn that placed
+  it in "This session", filling in line by line while it runs (a call whose turn already
+  ended becomes its own row). When it ends the page fetches the record once for the final
+  status and timings. The **Calls** panel lists every logged call; a row opens the same
+  view, with "Copy transcript" and "Show its turn" when that turn is still in the page.
+  `include_transcripts: false` keeps no transcript to show and the page says so. Everything
+  is drawn with `textContent`: the other side's words reach it.
 - **Watch-only on purpose.** Nothing on the page changes what she does. A typed turn and
   a device status card (`room_status()` costs an ADB ping, so on demand, not polled)
   are the next steps.

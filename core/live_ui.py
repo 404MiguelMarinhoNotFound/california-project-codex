@@ -8,12 +8,17 @@ by itself and resumes from `Last-Event-ID`, and `http.server` needs nothing
 added to uv.lock, on the laptop or the Pi.
 
 The token is in the PATH, not a query string: `http://<host>:8765/<token>/`.
+By default the token is the word `california` (`http://<host>:8765/california/`),
+easy to type and to read off a phone; it is a name, not a secret, so keep the
+port on a trusted LAN or set a longer `CALIFORNIA_UI_TOKEN`.
 That way the page's relative `app.js`, `app.css` and `events` URLs carry it
 with no JavaScript, and anything without it gets a 404. That includes the bare
 `/`, so a scan of the LAN learns nothing. The page shows what he said, phone
 call transcripts and log lines, so it is never served without the token.
-`CALIFORNIA_UI_TOKEN` in .env fixes it so a bookmark survives a restart; unset,
-a fresh one is made each run and the URL is logged at boot.
+`CALIFORNIA_UI_TOKEN` in .env (or `ui.token`) overrides it.
+
+Past calls are served from `logs/calls.jsonl` at `calls` (a list) and
+`calls/<call_id>` (one, with its full timed transcript), behind the same token.
 
 Same contract as every service: never raises at construction, `start()`
 returns False and logs once when it cannot bind, and California carries on.
@@ -24,7 +29,6 @@ import json
 import logging
 import os
 import queue
-import secrets
 import socket
 import threading
 import time
@@ -51,7 +55,9 @@ _STATIC = {
     "vendor/three.min.js": ("vendor/three.min.js", "text/javascript; charset=utf-8", _IMMUTABLE),
 }
 
+DEFAULT_TOKEN = "california"
 _HEARTBEAT_S = 15.0
+_CALLS_MAX = 200
 _SECURITY_HEADERS = (
     ("Referrer-Policy", "no-referrer"),
     ("X-Content-Type-Options", "nosniff"),
@@ -80,9 +86,12 @@ class LiveUI:
         self.enabled = cfg.get("enabled", False) is not False
         self.host = str(cfg.get("host", "0.0.0.0"))
         self.port = int(cfg.get("port", 8765))
-        # Hex, not urlsafe: a "-" or "_" in the path stopped WhatsApp turning the
-        # boot message's URL into a link (2026-10-13). 64 bits is plenty on a LAN.
-        self.token = os.environ.get("CALIFORNIA_UI_TOKEN") or secrets.token_hex(8)
+        # A plain word by default (2026-10-15, his call): a uuid-like path was hard
+        # to read and type. Letters only, so WhatsApp still links the URL.
+        self.token = os.environ.get("CALIFORNIA_UI_TOKEN") or str(cfg.get("token") or "") or DEFAULT_TOKEN
+        log_cfg = (config or {}).get("logging") or {}
+        phone_cfg = (config or {}).get("phone") or {}
+        self.calls_path = str(phone_cfg.get("log_path") or os.path.join(log_cfg.get("dir", "logs"), "calls.jsonl"))
         self.bus = bus
         self.ui_dir = ui_dir
         self._server: ThreadingHTTPServer | None = None
@@ -128,6 +137,41 @@ class LiveUI:
 
     def token_ok(self, candidate: str) -> bool:
         return hmac.compare_digest(candidate.encode(), self.token.encode())
+
+
+def read_calls(path: str, limit: int = _CALLS_MAX) -> list[dict]:
+    """Logged calls, newest first. A missing file or a bad line is skipped, never raised."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.readlines()[-limit:]
+    except OSError:
+        return []
+    records = []
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def call_summary(record: dict) -> dict:
+    """What the Calls list shows for one call: no transcript, no brief."""
+    meta = record.get("meta") or {}
+    return {
+        "id": meta.get("call_id") or str(record.get("ts") or ""),
+        "ts": record.get("ts"),
+        "to": record.get("to"),
+        "kind": record.get("kind"),
+        "status": record.get("status"),
+        "duration_s": record.get("duration_s"),
+        "talk_s": meta.get("talk_s"),
+        "turn": meta.get("turn"),
+        "summary": (record.get("outcome") or {}).get("summary"),
+        "has_transcript": bool(record.get("transcript")),
+    }
 
 
 def _hello(config: dict) -> dict:
@@ -184,6 +228,8 @@ def _make_handler(ui: LiveUI):
                 return self._not_found()
             if rest == "events":
                 return self._events()
+            if rest == "calls" or rest.startswith("calls/"):
+                return self._calls(rest)
             entry = _STATIC.get(rest)
             if entry is None:
                 return self._not_found()
@@ -198,6 +244,25 @@ def _make_handler(ui: LiveUI):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", cache)
+            for k, v in _SECURITY_HEADERS:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _calls(self, rest: str):
+            records = read_calls(ui.calls_path)
+            if rest == "calls":
+                payload = [call_summary(r) for r in records]
+            else:
+                wanted = rest.split("/", 1)[1]
+                payload = next((r for r in records if call_summary(r)["id"] == wanted), None)
+                if payload is None:
+                    return self._not_found()
+            body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             for k, v in _SECURITY_HEADERS:
                 self.send_header(k, v)
             self.end_headers()
