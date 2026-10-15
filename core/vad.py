@@ -50,6 +50,7 @@ class VAD:
         self.speech_timeout = float(vad_cfg.get("speech_timeout", 4.0))
         self.speech_start_frames = int(vad_cfg.get("speech_start_frames", 2))
         self.silero_threshold = float(vad_cfg.get("silero_threshold", 0.5))
+        self._active_speech_timeout = self.speech_timeout
 
         # State
         self._silence_start = None
@@ -154,8 +155,17 @@ class VAD:
 
         return detected
 
-    def start_recording(self):
-        """Call when recording begins."""
+    def start_recording(self, speech_timeout: float | None = None):
+        """
+        Call when recording begins.
+
+        `speech_timeout` overrides the configured pre-speech window for this
+        recording only: a follow-up (answering her question) waits less than
+        a wake-word turn. None means the configured value.
+        """
+        self._active_speech_timeout = (
+            self.speech_timeout if speech_timeout is None else float(speech_timeout)
+        )
         self._recording_start = time.time()
         self._silence_start = None
         self._saw_speech = False
@@ -190,7 +200,7 @@ class VAD:
                 self._speech_run = 0
 
             if not self._saw_speech:
-                if elapsed >= self.speech_timeout:
+                if elapsed >= self._active_speech_timeout:
                     # Nothing was ever said. This is a false wake or an
                     # abandoned one, and the caller drops it without an STT call.
                     return True, "no_speech"

@@ -30,6 +30,11 @@ from services.youtube_playlist_resolver import playlist_ids
 
 logger = logging.getLogger(__name__)
 
+# What she says when the provider fails. It ends in a question mark, so the
+# orchestrator checks for it by name: a reply carrying it must never open a
+# follow-up window, or one outage becomes a loop.
+ERROR_LINE = "Sorry, I had trouble thinking about that. Could you try again?"
+
 # --- Tool definitions shared across providers ---
 
 CONTROL_TV_TOOL = {
@@ -818,7 +823,7 @@ class LLMService:
 
         except Exception as e:
             logger.error(f"LLM error: {e}")
-            error_msg = "Sorry, I had trouble thinking about that. Could you try again?"
+            error_msg = ERROR_LINE
             full_response = error_msg
             if getattr(e, "status_code", None) == 400:
                 # The API rejected the request itself, and the request is
@@ -1115,6 +1120,21 @@ class LLMService:
         if len(starts) <= self.max_history:
             return
         del self.history[:starts[len(starts) - self.max_history]]
+
+    def drop_last_exchange(self) -> bool:
+        """
+        Forget the last exchange: its spoken user message and everything after
+        it, tool rounds included. Used when a follow-up turn turns out not to
+        be meant for her ("[ignore]"), so TV dialogue never stays in context.
+        Same exchange boundaries as _trim_history. Returns True if anything
+        was removed; with no exchange start it logs and leaves history alone.
+        """
+        starts = [i for i, m in enumerate(self.history) if self._starts_exchange(m)]
+        if not starts:
+            logger.warning("drop_last_exchange: no exchange in history to drop")
+            return False
+        del self.history[starts[-1]:]
+        return True
 
     def clear_history(self):
         """Clear conversation history."""

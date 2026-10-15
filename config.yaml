@@ -159,6 +159,15 @@ vad:
   # STT rather than sent as a command.
   min_recording: 0.6
 
+# Answering her questions without the wake word: after a reply that asks him
+# something (a "?" at the end, or a tool waiting on a read-back), the mic stays
+# open this long for him to START answering. See
+# docs/superpowers/specs/2026-10-15-follow-up-listening-design.md.
+conversation:
+  follow_up_enabled: true
+  follow_up_timeout_s: 3.0
+  max_follow_ups: 10
+
 # --- Audio Capture ---
 audio:
   sample_rate: 16000          # 16kHz mono — what Whisper expects
@@ -393,6 +402,9 @@ sounds:
   # Same deal for the launch greeting, from generate_bootup_sounds.py.
   bootup_dir: "sounds/bootup/google_en-US-Chirp3-HD-Aoede"
   # bootup_dir: "sounds/bootup/kokoro_af_bella"
+  # The two "I've stopped listening" lines for follow-up answers, from
+  # generate_stop_lines.py. Pre-recorded on purpose: never synthesized live.
+  stop_lines_dir: "sounds/stop_lines/google_en-US-Chirp3-HD-Aoede"
 
   # The wake acknowledgement is split into two pools by
   # generate_activation_phrases.py:

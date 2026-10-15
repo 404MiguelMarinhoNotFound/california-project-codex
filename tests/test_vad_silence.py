@@ -71,6 +71,29 @@ class GraceWindowTests(unittest.TestCase):
             clock.now += 0.2
             self.assertEqual(vad.should_stop_recording(QUIET), (True, "no_speech"))
 
+    def test_a_per_recording_timeout_overrides_the_configured_one(self):
+        # A follow-up window (answering her question) is shorter than the
+        # wake-word grace window, for this recording only.
+        clock = _Clock()
+        with patch("core.vad.time.time", clock):
+            vad = _vad(speech_timeout=4.0)
+            vad.start_recording(speech_timeout=3.0)
+
+            clock.now += 2.9
+            self.assertEqual(vad.should_stop_recording(QUIET), (False, "continue"))
+            clock.now += 0.2
+            self.assertEqual(vad.should_stop_recording(QUIET), (True, "no_speech"))
+
+    def test_the_override_does_not_leak_into_the_next_recording(self):
+        clock = _Clock()
+        with patch("core.vad.time.time", clock):
+            vad = _vad(speech_timeout=4.0)
+            vad.start_recording(speech_timeout=3.0)
+            vad.start_recording()
+
+            clock.now += 3.1
+            self.assertEqual(vad.should_stop_recording(QUIET), (False, "continue"))
+
     def test_a_late_start_still_gets_a_full_turn(self):
         # Call her, think for three seconds, then speak. This is the bug report.
         clock = _Clock()
