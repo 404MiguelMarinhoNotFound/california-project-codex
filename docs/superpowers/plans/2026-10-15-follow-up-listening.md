@@ -18,7 +18,8 @@
     follow_up_enabled: true
     follow_up_timeout_s: 3.0
     max_follow_ups: 10
-    stop_listening_line: "I'll stop listening now. Just say California when you need me."
+    stop_line_timeout: "I'll take that as a no. Say my name if you need me."
+  stop_line_cap: "Okay, I'll stop listening now. Say California if you need me."
   ```
 - Sentinel is exactly `[ignore]`; matched after `lstrip()`, case-insensitive, on the *start* of the reply.
 - Follow-up message prefix, verbatim: `[Heard without the wake word, right after your question. If this is not him answering you, reply with exactly [ignore].] ` followed by the transcript.
@@ -90,7 +91,7 @@
 **Interfaces:**
 - Consumes: `services.llm.ERROR_LINE` (Task 2).
 - Produces, as class-level defaults on `Orchestrator` (overwritten in `__init__` from `config["conversation"]`):
-  - `_follow_up_enabled: bool = False`, `_follow_up_timeout_s: float = 3.0`, `_max_follow_ups: int = 10`, `_stop_listening_line: str = ""`
+  - `_follow_up_enabled: bool = False`, `_follow_up_timeout_s: float = 3.0`, `_max_follow_ups: int = 10`, `_stop_line_timeout: str = ""`, `_stop_line_cap: str = ""`
   - `_next_follow_up: bool = False`: set at the end of every turn, and read by Task 5
   - `_turn_awaiting: bool = False`: reset to False at the start of every turn (`_handle_activation`, `_report_turn`, Task 5's `_handle_follow_up`); set True in `_handle_tool_call`'s `finally` when `awaiting` is True
   - `_follow_up_index: int = 0`: the current turn's position in the chain (0 = a wake-word turn)
@@ -103,13 +104,13 @@ At the end of `_stream_response` (after `reply_done`), set:
 wanted = enabled and outcome != "error" and (self._turn_awaiting or _wants_follow_up(parts, interrupted))
           and not (an awaiting tool that was interrupted)
 if wanted and self._follow_up_index >= self._max_follow_ups:
-    self._say_fixed(self._stop_listening_line, "stop_listening"); turn.set(stopped_listening="cap"); wanted = False
+    self._say_fixed(self._stop_line_cap, "stop_listening"); turn.set(stopped_listening="cap"); wanted = False
 self._next_follow_up = wanted
 ```
 
 `_report_turn` forces `_next_follow_up = False` after streaming. `_handle_activation` and `_report_turn` reset `_next_follow_up = False` and `_turn_awaiting = False` at their start.
 
-- [ ] **Step 1: Write the failing tests.** Reuse the fakes from `tests/test_reply_barge_in.py` by importing `_orchestrator`, `_FakeMic` and `SENTENCES` from it, and set `_follow_up_enabled = True`, `_stop_listening_line = "I'll stop listening now."`, `_turn = NULL_TURN` (or a `Mock`):
+- [ ] **Step 1: Write the failing tests.** Reuse the fakes from `tests/test_reply_barge_in.py` by importing `_orchestrator`, `_FakeMic` and `SENTENCES` from it, and set `_follow_up_enabled = True`, `_stop_line_timeout = "timeout line"`, `_stop_line_cap = "cap line"`, `_turn = NULL_TURN` (or a `Mock`):
   - `test_a_reply_ending_in_a_question_wants_a_follow_up` (last sentence `"…want the first source?"`)
   - `test_a_statement_does_not`
   - `test_a_question_mid_reply_followed_by_a_statement_does_not`
@@ -117,7 +118,7 @@ self._next_follow_up = wanted
   - `test_the_llm_error_line_never_opens_a_window` (sentences = `[ERROR_LINE]`)
   - `test_a_barged_in_reply_never_wants_one` (`fire_on=8`, question at the end)
   - `test_disabled_never_wants_one`
-  - `test_the_tenth_follow_up_asking_again_says_the_stop_line_once`: `_follow_up_index = 10`, question reply → `_next_follow_up` False, the stop line appears exactly once in `audio.played`
+  - `test_the_tenth_follow_up_asking_again_says_the_stop_line_once`: `_follow_up_index = 10`, question reply → `_next_follow_up` False, "cap line" appears exactly once in `audio.played`, "timeout line" never
   - `test_handle_tool_call_marks_the_turn_awaiting`: patch `_dispatch_tool` to call `core.orchestrator._await_answer()` and return `"ok"` → `_turn_awaiting` True
   - `test_shipped_config_carries_the_conversation_block`: `config_for_tests()["conversation"]` equals the Global Constraints values
 - [ ] **Step 2: Run** `uv run python -m unittest tests.test_follow_up -v`. Expected: the new tests FAIL.
@@ -168,7 +169,7 @@ self._next_follow_up = wanted
 **Interfaces:**
 - Consumes: Task 1 `_record_speech(..., speech_timeout=)`, Task 3 attributes and `_say_fixed`, Task 4 `_stream_response(..., follow_up=True)`.
 - Produces: `_handle_follow_up(mic_stream, index: int) -> bool` (barged_in). It mirrors `_handle_activation`'s `TurnTimer` wrapper (`chained=True`, plus `turn.set(follow_up=True, follow_up_index=index)`), resets `_next_follow_up`/`_turn_awaiting`, sets `_follow_up_index = index`, and runs `_run_follow_up`.
-- Produces: `_run_follow_up(mic_stream, index) -> bool`. `reset_playback()`, `_set_state("listening")`, `_record_speech(mic_stream, None, speech_timeout=self._follow_up_timeout_s)`, then STT, the empty check, `_handle_command`, `_capture_incoming_target()`, and `_stream_response(transcript, mic_stream, follow_up=True)`. No activation clip, no `_wake_count` change, no `strip_activation_echo`. **No reply** (recording `None` → outcome `_last_record_outcome`, or an empty transcript → `empty_transcript`): call `wake_word.reset()`, and when `index >= 2` call `_say_fixed(self._stop_listening_line, "stop_listening")` and `turn.set(stopped_listening="timeout")`. Return False with `_next_follow_up` False.
+- Produces: `_run_follow_up(mic_stream, index) -> bool`. `reset_playback()`, `_set_state("listening")`, `_record_speech(mic_stream, None, speech_timeout=self._follow_up_timeout_s)`, then STT, the empty check, `_handle_command`, `_capture_incoming_target()`, and `_stream_response(transcript, mic_stream, follow_up=True)`. No activation clip, no `_wake_count` change, no `strip_activation_echo`. **No reply** (recording `None` → outcome `_last_record_outcome`, or an empty transcript → `empty_transcript`): call `wake_word.reset()`, and when `index >= 2` call `_say_fixed(self._stop_line_timeout, "stop_listening")` and `turn.set(stopped_listening="timeout")`. Return False with `_next_follow_up` False.
 - Produces: `_run_conversation(mic_stream, barged_in: bool) -> None`:
 
 ```text
@@ -185,8 +186,8 @@ finally: self._follow_up_index = 0; self._next_follow_up = False
 - [ ] **Step 1: Write the failing tests.** Patch `_handle_activation`, `_record_speech`, `stt.transcribe` and `llm` with fakes that script each turn. Count `audio.speaker_opens`/`speaker_closes` through `_idle_loop` with a `_FakeWake` that fires on chunk 1.
   - `test_an_answer_in_the_window_is_a_follow_up_turn_with_no_acknowledgement`: the wake turn asks; the follow-up records audio "yes"; `play_activation_sound` not called; `_wake_count` unchanged; `_record_speech` got `speech_timeout=3.0`
   - `test_silence_after_the_first_question_ends_quietly`: the follow-up `_record_speech` returns None at index 1 → stop line not played, one speaker open and one close
-  - `test_silence_in_a_chained_window_says_the_stop_line_once`: follow-up 1 answered and asks again; follow-up 2 silent → stop line played once
-  - `test_ten_follow_ups_then_the_cap_line`: every reply asks → exactly 10 follow-up turns, then the stop line once, then idle
+  - `test_silence_in_a_chained_window_says_the_stop_line_once`: follow-up 1 answered and asks again; follow-up 2 silent → "timeout line" played once, "cap line" never
+  - `test_ten_follow_ups_then_the_cap_line`: every reply asks → exactly 10 follow-up turns, then "cap line" once, then idle
   - `test_a_barge_in_inside_a_follow_up_resets_the_chain`: follow-up 1 barged in → `_handle_activation` runs next, and its turn starts at index 0
   - `test_an_ignored_follow_up_ends_the_conversation_without_a_line`
   - `test_disabled_is_todays_flow`: `_follow_up_enabled = False`, the reply asks → no follow-up turn, `_record_speech` called once

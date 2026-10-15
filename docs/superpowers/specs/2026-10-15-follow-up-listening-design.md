@@ -110,8 +110,13 @@ something else.
      follow-up turn (chain depth >= 1).
 - She says **nothing** when the first window after a wake-word turn times out
   (he ignored one question), and nothing after an `[ignore]`.
-- The line is fixed text, e.g. "I'll stop listening now. Just say California when
-  you need me." Spoken on the open speaker session, then the mic is drained.
+- Two fixed lines, one per case, both in config: after a silent chained window
+  `stop_line_timeout` ("I'll take that as a no. Say my name if you need me."), at
+  the cap `stop_line_cap` ("Okay, I'll stop listening now. Say California if you
+  need me."). Synthesized live through `TTSService` on the open speaker session,
+  so they are always in her current voice (Aoede today) and follow any voice
+  change with nothing to regenerate; the ~0.3-1s synthesis lands after a silence,
+  where it is not felt. Then the mic is drained.
 
 ## Config
 
@@ -122,7 +127,8 @@ conversation:
   follow_up_enabled: true
   follow_up_timeout_s: 3.0
   max_follow_ups: 10
-  stop_listening_line: "I'll stop listening now. Just say California when you need me."
+  stop_line_timeout: "I'll take that as a no. Say my name if you need me."
+  stop_line_cap: "Okay, I'll stop listening now. Say California if you need me."
 ```
 
 `tests/config_fixture.py` needs no override. `follow_up_enabled: false` must
