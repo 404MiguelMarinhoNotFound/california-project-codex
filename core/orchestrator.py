@@ -29,7 +29,9 @@ from services.deebot_service import DeebotCommandResult, DeebotService
 from services.govee_service import GoveeCommandResult, GoveeService, clamp_percent, resolve_color
 from services.media_service import MediaService
 from services.light_shadow import LightShadow
+from services.llm import ERROR_LINE
 from services.now_playing import NowPlaying
+from services.stop_lines import load_stop_lines
 from services.stremio_service import AUTOPLAY_FALLBACK_LINE, StremioService
 from services.whatsapp_groups import GroupMatch
 from services.whatsapp_groups import speakable_title as speakable_group_title
@@ -1104,6 +1106,20 @@ def _timed_tokens(token_stream, turn):
         yield token
 
 
+def _wants_follow_up(reply_parts: list[str], interrupted: bool) -> bool:
+    """
+    Whether her reply asked him something, by its words: the last spoken
+    chunk ends in a question mark. A "?" earlier in the reply followed by a
+    statement does not count. The provider's error line also ends in "?" and
+    must never open a window, or one outage would loop.
+    """
+    if interrupted or not reply_parts:
+        return False
+    if ERROR_LINE in " ".join(reply_parts):
+        return False
+    return reply_parts[-1].rstrip().endswith("?")
+
+
 def _drain_queue(q: queue.Queue) -> None:
     """Throw away everything queued, without blocking."""
     while True:
@@ -1974,6 +1990,19 @@ class Orchestrator:
     _activation_seq = 0
     _whatsapp_send_seq = -1
     _whatsapp_send_unresolved = False
+    # Follow-up listening (answering her question without the wake word).
+    # Off by default so a __new__-built test orchestrator behaves as before;
+    # __init__ reads the `conversation:` block. See _run_conversation.
+    _follow_up_enabled = False
+    _follow_up_timeout_s = 3.0
+    _max_follow_ups = 10
+    _stop_lines: dict = {}
+    # Set at the end of every turn: did it ask him something?
+    _next_follow_up = False
+    # A tool in this turn is waiting on his answer (read-back, "which one?").
+    _turn_awaiting = False
+    # This turn's place in the chain: 0 for a wake-word turn.
+    _follow_up_index = 0
 
     def __init__(self, config: dict):
         self.config = config
@@ -2240,6 +2269,18 @@ class Orchestrator:
             ww_cfg.get("barge_in_threshold", ww_cfg.get("threshold", 0.5))
         )
 
+        # Answering her questions without the wake word. The two "I've stopped
+        # listening" lines are pre-recorded (generate_stop_lines.py), never
+        # synthesized live; a missing one is silence, not a failure.
+        conv_cfg = config.get("conversation", {}) or {}
+        self._follow_up_enabled = bool(conv_cfg.get("follow_up_enabled", False))
+        self._follow_up_timeout_s = float(conv_cfg.get("follow_up_timeout_s", 3.0))
+        self._max_follow_ups = int(conv_cfg.get("max_follow_ups", 10))
+        self._stop_lines = (
+            load_stop_lines(config.get("sounds", {}).get("stop_lines_dir", ""))
+            if self._follow_up_enabled else {}
+        )
+
         # State
         self._running = False
         # Set by the reply listener (wake word heard mid-reply) or the "stop"
@@ -2475,11 +2516,15 @@ class Orchestrator:
         """One timed turn whose input is the call report instead of his speech."""
         self._turn = TurnTimer(self._turn_writer, chained=False, bus=self.bus)
         self._activation_seq += 1
+        self._next_follow_up = False
+        self._turn_awaiting = False
         barged_in = False
         try:
             self._turn.set(outcome="phone_report")
             self.audio.reset_playback()
             barged_in = self._stream_response(_phone_report_message(report), mic_stream)
+            # A report is unprompted: a question in it never opens a window.
+            self._next_follow_up = False
             return barged_in
         except BaseException:
             self._turn.set(outcome="error")
@@ -2500,6 +2545,8 @@ class Orchestrator:
         self._turn = TurnTimer(self._turn_writer, chained=pre_roll is None, bus=self.bus)
         self._activation_seq += 1
         self._incoming_target = None
+        self._next_follow_up = False
+        self._turn_awaiting = False
         barged_in = False
         try:
             barged_in = self._run_activation(mic_stream, pre_roll)
@@ -2830,6 +2877,8 @@ class Orchestrator:
         # Queue for sentences waiting to be spoken
         tts_queue: queue.Queue[str | None] = queue.Queue()
         full_response_parts = []
+        errored = False
+        self._next_follow_up = False
         self._interrupted.clear()
 
         # A tool call runs synchronously on THIS thread inside the LLM stream,
@@ -2888,6 +2937,7 @@ class Orchestrator:
 
         except Exception as e:
             logger.exception(f"Streaming error: {e}")
+            errored = True
             self._turn.set(outcome="error", error=str(e)[:200])
             tts_queue.put("Sorry, something went wrong.")
 
@@ -2910,7 +2960,46 @@ class Orchestrator:
             self._turn.set(reply=full_response)
             print(f"  🌴 California: {full_response}")
 
-        return self._interrupted.is_set()
+        interrupted = self._interrupted.is_set()
+        self._decide_follow_up(full_response_parts, interrupted, errored)
+        return interrupted
+
+    def _decide_follow_up(self, reply_parts: list[str], interrupted: bool, errored: bool) -> None:
+        """
+        At the end of a reply: did she ask him something? Either a tool is
+        waiting on his answer, or her last sentence is a question. If so the
+        conversation loop keeps the mic open (see _run_conversation). Past
+        conversation.max_follow_ups she says the pre-recorded cap line instead.
+        """
+        wanted = (
+            self._follow_up_enabled
+            and not errored
+            and not interrupted
+            and (self._turn_awaiting or _wants_follow_up(reply_parts, interrupted))
+        )
+        if wanted and self._follow_up_index >= self._max_follow_ups:
+            logger.info("Follow-up cap reached (%d); back to the wake word", self._max_follow_ups)
+            self._play_stop_line("cap")
+            self._turn.set(stopped_listening="cap")
+            wanted = False
+        self._next_follow_up = bool(wanted)
+
+    def _play_stop_line(self, which: str) -> None:
+        """
+        Say one of the pre-recorded "I've stopped listening" lines on the open
+        speaker. No TTS call, no history, no LLM. A missing clip is silence.
+        Never raises.
+        """
+        clip = self._stop_lines.get(which) if isinstance(self._stop_lines, dict) else None
+        if clip is None:
+            logger.debug("No %r stop line loaded; staying quiet", which)
+            return
+        audio, sr, text = clip
+        try:
+            self.audio.reset_playback()
+            self.audio.play_audio(audio, sr, blocking=True, text=text, kind="stop_listening")
+        except Exception:
+            logger.exception("Stop line %r failed to play", which)
 
     def _reply_listener(self, mic_stream, stop: threading.Event) -> None:
         """
@@ -3071,6 +3160,9 @@ class Orchestrator:
             awaiting = _TOOL_AWAITING.get() is True
             _TOOL_OUTCOME.reset(token)
             _TOOL_AWAITING.reset(asked)
+            if awaiting:
+                # He owes her an answer: keep the mic open after this reply.
+                self._turn_awaiting = True
             if result is None:
                 ok = False  # the tool raised
             self._turn.tool(

@@ -159,6 +159,15 @@ vad:
   # STT rather than sent as a command.
   min_recording: 0.6
 
+# Answering her questions without the wake word: after a reply that asks him
+# something (a "?" at the end, or a tool waiting on a read-back), the mic stays
+# open this long for him to START answering. See
+# docs/superpowers/specs/2026-10-15-follow-up-listening-design.md.
+conversation:
+  follow_up_enabled: true
+  follow_up_timeout_s: 3.0
+  max_follow_ups: 10
+
 # --- Audio Capture ---
 audio:
   sample_rate: 16000          # 16kHz mono — what Whisper expects

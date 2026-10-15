@@ -17,6 +17,8 @@ import os
 import tempfile
 import unittest
 
+from unittest.mock import Mock, patch
+
 import numpy as np
 import soundfile as sf
 
@@ -133,6 +135,122 @@ class StopLinesTests(unittest.TestCase):
             config_for_tests()["sounds"]["stop_lines_dir"],
             "sounds/stop_lines/google_en-US-Chirp3-HD-Aoede",
         )
+
+
+# ── Deciding a follow-up at the end of a turn ─────────────────────────────
+
+from tests.test_reply_barge_in import SENTENCES, _FakeMic, _orchestrator, _tts_synthesize  # noqa: E402
+
+QUESTION = "I found two sources for that one, do you want the first source?"
+STATEMENT = "Done, the attic lights are off now and the room is dark again."
+
+
+def _stop_lines():
+    return {
+        "timeout": (_tts_synthesize("timeout line")[0], 24000, "timeout line"),
+        "cap": (_tts_synthesize("cap line")[0], 24000, "cap line"),
+    }
+
+
+def _follow_up_orch(sentences, fire_on=None):
+    orch = _orchestrator(fire_on=fire_on, sentences=sentences)
+    orch.tts.synthesize = Mock(side_effect=_tts_synthesize)
+    orch._follow_up_enabled = True
+    orch._stop_lines = _stop_lines()
+    orch._follow_up_index = 0
+    orch._turn_awaiting = False
+    orch._next_follow_up = False
+    return orch
+
+
+class FollowUpDecisionTests(unittest.TestCase):
+    def test_a_reply_ending_in_a_question_wants_a_follow_up(self):
+        orch = _follow_up_orch([STATEMENT, QUESTION])
+        orch._stream_response("play fallout", _FakeMic())
+        self.assertTrue(orch._next_follow_up)
+
+    def test_a_statement_does_not(self):
+        orch = _follow_up_orch([STATEMENT])
+        orch._stream_response("lights off", _FakeMic())
+        self.assertFalse(orch._next_follow_up)
+
+    def test_a_question_mid_reply_followed_by_a_statement_does_not(self):
+        orch = _follow_up_orch([QUESTION, STATEMENT])
+        orch._stream_response("hi", _FakeMic())
+        self.assertFalse(orch._next_follow_up)
+
+    def test_an_awaiting_tool_wants_one_without_a_question_mark(self):
+        orch = _follow_up_orch([STATEMENT])
+        orch._turn_awaiting = True
+        orch._stream_response("tell marta im late", _FakeMic())
+        self.assertTrue(orch._next_follow_up)
+
+    def test_the_llm_error_line_never_opens_a_window(self):
+        orch = _follow_up_orch([ERROR_LINE])
+        orch._stream_response("hi", _FakeMic())
+        self.assertFalse(orch._next_follow_up)
+
+    def test_a_barged_in_reply_never_wants_one(self):
+        orch = _follow_up_orch(SENTENCES + [QUESTION], fire_on=8)
+        orch._turn_awaiting = True
+        barged = orch._stream_response("hi", _FakeMic())
+        self.assertTrue(barged)
+        self.assertFalse(orch._next_follow_up)
+
+    def test_disabled_never_wants_one(self):
+        orch = _follow_up_orch([QUESTION])
+        orch._follow_up_enabled = False
+        orch._turn_awaiting = True
+        orch._stream_response("hi", _FakeMic())
+        self.assertFalse(orch._next_follow_up)
+
+    def test_the_tenth_follow_up_asking_again_says_the_stop_line_once(self):
+        orch = _follow_up_orch([QUESTION])
+        orch._follow_up_index = 10
+        orch._stream_response("yes", _FakeMic())
+        self.assertFalse(orch._next_follow_up)
+        self.assertEqual(orch.audio.played.count("cap line"), 1)
+        self.assertNotIn("timeout line", orch.audio.played)
+        spoken_by_tts = [c.args[0] for c in orch.tts.synthesize.call_args_list]
+        self.assertNotIn("cap line", spoken_by_tts)
+        self.assertNotIn("timeout line", spoken_by_tts)
+
+    def test_below_the_cap_no_stop_line(self):
+        orch = _follow_up_orch([QUESTION])
+        orch._follow_up_index = 9
+        orch._stream_response("yes", _FakeMic())
+        self.assertTrue(orch._next_follow_up)
+        self.assertNotIn("cap line", orch.audio.played)
+
+    def test_a_missing_stop_clip_plays_nothing_and_does_not_raise(self):
+        orch = _follow_up_orch([QUESTION])
+        orch._stop_lines = {}
+        orch._follow_up_index = 10
+        orch._stream_response("yes", _FakeMic())
+        self.assertFalse(orch._next_follow_up)
+        self.assertEqual(" ".join(orch.audio.played), QUESTION)
+
+    def test_handle_tool_call_marks_the_turn_awaiting(self):
+        import core.orchestrator as orch_mod
+
+        orch = _follow_up_orch([STATEMENT])
+        orch.bus = Mock()
+
+        def dispatch(name, tool_input):
+            orch_mod._await_answer()
+            return "ok"
+
+        with patch.object(orch, "_dispatch_tool", side_effect=dispatch), \
+                patch.object(orch, "_publish_mood_for_tool"):
+            orch._handle_tool_call("control_whatsapp", {"action": "whatsapp_send"})
+        self.assertTrue(orch._turn_awaiting)
+
+    def test_shipped_config_carries_the_conversation_block(self):
+        self.assertEqual(config_for_tests()["conversation"], {
+            "follow_up_enabled": True,
+            "follow_up_timeout_s": 3.0,
+            "max_follow_ups": 10,
+        })
 
 
 if __name__ == "__main__":
