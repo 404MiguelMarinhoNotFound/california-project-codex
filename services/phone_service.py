@@ -211,6 +211,7 @@ class CallReport:
     backend: str = ""
     model: str = ""
     voice: str = ""
+    turn: int | None = None  # the live UI turn that placed the call, to nest it under that turn
 
     def metadata(self) -> dict:
         """The numbers that describe the call, derived once for the log and the report."""
@@ -240,6 +241,7 @@ class CallReport:
             "backend": self.backend,
             "model": self.model,
             "voice": self.voice,
+            "turn": self.turn,
         }
         for key in ("connect_s", "dial_s", "interruptions", "nudges", "refused_hang_ups",
                     "unknown_tools", "loopback_peak", "heard_nothing", "loopback_source"):
@@ -382,6 +384,10 @@ class PhoneService:
         # are heard; with logging.include_transcripts off, only the call's
         # state does.
         self._publish_event = publish
+        # Set by the orchestrator: the id of the turn in progress, read when a
+        # call is placed so the live UI can nest the call under that turn.
+        self.current_turn: Callable[[], int | None] | None = None
+        self._call_turn: int | None = None
         self._publish_text = ((config.get("logging") or {}).get("include_transcripts", True)) is not False
         self.owner = str(cfg.get("owner_name") or "Miguel")
         self.callback_number = str(cfg.get("callback_number") or "")
@@ -705,6 +711,10 @@ class PhoneService:
             if refusal is not None:
                 return refusal
             self._active = {"owner": "outgoing", "label": label, "number": resolved, "since": time.monotonic()}
+        try:
+            self._call_turn = self.current_turn() if self.current_turn else None
+        except Exception:
+            self._call_turn = None
         self._thread = threading.Thread(
             target=self._run_call, args=(brief, resolved, label, source), name="phone-call", daemon=True
         )
@@ -1116,6 +1126,9 @@ class PhoneService:
     def _run_call(self, brief: CallBrief, number: str, label: str, source: str = "") -> None:
         started = datetime.now()
         started_at = started.isoformat(timespec="seconds")
+        call_id = started.strftime("%Y%m%d-%H%M%S")
+        turn = self._call_turn
+        ident = {"call_id": call_id, "turn": turn}
         hang_up_status = ""
         result = CallResult()
         dial_status: list[str] = []
@@ -1125,7 +1138,7 @@ class PhoneService:
             audio_box: list = []
 
             def dial() -> bool:
-                self._publish("call_state", {"state": "dialing", "label": label})
+                self._publish("call_state", {"state": "dialing", "label": label, **ident})
                 dial_status.append(dialer.dial(number))
                 placed = dial_status[-1] in _DIALED
                 if placed and audio_box and audio_box[0] is not None:
@@ -1140,7 +1153,7 @@ class PhoneService:
 
             prompt = build_call_prompt(brief, owner=self.owner, callback_number=self.callback_number)
             self._publish("call_state", {
-                "state": "starting", "label": label, "kind": brief.kind, "started_at": started_at,
+                "state": "starting", "label": label, "kind": brief.kind, "started_at": started_at, **ident,
             })
             # The other side's audio, recorded for debugging only when
             # transcripts are kept at all (it is their voice).
@@ -1179,13 +1192,13 @@ class PhoneService:
             result.error = str(exc)[:300]
         self._publish("call_state", {
             "state": "ended", "label": label, "ended_by": result.ended_by or "",
-            "error": result.error or "",
+            "error": result.error or "", **ident,
         })
         if result.outcome is None and result.lines:
             result.outcome = self._read_outcome(brief, result)
         report = CallReport(
             label=label, number=number, brief=brief, result=result, started_at=started_at,
-            call_id=started.strftime("%Y%m%d-%H%M%S"),
+            call_id=call_id, turn=turn,
             ended_at=datetime.now().isoformat(timespec="seconds"),
             number_source=source,
             dial_status=dial_status[-1] if dial_status else "",

@@ -190,9 +190,10 @@ logging:
 # A read-only web page that shows what she is doing right now: state, the live
 # wake score against the threshold, each turn's stages as they happen, a phone
 # call's transcript while it is on, and the log tail. Open it from a phone on
-# the home Wi-Fi at the URL logged at boot (http://<this machine>:8765/<token>/).
-# The token comes from CALIFORNIA_UI_TOKEN in .env; set it, or the URL changes
-# every run. logging.include_transcripts: false keeps what he said off the page too.
+# the home Wi-Fi at the URL logged at boot (http://<this machine>:8765/california/).
+# The word in the URL is "california" unless CALIFORNIA_UI_TOKEN (.env) or ui.token
+# overrides it; it is a name, not a secret. Past calls, with their whole transcript,
+# are under "Calls" and nested under the turn that placed them. logging.include_transcripts: false keeps what he said off the page too.
 ui:
   enabled: true
   host: "0.0.0.0"             # LAN. "127.0.0.1" for this machine only

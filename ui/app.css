@@ -208,7 +208,7 @@ body.ambient .halo canvas { touch-action: none; }
   .grid { grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); align-items: start; }
   .wake { grid-column: 1; }
   .now { grid-column: 1; }
-  .call, .feed, .log { grid-column: 2; }
+  .call, .feed, .calls, .log { grid-column: 2; }
   .call { grid-row: 1; }
 }
 .panel {
@@ -282,6 +282,28 @@ body.ambient .halo canvas { touch-action: none; }
 .call-lines .at { font: 12px var(--mono); color: var(--muted); padding-top: 2px; }
 .call-lines .who { font-size: 12px; color: var(--muted); }
 .call-lines li.her .who { color: var(--accent); }
+
+/* Call history: a call is a sub-turn under its turn, and a row in Calls */
+.sub { margin: 8px 0 4px 14px; padding-left: 12px; border-left: 2px solid var(--line); }
+.subhead { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 14px; cursor: pointer; }
+.subhead:hover { border-color: var(--accent); }
+.sub-who { font-weight: 500; overflow-wrap: anywhere; }
+.subhead .chev { margin-left: auto; transition: transform .15s; }
+.subhead[aria-expanded="true"] .chev { transform: rotate(90deg); }
+.call-pill { font-size: 12px; padding: 1px 8px; border-radius: 8px; border: 1px solid var(--line); color: var(--muted); }
+.call-pill[data-tone="good"] { color: var(--accent); border-color: var(--accent); }
+.call-pill[data-tone="bad"] { color: var(--bad, #e5484d); border-color: var(--bad, #e5484d); }
+.sub-body { padding: 10px 2px 2px; }
+.call-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+.call-chip { font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 8px; padding: 2px 8px; }
+.call-sum { margin: 0 0 8px; font-size: 14px; }
+.call-full { max-height: 60dvh; }
+.call-btn { margin-top: 10px; margin-right: 8px; padding: 4px 10px; font: inherit; font-size: 12px; color: inherit;
+  background: transparent; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+.call-btn:hover { border-color: var(--accent); }
+.calls-list { display: grid; gap: 6px; max-height: 60dvh; overflow-y: auto; }
+.flash { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* Feed */
 .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-size: 11px; }

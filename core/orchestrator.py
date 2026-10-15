@@ -2064,6 +2064,7 @@ class Orchestrator:
             publish=self.bus.publish,
             current_ring=self._current_ring if self.incoming_calls is not None else None,
         )
+        self.phone_service.current_turn = lambda: getattr(self._turn, "_turn_id", None)
 
         # The phone's own contact book, re-read over adb weekly (and at boot
         # when the snapshot is stale) for WhatsApp and calls to resolve names

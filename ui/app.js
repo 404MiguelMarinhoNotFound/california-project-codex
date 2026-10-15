@@ -427,6 +427,7 @@
   function onReplayed(d) {
     noteServerTs(d.ts);
     replaying = false;
+    loadCalls();
     if (!halo) return;
     halo.toolsClear();
     for (const e of [...toolEntries.values()]) {
@@ -449,7 +450,7 @@
 
   function onTurnEnd(d) {
     toolsAtTurnEnd(d.turn);
-    addTurnToFeed(d.record || {}, d.ts);
+    addTurnToFeed(d.record || {}, d.ts, d.turn);
     if (turn && turn.id === d.turn) {
       turn = null;
       clearInterval(clockTimer);
@@ -693,7 +694,7 @@
     return out;
   }
 
-  function addTurnToFeed(r, ts) {
+  function addTurnToFeed(r, ts, turnId) {
     $("feed-empty").hidden = true;
     const marks = r.marks || {};
     const total = r.total_ms || 1;
@@ -734,6 +735,12 @@
       btn.setAttribute("aria-expanded", String(!detail.hidden));
     });
     li.append(btn, detail);
+    if (turnId != null) {
+      li.dataset.turn = turnId;
+      feedByTurn.set(turnId, li);
+      for (const pending of subsByTurn.get(turnId) || []) li.append(pending.root);
+      subsByTurn.delete(turnId);
+    }
     const list = $("turns");
     list.prepend(li);
     while (list.children.length > 200) list.lastChild.remove();
@@ -745,6 +752,7 @@
 
   function onCallState(d) {
     callSatellite(d);
+    callSubState(d);
     const panel = $("call");
     if (d.state === "starting") {
       panel.hidden = false;
@@ -782,6 +790,218 @@
     }
     li.querySelector(".text").textContent += d.text;
     list.scrollTop = list.scrollHeight;
+    if (liveSub) {
+      fillLine(liveSub.lines, d);
+      liveSub.lines.scrollTop = liveSub.lines.scrollHeight;
+    }
+  }
+
+  // ---------------------------------------------------------- call history
+  // A call is a sub-turn: nested under the turn that placed it in the feed,
+  // filling in line by line while it runs, and listed in the Calls panel
+  // afterwards. Past calls are fetched from the server (logs/calls.jsonl) on
+  // demand, so the live event ring never has to hold them.
+  const feedByTurn = new Map();
+  const subsByTurn = new Map();
+  const subs = new Map();
+  let liveSub = null;
+
+  const GOOD = /book|deliver|confirm|success|answered|agreed|done/;
+  const BAD = /fail|error|no_answer|declin|refus|not_placed|busy/;
+  const tone = (status) => {
+    const st = String(status || "");
+    return BAD.test(st) ? "bad" : GOOD.test(st) ? "good" : "";
+  };
+  const dur = (sec) => (sec == null ? "" : sec >= 60 ? `${Math.floor(sec / 60)}m ${String(Math.round(sec % 60)).padStart(2, "0")}s` : `${Math.round(sec)}s`);
+
+  function fillLine(list, d) {
+    let li = list.querySelector(`[data-index="${d.index}"]`);
+    if (!li) {
+      li = el("li", d.who === "them" ? "them" : "her");
+      li.dataset.index = d.index;
+      const body = el("div");
+      body.append(el("div", "who", d.who === "them" ? "them" : "California"), el("div", "text", ""));
+      li.append(el("span", "at", mss(d.at || 0)), body);
+      list.append(li);
+    }
+    li.querySelector(".text").textContent += d.text;
+  }
+
+  function chipsFor(rec) {
+    const m = rec.meta || {};
+    const row = el("div", "call-chips");
+    const add = (k, v) => { if (v !== null && v !== undefined && v !== "") row.append(el("span", "call-chip", `${k} ${v}`)); };
+    add("rang", m.ring_s != null ? dur(m.ring_s) : "");
+    add("talked", m.talk_s != null ? dur(m.talk_s) : "");
+    add("turns", m.her_turns != null ? `${m.her_turns} / ${m.their_turns}` : "");
+    add("interruptions", m.interruptions);
+    add("ended", m.ended_how);
+    add("number", m.number_source);
+    return row;
+  }
+
+  // The body of one call: chips, the whole timed transcript, copy.
+  function renderCall(host, rec) {
+    host.replaceChildren();
+    const summary = rec.outcome && rec.outcome.summary;
+    if (summary && hello && hello.transcripts !== false) host.append(el("p", "call-sum", summary));
+    host.append(chipsFor(rec));
+    const lines = el("ol", "call-lines call-full");
+    (rec.transcript || []).forEach((l, i) => fillLine(lines, { index: i, who: l.who, text: l.text, at: l.at }));
+    if (!lines.children.length) {
+      host.append(el("p", "muted", hello && hello.transcripts === false ? "Transcripts are switched off." : "No transcript was kept for this call."));
+    } else {
+      host.append(lines);
+      const copy = el("button", "call-btn", "Copy transcript");
+      copy.type = "button";
+      copy.addEventListener("click", () => copyText((rec.transcript || []).map((l) => `[${mss(l.at || 0)}] ${l.who === "them" ? "Them" : "California"}: ${l.text}`).join("\n"), copy));
+      host.append(copy);
+    }
+    return lines;
+  }
+
+  function copyText(text, btn) {
+    const done = () => { const was = btn.textContent; btn.textContent = "Copied"; setTimeout(() => { btn.textContent = was; }, 1500); };
+    if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(text).then(done, () => {}); return; }
+    const ta = el("textarea");
+    ta.value = text;
+    ta.style.position = "absolute"; ta.style.left = "-9999px";
+    document.body.append(ta);
+    ta.select();
+    try { document.execCommand("copy"); done(); } catch (err) { /* a locked-down browser: nothing to do */ }
+    ta.remove();
+  }
+
+  async function fetchCall(id) {
+    try {
+      const res = await fetch(`calls/${encodeURIComponent(id)}`, { cache: "no-store" });
+      return res.ok ? await res.json() : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function callHead(label, status, seconds) {
+    const head = el("button", "subhead");
+    head.type = "button";
+    head.setAttribute("aria-expanded", "false");
+    const pill = el("span", "call-pill", String(status || "calling").replace(/_/g, " "));
+    pill.dataset.tone = tone(status);
+    const d = el("span", "muted mono", seconds == null ? "" : dur(seconds));
+    head.append(el("span", "sub-who", label), pill, d, el("span", "chev", "›"));
+    return { head, pill, d };
+  }
+
+  function callSub(id, turnId, label) {
+    let sub = subs.get(id);
+    if (sub) return sub;
+    const root = el("div", "sub");
+    const { head, pill, d } = callHead(label ? `Call to ${label}` : "Call", "calling", null);
+    const body = el("div", "sub-body");
+    body.hidden = true;
+    const lines = el("ol", "call-lines call-full");
+    body.append(lines);
+    root.append(head, body);
+    sub = { id, turn: turnId, root, head, pill, d, body, lines, loaded: false, done: false };
+    head.addEventListener("click", async () => {
+      body.hidden = !body.hidden;
+      head.setAttribute("aria-expanded", String(!body.hidden));
+      if (!body.hidden && !sub.loaded && sub.done) await loadSub(sub);
+    });
+    subs.set(id, sub);
+    return sub;
+  }
+
+  async function loadSub(sub) {
+    const rec = await fetchCall(sub.id);
+    if (!rec) return;
+    sub.loaded = true;
+    sub.lines = renderCall(sub.body, rec);
+    sub.pill.textContent = String(rec.status || "").replace(/_/g, " ");
+    sub.pill.dataset.tone = tone(rec.status);
+    sub.d.textContent = dur(rec.duration_s);
+  }
+
+  function placeSub(sub) {
+    const li = sub.turn != null ? feedByTurn.get(sub.turn) : null;
+    if (li) { li.append(sub.root); return; }
+    if (sub.turn != null && !endedTurns.has(sub.turn)) {
+      // The turn that placed it is still running: nest it when it lands.
+      if (!subsByTurn.has(sub.turn)) subsByTurn.set(sub.turn, []);
+      subsByTurn.get(sub.turn).push(sub);
+      return;
+    }
+    $("feed-empty").hidden = true;
+    const solo = el("li", "turn call-solo");
+    solo.append(sub.root);
+    $("turns").prepend(solo);
+  }
+
+  function callSubState(d) {
+    if (!d.call_id) return;
+    if (d.state === "starting") {
+      liveSub = callSub(d.call_id, d.turn, hello && hello.transcripts === false ? "" : d.label);
+      placeSub(liveSub);
+      liveSub.body.hidden = false;
+      liveSub.head.setAttribute("aria-expanded", "true");
+    } else if (d.state === "dialing" && liveSub) {
+      liveSub.pill.textContent = "on the call";
+    } else if (d.state === "ended") {
+      const sub = subs.get(d.call_id);
+      if (!sub) return;
+      sub.done = true;
+      sub.pill.textContent = String(d.ended_by || "ended").replace(/_/g, " ");
+      if (liveSub === sub) liveSub = null;
+      if (!replaying) {
+        // The server has the final status, outcome and timings once the log write lands.
+        setTimeout(async () => { await loadSub(sub); loadCalls(); }, 1500);
+      }
+    }
+  }
+
+  // The Calls panel: every logged call, newest first.
+  async function loadCalls() {
+    let list = null;
+    try {
+      const res = await fetch("calls", { cache: "no-store" });
+      list = res.ok ? await res.json() : null;
+    } catch (err) {
+      list = null;
+    }
+    if (!Array.isArray(list)) return;
+    const ol = $("calls-list");
+    ol.replaceChildren();
+    $("calls-empty").hidden = list.length > 0;
+    for (const c of list) {
+      const li = el("li", "call-row");
+      const { head } = callHead(c.to || c.kind || "Call", c.status, c.duration_s);
+      head.prepend(el("span", "muted mono", c.ts ? new Date(c.ts).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : ""));
+      const body = el("div", "sub-body");
+      body.hidden = true;
+      let loaded = false;
+      head.addEventListener("click", async () => {
+        body.hidden = !body.hidden;
+        head.setAttribute("aria-expanded", String(!body.hidden));
+        if (body.hidden || loaded) return;
+        const rec = await fetchCall(c.id);
+        if (!rec) { body.append(el("p", "muted", "Couldn't load this call.")); return; }
+        loaded = true;
+        renderCall(body, rec);
+        const turnLi = c.turn != null ? feedByTurn.get(c.turn) : null;
+        if (turnLi) {
+          const jump = el("button", "call-btn", "Show its turn");
+          jump.type = "button";
+          jump.addEventListener("click", () => {
+            turnLi.scrollIntoView({ behavior: "smooth", block: "center" });
+            turnLi.classList.add("flash");
+            setTimeout(() => turnLi.classList.remove("flash"), 1500);
+          });
+          body.append(jump);
+        }
+      });
+      li.append(head, body);
+      ol.append(li);
+    }
   }
 
   // ------------------------------------------------------------------ log
@@ -833,6 +1053,10 @@
     setMood("none");
     toolEntries.clear();
     endedTurns.clear();
+    feedByTurn.clear();
+    subsByTurn.clear();
+    subs.clear();
+    liveSub = null;
     latestTurn = 0;
     if (halo) halo.toolsClear();
   }

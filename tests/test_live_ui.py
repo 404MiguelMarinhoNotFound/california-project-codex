@@ -183,13 +183,11 @@ class LiveUILifecycleTests(unittest.TestCase):
         self.assertFalse(ui.start())
         ui.stop()  # safe on a UI that never started
 
-    def test_without_a_configured_token_one_is_generated(self):
+    def test_without_a_configured_token_the_url_is_california(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CALIFORNIA_UI_TOKEN", None)
-            a = LiveUI(_config(), EventBus()).token
-            b = LiveUI(_config(), EventBus()).token
-        self.assertGreaterEqual(len(a), 16)
-        self.assertNotEqual(a, b)
+            token = LiveUI(_config(), EventBus()).token
+        self.assertEqual(token, "california")
 
 
 if __name__ == "__main__":
