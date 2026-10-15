@@ -192,6 +192,7 @@ california/
 ├── setup.ps1                    # uv bootstrap for Windows
 ├── generate_bootup_sounds.py    # Regenerates the startup one-liners in sounds/bootup/
 ├── generate_activation_phrases.py # Regenerates the post-wake acknowledgements
+├── generate_stop_lines.py       # Regenerates the two "I've stopped listening" lines (follow-ups)
 ├── core/
 │   ├── orchestrator.py          # Main state machine and tool dispatch
 │   ├── audio_pipeline.py        # Microphone capture and playback
@@ -212,6 +213,7 @@ california/
 │   ├── name_matcher.py          # Shared fuzzy hint -> key matching: exact, despaced, substring, token overlap
 │   ├── media_service.py         # Generic Mi Box / Android TV ADB controls
 │   ├── sentence_chunker.py      # Splits streamed LLM output into sentences
+│   ├── stop_lines.py            # Loads the pre-recorded follow-up stop lines; never synthesizes
 │   ├── stremio_service.py       # Stremio auth, sync, TMDB lookup, deep-link playback
 │   ├── surfshark_service.py     # Route-based Surfshark VPN automation for YouTube and Stremio
 │   ├── tv_volume.py             # The TV's own 0-100 volume and mute over UPnP RenderingControl (:9197)
@@ -261,6 +263,7 @@ california/
 │   ├── test_mic_drain.py        # Stale mic-buffer draining after playback
 │   ├── test_speaker_session.py  # Per-turn OutputStream: block writes, stop-within-a-block, reopen after abort, tail on close
 │   ├── test_reply_barge_in.py   # Wake word over a reply: interrupt, queue drain, own-name guard, idle-loop chaining
+│   ├── test_follow_up.py        # Answering her question without the wake word: trigger, window, [ignore], cap, stop lines
 │   ├── test_orchestrator_lights.py # control_lights dispatch behavior
 │   ├── test_orchestrator_vpn_routing.py # VPN preflight routing behavior
 │   ├── test_stremio_service.py  # Stremio / TMDB / playback unit tests
@@ -296,10 +299,10 @@ Important runtime note:
   is what makes a moved device self-heal -- deleting it costs one rediscovery (~0.5-2s),
   never a failure. `tv_state.json` is the TV's pre-2026-09-11 private cache; it is no
   longer read or written and can be deleted
-- `sounds/bootup/`, `sounds/california_activations/`, `sounds/chime.wav`, and
+- `sounds/bootup/`, `sounds/california_activations/`, `sounds/stop_lines/`, `sounds/chime.wav`, and
   `sounds/error.wav` are generated audio and are **not** committed. This repo carries
-  audio sources, not audio output. Run `generate_bootup_sounds.py` and
-  `generate_activation_phrases.py` on a fresh clone. Both synthesize with whatever
+  audio sources, not audio output. Run `generate_bootup_sounds.py`,
+  `generate_activation_phrases.py` and `generate_stop_lines.py` on a fresh clone. All synthesize with whatever
   `config.yaml`'s `tts` block selects (the same `TTSService` the assistant speaks
   with), so the clips always match the live voice. Missing files are handled
   gracefully: the orchestrator skips the greeting and `sounds.generate_if_missing`
@@ -627,6 +630,52 @@ or "stop".
 - `tests/test_reply_barge_in.py` covers the interrupt, the chaining, the
   own-name guard, the threshold override, and that a reply with no mic (the
   test modes) is a normal reply
+
+### Answering Her Questions Without The Wake Word
+
+When her reply asks Master Miguel something, the mic stays open for his answer
+and he does not say "California" first (2026-10-15). Spec:
+`docs/superpowers/specs/2026-10-15-follow-up-listening-design.md`.
+
+- **When it opens.** A tool in the turn is waiting on him (`awaiting`: a
+  WhatsApp/phone read-back, "which one?", Stremio's source question, the volume
+  cap), or her **last** spoken chunk ends in `?`. A `?` mid-reply followed by a
+  statement does not count, a plain statement never opens it, and neither does a
+  barge-in, an error, a phone report, or the provider's `ERROR_LINE` (which ends
+  in `?`: one outage would loop). `_decide_follow_up` sets `_next_follow_up`.
+- **The loop.** `_run_conversation` runs after every turn on the same open
+  speaker session: a barge-in chains into `_handle_activation` as before (and
+  resets the count: a wake word is a new conversation), a follow-up into
+  `_handle_follow_up` -- no acknowledgement clip, no `_wake_count` change.
+- **The window is `conversation.follow_up_timeout_s: 3.0`, shorter than the
+  wake path's 4.0 on purpose.** It only times how long until he *starts*
+  talking (the silence timer takes over once he does), people answer a question
+  well inside a second, and a shorter window gives the TV less room.
+  `_record_speech(..., speech_timeout=)` passes it to `VAD.start_recording` for
+  that recording only.
+- **Speech that is not him answering her is dropped by the model.** The
+  follow-up message is prefixed with `FOLLOW_UP_PREFIX` ("heard without the
+  wake word ... reply with exactly [ignore]"), in the message, not the system
+  prompt. `_ignore_gate` holds back only the first few tokens: a reply starting
+  `[ignore]` is never spoken, `LLMService.drop_last_exchange()` removes it from
+  history, and the turn logs `outcome: "ignored"`. A tool boundary releases the
+  gate, so "yes" into a read-back confirms at once.
+- **The confirmation tokens are still the safety net.** A TV "yes" can only
+  confirm what she just read back, never a different message or number.
+- **Going quiet.** At most `max_follow_ups: 10` in a row; the 10th that asks
+  again plays the cap line. A window in a chain (index >= 2) that gets no reply
+  -- silence, too short, or a transcript Whisper's filter empties -- plays the
+  timeout line. The first unanswered question and an `[ignore]` end silently.
+- **The two lines are pre-recorded, never synthesized live**:
+  `generate_stop_lines.py` writes `sounds/stop_lines/<voice>/{timeout,cap}.wav`
+  (not committed; run it on a fresh clone and after a voice change) and
+  `sounds.stop_lines_dir` points at them. A missing clip is a warning at boot
+  and silence at runtime.
+- `turns.jsonl`: follow-up turns carry `chained`, `follow_up`,
+  `follow_up_index`, and `stopped_listening: "cap" | "timeout"` when she said a
+  line. `follow_up_enabled: false` is the old flow exactly.
+- **Not measured yet:** whether 3s is right (read the `no_speech` follow-ups in
+  `turns.jsonl`), and how reliably the model answers `[ignore]` to TV dialogue.
 
 ### Tool-Driven Device Control
 
@@ -2038,6 +2087,16 @@ Current automated coverage exists for:
   not end the turn; `_idle_loop` chains a barged-in turn into another activation
   on one speaker session; and a closed LLM generator keeps the partial answer
   in history
+- Follow-up listening (`tests/test_follow_up.py`): a reply ending in `?` or an
+  awaiting tool opens a window, a statement, a mid-reply `?`, a barge-in, an
+  error line, a phone report and the disabled flag do not; the window uses
+  `follow_up_timeout_s` for that recording only; no acknowledgement clip and no
+  `_wake_count` change; `[ignore]` (split, any case, with trailing text) speaks
+  nothing and drops the exchange while a tool boundary or a partial sentinel
+  passes; silence after the first question is quiet, in a chain it plays the
+  timeout line once; ten follow-ups then the cap line once, never via TTS; a
+  barge-in resets the chain; one speaker session for the whole conversation;
+  the stop lines load from their folder and a missing one is a warning
 - Halo inputs: `envelope()` and `level()` on one dBFS scale (silence zero, never
   above one, length rounded up, int16/float32/stereo agree, under 5ms for 10s);
   `PeakThrottle` keeping the peak, `WakeScorePublisher` unchanged, clip/mic events
