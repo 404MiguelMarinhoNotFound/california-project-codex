@@ -2696,7 +2696,7 @@ class Orchestrator:
         except Exception:
             logger.exception("Failed to capture activation clip")
 
-    def _record_speech(self, mic_stream, playback=None) -> np.ndarray | None:
+    def _record_speech(self, mic_stream, playback=None, speech_timeout: float | None = None) -> np.ndarray | None:
         """
         Record audio until VAD detects silence.
         Returns numpy array of recorded audio (int16), or None if too short.
@@ -2710,6 +2710,9 @@ class Orchestrator:
         Returns None when he never spoke ("no_speech", the VAD's grace window
         expired) or when what he said is shorter than vad.min_recording. Both
         are dropped before STT — an empty turn is cheaper than a hallucinated one.
+
+        `speech_timeout` overrides vad.speech_timeout for this recording: a
+        follow-up window (answering her question) is shorter. None keeps it.
         """
         self._last_record_outcome = "ok"
 
@@ -2723,7 +2726,7 @@ class Orchestrator:
         window = playback.duration if playback else 0.0
         gate = EchoGate(window, self._barge_in_rms, self._onset_guard_s)
 
-        self.vad.start_recording()
+        self.vad.start_recording(speech_timeout=speech_timeout)
         started = time.monotonic()
         chunks = []
         trim_from = 0
@@ -2755,7 +2758,7 @@ class Orchestrator:
                     trim_from = len(chunks) - 1
                 # min_recording and the silence timer should measure his speech,
                 # not the activation line, so restart the VAD clock here.
-                self.vad.start_recording()
+                self.vad.start_recording(speech_timeout=speech_timeout)
                 continue
 
             should_stop, reason = self.vad.should_stop_recording(audio_chunk)
@@ -2770,8 +2773,8 @@ class Orchestrator:
             # way there is nothing to transcribe.
             self._last_record_outcome = "no_speech"
             logger.info(
-                "Nothing said within %.1fs of the wake word — dropping the turn",
-                getattr(self.vad, "speech_timeout", 0.0),
+                "Nothing said within %.1fs — dropping the turn",
+                speech_timeout if speech_timeout is not None else getattr(self.vad, "speech_timeout", 0.0),
             )
             return None
 
