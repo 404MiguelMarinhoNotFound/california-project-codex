@@ -2523,12 +2523,7 @@ class Orchestrator:
             self.audio.open_speaker()
             try:
                 barged_in = self._handle_activation(mic_stream, pre_roll=pre_roll)
-                while barged_in:
-                    # He said her name over the reply. The listener thread
-                    # was reading the mic, so the buffer is nearly fresh; the
-                    # drain covers the moments between it stopping and this.
-                    self._drain_mic(mic_stream, "barge-in")
-                    barged_in = self._handle_activation(mic_stream)
+                self._run_conversation(mic_stream, barged_in)
             finally:
                 self.audio.close_speaker()
 
@@ -2550,9 +2545,7 @@ class Orchestrator:
         self.audio.open_speaker()
         try:
             barged_in = self._report_turn(report, mic_stream)
-            while barged_in:
-                self._drain_mic(mic_stream, "barge-in")
-                barged_in = self._handle_activation(mic_stream)
+            self._run_conversation(mic_stream, barged_in)
         finally:
             self.audio.close_speaker()
         self._drain_mic(mic_stream, "phone report")
@@ -2592,6 +2585,7 @@ class Orchestrator:
         self._incoming_target = None
         self._next_follow_up = False
         self._turn_awaiting = False
+        self._follow_up_index = 0
         barged_in = False
         try:
             barged_in = self._run_activation(mic_stream, pre_roll)
@@ -2606,6 +2600,118 @@ class Orchestrator:
                 self._turn.set(outcome="barged_in")
             self._mood_for_turn_end(self._turn.finish())
             self._turn = NULL_TURN
+
+    def _run_conversation(self, mic_stream, barged_in: bool) -> None:
+        """
+        What happens after a turn, on the same open speaker session.
+
+        - A barge-in ("California" over her reply) chains straight into a new
+          activation, as it always has. A wake word starts a new conversation,
+          so the follow-up count goes back to 0.
+        - A reply that asked him something (`_next_follow_up`) keeps the mic
+          open for his answer, without the wake word: _handle_follow_up.
+          The cap and the two stop lines live in _decide_follow_up and
+          _run_follow_up.
+        """
+        try:
+            while True:
+                if barged_in:
+                    # He said her name over the reply. The listener thread
+                    # was reading the mic, so the buffer is nearly fresh; the
+                    # drain covers the moments between it stopping and this.
+                    self._drain_mic(mic_stream, "barge-in")
+                    self._follow_up_index = 0
+                    barged_in = self._handle_activation(mic_stream)
+                    continue
+                if not self._next_follow_up:
+                    return
+                # Her own reply is in the mic buffer; start from the room now.
+                self._drain_mic(mic_stream, "follow-up")
+                barged_in = self._handle_follow_up(mic_stream, self._follow_up_index + 1)
+        finally:
+            self._follow_up_index = 0
+            self._next_follow_up = False
+
+    def _handle_follow_up(self, mic_stream, index: int) -> bool:
+        """
+        One follow-up turn, timed like an activation (one turns.jsonl line),
+        flagged `follow_up` with its place in the chain. Returns barged_in.
+        """
+        self._turn = TurnTimer(self._turn_writer, chained=True, bus=self.bus)
+        self._turn.set(follow_up=True, follow_up_index=index)
+        self._activation_seq += 1
+        self._incoming_target = None
+        self._next_follow_up = False
+        self._turn_awaiting = False
+        self._follow_up_index = index
+        barged_in = False
+        try:
+            barged_in = self._run_follow_up(mic_stream, index)
+            return barged_in
+        except BaseException:
+            self._turn.set(outcome="error")
+            self._next_follow_up = False
+            raise
+        finally:
+            self._incoming_target = None
+            if barged_in:
+                self._turn.set(outcome="barged_in")
+            self._mood_for_turn_end(self._turn.finish())
+            self._turn = NULL_TURN
+
+    def _run_follow_up(self, mic_stream, index: int) -> bool:
+        """
+        His answer to her question, heard without the wake word: no
+        acknowledgement clip, no `_wake_count` change, a shorter pre-speech
+        window (conversation.follow_up_timeout_s). Speech that is not him
+        answering her is dropped by the [ignore] gate in _stream_response.
+
+        No reply -- silence, too short, or nothing Whisper would keep -- ends
+        the conversation. After the first question that is quiet; in a chain
+        (index >= 2) she says the pre-recorded timeout line.
+        """
+        self.audio.reset_playback()
+        self._set_state("listening")
+        audio_data = self._record_speech(mic_stream, None, speech_timeout=self._follow_up_timeout_s)
+        self._turn.mark("speech_end")
+
+        transcript = ""
+        if audio_data is None or len(audio_data) == 0:
+            self._turn.set(outcome=self._last_record_outcome)
+        else:
+            rate = getattr(self.audio, "sample_rate", None)
+            if isinstance(rate, (int, float)) and rate:
+                self._turn.set(speech_s=round(len(audio_data) / rate, 2))
+            self._set_state("thinking")
+            transcript = self.stt.transcribe(self.audio.numpy_to_wav_bytes(audio_data))
+            self._turn.mark("stt_done")
+            if not transcript or not transcript.strip():
+                self._turn.set(outcome="empty_transcript")
+                transcript = ""
+
+        if not transcript:
+            logger.info("No answer in follow-up window %d — back to the wake word", index)
+            self.wake_word.reset()
+            if index >= 2:
+                self._play_stop_line("timeout")
+                self._turn.set(stopped_listening="timeout")
+            self._next_follow_up = False
+            self._set_state("idle")
+            return False
+
+        self._turn.set(transcript=transcript)
+        logger.info("User said (follow-up %d): '%s'", index, transcript)
+        print(f"\n  👤 You: {transcript}")
+
+        if self._handle_command(transcript):
+            self._turn.set(outcome="command")
+            return False
+
+        self._capture_incoming_target()
+
+        self._set_state("thinking")
+        self._turn.set(outcome="reply")
+        return self._stream_response(transcript, mic_stream, follow_up=True)
 
     def _current_ring(self):
         """The watcher's live RingOffer, or None. PhoneService's episode check."""

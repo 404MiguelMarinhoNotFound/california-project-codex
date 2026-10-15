@@ -344,5 +344,194 @@ class IgnoredFollowUpTests(unittest.TestCase):
         orch.llm.drop_last_exchange.assert_not_called()
 
 
+# ── The follow-up turn and the conversation loop ──────────────────────────
+
+from tests.test_reply_barge_in import _FakeWake  # noqa: E402
+
+SPEECH = np.ones(16000, dtype=np.int16)
+
+
+class _ScriptedLLM:
+    """One scripted reply per call, each a list of sentences."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.received = []
+        self.drop_last_exchange = Mock(return_value=True)
+
+    def stream_response(self, text):
+        self.received.append(text)
+        reply = self.replies.pop(0) if self.replies else [STATEMENT]
+        for s in reply:
+            yield s + " "
+
+
+def _loop_orch(replies, recordings, transcripts=None):
+    """
+    `recordings` scripts _record_speech for each follow-up window: an array
+    (he answered) or None (silence). `replies` scripts the LLM per follow-up.
+    """
+    orch = _follow_up_orch([STATEMENT])
+    orch.llm = _ScriptedLLM(replies)
+    orch.stt = Mock()
+    orch.stt.transcribe = Mock(side_effect=list(transcripts or ["yes"] * len(recordings)))
+    orch._handle_command = Mock(return_value=False)
+    orch._capture_incoming_target = Mock()
+    orch.audio.play_activation_sound = Mock()
+    orch._wake_count = 1
+    orch.record_calls = []
+    script = list(recordings)
+
+    def record(mic_stream, playback=None, speech_timeout=None):
+        orch.record_calls.append((playback, speech_timeout))
+        audio = script.pop(0) if script else None
+        orch._last_record_outcome = "ok" if audio is not None else "no_speech"
+        return audio
+
+    orch._record_speech = Mock(side_effect=record)
+    return orch
+
+
+class ConversationLoopTests(unittest.TestCase):
+    def test_an_answer_in_the_window_is_a_follow_up_turn_with_no_acknowledgement(self):
+        orch = _loop_orch(replies=[[STATEMENT]], recordings=[SPEECH])
+        orch._next_follow_up = True  # the wake-word turn asked something
+
+        orch._run_conversation(_FakeMic(), False)
+
+        self.assertEqual(orch.record_calls, [(None, 3.0)])
+        orch.audio.play_activation_sound.assert_not_called()
+        self.assertEqual(orch._wake_count, 1)
+        self.assertEqual(" ".join(orch.audio.played), STATEMENT)
+        self.assertEqual(len(orch.llm.received), 1)
+        self.assertFalse(orch._next_follow_up)
+        self.assertEqual(orch._follow_up_index, 0)
+
+    def test_silence_after_the_first_question_ends_quietly(self):
+        orch = _loop_orch(replies=[], recordings=[None])
+        orch._next_follow_up = True
+
+        orch._run_conversation(_FakeMic(), False)
+
+        orch.stt.transcribe.assert_not_called()
+        self.assertEqual(orch.llm.received, [])
+        self.assertEqual(orch.audio.played, [])
+
+    def test_silence_in_a_chained_window_says_the_stop_line_once(self):
+        orch = _loop_orch(replies=[[QUESTION]], recordings=[SPEECH, None])
+        orch._next_follow_up = True
+
+        orch._run_conversation(_FakeMic(), False)
+
+        self.assertEqual(len(orch.record_calls), 2)
+        self.assertEqual(orch.audio.played.count("timeout line"), 1)
+        self.assertNotIn("cap line", orch.audio.played)
+
+    def test_an_empty_transcript_in_a_chained_window_counts_as_no_reply(self):
+        orch = _loop_orch(replies=[[QUESTION]], recordings=[SPEECH, SPEECH], transcripts=["yes", ""])
+        orch._next_follow_up = True
+
+        orch._run_conversation(_FakeMic(), False)
+
+        self.assertEqual(len(orch.llm.received), 1)
+        self.assertEqual(orch.audio.played.count("timeout line"), 1)
+
+    def test_ten_follow_ups_then_the_cap_line(self):
+        orch = _loop_orch(replies=[[QUESTION]] * 12, recordings=[SPEECH] * 12)
+        orch._next_follow_up = True
+
+        orch._run_conversation(_FakeMic(), False)
+
+        self.assertEqual(len(orch.llm.received), 10)
+        self.assertEqual(orch.audio.played.count("cap line"), 1)
+        self.assertNotIn("timeout line", orch.audio.played)
+        self.assertFalse(orch._next_follow_up)
+
+    def test_a_barge_in_inside_a_follow_up_resets_the_chain(self):
+        orch = _loop_orch(replies=[[QUESTION]], recordings=[SPEECH])
+        orch._next_follow_up = True
+        seen = []
+        results = iter([True, False])
+
+        def follow_up(mic_stream, index):
+            seen.append(("follow_up", index))
+            orch._follow_up_index = index
+            return next(results)
+
+        def activation(mic_stream, pre_roll=None):
+            seen.append(("activation", orch._follow_up_index))
+            orch._next_follow_up = False
+            return False
+
+        orch._handle_follow_up = Mock(side_effect=follow_up)
+        orch._handle_activation = Mock(side_effect=activation)
+
+        orch._run_conversation(_FakeMic(), False)
+
+        self.assertEqual(seen, [("follow_up", 1), ("activation", 0)])
+        self.assertNotIn("cap line", orch.audio.played)
+        self.assertNotIn("timeout line", orch.audio.played)
+
+    def test_an_ignored_follow_up_ends_the_conversation_without_a_line(self):
+        orch = _loop_orch(replies=[["[ignore]"]], recordings=[SPEECH])
+        orch._next_follow_up = True
+
+        orch._run_conversation(_FakeMic(), False)
+
+        self.assertEqual(orch.audio.played, [])
+        orch.llm.drop_last_exchange.assert_called_once_with()
+        self.assertEqual(len(orch.record_calls), 1)
+
+    def test_the_follow_up_turn_is_logged_as_one(self):
+        orch = _loop_orch(replies=[[STATEMENT]], recordings=[SPEECH])
+        orch._next_follow_up = True
+        records = []
+        orch._turn_writer = Mock()
+        orch._turn_writer.include_text = True
+        orch._turn_writer.write = Mock(side_effect=records.append)
+
+        orch._run_conversation(_FakeMic(), False)
+
+        self.assertEqual(len(records), 1)
+        self.assertTrue(records[0].get("follow_up"))
+        self.assertEqual(records[0].get("follow_up_index"), 1)
+        self.assertTrue(records[0].get("chained"))
+
+    def test_disabled_is_todays_flow(self):
+        orch = _loop_orch(replies=[], recordings=[SPEECH])
+        orch._follow_up_enabled = False
+        orch._stream_response("hi", _FakeMic())  # a plain reply, even ending in "?"
+        orch._run_conversation(_FakeMic(), False)
+        orch._record_speech.assert_not_called()
+
+    def test_a_phone_report_question_opens_no_window(self):
+        orch = _loop_orch(replies=[[QUESTION]], recordings=[SPEECH])
+        report = Mock()
+        report.label = "Taberna"
+        report.status = "booked"
+        with patch("core.orchestrator._phone_report_message", return_value="report"):
+            orch._deliver_phone_report(report, _FakeMic())
+        orch._record_speech.assert_not_called()
+        self.assertEqual(orch.audio.speaker_opens, 1)
+        self.assertEqual(orch.audio.speaker_closes, 1)
+
+    def test_idle_loop_holds_one_speaker_session_for_the_whole_conversation(self):
+        orch = _loop_orch(replies=[[QUESTION], [STATEMENT]], recordings=[SPEECH, SPEECH])
+        orch.wake_word = _FakeWake(fire_on=1)
+
+        def wake_turn(mic_stream, pre_roll=None):
+            orch._next_follow_up = True
+            orch._follow_up_index = 0
+            return False
+
+        orch._handle_activation = Mock(side_effect=wake_turn)
+
+        orch._idle_loop(_FakeMic())
+
+        self.assertEqual(len(orch.llm.received), 2)
+        self.assertEqual(orch.audio.speaker_opens, 1)
+        self.assertEqual(orch.audio.speaker_closes, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
