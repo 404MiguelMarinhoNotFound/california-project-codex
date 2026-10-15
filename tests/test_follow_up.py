@@ -253,5 +253,96 @@ class FollowUpDecisionTests(unittest.TestCase):
         })
 
 
+# ── "That wasn't for me": the [ignore] gate ──────────────────────────────
+
+import threading  # noqa: E402
+
+from services.sentence_chunker import TOOL_BOUNDARY  # noqa: E402
+
+
+def _gate(tokens):
+    from core.orchestrator import _ignore_gate
+
+    ignored = threading.Event()
+    out = list(_ignore_gate(iter(tokens), ignored))
+    return out, ignored.is_set()
+
+
+class IgnoreGateTests(unittest.TestCase):
+    def test_a_split_sentinel_yields_nothing(self):
+        self.assertEqual(_gate(["[ign", "ore]"]), ([], True))
+
+    def test_case_and_leading_space_and_trailing_text(self):
+        self.assertEqual(_gate(["  [IGNORE]", " anyway"]), ([], True))
+
+    def test_a_real_answer_passes_through(self):
+        self.assertEqual(_gate(["Yes", ", sending"]), (["Yes", ", sending"], False))
+
+    def test_a_partial_sentinel_at_stream_end_is_spoken(self):
+        self.assertEqual(_gate(["[ign"]), (["[ign"], False))
+
+    def test_a_tool_boundary_releases_the_gate(self):
+        self.assertEqual(_gate([TOOL_BOUNDARY, "Done."]), ([TOOL_BOUNDARY, "Done."], False))
+
+    def test_the_word_ignore_later_in_a_reply_is_not_the_sentinel(self):
+        self.assertEqual(_gate(["I'll ignore that"]), (["I'll ignore that"], False))
+
+
+class _RecordingLLM:
+    def __init__(self, sentences):
+        self.sentences = sentences
+        self.received = []
+        self.closed = False
+        self.drop_last_exchange = Mock(return_value=True)
+
+    def stream_response(self, text):
+        self.received.append(text)
+        try:
+            for s in self.sentences:
+                yield s + " "
+        except GeneratorExit:
+            self.closed = True
+            raise
+
+
+class IgnoredFollowUpTests(unittest.TestCase):
+    def _orch(self, sentences):
+        orch = _follow_up_orch(sentences)
+        orch.llm = _RecordingLLM(sentences)
+        return orch
+
+    def test_a_follow_up_reply_of_ignore_is_silent_and_dropped(self):
+        orch = self._orch(["[ignore]"])
+        orch._next_follow_up = True
+        barged = orch._stream_response("maybe tomorrow", _FakeMic(), follow_up=True)
+        self.assertFalse(barged)
+        self.assertEqual(orch.audio.played, [])
+        orch.llm.drop_last_exchange.assert_called_once_with()
+        self.assertTrue(orch.llm.closed)
+        self.assertFalse(orch._next_follow_up)
+
+    def test_the_follow_up_message_carries_the_prefix(self):
+        from core.orchestrator import FOLLOW_UP_PREFIX
+
+        orch = self._orch([STATEMENT])
+        orch._stream_response("yes", _FakeMic(), follow_up=True)
+        self.assertEqual(orch.llm.received, [FOLLOW_UP_PREFIX + "yes"])
+        self.assertTrue(FOLLOW_UP_PREFIX.startswith("[Heard without the wake word"))
+        self.assertTrue(FOLLOW_UP_PREFIX.endswith("reply with exactly [ignore].] "))
+
+    def test_a_normal_turn_never_gates(self):
+        orch = self._orch(["[ignore] hm, that was odd but I will say it anyway."])
+        orch._stream_response("hi", _FakeMic())
+        self.assertEqual(orch.llm.received, ["hi"])
+        self.assertTrue(orch.audio.played)
+        orch.llm.drop_last_exchange.assert_not_called()
+
+    def test_a_real_answer_is_spoken(self):
+        orch = self._orch([STATEMENT])
+        orch._stream_response("yes", _FakeMic(), follow_up=True)
+        self.assertEqual(" ".join(orch.audio.played), STATEMENT)
+        orch.llm.drop_last_exchange.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

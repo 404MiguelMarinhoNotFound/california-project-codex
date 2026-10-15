@@ -1106,6 +1106,51 @@ def _timed_tokens(token_stream, turn):
         yield token
 
 
+# A follow-up turn is heard without the wake word, so it may be the TV or
+# someone else in the room. The model is told so in the message (not the
+# system prompt, which stays unchanged) and answers exactly SENTINEL when it
+# is not him answering her; _ignore_gate catches that before any TTS.
+SENTINEL = "[ignore]"
+FOLLOW_UP_PREFIX = (
+    "[Heard without the wake word, right after your question. If this is not "
+    "him answering you, reply with exactly [ignore].] "
+)
+
+
+def _ignore_gate(tokens, ignored: threading.Event):
+    """
+    Hold back the start of a follow-up reply until it is clearly not SENTINEL.
+
+    Text tokens are buffered while they could still be the start of
+    "[ignore]" (leading whitespace and case ignored). A reply that starts with
+    it sets `ignored` and yields nothing at all, even if the model kept
+    writing. Anything else -- a token that rules it out, a TOOL_BOUNDARY, or
+    the end of the stream -- releases the buffer and passes the rest through
+    untouched, so a real answer loses no time.
+    """
+    buf = ""
+    for token in tokens:
+        if isinstance(token, str):
+            buf += token
+            head = buf.lstrip().lower()
+            if head.startswith(SENTINEL):
+                ignored.set()
+                return
+            if SENTINEL.startswith(head):
+                continue
+        if buf:
+            yield buf
+            buf = ""
+        if not isinstance(token, str):
+            yield token
+        break
+    else:
+        if buf:
+            yield buf
+        return
+    yield from tokens
+
+
 def _wants_follow_up(reply_parts: list[str], interrupted: bool) -> bool:
     """
     Whether her reply asked him something, by its words: the last spoken
@@ -2851,7 +2896,7 @@ class Orchestrator:
 
         return audio_data
 
-    def _stream_response(self, user_text: str, mic_stream=None) -> bool:
+    def _stream_response(self, user_text: str, mic_stream=None, follow_up: bool = False) -> bool:
         """
         The streaming pipeline: LLM → Sentence Chunker → TTS → Speaker.
 
@@ -2873,11 +2918,16 @@ class Orchestrator:
         Returns True when the reply was cut off that way. The caller then
         treats it as a fresh activation — "California, no, the other one" is
         one motion.
+
+        `follow_up=True` is a turn heard without the wake word: the message
+        carries FOLLOW_UP_PREFIX, and a reply of "[ignore]" is dropped before
+        anything is spoken, along with its exchange in history.
         """
         # Queue for sentences waiting to be spoken
         tts_queue: queue.Queue[str | None] = queue.Queue()
         full_response_parts = []
         errored = False
+        ignored = threading.Event()
         self._next_follow_up = False
         self._interrupted.clear()
 
@@ -2914,10 +2964,15 @@ class Orchestrator:
             # Stream LLM → accumulate sentences → enqueue for TTS
             from services.sentence_chunker import chunk_sentences
 
-            token_stream = self.llm.stream_response(user_text)
+            if follow_up:
+                token_stream = self.llm.stream_response(FOLLOW_UP_PREFIX + user_text)
+                tokens = _ignore_gate(token_stream, ignored)
+            else:
+                token_stream = self.llm.stream_response(user_text)
+                tokens = token_stream
             first_sentence = True
 
-            for sentence in chunk_sentences(_timed_tokens(token_stream, self._turn)):
+            for sentence in chunk_sentences(_timed_tokens(tokens, self._turn)):
                 if self._interrupted.is_set():
                     # Close the LLM stream now rather than whenever the
                     # generator is collected; stream_response records what was
@@ -2934,6 +2989,15 @@ class Orchestrator:
                     first_sentence = False
 
                 tts_queue.put(sentence)
+
+            if ignored.is_set():
+                # Not him answering her. Nothing reached TTS; close the stream
+                # (the LLM keeps "[ignore]" as a partial reply) and forget the
+                # whole exchange so TV dialogue never stays in context.
+                logger.info("Follow-up was not meant for her ([ignore]); dropping it")
+                token_stream.close()
+                self.llm.drop_last_exchange()
+                self._turn.set(outcome="ignored")
 
         except Exception as e:
             logger.exception(f"Streaming error: {e}")
@@ -2961,6 +3025,9 @@ class Orchestrator:
             print(f"  🌴 California: {full_response}")
 
         interrupted = self._interrupted.is_set()
+        if ignored.is_set():
+            self._next_follow_up = False
+            return interrupted
         self._decide_follow_up(full_response_parts, interrupted, errored)
         return interrupted
 
