@@ -382,7 +382,7 @@ def _loop_orch(replies, recordings, transcripts=None):
     orch.record_calls = []
     script = list(recordings)
 
-    def record(mic_stream, playback=None, speech_timeout=None):
+    def record(mic_stream, playback=None, speech_timeout=None, echo_tail_s=0.0):
         orch.record_calls.append((playback, speech_timeout))
         audio = script.pop(0) if script else None
         orch._last_record_outcome = "ok" if audio is not None else "no_speech"
@@ -531,6 +531,72 @@ class ConversationLoopTests(unittest.TestCase):
         self.assertEqual(len(orch.llm.received), 2)
         self.assertEqual(orch.audio.speaker_opens, 1)
         self.assertEqual(orch.audio.speaker_closes, 1)
+
+
+# ── Final-review fixes ────────────────────────────────────────────────────
+
+
+class ReviewFixTests(unittest.TestCase):
+    def test_an_awaiting_tool_with_the_error_line_opens_no_window(self):
+        orch = _follow_up_orch([ERROR_LINE])
+        orch._turn_awaiting = True
+        orch._stream_response("tell marta im late", _FakeMic())
+        self.assertFalse(orch._next_follow_up)
+
+    def test_no_window_while_he_is_on_his_own_phone_call(self):
+        # "Answer it on speaker" worked; her reply ended in a question. The mic
+        # must not record his call and send it to Whisper and the LLM.
+        orch = _follow_up_orch([QUESTION])
+        orch.phone_service = Mock()
+        orch.phone_service.human_call_active.return_value = True
+        orch.phone_service.busy.return_value = False
+        orch._stream_response("answer it on speaker", _FakeMic())
+        self.assertFalse(orch._next_follow_up)
+
+    def test_no_window_during_one_of_her_calls(self):
+        orch = _follow_up_orch([QUESTION])
+        orch.phone_service = Mock()
+        orch.phone_service.human_call_active.return_value = False
+        orch.phone_service.busy.return_value = True
+        orch._stream_response("hi", _FakeMic())
+        self.assertFalse(orch._next_follow_up)
+
+    def test_a_bare_mock_phone_service_does_not_block_the_window(self):
+        orch = _follow_up_orch([QUESTION])
+        orch.phone_service = Mock()  # attributes are truthy Mocks, not True
+        orch._stream_response("hi", _FakeMic())
+        self.assertTrue(orch._next_follow_up)
+
+    def test_the_follow_up_recording_holds_back_her_speaker_tail(self):
+        from core.orchestrator import FOLLOW_UP_ECHO_TAIL_S
+
+        orch = _loop_orch(replies=[[STATEMENT]], recordings=[SPEECH])
+        tails = []
+        inner = orch._record_speech.side_effect
+
+        def record(mic_stream, playback=None, speech_timeout=None, echo_tail_s=0.0):
+            tails.append(echo_tail_s)
+            return inner(mic_stream, playback, speech_timeout)
+
+        orch._record_speech = Mock(side_effect=record)
+        orch._next_follow_up = True
+        orch._run_conversation(_FakeMic(), False)
+        self.assertEqual(tails, [FOLLOW_UP_ECHO_TAIL_S])
+        self.assertGreaterEqual(FOLLOW_UP_ECHO_TAIL_S, 0.2)
+
+    def test_record_speech_gates_the_echo_tail_like_a_playback_window(self):
+        from core.orchestrator import Orchestrator
+
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.audio = Mock()
+        orch._barge_in_rms = 900
+        orch._onset_guard_s = 0.0
+        orch._drain_mic = Mock()
+        orch.vad = Mock()
+        with patch("core.orchestrator.EchoGate", side_effect=RuntimeError("stop")) as gate:
+            with self.assertRaises(RuntimeError):
+                orch._record_speech(_FakeMic(), None, speech_timeout=3.0, echo_tail_s=0.25)
+        self.assertEqual(gate.call_args.args[0], 0.25)
 
 
 if __name__ == "__main__":

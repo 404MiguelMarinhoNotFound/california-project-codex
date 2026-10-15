@@ -1111,6 +1111,11 @@ def _timed_tokens(token_stream, turn):
 # system prompt, which stays unchanged) and answers exactly SENTINEL when it
 # is not him answering her; _ignore_gate catches that before any TTS.
 SENTINEL = "[ignore]"
+# The output latency (~180ms with sounddevice latency='high') plus room reverb:
+# her question's last syllable is still leaving the speaker when the follow-up
+# recording starts. The EchoGate holds the VAD clock and drops that much audio,
+# exactly as it does for an activation line. A loud barge-in still arms it early.
+FOLLOW_UP_ECHO_TAIL_S = 0.25
 FOLLOW_UP_PREFIX = (
     "[Heard without the wake word, right after your question. If this is not "
     "him answering you, reply with exactly [ignore].] "
@@ -2672,7 +2677,10 @@ class Orchestrator:
         """
         self.audio.reset_playback()
         self._set_state("listening")
-        audio_data = self._record_speech(mic_stream, None, speech_timeout=self._follow_up_timeout_s)
+        audio_data = self._record_speech(
+            mic_stream, None, speech_timeout=self._follow_up_timeout_s,
+            echo_tail_s=FOLLOW_UP_ECHO_TAIL_S,
+        )
         self._turn.mark("speech_end")
 
         transcript = ""
@@ -2894,7 +2902,9 @@ class Orchestrator:
         except Exception:
             logger.exception("Failed to capture activation clip")
 
-    def _record_speech(self, mic_stream, playback=None, speech_timeout: float | None = None) -> np.ndarray | None:
+    def _record_speech(
+        self, mic_stream, playback=None, speech_timeout: float | None = None, echo_tail_s: float = 0.0,
+    ) -> np.ndarray | None:
         """
         Record audio until VAD detects silence.
         Returns numpy array of recorded audio (int16), or None if too short.
@@ -2911,6 +2921,8 @@ class Orchestrator:
 
         `speech_timeout` overrides vad.speech_timeout for this recording: a
         follow-up window (answering her question) is shorter. None keeps it.
+        `echo_tail_s` is an echo window to gate when there is no playback: her
+        reply's tail still leaving the speaker at the start of a follow-up.
         """
         self._last_record_outcome = "ok"
 
@@ -2921,7 +2933,7 @@ class Orchestrator:
         # transcribed and answered.
         self._drain_mic(mic_stream, "activation line")
 
-        window = playback.duration if playback else 0.0
+        window = playback.duration if playback else float(echo_tail_s or 0.0)
         gate = EchoGate(window, self._barge_in_rms, self._onset_guard_s)
 
         self.vad.start_recording(speech_timeout=speech_timeout)
@@ -3144,10 +3156,14 @@ class Orchestrator:
         conversation loop keeps the mic open (see _run_conversation). Past
         conversation.max_follow_ups she says the pre-recorded cap line instead.
         """
+        # The error line ends in "?", and a tool can be waiting on him when the
+        # next request fails: check it here, for both triggers.
+        errored = errored or ERROR_LINE in " ".join(reply_parts)
         wanted = (
             self._follow_up_enabled
             and not errored
             and not interrupted
+            and not self._on_a_phone_call()
             and (self._turn_awaiting or _wants_follow_up(reply_parts, interrupted))
         )
         if wanted and self._follow_up_index >= self._max_follow_ups:
@@ -3156,6 +3172,22 @@ class Orchestrator:
             self._turn.set(stopped_listening="cap")
             wanted = False
         self._next_follow_up = bool(wanted)
+
+    def _on_a_phone_call(self) -> bool:
+        """
+        His own call (answered natively on speakerphone) or one of hers is
+        live. A follow-up window then would record the call and send it to
+        Whisper and the LLM, and could speak into it. `is True`: a bare Mock
+        never blocks. Never raises.
+        """
+        phone = getattr(self, "phone_service", None)
+        if phone is None:
+            return False
+        try:
+            return phone.human_call_active() is True or phone.busy() is True
+        except Exception:
+            logger.exception("Could not read the phone's call state; no follow-up window")
+            return True
 
     def _play_stop_line(self, which: str) -> None:
         """
