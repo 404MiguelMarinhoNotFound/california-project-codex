@@ -7,11 +7,18 @@
   <meta name="referrer" content="no-referrer">
   <title>California Live</title>
   <link rel="icon" href="data:,">
+  <link rel="preload" href="fonts/geist-1.7.2.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="app.css">
 </head>
-<body>
+<body class="loading">
   <header class="top">
-    <div class="brand">California</div>
+    <div class="brand-wrap">
+      <div class="brand">California</div>
+      <div class="pin" id="pin" aria-hidden="true">
+        <canvas id="pin-ring" width="80" height="80"></canvas>
+        <div class="pin-tx"><span id="pin-state">Connecting</span><span id="pin-line"></span></div>
+      </div>
+    </div>
     <div class="state" id="state" data-state="unknown" aria-live="polite">
       <span class="state-dot" aria-hidden="true"></span>
       <span class="state-label" id="state-label">Connecting</span>
@@ -31,6 +38,7 @@
     <div class="halo-caption" id="halo-caption" aria-live="polite"></div>
     <button class="halo-full" id="halo-full" type="button" aria-pressed="false">Full screen</button>
     <p class="halo-nogl" id="halo-nogl" hidden>This browser can't draw the halo.</p>
+    <div class="halo-end" id="halo-end" aria-hidden="true"></div>
   </section>
 
   <div class="banner" id="banner" hidden></div>
@@ -50,8 +58,8 @@
       </div>
       <div class="meter" id="meter" aria-hidden="true">
         <div class="meter-fill" id="meter-fill"></div>
-        <div class="meter-tick" id="tick-idle" title="Wake threshold"></div>
-        <div class="meter-tick tick-barge" id="tick-barge" title="Barge-in threshold"></div>
+        <div class="meter-tick" id="tick-idle" title="Wake threshold" data-label="wake"></div>
+        <div class="meter-tick tick-barge" id="tick-barge" title="Barge-in threshold" data-label="barge"></div>
       </div>
       <canvas class="spark" id="spark" height="72" aria-label="Wake score over the last 30 seconds"></canvas>
       <ol class="hits mono" id="hits"></ol>
@@ -62,8 +70,13 @@
         <h2 id="now-h">Now</h2>
         <span class="mono muted" id="now-clock"></span>
       </div>
-      <div class="empty" id="now-empty">Waiting for the wake word. Say "California".</div>
+      <div class="empty" id="now-empty">Waiting for the wake word. Say "California" and this turn fills in stage by stage.</div>
       <div id="now-body" hidden>
+        <div class="timeline" id="timeline" role="img" aria-label="Turn stages over time">
+          <span class="tl-trk"></span><span class="tl-run" id="tl-run"></span>
+          <span id="tl-dots"></span>
+          <span class="tl-ax start">0s</span><span class="tl-ax stop" id="tl-end">6s</span>
+        </div>
         <ol class="stages" id="stages"></ol>
         <div class="said" id="said" hidden>
           <div class="label">He said</div>
@@ -89,15 +102,15 @@
     <section class="panel feed" aria-labelledby="feed-h">
       <div class="panel-head">
         <h2 id="feed-h">This session</h2>
-        <span class="legend mono muted">
-          <i class="seg seg-listen"></i>listen
-          <i class="seg seg-stt"></i>stt
-          <i class="seg seg-llm"></i>think
-          <i class="seg seg-tts"></i>voice
-          <i class="seg seg-speak"></i>speak
+        <span class="legend muted">
+          <span><i class="seg seg-listen"></i>listen</span>
+          <span><i class="seg seg-stt"></i>speech to text</span>
+          <span><i class="seg seg-llm"></i>think</span>
+          <span><i class="seg seg-tts"></i>voice</span>
+          <span><i class="seg seg-speak"></i>speak</span>
         </span>
       </div>
-      <div class="empty" id="feed-empty">No turns yet in this run.</div>
+      <div class="empty" id="feed-empty">No turns yet in this run. Each turn lands here with its timing.</div>
       <ol class="turns" id="turns"></ol>
     </section>
 
@@ -106,7 +119,7 @@
         <h2 id="calls-h">Calls</h2>
         <span class="muted mono">newest first</span>
       </div>
-      <div class="empty" id="calls-empty">No calls logged yet.</div>
+      <div class="empty" id="calls-empty">No calls logged yet. Calls she places show up here with their transcript.</div>
       <ol class="calls-list" id="calls-list"></ol>
     </section>
 

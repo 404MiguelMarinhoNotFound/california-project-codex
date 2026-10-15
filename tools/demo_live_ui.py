@@ -568,6 +568,7 @@ def check(port: int, include_text: bool) -> int:
                       f"{len(errors)} console errors")
                 ctx.close()
         failures += _check_ambient_and_fallback(browser, url)
+        failures += _check_dusk(browser, url)
         browser.close()
     live.stop()
     if failures:
@@ -577,6 +578,71 @@ def check(port: int, include_text: bool) -> int:
         return 1
     print(f"OK: screenshots in {SHOTS}")
     return 0
+
+
+def _check_dusk(browser, url) -> list[str]:
+    """
+    The Dusk redesign's promises: the fonts load, the strip pins once the halo
+    scrolls away and lets go in ambient, every control is a 44px target, and a
+    turn row (and a call row, when there is one) opens on a tap. Opened on the
+    session the earlier contexts played, so the feed has rows to click.
+    """
+    failures: list[str] = []
+    for width, height, scheme in ((390, 844, "dark"), (390, 844, "light"), (1280, 900, "dark")):
+        name = f"dusk-{width}-{scheme}"
+        ctx, page, errors = _open(browser, url, width, height, scheme)
+        _wait_for(page, "!document.body.classList.contains('loading')")
+        page.evaluate("document.fonts.ready")
+        if page.evaluate("document.fonts.check('16px Geist') && document.fonts.check('16px \"Geist Mono\"')") is not True:
+            failures.append(f"{name}: Geist did not load")
+
+        page.evaluate("window.scrollTo(0, document.getElementById('halo').offsetHeight + 240)")
+        page.wait_for_timeout(500)
+        if page.evaluate("document.body.classList.contains('pinned')") is not True:
+            failures.append(f"{name}: the strip did not pin after scrolling past the halo")
+        elif float(page.evaluate("getComputedStyle(document.getElementById('pin')).opacity")) < 0.9:
+            failures.append(f"{name}: pinned, but the strip is not showing")
+        page.screenshot(path=os.path.join(SHOTS, f"{name}-pinned.png"))
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(500)
+        if page.evaluate("document.body.classList.contains('pinned')"):
+            failures.append(f"{name}: still pinned with the halo back in view")
+
+        page.evaluate("window.scrollTo(0, document.getElementById('halo').offsetHeight + 240)")
+        page.wait_for_timeout(400)
+        page.evaluate("document.getElementById('halo-full').click()")
+        page.wait_for_timeout(300)
+        if page.evaluate("document.body.classList.contains('pinned')"):
+            failures.append(f"{name}: still pinned in ambient mode")
+        page.evaluate("document.getElementById('halo-full').click()")
+        page.wait_for_timeout(300)
+
+        small = page.evaluate("""[...document.querySelectorAll('button')].filter((b) => {
+            const r = b.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && r.height < 44;
+          }).map((b) => (b.id || b.className || b.textContent).slice(0, 30))""")
+        if small:
+            failures.append(f"{name}: buttons under 44px tall: {small[:5]}")
+
+        if page.evaluate("document.querySelectorAll('#turns .turn > button').length") == 0:
+            failures.append(f"{name}: no turn rows to open")
+        else:
+            page.click("#turns .turn > button")
+            page.wait_for_timeout(200)
+            if page.evaluate("document.querySelector('#turns .turn > button').getAttribute('aria-expanded')") != "true" \
+                    or page.evaluate("document.querySelector('#turns .turn .detail').hidden"):
+                failures.append(f"{name}: a turn row did not open on a tap")
+        if page.evaluate("document.querySelectorAll('#calls-list .subhead').length"):
+            page.click("#calls-list .subhead")
+            page.wait_for_timeout(400)
+            if page.evaluate("document.querySelector('#calls-list .sub-body').hidden"):
+                failures.append(f"{name}: a call row did not open on a tap")
+        page.screenshot(path=os.path.join(SHOTS, f"{name}-feed.png"), full_page=True)
+        if errors:
+            failures.append(f"{name}: console errors: {errors[:3]}")
+        print(f"{name}: pinned strip, targets, rows checked")
+        ctx.close()
+    return failures
 
 
 def _launch(pw):
