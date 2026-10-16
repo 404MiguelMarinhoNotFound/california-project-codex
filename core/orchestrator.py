@@ -2386,6 +2386,10 @@ class Orchestrator:
             payload["label"] = who
         self.bus.publish("incoming_call", payload)
         logger.info("Announcing an incoming call (%s)", kind)
+        # Speaking, then idle again, like a turn: the console status line and
+        # the live page only redraw on a change, so an announcement that never
+        # left "idle" looked like she was stuck once the log scrolled past it.
+        self._set_state("speaking")
         try:
             self.audio.open_speaker()
             try:
@@ -2400,6 +2404,7 @@ class Orchestrator:
         except Exception:
             logger.exception("Incoming-call announcement failed")
         self._drain_mic(mic_stream, "announcement")
+        self._set_state("idle")
 
     def _play_bootup_sound(self):
         """Pick a random WAV from `sounds.bootup_dir` and play it."""
