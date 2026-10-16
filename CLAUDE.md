@@ -2504,7 +2504,14 @@ instructions, read back once before agreeing, goodbye then `end_call`), a templa
 
 **Every call is read back, even to an exact contact**, through the same server-side token
 as WhatsApp: `confirm=True` works only against a pending read-back of the same number AND
-the same `brief.signature()`, inside `confirm_timeout_ms`, one shot. Numbers are
+the same `brief.signature()`, inside `confirm_timeout_ms`, one shot.
+
+**That read-back is the ONLY question (2026-10-15).** `logs/turns.jsonl` showed a call
+taking three "go"s: she first asked permission with no tool call, then read the plan back
+in her own words (still no tool call), and only then called the tool and got its
+read-back. The system prompt's "Phone calls:" paragraph and the `control_phone`
+description now say: call `phone_call` in the same reply he asks, no "want me to?" and no
+self-made read-back first. Replayed against the real model, 3/3 took one "go". Numbers are
 `normalize_phone`d; short codes (112), `blocked_prefixes` (PT premium rate) and countries
 outside `allowed_country_codes` are refused.
 
@@ -4403,7 +4410,9 @@ angle). How it ends:
 
 - `logs/california.log` -- the console log plus DEBUG, rotated at 5MB x 5. SDK
   clients (`anthropic`, `groq`, ...) are held at INFO, because at DEBUG they log
-  every request body and bury everything else.
+  every request body and bury everything else. `websockets`, `google_genai` and
+  `google.auth` are held there too: at DEBUG `websockets` logged the Gemini Live
+  call's `Authorization: Bearer` token into the file (found 2026-10-15).
 - `logs/turns.jsonl` -- one line per activation, ms since the wake word:
   `speech_end`, `stt_done`, `llm_first_token`, `first_sentence`, `first_audio`,
   `reply_done`, and `tools` (name, action, start, duration, result). A stage that
