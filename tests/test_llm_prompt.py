@@ -162,10 +162,13 @@ class ToolSchemaTests(unittest.TestCase):
         # get_status already existed. Reading state back cost one enum value in
         # total, on the lights side. The one addition since is "unmute": TV
         # volume moved to UPnP, where mute is explicit rather than the box's
-        # KEYCODE_VOLUME_MUTE toggle, and "unmute" must never mute.
+        # KEYCODE_VOLUME_MUTE toggle, and "unmute" must never mute. And
+        # "press_ok", the remote's middle button: asked for by voice and refused
+        # on 2026-10-16 with YouTube stuck on its profile picker.
         actions = CONTROL_TV_TOOL["input_schema"]["properties"]["action"]["enum"]
         self.assertIn("get_status", actions)
-        self.assertEqual(len(actions), 24)
+        self.assertIn("press_ok", actions)
+        self.assertEqual(len(actions), 25)
 
     def test_control_phone_offers_contact_sync(self):
         actions = CONTROL_PHONE_TOOL["input_schema"]["properties"]["action"]["enum"]

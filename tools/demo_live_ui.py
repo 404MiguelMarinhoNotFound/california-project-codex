@@ -205,7 +205,7 @@ class Script:
                                          "start_ms": start_ms, "target": label}, wait_s)
         return (name, action, start_ms, target)
 
-    def tool_end(self, call, result, ok=None, awaiting=False, ms=None, wait_s=0.0):
+    def tool_end(self, call, result, ok=None, awaiting=False, ms=None, wait_s=0.0, tool_input=None):
         name, action, start_ms, target = call
         entry = {"turn": self.turn, "name": name, "action": action, "start_ms": start_ms,
                  "ms": int(ms if ms is not None else wait_s * 1000), "result": result}
@@ -216,15 +216,20 @@ class Script:
         label = _short_target(target) if self.v.include_text else None
         if label:
             entry["target"] = label
+        if tool_input and self.v.include_text:
+            entry["input"] = tool_input
         self.pub("turn_tool", entry, wait_s)
 
-    def call_tool(self, name, action, target, result, ok=None, awaiting=False, seconds=1.0, ms=None, snap=None):
+    def call_tool(self, name, action, target, result, ok=None, awaiting=False, seconds=1.0, ms=None, snap=None,
+                  tool_input=None):
         call = self.tool_start(name, action, target)
         if snap:
             self.at(seconds * 0.6, "snap", snap)
-            self.tool_end(call, result, ok, awaiting, ms if ms is not None else int(seconds * 1000), seconds * 0.4)
+            self.tool_end(call, result, ok, awaiting, ms if ms is not None else int(seconds * 1000), seconds * 0.4,
+                          tool_input=tool_input)
         else:
-            self.tool_end(call, result, ok, awaiting, ms if ms is not None else int(seconds * 1000), seconds)
+            self.tool_end(call, result, ok, awaiting, ms if ms is not None else int(seconds * 1000), seconds,
+                          tool_input=tool_input)
         return call
 
     def probe(self, label, js, predicate, message, wait_s=0.0):
@@ -304,7 +309,9 @@ class Script:
         self.idle_scores(1.0)
         self.wake("yes send it")
         self.call_tool("control_whatsapp", "whatsapp_send", "to Marta", "Sent to Marta Zuka.", ok=True, seconds=1.8,
-                       ms=1900, snap="whatsapp-sending")
+                       ms=1900, snap="whatsapp-sending",
+                       tool_input={"to": "Marta", "message": "Chego daqui a dez minutos, guarda-me um pastel de nata",
+                                   "confirm": "True"})
         self.probe("ask retired", sats, lambda v: not any(x["st"] == "ask" for x in v),
                    "the parked read-back should go once he answered")
         self.reply("Sent.", mood="happy")

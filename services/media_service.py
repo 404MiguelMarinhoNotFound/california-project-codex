@@ -448,6 +448,12 @@ class MediaService:
         self.youtube_warm_launch_delay_s = media_cfg.get("youtube_warm_launch_delay_ms", 1500) / 1000
         self.youtube_profile_select_on_cold_start = media_cfg.get("youtube_profile_select_on_cold_start", True)
         self.youtube_profile_select_delay_s = media_cfg.get("youtube_profile_select_delay_ms", 1200) / 1000
+        # A fresh start (no YouTube process) always shows "Who's watching", but
+        # only once the app has drawn: an OK sent while focus is still null goes
+        # nowhere (seen live 2026-10-16). Wait for YouTube to hold focus, then
+        # give the picker a beat to render before the OK.
+        self.youtube_focus_wait_s = max(0, int(media_cfg.get("youtube_focus_wait_ms", 10000))) / 1000
+        self.youtube_fresh_picker_settle_s = max(0, int(media_cfg.get("youtube_fresh_picker_settle_ms", 1500))) / 1000
         # A search deep link stops at the results page. See youtube_play_video
         # and services/youtube_search.py.
         self.youtube_search_autoplay = bool(media_cfg.get("youtube_search_autoplay", True))
@@ -768,6 +774,11 @@ class MediaService:
         return self.ensure_connected() and self._adb(
             "shell input keyevent KEYCODE_MEDIA_PLAY_PAUSE")[0]
 
+    def press_ok(self) -> bool:
+        """The remote's middle button. In a player it plays/pauses too."""
+        return self.ensure_connected() and self._adb(
+            "shell input keyevent KEYCODE_DPAD_CENTER")[0]
+
     def stop(self) -> bool:
         return self.ensure_connected() and self._adb(
             "shell input keyevent KEYCODE_MEDIA_STOP")[0]
@@ -1082,6 +1093,27 @@ class MediaService:
 
         return False, "no_marker_found"
 
+    def _youtube_process_running(self) -> bool | None:
+        """Is YouTube's process alive? None when the box would not say."""
+        ok, output = self._adb(f'shell "pidof {self._youtube_package()}; echo rc=$?"')
+        if not ok or "rc=" not in (output or ""):
+            return None
+        head, _, rc = output.rpartition("rc=")
+        if head.strip():
+            return True
+        return False if rc.strip().startswith("1") else None
+
+    def _wait_for_youtube_focus(self, timeout_s: float) -> bool:
+        """Poll the focused window until it is YouTube's. False on timeout."""
+        deadline = time.monotonic() + timeout_s
+        youtube_pkg = self._youtube_package().lower()
+        while True:
+            if youtube_pkg in (self.get_current_focus() or "").lower():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.4)
+
     def _prepare_youtube_launch(self) -> bool:
         t_start = time.monotonic()
 
@@ -1090,6 +1122,9 @@ class MediaService:
             log.info("[timing] _prepare_youtube_launch: already foreground, skipped in %.3fs", time.monotonic() - t_start)
             return True
 
+        # Read BEFORE the launch: afterwards the process always exists.
+        fresh = self.youtube_profile_select_on_cold_start and self._youtube_process_running() is False
+
         t_launch = time.monotonic()
         ok, _ = self.launch_app("youtube")
         log.info("[timing] _prepare_youtube_launch: launch_app took %.3fs ok=%s", time.monotonic() - t_launch, ok)
@@ -1097,7 +1132,16 @@ class MediaService:
             return False
         self._youtube_cold_launch = True
 
-        if self.youtube_warm_launch_delay_s > 0:
+        if fresh:
+            t_focus = time.monotonic()
+            focused = self._wait_for_youtube_focus(self.youtube_focus_wait_s)
+            if self.youtube_fresh_picker_settle_s > 0:
+                time.sleep(self.youtube_fresh_picker_settle_s)
+            log.info(
+                "[timing] _prepare_youtube_launch: fresh start, focus %s after %.3fs (incl. settle)",
+                "held" if focused else "never seen", time.monotonic() - t_focus,
+            )
+        elif self.youtube_warm_launch_delay_s > 0:
             t_warm = time.monotonic()
             time.sleep(self.youtube_warm_launch_delay_s)
             log.info("[timing] _prepare_youtube_launch: warm_delay took %.3fs", time.monotonic() - t_warm)
@@ -1109,7 +1153,11 @@ class MediaService:
         # session stamp.
         if self.youtube_profile_select_on_cold_start:
             t_detect = time.monotonic()
-            should_press, detection_source = self._detect_youtube_profile_picker_fast()
+            if fresh:
+                # From scratch, the picker is a certainty, not a guess.
+                should_press, detection_source = True, "fresh_start"
+            else:
+                should_press, detection_source = self._detect_youtube_profile_picker_fast()
             log.info(
                 "[timing] _prepare_youtube_launch: profile_detect took %.3fs should_press=%s source=%s",
                 time.monotonic() - t_detect,

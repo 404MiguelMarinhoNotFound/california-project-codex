@@ -701,7 +701,8 @@ class PhoneService:
             return PhoneCommandResult(
                 False,
                 f"Ready to call {label} at {_spoken_number(resolved)} ({source}) to {what}. "
-                "Read that back to Master Miguel, including where the number came from, "
+                "Read that back to Master Miguel in English, including where the number came from "
+                "(say the plan in English even though the call will be in Portuguese), "
                 "and only call again with confirm true once he says go.",
                 awaiting=True,
             )

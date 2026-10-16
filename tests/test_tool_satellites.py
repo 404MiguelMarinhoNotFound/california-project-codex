@@ -147,6 +147,36 @@ class TurnTimerTargetTests(unittest.TestCase):
         self.assertNotIn("+351", repr(bus.subscribe()[0]))
         self.assertIs(record["tools"][0]["awaiting"], True)
 
+    def test_the_tool_input_rides_along_for_the_opened_row(self):
+        """Tapping the Now row shows what went out, so the event carries it."""
+        bus = EventBus()
+        turn = TurnTimer(_writer(True), bus=bus)
+        turn.tool("control_whatsapp", "whatsapp_send", 0, "Sent to Marta.", ok=True,
+                  tool_input={"action": "whatsapp_send", "to": "Marta", "message": "Chego já",
+                              "confirm": True, "at": "", "group": None, "rooms": ["sala"]})
+        shown = _events(bus, "turn_tool")[0]["input"]
+        self.assertEqual(shown, {"to": "Marta", "message": "Chego já", "rooms": '["sala"]'})
+        self.assertEqual(turn.finish("reply")["tools"][0]["input"], shown)
+
+    def test_no_transcripts_means_no_tool_input(self):
+        bus = EventBus()
+        turn = TurnTimer(_writer(False), bus=bus)
+        turn.tool("control_whatsapp", "whatsapp_send", 0, "Sent.", ok=True,
+                  tool_input={"to": "+351900000000", "message": "the door code is 4471"})
+        record = turn.finish("reply")
+        self.assertNotIn("input", record["tools"][0])
+        self.assertNotIn("4471", repr(bus.subscribe()[0]))
+
+    def test_a_long_input_value_is_cut_and_junk_never_raises(self):
+        turn = TurnTimer(None)
+        turn.tool("control_phone", "phone_call", 0, "ok", tool_input={"details": "x" * 5000})
+        turn.tool("control_tv", "turn_on", 0, "ok", tool_input="not a dict")
+        turn.tool("control_tv", "turn_on", 0, "ok", tool_input={"action": "turn_on"})
+        tools = turn.finish("reply")["tools"]
+        self.assertLessEqual(len(tools[0]["input"]["details"]), 600)
+        self.assertNotIn("input", tools[1])
+        self.assertNotIn("input", tools[2])
+
     def test_a_long_label_is_one_short_line(self):
         bus = EventBus()
         turn = TurnTimer(None, bus=bus)
@@ -266,7 +296,16 @@ class AwaitingTests(unittest.TestCase):
         self.assertNotIn("ok", tool)
         self.assertEqual(tool["target"], "to marta")
         self.assertEqual(_events(orch.bus, "mood"), [])
-        self.assertNotIn("the secret", repr(_events(orch.bus)))
+        # The body is never the label; it rides only in `input`, which the page
+        # shows when the row is tapped (and which transcripts-off drops).
+        self.assertNotIn("the secret", repr(_events(orch.bus, "turn_tool_start")))
+        self.assertNotIn("the secret", tool["target"])
+        self.assertEqual(tool["input"]["message"], "the secret")
+        quiet = _orch(include_text=False)
+        quiet.whatsapp_service = self._whatsapp(WhatsAppCommandResult(False, "Say send it.", awaiting=True))
+        quiet._say_now = lambda text: None
+        quiet._handle_tool_call("control_whatsapp", {"action": "whatsapp_send", "to": "marta", "message": "the secret"})
+        self.assertNotIn("the secret", repr(_events(quiet.bus)))
 
     def test_the_awaiting_flag_does_not_leak_into_the_next_call(self):
         orch = _orch()
