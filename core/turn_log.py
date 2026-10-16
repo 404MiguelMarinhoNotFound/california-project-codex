@@ -46,6 +46,8 @@ _TURN_IDS = itertools.count(1)
 _CHATTY_LIBRARIES = (
     "anthropic", "groq", "openai", "asyncio", "PIL", "bleak",
     "playwright", "websocket", "numba", "matplotlib", "filelock",
+    # The Gemini Live call: websockets logs the Bearer token at DEBUG.
+    "websockets", "google_genai", "google.auth", "urllib3", "httpx", "httpcore",
 )
 
 
