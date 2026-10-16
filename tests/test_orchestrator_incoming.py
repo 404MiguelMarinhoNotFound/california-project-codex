@@ -168,6 +168,26 @@ class AnnounceTests(unittest.TestCase):
         # The ring is still there for the next pass.
         self.assertIsNotNone(orch.incoming_calls.call)
 
+    def test_the_announcement_shows_speaking_then_idle_again(self):
+        # The console and the live page only redraw on a state change; an
+        # announcement that never left "idle" looked stuck once log lines
+        # pushed the status line away (2026-10-16).
+        orch = _orch(_call())
+        states = []
+        orch._set_state = lambda s: states.append(s)
+        orch.audio.play_audio.side_effect = lambda *a, **k: states.append("play")
+        orch._idle_loop(_mic())
+        self.assertEqual(states, ["idle", "speaking", "play", "idle"])
+
+    def test_a_failed_announcement_still_returns_to_idle(self):
+        orch = _orch(_call())
+        states = []
+        orch._set_state = lambda s: states.append(s)
+        orch.tts.synthesize.side_effect = RuntimeError("tts down")
+        with self.assertLogs("core.orchestrator", level="ERROR"):
+            orch._idle_loop(_mic())
+        self.assertEqual(states[-1], "idle")
+
     def test_an_announcement_is_not_an_llm_turn(self):
         orch = _orch(_call())
         orch._idle_loop(_mic())
