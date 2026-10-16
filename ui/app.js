@@ -389,7 +389,41 @@
         li.querySelector(".tool-result")?.remove();
         li.append(el("span", "tool-result", d.result));
       }
+      railDetail(li, d);
     }
+  }
+
+  // Tapping a finished row opens what the tool was asked to do (the message
+  // that went out, the call brief); its answer is already on the row. Text only, and only
+  // with transcripts on: the server sends no `input` otherwise.
+  function railDetail(li, d) {
+    if (!hello || hello.transcripts === false) return;
+    const rows = Object.entries(d.input || {});
+    if (!rows.length) return;
+    const box = el("div", "tool-detail");
+    box.hidden = li.getAttribute("aria-expanded") !== "true";
+    const dl = el("dl");
+    for (const [k, v] of rows) dl.append(el("dt", "", k.replace(/_/g, " ")), el("dd", "", String(v)));
+    box.append(dl);
+    li.querySelector(".tool-detail")?.remove();
+    li.append(box);
+    if (li.classList.contains("openable")) return;
+    li.classList.add("openable");
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    li.setAttribute("aria-expanded", "false");
+    const flip = (ev) => {
+      // Selecting text inside the opened detail is not a tap.
+      if (ev && ev.target && ev.target.closest && ev.target.closest(".tool-detail")) return;
+      const b = li.querySelector(".tool-detail");
+      if (!b) return;
+      b.hidden = !b.hidden;
+      li.setAttribute("aria-expanded", String(!b.hidden));
+    };
+    li.addEventListener("click", flip);
+    li.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); flip(); }
+    });
   }
 
   function retire(e) {
@@ -842,6 +876,7 @@
     for (const t of r.tools || []) {
       const how = t.ok === true ? "worked" : t.ok === false ? "failed" : t.awaiting ? "asked" : "";
       detail.append(el("div", "mono", `${t.name}.${t.action || ""}${t.target ? " (" + t.target + ")" : ""} ${fmtMs(t.ms)}${how ? " " + how : ""}: ${t.result || ""}`));
+      for (const [k, v] of Object.entries(t.input || {})) detail.append(el("div", "tool-in", `${k.replace(/_/g, " ")}: ${v}`));
     }
     if (r.reply) detail.append(el("div", "", r.reply));
     if (r.error) detail.append(el("div", "", r.error));

@@ -14,6 +14,9 @@ from services.media_service import (
 )
 from tests.config_fixture import config_for_tests
 
+# The real method, kept before the class setUp patches it for every test.
+_real_process_running = MediaService._youtube_process_running
+
 
 class MediaServiceYouTubeTests(unittest.TestCase):
     def setUp(self):
@@ -26,6 +29,11 @@ class MediaServiceYouTubeTests(unittest.TestCase):
         self.config = config_for_tests(
             media={"cec_wake": {"enabled": False}, "discovery": {"enabled": False}},
         )
+        # Unless a test says otherwise, YouTube is running in the background:
+        # the guess-the-picker path. The fresh-start path has its own tests.
+        running = patch.object(MediaService, "_youtube_process_running", return_value=True)
+        running.start()
+        self.addCleanup(running.stop)
 
     def test_youtube_playlist_launches_expected_url(self):
         svc = MediaService(self.config)
@@ -300,6 +308,49 @@ class MediaServiceYouTubeTests(unittest.TestCase):
         # Fallback: DPAD_CENTER + deep-link = 2 calls
         self.assertEqual(adb.call_count, 2)
         self.assertEqual(adb.call_args_list[0][0][0], "shell input keyevent KEYCODE_DPAD_CENTER")
+
+    def test_a_fresh_start_waits_for_youtube_focus_then_presses_ok(self):
+        """Seen live 2026-10-16: OK sent while focus was still null went nowhere,
+        and the picker then swallowed the samba playlist."""
+        svc = MediaService(self.config)
+        main_focus = "com.google.android.youtube.tv/com.google.android.apps.youtube.tv.activity.MainActivity"
+        focus = iter(["", "null", main_focus, main_focus, main_focus])
+        with patch.object(svc, "_youtube_process_running", return_value=False),                 patch.object(svc, "ensure_connected", return_value=True),                 patch.object(svc, "get_current_app", return_value="stremio"),                 patch.object(svc, "launch_app", return_value=(True, "Opening youtube")),                 patch("services.media_service.time.sleep") as sleep,                 patch.object(svc, "get_current_focus", side_effect=lambda: next(focus)) as get_focus,                 patch.object(svc, "_adb", return_value=(True, "ok")) as adb:
+            ok = svc.youtube_playlist("PL12345")
+
+        self.assertTrue(ok)
+        # Polled until YouTube held focus; the main activity is NOT read as "no picker".
+        self.assertEqual(get_focus.call_count, 3)
+        sleep.assert_any_call(svc.youtube_fresh_picker_settle_s)
+        commands = [c[0][0] for c in adb.call_args_list]
+        self.assertEqual(commands[0], "shell input keyevent KEYCODE_DPAD_CENTER")
+        self.assertIn("playlist?list=PL12345", commands[1])
+        self.assertEqual(len(commands), 2)
+        self.assertFalse(svc._youtube_cold_launch)  # cleared: no second press later
+
+    def test_a_fresh_start_presses_once_even_if_focus_never_comes(self):
+        svc = MediaService(self.config)
+        svc.youtube_focus_wait_s = 0
+        with patch.object(svc, "_youtube_process_running", return_value=False),                 patch.object(svc, "ensure_connected", return_value=True),                 patch.object(svc, "get_current_app", return_value="stremio"),                 patch.object(svc, "launch_app", return_value=(True, "Opening youtube")),                 patch("services.media_service.time.sleep"),                 patch.object(svc, "get_current_focus", return_value=""),                 patch.object(svc, "_adb", return_value=(True, "ok")) as adb:
+            self.assertTrue(svc.youtube_playlist("PL12345"))
+        commands = [c[0][0] for c in adb.call_args_list]
+        self.assertEqual(commands.count("shell input keyevent KEYCODE_DPAD_CENTER"), 1)
+
+    def test_an_unreadable_process_check_keeps_the_old_guess(self):
+        svc = MediaService(self.config)
+        main_focus = "com.google.android.youtube.tv/com.google.android.apps.youtube.tv.activity.MainActivity"
+        with patch.object(svc, "_youtube_process_running", return_value=None),                 patch.object(svc, "ensure_connected", return_value=True),                 patch.object(svc, "get_current_app", return_value="stremio"),                 patch.object(svc, "launch_app", return_value=(True, "Opening youtube")),                 patch("services.media_service.time.sleep"),                 patch.object(svc, "get_current_focus", return_value=main_focus),                 patch.object(svc, "_adb", return_value=(True, "ok")) as adb:
+            self.assertTrue(svc.youtube_playlist("PL12345"))
+        self.assertEqual(adb.call_count, 1)  # the link only
+
+    def test_process_check_reads_pidof(self):
+        svc = MediaService(self.config)
+        cases = [((True, "7397\nrc=0\n"), True), ((True, "rc=1\n"), False),
+                 ((False, ""), None), ((True, "weird"), None)]
+        for reply, expected in cases:
+            with self.subTest(reply=reply), patch.object(svc, "_adb", return_value=reply) as adb:
+                self.assertIs(_real_process_running(svc), expected)
+                self.assertIn("pidof com.google.android.youtube.tv", adb.call_args[0][0])
 
     def test_detect_youtube_profile_picker_fast_main_activity(self):
         svc = MediaService(self.config)

@@ -808,7 +808,8 @@ and he does not say "California" first (2026-10-15). Spec:
 - Box volume over ADB key presses -- only the fallback now; the TV's own volume goes through `TvVolume`, see below
 - App launching for Stremio, YouTube, Surfshark, and Spotify
 - Explicit activity launch when configured, with fallback to plain package launch
-- Navigation commands like home and back
+- Navigation commands like home and back, and `press_ok` -- the remote's round middle button
+  (`KEYCODE_DPAD_CENTER`), added 2026-10-16 after "press OK" was refused with YouTube stuck on its picker
 - Power commands, which are asymmetric — see the section below
 - Current-app and media-session inspection
 - Current focus inspection, UI dump capture, and screenshot capture for TV debugging
@@ -854,7 +855,7 @@ sets refuse hosts missing from the TV's device list -- this one does not).
 - **`mute` and `unmute` are explicit.** The box's `KEYCODE_VOLUME_MUTE` is a
   toggle, so "unmute" could mute; `SetMute` cannot. `unmute` is the one enum
   value added to `control_tv` for this, and `tests/test_llm_prompt.py` pins the
-  count at 24.
+  count (25 since `press_ok`).
 - **`get_status` reports "TV volume N"** (or "TV muted"), skipped when the CEC bus
   already says standby. The box's volume is then only mentioned when it is
   below max, because that is the only case where it explains a quiet room.
@@ -2506,6 +2507,11 @@ instructions, read back once before agreeing, goodbye then `end_call`), a templa
 as WhatsApp: `confirm=True` works only against a pending read-back of the same number AND
 the same `brief.signature()`, inside `confirm_timeout_ms`, one shot.
 
+**Read-backs are spoken in English (2026-10-16).** Chirp mangles Portuguese, so the
+system prompt, the group-send read-back and the call read-back tell her to say in
+English what a Portuguese message or call says, never the Portuguese words. What is
+sent, and the call itself, stay exactly as written.
+
 **That read-back is the ONLY question (2026-10-15).** `logs/turns.jsonl` showed a call
 taking three "go"s: she first asked permission with no tool call, then read the plan back
 in her own words (still no tool call), and only then called the tool and got its
@@ -3000,6 +3006,12 @@ Cold-start behavior:
   within `media.youtube_picker_probe_ms` (3s), press OK once and resend the link (the resend restarts the
   video, so an OK that landed in a player cannot leave it paused). Never on a warm launch, and never on an
   unreadable session. Playlists and results pages have no stamp oracle, so they still rely on the activity guess
+- **A fresh start is not a guess (2026-10-16).** `pidof` before the launch says whether YouTube's process
+  exists. If it does not, the picker is certain: `_prepare_youtube_launch` waits up to
+  `media.youtube_focus_wait_ms` (10s) for YouTube to hold window focus, then `youtube_fresh_picker_settle_ms`
+  (1.5s, not yet measured) for the picker to draw, then presses OK once. The old fixed 1.5s wait pressed OK
+  while focus was still `null` -- nothing drawn yet -- so the press went nowhere and the samba playlist landed
+  in the picker (log, 16:08 that day). A process check that cannot be read falls back to the activity guess
 
 ### "Search for X and play it": the results page never plays
 
@@ -3173,7 +3185,7 @@ At the time of this update:
 The Claude path supports:
 
 - Anthropic web search via `web_search_20250305`
-- Custom `control_tv` tool for Mi Box and TV control (24 actions)
+- Custom `control_tv` tool for Mi Box and TV control (25 actions)
 - Custom `control_lights` tool for Govee light control (5 actions)
 - Custom `control_vacuum` tool for the Deebot N8+ (5 actions)
 - Custom `control_whatsapp` tool for WhatsApp messaging (4 actions)
@@ -3211,7 +3223,7 @@ The `control_tv` schema in `services/llm.py` currently supports these TV-related
 - `play_pause`, `stop`, `next`, `prev`
 - `fast_forward`, `rewind`
 - `volume_up`, `volume_down`, `volume_set`, `mute`, `unmute` (the TV's own volume over UPnP; see "Volume Is The Television's")
-- `launch_app`, `go_home`, `go_back`
+- `launch_app`, `go_home`, `go_back`, `press_ok`
 - `turn_on`, `turn_off`, `switch_hdmi`
 - `get_status`
 - `stremio_play`, `stremio_continue`, `stremio_get_progress`, `stremio_sync_library`
@@ -4379,6 +4391,12 @@ angle). How it ends:
   read only when their text changes, and styles are written only when they
   change, for the same reason. Satellites and labels are separated as boxes, so
   six on a phone do not sit on each other.
+- **A finished rail row opens on a tap (2026-10-16).** It shows what the tool
+  was asked to do -- the message that went out, the call brief -- from the
+  `input` field `TurnTimer.tool(..., tool_input=)` puts on `turn_tool` and the
+  turn record (`action` and `confirm` left out, values cut at 600 characters).
+  Like `result`, it exists only with transcripts on. The satellite label still
+  never carries the body; the detail is hidden until tapped.
 - **Also fixed: `include_transcripts: false` kept tool results.** A result can
   quote the request ("I've got Marta at +351...", a group read-back carries the
   message itself), and it was published and written to `turns.jsonl` regardless.

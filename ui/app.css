@@ -364,6 +364,17 @@ body.loading .empty::after { top: 30px; width: 48%; }
 .rail li[data-st="ask"] .fill { background: repeating-linear-gradient(90deg, var(--tint) 0 6px, transparent 6px 10px); }
 .rail li[data-st="lost"] .fill { opacity: 0.4; }
 .rail .tool-result { grid-column: 2 / -1; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+.rail li.openable { cursor: pointer; border-radius: 12px; transition: background-color var(--dur-fast) var(--ease-out); }
+.rail li.openable:hover { background: color-mix(in srgb, var(--surface-2) 50%, transparent); }
+.rail li.openable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rail li.openable .tool-result::after { content: " A"; color: var(--muted); }
+.rail li.openable[aria-expanded="true"] .tool-result::after { content: ""; }
+.rail .tool-detail { grid-column: 2 / -1; cursor: auto; padding: 12px 14px; border-radius: 12px; background: var(--surface-2);
+  font-size: 14px; overflow-wrap: anywhere; animation: reveal var(--dur) var(--ease-out); }
+.rail .tool-detail dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 12px; margin: 0; }
+.rail .tool-detail dt { color: var(--muted); }
+.rail .tool-detail dd { margin: 0; color: var(--text); white-space: pre-wrap; unicode-bidi: plaintext; }
+.turn .detail .tool-in { font-size: 14px; color: var(--text); margin-left: 12px; white-space: pre-wrap; }
 @media (max-width: 520px) {
   .rail li { grid-template-columns: 40px minmax(0, 1fr) 4.8rem; }
   .rail .trk { grid-column: 2 / 4; grid-row: 2; }

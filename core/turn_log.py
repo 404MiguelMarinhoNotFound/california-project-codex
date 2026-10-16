@@ -206,11 +206,15 @@ class TurnTimer:
         return start_ms if start_ms is not None else 0
 
     def tool(self, name: str, action: str | None, started_ms: int, result: str | None,
-             ok: bool | None = None, target: str | None = None, awaiting: bool = False) -> None:
+             ok: bool | None = None, target: str | None = None, awaiting: bool = False,
+             tool_input: dict | None = None) -> None:
         """`ok`: did the device action happen (True/False), absent when the tool
         had nothing to report -- a status read, or a question back.
         `awaiting`: the tool asked him something (a read-back, "which one?") and
-        is parked until he answers. Never set together with `ok`."""
+        is parked until he answers. Never set together with `ok`.
+        `tool_input`: what the model asked the tool to do (the message body, the
+        call brief), so the live page can show it when the row is opened. Goes
+        with the transcripts, like `result`."""
         with self._lock:
             entry = {
                 "name": name,
@@ -223,6 +227,9 @@ class TurnTimer:
             # transcripts: `include_transcripts: false` keeps only timings.
             if self._include_text:
                 entry["result"] = (result or "")[:160]
+                shown = _short_input(tool_input)
+                if shown:
+                    entry["input"] = shown
             if ok is True or ok is False:
                 entry["ok"] = ok
             elif awaiting is True:
@@ -276,6 +283,37 @@ def _short_target(target) -> str | None:
     if len(text) > _TARGET_MAX:
         text = text[: _TARGET_MAX - 1].rstrip() + "\u2026"
     return text
+
+
+# What a tool was asked to do, for the live page's opened row. Long fields
+# (a message body, a call brief) are cut, not dropped.
+_INPUT_VALUE_MAX = 600
+_INPUT_KEYS_MAX = 16
+
+
+def _short_input(tool_input) -> dict | None:
+    """The tool input minus `action` (the row already says it) and `confirm`
+    (bookkeeping, not what he asked for), each value a trimmed string. None when there is nothing to show. Never raises."""
+    try:
+        if not isinstance(tool_input, dict):
+            return None
+        out = {}
+        for key, value in tool_input.items():
+            if key in ("action", "confirm") or value is None or value == "" or len(out) >= _INPUT_KEYS_MAX:
+                continue
+            if isinstance(value, (dict, list)):
+                text = json.dumps(value, ensure_ascii=False)
+            else:
+                text = str(value)
+            text = text.strip()
+            if not text:
+                continue
+            if len(text) > _INPUT_VALUE_MAX:
+                text = text[: _INPUT_VALUE_MAX - 1].rstrip() + "…"
+            out[str(key)[:40]] = text
+        return out or None
+    except Exception:
+        return None
 
 
 class _NullTurn:

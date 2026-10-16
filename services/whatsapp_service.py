@@ -1329,7 +1329,8 @@ class WhatsAppService:
             return WhatsAppCommandResult(
                 False,
                 f"NOT SENT YET. The group is {spoken}. Read the message back to Master Miguel "
-                f"and ask if you should send it, then wait for his yes. Never say it went out "
+                f"in English (if it is in Portuguese, say in English what it says, never the "
+                f"Portuguese words; what gets sent stays exactly as written) and ask if you should send it, then wait for his yes. Never say it went out "
                 f"until a later call returns that it was sent. Message: {message}",
                 awaiting=True,
             )

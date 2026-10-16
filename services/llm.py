@@ -45,7 +45,9 @@ CONTROL_TV_TOOL = {
             "change volume, set volume to a percentage, open an app, launch "
             "Stremio titles, continue Stremio series, check Stremio episode progress, "
             "sync Stremio library, open YouTube playlists, search YouTube, "
-            "toggle power, or control the TV in any way. For plain Stremio series "
+            "toggle power, or control the TV in any way. press_ok is the round middle "
+            "button on his remote (OK / select): use it for \"press OK\", \"hit the "
+            "middle button\", or to get past a screen waiting on the remote. For plain Stremio series "
             "play requests without an explicit season and episode, sync the library "
             "first and resume the latest tracked episode when available. If there is "
             "no tracked progress, it starts at season 1 episode 1 on its own. "
@@ -61,7 +63,7 @@ CONTROL_TV_TOOL = {
                     "play_pause", "stop", "next", "prev",
                     "fast_forward", "rewind",
                     "volume_up", "volume_down", "volume_set", "mute", "unmute",
-                    "launch_app", "go_home", "go_back",
+                    "launch_app", "go_home", "go_back", "press_ok",
                     "turn_on", "turn_off", "switch_hdmi",
                     "get_status",
                     "stremio_play", "stremio_continue", "stremio_get_progress", "stremio_sync_library",

@@ -668,7 +668,7 @@ def _dispatch_tv(
     requires_tv = {
         "play_pause", "stop", "next", "prev", "fast_forward", "rewind",
         "volume_up", "volume_down", "volume_set", "mute", "unmute",
-        "launch_app", "go_home", "go_back",
+        "launch_app", "go_home", "go_back", "press_ok",
         # Deliberately NOT the power actions. This gate returns early when the
         # TV is unreachable, and unreachable is precisely the state turn_on
         # exists to fix -- the box drops off Wi-Fi in standby. Listing "wake"
@@ -745,6 +745,8 @@ def _dispatch_tv(
     # Playback
     if action == "play_pause":
         return "done" if media_svc.play_pause() else "command failed"
+    elif action == "press_ok":
+        return "Pressed OK." if media_svc.press_ok() else "command failed"
     elif action == "stop":
         _forget_launch(now_playing)
         return "done" if media_svc.stop() else "command failed"
@@ -3373,7 +3375,7 @@ class Orchestrator:
             self._turn.tool(
                 tool_name, action, started,
                 result if result is not None else "<raised>", ok=ok,
-                target=target, awaiting=awaiting,
+                target=target, awaiting=awaiting, tool_input=tool_input,
             )
             self._publish_mood_for_tool(tool_name, action, result, ok)
 
