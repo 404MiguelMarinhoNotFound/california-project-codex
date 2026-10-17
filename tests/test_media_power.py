@@ -1059,7 +1059,48 @@ class EnsurePlayableTests(unittest.TestCase):
         media = self._media(reachable=True, awake=False)
         media.turn_on.return_value = True
         media.last_wake_result = WakeResult(True, "TV on HDMI 1", tv_confirmed=False)
+        media.hdmi_state.return_value = HdmiState(False, "on")  # the box says: not me
         self.assertIn("remote", _ensure_playable(media))
+
+    def _tv_off_the_network(self, hdmi):
+        """Box awake, TV answering nothing on the LAN, the box's CEC view = `hdmi`."""
+        media = self._media(awake=True)
+        media.cec_waker.available = True
+        media.cec_waker.tv_power.return_value = "off"
+        media.hdmi_state.return_value = hdmi
+        return media
+
+    def test_a_tv_off_the_wifi_but_showing_the_box_plays_without_a_wake(self):
+        """
+        2026-10-17: TV on and on HDMI 2, but dropped off Wi-Fi. Two "put on
+        Friends" each spent 20s on Wake-on-LAN and told him to use the remote.
+        The box is all a deep link needs, and its CEC view says it is on screen.
+        """
+        media = self._tv_off_the_network(HdmiState(True, "on"))
+        spoken = []
+        self.assertEqual(_ensure_playable(media, say_now=spoken.append), "")
+        media.turn_on.assert_not_called()
+        self.assertEqual(spoken, [], "no 'waking everything up' when nothing needs waking")
+
+    def test_a_dark_tv_under_a_box_that_claimed_its_input_is_still_woken(self):
+        """
+        Re-enabling CEC after tv_only_standby makes the box claim the active
+        source while the set stays dark. The power reading must say "on" too.
+        """
+        for hdmi in (HdmiState(True, "standby"), HdmiState(True, None), HdmiState(False, "on")):
+            with self.subTest(hdmi=hdmi):
+                media = self._tv_off_the_network(hdmi)
+                media.turn_on.return_value = True
+                media.last_wake_result = WakeResult(True, "tv up", tv_confirmed=True)
+                self.assertEqual(_ensure_playable(media), "")
+                media.turn_on.assert_called_once()
+
+    def test_a_wake_unconfirmed_over_the_network_plays_if_the_box_is_on_screen(self):
+        media = self._media(reachable=True, awake=False)
+        media.turn_on.return_value = True
+        media.last_wake_result = WakeResult(True, "TV did not come on after WoL", tv_confirmed=False)
+        media.hdmi_state.return_value = HdmiState(True, "on")
+        self.assertEqual(_ensure_playable(media), "")
 
     def test_a_wake_whose_tv_rejected_the_token_says_approve_me(self):
         media = self._media(reachable=True, awake=False)
