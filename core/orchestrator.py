@@ -490,6 +490,18 @@ def _status_line(status, launch=None, tv_level=None, tv_muted=None) -> str:
     return ". ".join(parts) + "."
 
 
+def _box_on_screen(hdmi) -> bool:
+    """
+    The box's own CEC view says the TV is on AND showing it.
+
+    Both are required: re-enabling HDMI-CEC after tv_only_standby makes the box
+    claim the active source while the set stays dark, and that exchange leaves a
+    "standby" power reading in the tail. Identity checks: Mock attributes are truthy.
+    """
+    return (getattr(hdmi, "active_source", None) is True
+            and getattr(hdmi, "tv_power", None) == "on")
+
+
 def _ensure_playable(media_svc, say_now=None) -> str:
     """
     Get the room ready to show something. Returns "" on success, else a spoken line.
@@ -536,7 +548,15 @@ def _ensure_playable(media_svc, say_now=None) -> str:
         # normal state. Identity checks: a bare Mock's `available` is truthy.
         waker = getattr(media_svc, "cec_waker", None)
         tv = waker.tv_power() if getattr(waker, "available", False) is True else None
-        hdmi = media_svc.hdmi_state() if tv is None else None
+        hdmi = media_svc.hdmi_state() if tv in (None, "off") else None
+        if tv == "off" and _box_on_screen(hdmi):
+            # "off" is "nothing answered on the network": deep standby, OR a set
+            # that is on but dropped off Wi-Fi. 2026-10-17: the TV was on and
+            # showing the box, .201 was not even in ARP, and two "put on
+            # Friends" were refused after a 20s Wake-on-LAN each. The box's
+            # own CEC view is the tie-break, and the box is all a deep link needs.
+            logger.info("TV silent on the network but the box is on screen; playing")
+            return ""
         if tv == "on" or (tv is None and getattr(hdmi, "tv_power", None) != "standby"):
             # Verified, not fire-and-forget: switch_input reports success on a
             # key the TV accepted and ignored. None is "could not tell" and never
@@ -554,6 +574,11 @@ def _ensure_playable(media_svc, say_now=None) -> str:
             return ("The box is on, but the TV rejected my pairing token. Approve "
                     "me on screen and I'll try again.")
         if getattr(result, "tv_confirmed", None) is False:
+            # The network-side verdict can be wrong (see above); one more look
+            # at the box's own view before handing the job to the remote.
+            if _box_on_screen(media_svc.hdmi_state()):
+                logger.info("Wake unconfirmed over the network, but the box is on screen; playing")
+                return ""
             return remote_line
         # True, or None (unconfirmed): proceed. A deep link into a room that
         # is probably fine beats refusing to play on a maybe.

@@ -954,6 +954,17 @@ is still on the LAN. Two halves on a two-thread pool, then a confirm loop:
    (`_parse_tv_power(..., since=)`), because the tail read "standby" for good
    after the set was switched back on by hand (2026-09-21).
 
+**A TV silent on the network is not necessarily off (2026-10-17).** `tv_power()`
+returns `"off"` when nothing answers, which is also what a set that is on but has
+dropped off Wi-Fi looks like. That day the TV was on and showing the box, `.201`
+was not even in ARP, and two "put on Friends" each spent 20s on Wake-on-LAN and
+ended in "use the remote". `_ensure_playable` now asks the box before waking:
+when the network says `"off"` and the box's own CEC view says the TV is `"on"`
+**and** the box is the active source (`_box_on_screen`), it plays at once. Both
+are required, because re-enabling CEC after `tv_only_standby` makes the box claim
+the active source under a dark set. The same check runs once more after a wake
+that comes back `tv_confirmed=False`, before the remote line.
+
 `turn_on()` returns "the box is awake". The television is a separate claim in
 `last_wake_result.tv_confirmed`: `True`, `False` (still dark, or on another
 input), `None` (could not tell). `_dispatch_tv` and `_ensure_playable` read it
